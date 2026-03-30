@@ -7,7 +7,9 @@ use clap::{Parser, Subcommand};
 
 use api::ApiClient;
 use cli::commands::{auth, goals, org};
-use config::{load_credentials, load_settings};
+use config::load_credentials;
+
+use crate::config::Settings;
 
 #[derive(Parser)]
 #[command(
@@ -40,11 +42,10 @@ enum Commands {
 
 fn build_client() -> Result<ApiClient> {
     let creds = load_credentials()?;
-    let settings = load_settings()?;
+    let settings = Settings::load()?;
     match creds {
-        Some(c) => {
-            Ok(ApiClient::new(&c.token, &c.api_url)?.with_org_id(settings.current_organization_id))
-        }
+        Some(c) => Ok(ApiClient::new(&c.token, &c.api_url)?
+            .with_org_id(settings.current_organization_id().clone())),
         None => bail!("Not authenticated. Run: addness auth set-token <token>"),
     }
 }

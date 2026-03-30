@@ -1,6 +1,6 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -9,8 +9,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 
-use crate::api::ApiClient;
-use crate::config::{save_credentials, save_settings, Credentials};
+use crate::config::{Credentials, Settings};
 
 #[derive(serde::Deserialize)]
 struct StartSessionResponse {
@@ -41,6 +40,7 @@ struct OrgInfo {
 
 #[derive(serde::Deserialize)]
 struct RegisterResponse {
+    #[allow(dead_code)]
     data: RegisterData,
 }
 
@@ -83,7 +83,7 @@ fn sha256_base64url(value: &str) -> String {
 fn timestamp() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .expect("system clock before Unix epoch")
         .as_secs() as i64
 }
 
@@ -163,21 +163,6 @@ pub async fn handle_login(api_url: &str, frontend_url: Option<&str>) -> Result<(
     let start_token = start_data.data.start_token;
 
     // 7. ブラウザを開く
-    let browser_url = format!(
-        "{}/api/v1/public/desktop/auth/start-sessions/redeem?start_token={}",
-        api_url, start_token
-    );
-
-    // ただし、redeemはPOSTなので、ブラウザに直接開かせる方法を変える必要がある
-    // Desktop Authの設計を見ると、ブラウザはフロントエンド経由でredeemする
-    // CLIはstart_tokenをフロントエンドのURLパラメータとして渡す
-    // フロントエンドのsign-inページがstart_tokenを受け取ってredeemする
-
-    // 実際のDesktop Authフロー:
-    // CLIがlocalhostでHTTPサーバーを起動
-    // ブラウザがClerkでログイン → intent complete → localhostにリダイレクト
-
-    // フロントエンドのDesktop Auth用URLにstart_tokenを渡す
     let fe_url = frontend_url
         .map(|s| s.to_string())
         .unwrap_or_else(|| api_url.replace(":8080", ":3000").replace("api.", ""));
@@ -191,17 +176,23 @@ pub async fn handle_login(api_url: &str, frontend_url: Option<&str>) -> Result<(
     println!("  {}", browser_url);
     println!();
 
-    if let Err(_) = open::that(&browser_url) {
+    if open::that(&browser_url).is_err() {
         println!("Could not open browser automatically.");
     }
 
     println!("Waiting for login...");
 
     // 8. localhostでコールバックを待機
-    let (handoff_id, callback_state) = tokio::task::spawn_blocking(move || {
-        wait_for_callback(listener)
-    })
-    .await??;
+    let callback_result = tokio::time::timeout(
+        Duration::from_secs(300),
+        tokio::task::spawn_blocking(move || wait_for_callback(listener)),
+    )
+    .await;
+    let (handoff_id, callback_state) = match callback_result {
+        Ok(Ok(result)) => result?,
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => bail!("Login timed out (5 minutes). Please try again."),
+    };
 
     if callback_state != state {
         bail!("State mismatch: expected {}, got {}", state, callback_state);
@@ -244,23 +235,24 @@ pub async fn handle_login(api_url: &str, frontend_url: Option<&str>) -> Result<(
         .context("Server did not return an API key. Is the API Key feature enabled?")?;
 
     // 10. 保存
-    save_credentials(&Credentials {
-        token: api_key.clone(),
-        api_url: api_url.to_string(),
-    })?;
+    Credentials::new(api_key.clone(), api_url.to_string()).save()?;
 
     // 組織が返ってきた場合、最初の組織をデフォルトに設定
     if let Some(orgs) = &exchange_data.data.organizations {
         if !orgs.is_empty() {
-            let mut settings = crate::config::load_settings()?;
-            settings.current_organization_id = Some(orgs[0].id.clone());
-            save_settings(&settings)?;
+            let mut settings = Settings::load()?;
+            settings.set_current_organization_id(orgs[0].id.clone())?;
         }
     }
 
     println!();
     println!("Login successful!");
-    println!("  API Key: {}...{}", &api_key[..6], &api_key[api_key.len() - 4..]);
+    let masked = if api_key.len() >= 10 {
+        format!("{}...{}", &api_key[..6], &api_key[api_key.len() - 4..])
+    } else {
+        "[saved]".to_string()
+    };
+    println!("  API Key: {}", masked);
     println!("  API URL: {}", api_url);
 
     if let Some(orgs) = &exchange_data.data.organizations {
@@ -280,46 +272,58 @@ pub async fn handle_login(api_url: &str, frontend_url: Option<&str>) -> Result<(
 }
 
 fn wait_for_callback(listener: TcpListener) -> Result<(String, String)> {
-    let (mut stream, _) = listener.accept().context("Failed to accept connection")?;
+    loop {
+        let (mut stream, _) = listener.accept().context("Failed to accept connection")?;
 
-    let mut reader = BufReader::new(&stream);
-    let mut request_line = String::new();
-    reader
-        .read_line(&mut request_line)
-        .context("Failed to read request")?;
+        let mut reader = BufReader::new(&stream);
+        let mut request_line = String::new();
+        reader
+            .read_line(&mut request_line)
+            .context("Failed to read request")?;
 
-    // Parse: GET /callback?handoff_id=xxx&state=yyy HTTP/1.1
-    let path = request_line
-        .split_whitespace()
-        .nth(1)
-        .unwrap_or("");
+        // Parse: GET /callback?handoff_id=xxx&state=yyy HTTP/1.1
+        let path = request_line.split_whitespace().nth(1).unwrap_or("");
 
-    let query = path.split('?').nth(1).unwrap_or("");
-    let mut handoff_id = String::new();
-    let mut state = String::new();
+        // Ignore requests that are not the callback (e.g. favicon, preflight)
+        if !path.starts_with("/callback") {
+            let body = "not found";
+            let response = format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            continue;
+        }
 
-    for param in query.split('&') {
-        if let Some((key, value)) = param.split_once('=') {
-            match key {
-                "handoff_id" => handoff_id = value.to_string(),
-                "state" => state = value.to_string(),
-                _ => {}
+        let query = path.split('?').nth(1).unwrap_or("");
+        let mut handoff_id = String::new();
+        let mut state = String::new();
+
+        for param in query.split('&') {
+            if let Some((key, value)) = param.split_once('=') {
+                match key {
+                    "handoff_id" => handoff_id = value.to_string(),
+                    "state" => state = value.to_string(),
+                    _ => {}
+                }
             }
         }
+
+        // レスポンスを返す
+        let body =
+            "<html><body><h1>Login successful!</h1><p>You can close this tab.</p></body></html>";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes())?;
+
+        if handoff_id.is_empty() {
+            bail!("No handoff_id in callback");
+        }
+
+        return Ok((handoff_id, state));
     }
-
-    // レスポンスを返す
-    let body = "<html><body><h1>Login successful!</h1><p>You can close this tab.</p></body></html>";
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    stream.write_all(response.as_bytes())?;
-
-    if handoff_id.is_empty() {
-        bail!("No handoff_id in callback");
-    }
-
-    Ok((handoff_id, state))
 }

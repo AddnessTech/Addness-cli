@@ -63,7 +63,7 @@ pub fn handle_configure() -> Result<()> {
 
     // Organization ID
     let default_org = existing_settings
-        .default_organization_id
+        .current_organization_id
         .unwrap_or_default();
     let org_id = prompt("Default Organization ID", &default_org)?;
 
@@ -76,7 +76,7 @@ pub fn handle_configure() -> Result<()> {
 
     let mut settings = load_settings()?;
     if !org_id.is_empty() {
-        settings.default_organization_id = Some(org_id.clone());
+        settings.current_organization_id = Some(org_id.clone());
     }
     save_settings(&settings)?;
 
@@ -98,7 +98,7 @@ pub fn handle_status() -> Result<()> {
             println!("Authenticated");
             println!("  API Key: {}", mask_key(&creds.token));
             println!("  API URL: {}", creds.api_url);
-            if let Some(org_id) = settings.default_organization_id {
+            if let Some(org_id) = settings.current_organization_id {
                 println!("  Organization: {}", org_id);
             }
         }

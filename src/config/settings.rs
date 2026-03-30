@@ -6,7 +6,7 @@ use std::path::PathBuf;
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub default_organization_id: Option<String>,
+    pub current_organization_id: Option<String>,
 }
 
 fn settings_path() -> Result<PathBuf> {

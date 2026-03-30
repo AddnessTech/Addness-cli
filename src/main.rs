@@ -10,7 +10,10 @@ use cli::commands::{auth, goals, org};
 use config::{load_credentials, load_settings};
 
 #[derive(Parser)]
-#[command(name = "addness", about = "Addness CLI - Manage your goals from the terminal")]
+#[command(
+    name = "addness",
+    about = "Addness CLI - Manage your goals from the terminal"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -39,8 +42,9 @@ fn build_client() -> Result<ApiClient> {
     let creds = load_credentials()?;
     let settings = load_settings()?;
     match creds {
-        Some(c) => Ok(ApiClient::new(&c.token, &c.api_url)?
-            .with_org_id(settings.default_organization_id)),
+        Some(c) => {
+            Ok(ApiClient::new(&c.token, &c.api_url)?.with_org_id(settings.current_organization_id))
+        }
         None => bail!("Not authenticated. Run: addness auth set-token <token>"),
     }
 }

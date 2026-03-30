@@ -14,7 +14,7 @@ pub enum GoalsCommands {
         org: Option<String>,
         /// Tree depth (default: 3)
         #[arg(long, default_value = "3")]
-        depth: String,
+        depth: usize,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -25,11 +25,8 @@ pub async fn handle_goals(cmd: &GoalsCommands, client: &ApiClient) -> Result<()>
     match cmd {
         GoalsCommands::List { org, depth, json } => {
             let org_id = resolve_org_id(org.as_deref())?;
-            let path = format!(
-                "/api/v2/organizations/{}/objectives/tree?depth={}&include_owner=true",
-                org_id, depth
-            );
-            let resp: ApiResponse<TreeData> = client.get(&path).await?;
+
+            let resp: ApiResponse<TreeData> = client.get_goal_tree(&org_id, *depth).await?;
 
             if *json {
                 println!("{}", serde_json::to_string_pretty(&resp.data.items)?);

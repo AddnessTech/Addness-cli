@@ -6,7 +6,7 @@ use std::path::PathBuf;
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub default_organization_id: Option<String>,
+    pub current_organization_id: Option<String>,
 }
 
 fn settings_path() -> Result<PathBuf> {
@@ -19,8 +19,8 @@ pub fn load_settings() -> Result<Settings> {
     if !path.exists() {
         return Ok(Settings::default());
     }
-    let content = fs::read_to_string(&path)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let content =
+        fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?;
     let settings: Settings =
         serde_json::from_str(&content).context("Failed to parse config.json")?;
     Ok(settings)
@@ -33,7 +33,6 @@ pub fn save_settings(settings: &Settings) -> Result<()> {
             .with_context(|| format!("Failed to create directory {}", parent.display()))?;
     }
     let content = serde_json::to_string_pretty(settings)?;
-    fs::write(&path, &content)
-        .with_context(|| format!("Failed to write {}", path.display()))?;
+    fs::write(&path, &content).with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(())
 }

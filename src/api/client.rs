@@ -35,11 +35,16 @@ impl ApiClient {
         self
     }
 
-    pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+    /// ApiClient::get() は与えられた path をURLパスとして
+    /// GET path リクエストをAPIに発行して
+    /// レスポンスを返す
+    /// mod api 以下に各エンティティに応じて
+    /// このラッパをApiClientのメソッドとして実装する
+    pub(super) async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
         let url = format!("{}{}", self.base_url, path);
         let mut req = self.client.get(&url);
 
-        if let Some(ref org_id) = self.org_id {
+        if let Some(org_id) = &self.org_id {
             req = req.header(
                 HeaderName::from_static("x-organization-id"),
                 HeaderValue::from_str(org_id).context("Invalid organization ID")?,

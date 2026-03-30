@@ -2,10 +2,7 @@ use std::io::{self, Write};
 
 use anyhow::Result;
 
-use crate::config::{
-    delete_credentials, load_credentials, load_settings, save_credentials, save_settings,
-    Credentials,
-};
+use crate::config::{Credentials, Settings};
 
 fn prompt(label: &str, default: &str) -> Result<String> {
     if default.is_empty() {
@@ -39,50 +36,46 @@ pub fn handle_configure() -> Result<()> {
     println!();
 
     // 既存の設定を読み込み
-    let existing_creds = load_credentials()?.unwrap_or(Credentials {
-        token: String::new(),
-        api_url: "https://api.addness.app".to_string(),
-    });
-    let existing_settings = load_settings()?;
+    let existing_creds = Credentials::load()?.unwrap_or(Credentials::new(
+        String::new(),
+        "https://api.addness.app".to_string(),
+    ));
+    let existing_settings = Settings::load()?;
 
     // API Key
-    let key_hint = if existing_creds.token.is_empty() {
+    let key_hint = if existing_creds.token().is_empty() {
         String::new()
     } else {
-        mask_key(&existing_creds.token)
+        mask_key(existing_creds.token())
     };
     let api_key = prompt("API Key", &key_hint)?;
     let api_key = if api_key == key_hint {
-        existing_creds.token.clone()
+        existing_creds.token().to_string()
     } else {
         api_key
     };
 
     // API URL
-    let api_url = prompt("API URL", &existing_creds.api_url)?;
+    let api_url = prompt("API URL", existing_creds.api_url())?;
 
     // Organization ID
     let default_org = existing_settings
-        .default_organization_id
+        .current_organization_id()
         .unwrap_or_default();
-    let org_id = prompt("Default Organization ID", &default_org)?;
+    let org_id = prompt("Default Organization ID", default_org)?;
 
     // 保存
-    let creds = Credentials {
-        token: api_key,
-        api_url: api_url.clone(),
-    };
-    save_credentials(&creds)?;
+    let creds = Credentials::new(api_key, api_url.clone());
+    creds.save()?;
 
-    let mut settings = load_settings()?;
     if !org_id.is_empty() {
-        settings.default_organization_id = Some(org_id.clone());
+        let mut settings = Settings::load()?;
+        settings.set_current_organization_id(org_id.clone())?;
     }
-    save_settings(&settings)?;
 
     println!();
     println!("Configuration saved.");
-    println!("  API Key: {}", mask_key(&creds.token));
+    println!("  API Key: {}", mask_key(creds.token()));
     println!("  API URL: {}", api_url);
     if !org_id.is_empty() {
         println!("  Organization: {}", org_id);
@@ -92,13 +85,13 @@ pub fn handle_configure() -> Result<()> {
 }
 
 pub fn handle_status() -> Result<()> {
-    match load_credentials()? {
+    match Credentials::load()? {
         Some(creds) => {
-            let settings = load_settings()?;
+            let settings = Settings::load()?;
             println!("Authenticated");
-            println!("  API Key: {}", mask_key(&creds.token));
-            println!("  API URL: {}", creds.api_url);
-            if let Some(org_id) = settings.default_organization_id {
+            println!("  API Key: {}", mask_key(creds.token()));
+            println!("  API URL: {}", creds.api_url());
+            if let Some(org_id) = settings.current_organization_id() {
                 println!("  Organization: {}", org_id);
             }
         }
@@ -110,7 +103,7 @@ pub fn handle_status() -> Result<()> {
 }
 
 pub fn handle_logout() -> Result<()> {
-    delete_credentials()?;
+    Credentials::delete()?;
     println!("Logged out. Credentials removed.");
     Ok(())
 }

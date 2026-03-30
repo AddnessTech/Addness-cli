@@ -3,7 +3,7 @@ use clap::Subcommand;
 
 use crate::api::{ApiClient, OrganizationsResponse};
 use crate::cli::output::print_organizations_table;
-use crate::config::{load_settings, save_settings};
+use crate::config::Settings;
 
 #[derive(Subcommand)]
 pub enum OrgCommands {
@@ -13,43 +13,38 @@ pub enum OrgCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Switch default organization
+    /// Switch current organization
     Switch {
         /// Organization ID
         id: String,
     },
-    /// Show current default organization
+    /// Show current organization
     Current,
 }
 
 pub async fn handle_org(cmd: &OrgCommands, client: &ApiClient) -> Result<()> {
     match cmd {
         OrgCommands::List { json } => {
-            let resp: OrganizationsResponse =
-                client.get("/api/v1/team/organizations/my_organizations").await?;
+            let resp: OrganizationsResponse = client.list_organizations().await?;
             if *json {
                 println!("{}", serde_json::to_string_pretty(&resp.data)?);
             } else {
-                let settings = load_settings()?;
-                print_organizations_table(
-                    &resp.data,
-                    settings.default_organization_id.as_deref(),
-                );
+                let settings = Settings::load()?;
+                print_organizations_table(&resp.data, settings.current_organization_id());
             }
             Ok(())
         }
         OrgCommands::Switch { id } => {
-            let mut settings = load_settings()?;
-            settings.default_organization_id = Some(id.clone());
-            save_settings(&settings)?;
+            let mut settings = Settings::load()?;
+            settings.set_current_organization_id(id.clone())?;
             println!("Switched to organization: {}", id);
             Ok(())
         }
         OrgCommands::Current => {
-            let settings = load_settings()?;
-            match settings.default_organization_id {
+            let settings = Settings::load()?;
+            match settings.current_organization_id() {
                 Some(id) => println!("{}", id),
-                None => bail!("No default organization set. Run: addness org switch <id>"),
+                None => bail!("No current organization set. Run: addness org switch <id>"),
             }
             Ok(())
         }
@@ -60,12 +55,12 @@ pub fn resolve_org_id(flag: Option<&str>) -> Result<String> {
     if let Some(id) = flag {
         return Ok(id.to_string());
     }
-    let settings = load_settings()?;
-    match settings.default_organization_id {
-        Some(id) => Ok(id),
+    let settings = Settings::load()?;
+    match settings.current_organization_id() {
+        Some(id) => Ok(id.to_string()),
         None => bail!(
             "No organization specified.\n\
-             Use --org <id> or set a default with: addness org switch <id>"
+             Use --org <id> or set a current with: addness org switch <id>"
         ),
     }
 }

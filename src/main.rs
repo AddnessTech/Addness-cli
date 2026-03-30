@@ -5,12 +5,15 @@ mod config;
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 
+use crate::config::{Credentials, Settings};
 use api::ApiClient;
 use cli::commands::{auth, configure, goals, org};
-use config::{load_credentials, load_settings};
 
 #[derive(Parser)]
-#[command(name = "addness", about = "Addness CLI - Manage your goals from the terminal")]
+#[command(
+    name = "addness",
+    about = "Addness CLI - Manage your goals from the terminal"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -42,11 +45,11 @@ enum Commands {
 }
 
 fn build_client() -> Result<ApiClient> {
-    let creds = load_credentials()?;
-    let settings = load_settings()?;
+    let creds = Credentials::load()?;
+    let settings = Settings::load()?;
     match creds {
-        Some(c) => Ok(ApiClient::new(&c.token, &c.api_url)?
-            .with_org_id(settings.default_organization_id)),
+        Some(c) => Ok(ApiClient::new(c.token(), c.api_url())?
+            .with_org_id(settings.current_organization_id().map(|id| id.to_string()))),
         None => bail!("Not configured. Run: addness configure"),
     }
 }

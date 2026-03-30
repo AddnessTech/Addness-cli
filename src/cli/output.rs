@@ -27,11 +27,7 @@ pub fn print_goals_table(items: &[TreeItem]) {
         let indent = if item.parent_id.is_some() { "  " } else { "" };
         let children_mark = if item.has_children { " +" } else { "" };
 
-        let owner = item
-            .owner
-            .as_ref()
-            .map(|o| o.name.as_str())
-            .unwrap_or("-");
+        let owner = item.owner.as_ref().map(|o| o.name.as_str()).unwrap_or("-");
 
         println!(
             "{:<38} {}{:<38}{} {:<10} {}",

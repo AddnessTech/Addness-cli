@@ -264,7 +264,10 @@ async fn wait_for_callback(listener: tokio::net::TcpListener) -> Result<(String,
         Arc::new(std::sync::Mutex::new(None));
 
     loop {
-        let (stream, _) = listener.accept().await.context("Failed to accept connection")?;
+        let (stream, _) = listener
+            .accept()
+            .await
+            .context("Failed to accept connection")?;
         let io = hyper_util::rt::TokioIo::new(stream);
         let result_clone = result.clone();
 

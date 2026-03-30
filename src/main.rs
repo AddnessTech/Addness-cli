@@ -68,9 +68,10 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Login { api_url, frontend_url } => {
-            login::handle_login(api_url, frontend_url.as_deref()).await
-        }
+        Commands::Login {
+            api_url,
+            frontend_url,
+        } => login::handle_login(api_url, frontend_url.as_deref()).await,
         Commands::Configure => configure::handle_configure(),
         Commands::Status => configure::handle_status(),
         Commands::Logout => configure::handle_logout(),

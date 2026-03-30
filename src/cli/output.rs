@@ -21,7 +21,11 @@ pub fn print_goals_table(items: &[TreeItem]) {
         let status = if item.is_completed {
             "COMPLETED".green().to_string()
         } else {
-            "ACTIVE".yellow().to_string()
+            match item.status.as_deref() {
+                Some("IN_PROGRESS") => "IN_PROGRESS".cyan().to_string(),
+                Some("CANCELLED") => "CANCELLED".red().to_string(),
+                _ => "NOT_STARTED".yellow().to_string(),
+            }
         };
 
         let indent = if item.parent_id.is_some() { "  " } else { "" };

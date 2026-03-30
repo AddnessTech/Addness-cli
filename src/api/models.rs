@@ -22,6 +22,8 @@ pub struct TreeItem {
     #[serde(default)]
     pub parent_id: Option<String>,
     pub title: String,
+    #[serde(default)]
+    pub status: Option<String>,
     pub order_no: f64,
     pub is_completed: bool,
     pub has_children: bool,

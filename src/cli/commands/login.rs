@@ -1,13 +1,19 @@
-use std::io::{BufRead, BufReader, Write};
-use std::net::TcpListener;
+use std::convert::Infallible;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
+use http_body_util::Full;
+use hyper::body::{Bytes, Incoming};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Request, Response, StatusCode};
+use oauth2::PkceCodeChallenge;
 use rand::rngs::OsRng;
-use sha2::{Digest, Sha256};
+use spki::EncodePublicKey;
 
 use crate::config::{Credentials, Settings};
 
@@ -53,31 +59,15 @@ struct RegisterData {
 fn generate_keypair() -> (SigningKey, String) {
     let signing_key = SigningKey::generate(&mut OsRng);
     let verifying_key = signing_key.verifying_key();
-
-    // PEM形式のEd25519公開鍵
-    let public_key_bytes = verifying_key.as_bytes();
-    // PKIX wrapping for Ed25519: 12-byte prefix + 32-byte key
-    let mut pkix = vec![
-        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
-    ];
-    pkix.extend_from_slice(public_key_bytes);
-
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&pkix);
-    let pem = format!("-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----", b64);
-
+    let pem = verifying_key
+        .to_public_key_pem(spki::der::pem::LineEnding::LF)
+        .expect("failed to encode public key as PEM");
     (signing_key, pem)
 }
 
 fn sign_message(signing_key: &SigningKey, message: &str) -> String {
     let signature = signing_key.sign(message.as_bytes());
     URL_SAFE_NO_PAD.encode(signature.to_bytes())
-}
-
-fn sha256_base64url(value: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(value.as_bytes());
-    let result = hasher.finalize();
-    URL_SAFE_NO_PAD.encode(result)
 }
 
 fn timestamp() -> i64 {
@@ -94,15 +84,18 @@ pub async fn handle_login(api_url: &str, frontend_url: Option<&str>) -> Result<(
     // 1. Ed25519キーペア生成
     let (signing_key, public_key_pem) = generate_keypair();
     let installation_id = uuid::Uuid::new_v4().to_string().replace("-", "");
-    let installation_id = &installation_id[..32]; // max 128 chars, alphanumeric + hyphens
+    let installation_id = &installation_id[..32];
 
     // 2. localhostサーバー起動（空きポートを自動取得）
-    let listener = TcpListener::bind("127.0.0.1:0").context("Failed to bind localhost port")?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("Failed to bind localhost port")?;
     let port = listener.local_addr()?.port();
 
-    // 3. PKCE用のcode_verifierとcode_challenge生成
-    let code_verifier = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
-    let code_challenge = sha256_base64url(&code_verifier);
+    // 3. PKCE用のcode_verifierとcode_challenge生成（oauth2 crateを使用）
+    let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
+    let code_challenge = pkce_challenge.as_str().to_string();
+    let code_verifier = pkce_verifier.secret().to_string();
 
     // 4. State生成
     let state = uuid::Uuid::new_v4().to_string().replace("-", "");
@@ -168,7 +161,8 @@ pub async fn handle_login(api_url: &str, frontend_url: Option<&str>) -> Result<(
         .unwrap_or_else(|| api_url.replace(":8080", ":3000").replace("api.", ""));
     let browser_url = format!(
         "{}/desktop/browser-auth?start_token={}",
-        fe_url.trim_end_matches('/'), start_token
+        fe_url.trim_end_matches('/'),
+        start_token
     );
 
     println!("Opening browser for login...");
@@ -182,17 +176,11 @@ pub async fn handle_login(api_url: &str, frontend_url: Option<&str>) -> Result<(
 
     println!("Waiting for login...");
 
-    // 8. localhostでコールバックを待機
-    let callback_result = tokio::time::timeout(
-        Duration::from_secs(300),
-        tokio::task::spawn_blocking(move || wait_for_callback(listener)),
-    )
-    .await;
-    let (handoff_id, callback_state) = match callback_result {
-        Ok(Ok(result)) => result?,
-        Ok(Err(e)) => return Err(e.into()),
-        Err(_) => bail!("Login timed out (5 minutes). Please try again."),
-    };
+    // 8. localhostでコールバックを待機（hyperでHTTPリクエストを処理）
+    let (handoff_id, callback_state) =
+        tokio::time::timeout(Duration::from_secs(300), wait_for_callback(listener))
+            .await
+            .map_err(|_| anyhow::anyhow!("Login timed out (5 minutes). Please try again."))??;
 
     if callback_state != state {
         bail!("State mismatch: expected {}, got {}", state, callback_state);
@@ -271,59 +259,56 @@ pub async fn handle_login(api_url: &str, frontend_url: Option<&str>) -> Result<(
     Ok(())
 }
 
-fn wait_for_callback(listener: TcpListener) -> Result<(String, String)> {
+async fn wait_for_callback(listener: tokio::net::TcpListener) -> Result<(String, String)> {
+    let result: Arc<std::sync::Mutex<Option<(String, String)>>> =
+        Arc::new(std::sync::Mutex::new(None));
+
     loop {
-        let (mut stream, _) = listener.accept().context("Failed to accept connection")?;
+        let (stream, _) = listener.accept().await.context("Failed to accept connection")?;
+        let io = hyper_util::rt::TokioIo::new(stream);
+        let result_clone = result.clone();
 
-        let mut reader = BufReader::new(&stream);
-        let mut request_line = String::new();
-        reader
-            .read_line(&mut request_line)
-            .context("Failed to read request")?;
-
-        // Parse: GET /callback?handoff_id=xxx&state=yyy HTTP/1.1
-        let path = request_line.split_whitespace().nth(1).unwrap_or("");
-
-        // Ignore requests that are not the callback (e.g. favicon, preflight)
-        if !path.starts_with("/callback") {
-            let body = "not found";
-            let response = format!(
-                "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let _ = stream.write_all(response.as_bytes());
-            continue;
-        }
-
-        let query = path.split('?').nth(1).unwrap_or("");
-        let mut handoff_id = String::new();
-        let mut state = String::new();
-
-        for param in query.split('&') {
-            if let Some((key, value)) = param.split_once('=') {
-                match key {
-                    "handoff_id" => handoff_id = value.to_string(),
-                    "state" => state = value.to_string(),
-                    _ => {}
+        let service = service_fn(move |req: Request<Incoming>| {
+            let result = result_clone.clone();
+            async move {
+                if !req.uri().path().starts_with("/callback") {
+                    return Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(StatusCode::NOT_FOUND)
+                            .body(Full::new(Bytes::from("not found")))
+                            .unwrap(),
+                    );
                 }
+
+                let query = req.uri().query().unwrap_or("");
+                let params: std::collections::HashMap<String, String> =
+                    form_urlencoded::parse(query.as_bytes())
+                        .into_owned()
+                        .collect();
+
+                let handoff_id = params.get("handoff_id").cloned().unwrap_or_default();
+                let state = params.get("state").cloned().unwrap_or_default();
+
+                *result.lock().unwrap() = Some((handoff_id, state));
+
+                let body =
+                    "<html><body><h1>Login successful!</h1><p>You can close this tab.</p></body></html>";
+                Ok::<_, Infallible>(
+                    Response::builder()
+                        .header("Content-Type", "text/html")
+                        .body(Full::new(Bytes::from(body)))
+                        .unwrap(),
+                )
             }
+        });
+
+        let _ = http1::Builder::new().serve_connection(io, service).await;
+
+        if let Some((handoff_id, state)) = result.lock().unwrap().take() {
+            if handoff_id.is_empty() {
+                bail!("No handoff_id in callback");
+            }
+            return Ok((handoff_id, state));
         }
-
-        // レスポンスを返す
-        let body =
-            "<html><body><h1>Login successful!</h1><p>You can close this tab.</p></body></html>";
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        stream.write_all(response.as_bytes())?;
-
-        if handoff_id.is_empty() {
-            bail!("No handoff_id in callback");
-        }
-
-        return Ok((handoff_id, state));
     }
 }

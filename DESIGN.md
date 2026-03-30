@@ -373,20 +373,61 @@ addness goals update abc-123 --status COMPLETED --json
 }
 ```
 
+## 開発ログ
+
+### 2026-03-30: 初期実装完了
+
+以下の機能を実装し、ローカル環境で動作確認済み。
+
+#### 実装済み機能
+- **認証**: `addness auth set-token <JWT>`, `auth status`, `auth logout`
+  - `~/.addness/credentials.json` にトークンとAPI URLを保存（permission 600）
+  - 現時点ではClerk JWTを直接設定する方式（API Key対応は未実装）
+- **組織管理**: `addness org list`, `org switch <id>`, `org current`
+  - `~/.addness/config.json` にデフォルト組織IDを保存
+  - テーブル表示 + `--json` 出力対応
+- **ゴール一覧**: `addness goals list [--depth N] [--json]`
+  - V2 API (`/api/v2/organizations/:id/objectives/tree`) を使用
+  - `X-Organization-ID` ヘッダーを自動付与
+  - テーブル表示（ID, タイトル, ステータス, オーナー）+ JSON出力対応
+
+#### 動作確認結果
+- バックエンド: Docker Compose（localhost:8080）
+- 認証: Clerk Backend API (`/v1/sessions/:id/tokens`) でJWTを発行
+- ngrok経由でClerkログイン → セッション確立 → JWT取得 → CLI動作確認
+- `addness org list` → 4組織表示 ✅
+- `addness goals list` → ゴールツリー表示 ✅
+- `addness goals list --json` → JSON出力 ✅
+
+#### 技術的な発見
+- APIレスポンスは `{ "data": T, "message": "..." }` のラッパー形式
+- 組織一覧は `{ "data": [...] }` で直接配列を返す
+- ゴールツリーは `{ "data": { "items": [...] } }` でネストされたオブジェクト
+- V2 APIは `X-Organization-ID` ヘッダーが必須（cookieの代わり）
+- Clerk JWTは60秒で期限切れ → 実運用にはAPI Key機能が必須
+
+#### リポジトリ
+- https://github.com/AddnessTech/Addness-TUI (Private)
+
+---
+
 ## リリース計画
 
 ### v0.1 — CLI基盤 + 読み書き
 
 最小限だがClaude Code連携に必要な機能を揃える。
 
-- [ ] プロジェクトセットアップ（Cargo.toml、CI）
-- [ ] 認証: `auth set-key`, `auth status`, `auth logout`
-- [ ] 組織: `org list`, `org switch`, `org current`
-- [ ] ゴール読み取り: `goals list`, `goals get`, `goals search`, `goals tree`, `goals children`
+- [x] プロジェクトセットアップ（Cargo.toml、CI）
+- [x] 認証: `auth set-token`, `auth status`, `auth logout`
+- [x] 組織: `org list`, `org switch`, `org current`
+- [x] ゴール読み取り: `goals list`（ツリー表示 + JSON出力）
+- [x] 共通: `--json` フラグ
+- [ ] 認証: `auth set-key`（API Key対応）
+- [ ] ゴール読み取り: `goals get`, `goals search`, `goals tree`, `goals children`
 - [ ] ゴール書き込み: `goals create`, `goals update` (ステータス更新)
 - [ ] コメント: `comments list`, `comments create`（完了報告に必要）
 - [ ] 検索: `search`
-- [ ] 共通: `--json` フラグ、エラーハンドリング
+- [ ] エラーハンドリング改善
 - [ ] 配布: GitHub Releases + install.sh
 - [ ] バックエンド: API Key CRUD + 認証ミドルウェア
 

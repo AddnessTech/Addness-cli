@@ -5,9 +5,9 @@ use std::path::PathBuf;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Credentials {
-    pub token: String,
+    token: String,
     #[serde(default = "default_api_url")]
-    pub api_url: String,
+    api_url: String,
 }
 
 fn default_api_url() -> String {
@@ -19,43 +19,57 @@ fn credentials_path() -> Result<PathBuf> {
     Ok(home.join(".addness").join("credentials.json"))
 }
 
-pub fn load_credentials() -> Result<Option<Credentials>> {
-    let path = credentials_path()?;
-    if !path.exists() {
-        return Ok(None);
-    }
-    let content = fs::read_to_string(&path)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
-    let creds: Credentials =
-        serde_json::from_str(&content).context("Failed to parse credentials.json")?;
-    Ok(Some(creds))
-}
-
-pub fn save_credentials(creds: &Credentials) -> Result<()> {
-    let path = credentials_path()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create directory {}", parent.display()))?;
-    }
-    let content = serde_json::to_string_pretty(creds)?;
-    fs::write(&path, &content)
-        .with_context(|| format!("Failed to write {}", path.display()))?;
-
-    // Set file permissions to 600 on Unix
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+impl Credentials {
+    pub fn new(token: String, api_url: String) -> Self {
+        Self { token, api_url }
     }
 
-    Ok(())
-}
-
-pub fn delete_credentials() -> Result<()> {
-    let path = credentials_path()?;
-    if path.exists() {
-        fs::remove_file(&path)
-            .with_context(|| format!("Failed to delete {}", path.display()))?;
+    pub fn token(&self) -> &str {
+        &self.token
     }
-    Ok(())
+
+    pub fn api_url(&self) -> &str {
+        &self.api_url
+    }
+
+    pub fn load() -> Result<Option<Credentials>> {
+        let path = credentials_path()?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        let content = fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        let creds: Credentials =
+            serde_json::from_str(&content).context("Failed to parse credentials.json")?;
+        Ok(Some(creds))
+    }
+
+    pub fn save(&self) -> Result<()> {
+        let path = credentials_path()?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create directory {}", parent.display()))?;
+        }
+        let content = serde_json::to_string_pretty(self)?;
+        fs::write(&path, &content)
+            .with_context(|| format!("Failed to write {}", path.display()))?;
+
+        // Set file permissions to 600 on Unix
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        }
+
+        Ok(())
+    }
+
+    pub fn delete() -> Result<()> {
+        let path = credentials_path()?;
+        if path.exists() {
+            fs::remove_file(&path)
+                .with_context(|| format!("Failed to delete {}", path.display()))?;
+        }
+        Ok(())
+    }
 }

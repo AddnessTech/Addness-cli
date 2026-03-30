@@ -30,10 +30,7 @@ pub async fn handle_org(cmd: &OrgCommands, client: &ApiClient) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&resp.data)?);
             } else {
                 let settings = Settings::load()?;
-                print_organizations_table(
-                    &resp.data,
-                    settings.current_organization_id().as_deref(),
-                );
+                print_organizations_table(&resp.data, settings.current_organization_id());
             }
             Ok(())
         }
@@ -60,7 +57,7 @@ pub fn resolve_org_id(flag: Option<&str>) -> Result<String> {
     }
     let settings = Settings::load()?;
     match settings.current_organization_id() {
-        Some(id) => Ok(id.clone()),
+        Some(id) => Ok(id.to_string()),
         None => bail!(
             "No organization specified.\n\
              Use --org <id> or set a current with: addness org switch <id>"

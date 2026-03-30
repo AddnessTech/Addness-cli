@@ -43,8 +43,8 @@ impl Settings {
         Ok(())
     }
 
-    pub fn current_organization_id(&self) -> &Option<String> {
-        &self.current_organization_id
+    pub fn current_organization_id(&self) -> Option<&str> {
+        self.current_organization_id.as_deref()
     }
 
     pub fn set_current_organization_id(&mut self, org_id: String) -> Result<()> {

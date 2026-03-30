@@ -61,9 +61,8 @@ pub fn handle_configure() -> Result<()> {
     // Organization ID
     let default_org = existing_settings
         .current_organization_id()
-        .clone()
         .unwrap_or_default();
-    let org_id = prompt("Default Organization ID", &default_org)?;
+    let org_id = prompt("Default Organization ID", default_org)?;
 
     // 保存
     let creds = Credentials::new(api_key, api_url.clone());

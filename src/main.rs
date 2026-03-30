@@ -49,7 +49,7 @@ fn build_client() -> Result<ApiClient> {
     let settings = Settings::load()?;
     match creds {
         Some(c) => Ok(ApiClient::new(c.token(), c.api_url())?
-            .with_org_id(settings.current_organization_id().clone())),
+            .with_org_id(settings.current_organization_id().map(|id| id.to_string()))),
         None => bail!("Not configured. Run: addness configure"),
     }
 }

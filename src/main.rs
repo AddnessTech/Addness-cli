@@ -6,7 +6,7 @@ use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 
 use api::ApiClient;
-use cli::commands::{auth, goals, org};
+use cli::commands::{auth, configure, goals, org};
 use config::{load_credentials, load_settings};
 
 #[derive(Parser)]
@@ -18,7 +18,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Manage authentication
+    /// Configure API Key, URL, and default organization
+    Configure,
+    /// Show current configuration status
+    Status,
+    /// Remove saved credentials
+    Logout,
+    /// Manage authentication (legacy)
     Auth {
         #[command(subcommand)]
         command: auth::AuthCommands,
@@ -41,7 +47,7 @@ fn build_client() -> Result<ApiClient> {
     match creds {
         Some(c) => Ok(ApiClient::new(&c.token, &c.api_url)?
             .with_org_id(settings.default_organization_id)),
-        None => bail!("Not authenticated. Run: addness auth set-token <token>"),
+        None => bail!("Not configured. Run: addness configure"),
     }
 }
 
@@ -50,6 +56,9 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
+        Commands::Configure => configure::handle_configure(),
+        Commands::Status => configure::handle_status(),
+        Commands::Logout => configure::handle_logout(),
         Commands::Auth { command } => auth::handle_auth(command),
         Commands::Org { command } => {
             let client = build_client()?;

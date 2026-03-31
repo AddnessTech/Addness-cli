@@ -1,9 +1,9 @@
 use std::convert::Infallible;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context, Result};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use anyhow::{Context, Result, bail};
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signer, SigningKey};
 use http_body_util::Full;
 use hyper::body::{Bytes, Incoming};
@@ -228,11 +228,11 @@ timestamp={ts}"#
     Credentials::new(api_key.clone(), api_url.to_string()).save()?;
 
     // 組織が返ってきた場合、最初の組織をデフォルトに設定
-    if let Some(orgs) = &exchange_data.data.organizations {
-        if !orgs.is_empty() {
-            let mut settings = Settings::load()?;
-            settings.set_current_organization_id(orgs[0].id.clone())?;
-        }
+    if let Some(orgs) = &exchange_data.data.organizations
+        && !orgs.is_empty()
+    {
+        let mut settings = Settings::load()?;
+        settings.set_current_organization_id(orgs[0].id.clone())?;
     }
 
     println!();
@@ -247,10 +247,10 @@ timestamp={ts}"#
     println!("  API Key: {masked}");
     println!("  API URL: {api_url}");
 
-    if let Some(orgs) = &exchange_data.data.organizations {
-        if !orgs.is_empty() {
-            println!("  Organization: {} ({})", orgs[0].name, orgs[0].id);
-        }
+    if let Some(orgs) = &exchange_data.data.organizations
+        && !orgs.is_empty()
+    {
+        println!("  Organization: {} ({})", orgs[0].name, orgs[0].id);
         if orgs.len() > 1 {
             println!();
             println!(

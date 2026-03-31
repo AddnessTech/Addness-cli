@@ -278,7 +278,7 @@ async fn wait_for_callback(listener: tokio::net::TcpListener) -> Result<(String,
     let service = service_fn(move |req: Request<Incoming>| {
         let tx = tx.lock().unwrap().take();
         async move {
-            if req.uri().path() != "/callback" {
+            if !req.uri().path().starts_with("/callback") {
                 return Ok::<_, Infallible>(
                     Response::builder()
                         .status(StatusCode::NOT_FOUND)
@@ -304,6 +304,7 @@ async fn wait_for_callback(listener: tokio::net::TcpListener) -> Result<(String,
             Ok::<_, Infallible>(
                 Response::builder()
                     .header("Content-Type", "text/html")
+                    .header("Connection", "close")
                     .body(Full::new(Bytes::from(body)))
                     .unwrap(),
             )

@@ -1,4 +1,5 @@
 mod client;
+mod comments;
 mod goals;
 mod models;
 mod organizations;

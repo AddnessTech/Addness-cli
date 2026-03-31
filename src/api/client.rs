@@ -13,7 +13,7 @@ pub struct ApiClient {
 impl ApiClient {
     pub fn new(token: &str, base_url: &str) -> Result<Self> {
         let mut headers = HeaderMap::new();
-        let auth_value = format!("Bearer {}", token);
+        let auth_value = format!("Bearer {token}");
         headers.insert(
             AUTHORIZATION,
             HeaderValue::from_str(&auth_value).context("Invalid token format")?,
@@ -55,18 +55,50 @@ impl ApiClient {
         let response = req
             .send()
             .await
-            .with_context(|| format!("Failed to send request to {}", url))?;
+            .with_context(|| format!("Failed to send request to {url}"))?;
 
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            bail!("API error ({}): {}", status, body);
+            bail!("API error ({status}): {body}");
         }
 
         response
             .json::<T>()
             .await
-            .with_context(|| format!("Failed to parse response from {}", url))
+            .with_context(|| format!("Failed to parse response from {url}"))
+    }
+
+    pub(super) async fn post<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        let url = format!("{}{}", self.base_url, path);
+        let mut req = self.client.post(&url).json(body);
+
+        if let Some(org_id) = &self.org_id {
+            req = req.header(
+                HeaderName::from_static("x-organization-id"),
+                HeaderValue::from_str(org_id).context("Invalid organization ID")?,
+            );
+        }
+
+        let response = req
+            .send()
+            .await
+            .with_context(|| format!("Failed to send request to {url}"))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            bail!("API error ({status}): {body}");
+        }
+
+        response
+            .json::<T>()
+            .await
+            .with_context(|| format!("Failed to parse response from {url}"))
     }
 
     pub(super) async fn patch<T: DeserializeOwned, B: Serialize>(
@@ -87,17 +119,17 @@ impl ApiClient {
         let response = req
             .send()
             .await
-            .with_context(|| format!("Failed to send request to {}", url))?;
+            .with_context(|| format!("Failed to send request to {url}"))?;
 
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            bail!("API error ({}): {}", status, body);
+            bail!("API error ({status}): {body}");
         }
 
         response
             .json::<T>()
             .await
-            .with_context(|| format!("Failed to parse response from {}", url))
+            .with_context(|| format!("Failed to parse response from {url}"))
     }
 }

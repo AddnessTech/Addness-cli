@@ -3,7 +3,10 @@ use clap::Subcommand;
 
 use crate::api::{ApiClient, ApiResponse, Goal, GoalStatus, TreeData, UpdateGoalRequest};
 use crate::cli::commands::org::resolve_org_id;
-use crate::cli::output::{print_goals_table, resolve_status};
+use crate::cli::output::{
+    print_children_table, print_goal_detail, print_goals_table, print_search_results,
+    resolve_status,
+};
 
 #[derive(Subcommand)]
 pub enum GoalsCommands {
@@ -15,6 +18,44 @@ pub enum GoalsCommands {
         /// Tree depth (default: 3)
         #[arg(long, default_value = "3")]
         depth: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Get a goal's details
+    Get {
+        /// Goal ID
+        id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// List children of a goal
+    Children {
+        /// Goal ID
+        id: String,
+        /// Max number of children to return (default: 20)
+        #[arg(long, default_value = "20")]
+        limit: usize,
+        /// Offset for pagination
+        #[arg(long, default_value = "0")]
+        offset: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show subtree of a goal
+    Tree {
+        /// Goal ID
+        id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Search goals by keyword
+    Search {
+        /// Search query
+        query: String,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -66,6 +107,51 @@ pub async fn handle_goals(cmd: &GoalsCommands, client: &ApiClient) -> Result<()>
                 println!("{}", serde_json::to_string_pretty(&resp.data.items)?);
             } else {
                 print_goals_table(&resp.data.items);
+            }
+            Ok(())
+        }
+        GoalsCommands::Get { id, json } => {
+            let resp: ApiResponse<Goal> = client.get_goal(id).await?;
+
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&resp.data)?);
+            } else {
+                print_goal_detail(&resp.data);
+            }
+            Ok(())
+        }
+        GoalsCommands::Children {
+            id,
+            limit,
+            offset,
+            json,
+        } => {
+            let resp = client.get_goal_children(id, *limit, *offset).await?;
+
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&resp.data.children)?);
+            } else {
+                print_children_table(&resp.data.children);
+            }
+            Ok(())
+        }
+        GoalsCommands::Tree { id, json } => {
+            let resp: ApiResponse<TreeData> = client.get_goal_subtree(id).await?;
+
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&resp.data.items)?);
+            } else {
+                print_goals_table(&resp.data.items);
+            }
+            Ok(())
+        }
+        GoalsCommands::Search { query, json } => {
+            let resp = client.search_goals(query).await?;
+
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&resp.data.items)?);
+            } else {
+                print_search_results(&resp.data.items);
             }
             Ok(())
         }

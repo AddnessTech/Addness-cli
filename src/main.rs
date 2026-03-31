@@ -5,7 +5,7 @@ mod config;
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 
-use crate::config::{Credentials, Settings};
+use crate::config::{Credentials, DEFAULT_API_URL, Settings};
 use api::ApiClient;
 use cli::commands::{auth, configure, goals, login, org};
 
@@ -24,7 +24,7 @@ enum Commands {
     /// Log in via browser (recommended for first setup)
     Login {
         /// API base URL
-        #[arg(long, default_value = "https://api.addness.app")]
+        #[arg(long, default_value = DEFAULT_API_URL)]
         api_url: String,
         /// Frontend URL (for local dev with ngrok)
         #[arg(long)]

@@ -10,13 +10,21 @@ pub struct Credentials {
     api_url: String,
 }
 
+pub const DEFAULT_API_URL: &str = "https://api.addness.app";
+
 fn default_api_url() -> String {
-    "https://api.addness.app".to_string()
+    DEFAULT_API_URL.to_string()
 }
 
 fn credentials_path() -> Result<PathBuf> {
     let home = dirs::home_dir().context("Could not find home directory")?;
     Ok(home.join(".addness").join("credentials.json"))
+}
+
+impl Default for Credentials {
+    fn default() -> Self {
+        Self::new(String::new(), default_api_url())
+    }
 }
 
 impl Credentials {

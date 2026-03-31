@@ -36,10 +36,7 @@ pub fn handle_configure() -> Result<()> {
     println!();
 
     // 既存の設定を読み込み
-    let existing_creds = Credentials::load()?.unwrap_or(Credentials::new(
-        String::new(),
-        "https://api.addness.app".to_string(),
-    ));
+    let existing_creds = Credentials::load()?.unwrap_or(Credentials::default());
     let existing_settings = Settings::load()?;
 
     // API Key

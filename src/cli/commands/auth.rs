@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Subcommand;
 
-use crate::config::Credentials;
+use crate::config::{Credentials, DEFAULT_API_URL};
 
 #[derive(Subcommand)]
 pub enum AuthCommands {
@@ -9,8 +9,8 @@ pub enum AuthCommands {
     SetToken {
         /// The token to save
         token: String,
-        /// API base URL (default: https://api.addness.app)
-        #[arg(long, default_value = "https://api.addness.app")]
+        /// API base URL
+        #[arg(long, default_value = DEFAULT_API_URL)]
         api_url: String,
     },
     /// Show current authentication status

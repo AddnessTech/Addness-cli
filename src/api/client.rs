@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 pub struct ApiClient {
     client: Client,

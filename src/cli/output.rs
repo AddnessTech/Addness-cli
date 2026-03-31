@@ -1,6 +1,17 @@
 use colored::{ColoredString, Colorize};
+use unicode_width::UnicodeWidthStr;
 
 use crate::api::{ChildItem, Comment, Goal, GoalStatus, Organization, SearchItem, TreeItem};
+
+/// Pad `s` with spaces so its display width reaches `target_width`.
+fn pad_to_width(s: &str, target_width: usize) -> String {
+    let w = UnicodeWidthStr::width(s);
+    if w >= target_width {
+        s.to_string()
+    } else {
+        format!("{s}{}", " ".repeat(target_width - w))
+    }
+}
 
 /// Resolve display status from is_completed + status fields.
 /// Returns (label, colored_label).
@@ -19,37 +30,133 @@ pub fn resolve_status(
     }
 }
 
+struct TreeRow {
+    id: String,
+    title_col: String,
+    status_label: &'static str,
+    colored_status: ColoredString,
+    owner: String,
+}
+
 pub fn print_goals_table(items: &[TreeItem]) {
     if items.is_empty() {
         println!("{}", "No goals found.".dimmed());
         return;
     }
 
+    use std::collections::HashMap;
+
+    let mut children_map: HashMap<Option<&str>, Vec<&TreeItem>> = HashMap::new();
+    for item in items {
+        children_map
+            .entry(item.parent_id.as_deref())
+            .or_default()
+            .push(item);
+    }
+
+    let id_set: std::collections::HashSet<&str> = items.iter().map(|i| i.id.as_str()).collect();
+
+    let mut roots: Vec<&TreeItem> = items
+        .iter()
+        .filter(|i| match &i.parent_id {
+            None => true,
+            Some(pid) => !id_set.contains(pid.as_str()),
+        })
+        .collect();
+    roots.sort_by(|a, b| a.order_no.partial_cmp(&b.order_no).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Pass 1: collect rows in DFS order
+    let mut rows: Vec<TreeRow> = Vec::new();
+
+    fn collect_rows<'a>(
+        item: &'a TreeItem,
+        prefix: &str,
+        is_last: bool,
+        is_root: bool,
+        children_map: &HashMap<Option<&str>, Vec<&'a TreeItem>>,
+        rows: &mut Vec<TreeRow>,
+    ) {
+        let (status_label, colored_status) =
+            resolve_status(item.is_completed, item.status.as_ref());
+        let owner = item
+            .owner
+            .as_ref()
+            .map(|o| o.name.as_str())
+            .unwrap_or("-");
+
+        let connector = if is_root {
+            ""
+        } else if is_last {
+            "└─ "
+        } else {
+            "├─ "
+        };
+
+        rows.push(TreeRow {
+            id: item.id.clone(),
+            title_col: format!("{prefix}{connector}{}", item.title),
+            status_label,
+            colored_status,
+            owner: owner.to_string(),
+        });
+
+        let child_prefix = if is_root {
+            prefix.to_string()
+        } else if is_last {
+            format!("{prefix}   ")
+        } else {
+            format!("{prefix}│  ")
+        };
+
+        if let Some(children) = children_map.get(&Some(item.id.as_str())) {
+            let mut sorted = children.clone();
+            sorted.sort_by(|a, b| {
+                a.order_no
+                    .partial_cmp(&b.order_no)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let len = sorted.len();
+            for (i, child) in sorted.iter().enumerate() {
+                collect_rows(child, &child_prefix, i == len - 1, false, children_map, rows);
+            }
+        }
+    }
+
+    let roots_len = roots.len();
+    for (i, root) in roots.iter().enumerate() {
+        collect_rows(root, "", i == roots_len - 1, true, &children_map, &mut rows);
+    }
+
+    // Pass 2: compute max title display width, then print
+    let title_width = rows
+        .iter()
+        .map(|r| UnicodeWidthStr::width(r.title_col.as_str()))
+        .max()
+        .unwrap_or(5)
+        .max(5); // at least "TITLE" width
+
+    let id_width = 38;
+    let status_width = 12;
+    let total = id_width + 1 + title_width + 1 + status_width + 1 + 10;
+
     println!(
-        "{:<38} {:<40} {:<10} {}",
-        "ID".bold(),
-        "TITLE".bold(),
-        "STATUS".bold(),
+        "{} {} {} {}",
+        pad_to_width("ID", id_width).bold(),
+        pad_to_width("TITLE", title_width).bold(),
+        pad_to_width("STATUS", status_width).bold(),
         "OWNER".bold()
     );
-    println!("{}", "─".repeat(100));
+    println!("{}", "─".repeat(total));
 
-    for item in items {
-        let (_, colored_status) = resolve_status(item.is_completed, item.status.as_ref());
-
-        let indent = if item.parent_id.is_some() { "  " } else { "" };
-        let children_mark = if item.has_children { " +" } else { "" };
-
-        let owner = item.owner.as_ref().map(|o| o.name.as_str()).unwrap_or("-");
+    for row in &rows {
+        let status_pad = " ".repeat(status_width.saturating_sub(row.status_label.len()));
 
         println!(
-            "{:<38} {}{:<38}{} {:<10} {}",
-            item.id.dimmed(),
-            indent,
-            item.title,
-            children_mark.dimmed(),
-            colored_status,
-            owner.dimmed()
+            "{} {} {}{status_pad} {}",
+            pad_to_width(&row.id, id_width).dimmed(),
+            pad_to_width(&row.title_col, title_width),
+            row.colored_status,
+            row.owner.dimmed()
         );
     }
 }

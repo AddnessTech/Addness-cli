@@ -11,8 +11,14 @@ impl ApiClient {
         self.get(&path).await
     }
 
-    pub async fn update_goal(&self, id: &str, req: &UpdateGoalRequest) -> Result<ApiResponse<Goal>> {
-        let path = format!("/api/v2/objectives/{}", id);
+    pub async fn update_goal(
+        &self,
+        org_id: &str,
+        goal_id: &str,
+        req: &UpdateGoalRequest,
+    ) -> Result<ApiResponse<Goal>> {
+        let path = format!("/api/v2/organizations/{org_id}/objectives/{goal_id}");
+
         self.patch(&path, req).await
     }
 }

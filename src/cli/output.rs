@@ -1,6 +1,23 @@
-use colored::Colorize;
+use colored::{ColoredString, Colorize};
 
-use crate::api::{Organization, TreeItem};
+use crate::api::{GoalStatus, Organization, TreeItem};
+
+/// Resolve display status from is_completed + status fields.
+/// Returns (label, colored_label).
+pub fn resolve_status(
+    is_completed: bool,
+    status: Option<&GoalStatus>,
+) -> (&'static str, ColoredString) {
+    if is_completed {
+        ("COMPLETED", "COMPLETED".green())
+    } else {
+        match status {
+            Some(GoalStatus::InProgress) => ("IN_PROGRESS", "IN_PROGRESS".cyan()),
+            Some(GoalStatus::Cancelled) => ("CANCELLED", "CANCELLED".red()),
+            _ => ("NOT_STARTED", "NOT_STARTED".yellow()),
+        }
+    }
+}
 
 pub fn print_goals_table(items: &[TreeItem]) {
     if items.is_empty() {
@@ -18,24 +35,12 @@ pub fn print_goals_table(items: &[TreeItem]) {
     println!("{}", "─".repeat(100));
 
     for item in items {
-        let status = if item.is_completed {
-            "COMPLETED".green().to_string()
-        } else {
-            match item.status.as_deref() {
-                Some("IN_PROGRESS") => "IN_PROGRESS".cyan().to_string(),
-                Some("CANCELLED") => "CANCELLED".red().to_string(),
-                _ => "NOT_STARTED".yellow().to_string(),
-            }
-        };
+        let (_, colored_status) = resolve_status(item.is_completed, item.status.as_ref());
 
         let indent = if item.parent_id.is_some() { "  " } else { "" };
         let children_mark = if item.has_children { " +" } else { "" };
 
-        let owner = item
-            .owner
-            .as_ref()
-            .map(|o| o.name.as_str())
-            .unwrap_or("-");
+        let owner = item.owner.as_ref().map(|o| o.name.as_str()).unwrap_or("-");
 
         println!(
             "{:<38} {}{:<38}{} {:<10} {}",
@@ -43,7 +48,7 @@ pub fn print_goals_table(items: &[TreeItem]) {
             indent,
             item.title,
             children_mark.dimmed(),
-            status,
+            colored_status,
             owner.dimmed()
         );
     }

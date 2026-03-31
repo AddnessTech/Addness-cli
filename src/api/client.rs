@@ -69,7 +69,11 @@ impl ApiClient {
             .with_context(|| format!("Failed to parse response from {}", url))
     }
 
-    pub(super) async fn patch<T: DeserializeOwned, B: Serialize>(&self, path: &str, body: &B) -> Result<T> {
+    pub(super) async fn patch<T: DeserializeOwned, B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
         let url = format!("{}{}", self.base_url, path);
         let mut req = self.client.patch(&url).json(body);
 

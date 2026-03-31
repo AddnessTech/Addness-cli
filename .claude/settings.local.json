@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(gh repo:*)",
+      "Bash(git remote:*)",
+      "Bash(gh pr:*)",
+      "Bash(gh api:*)",
+      "Bash(cargo build:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(gh run:*)",
+      "Bash(cargo fmt:*)",
+      "Bash(cargo run:*)",
+      "Bash(git checkout:*)",
+      "Bash(rustc --version)",
+      "Bash(cargo --version)",
+      "Bash(cargo clippy:*)",
+      "Bash(git pull:*)"
+    ]
+  },
+  "enabledMcpjsonServers": [
+    "playwright",
+    "context7",
+    "postgres",
+    "awslabs-cloudwatch-logs",
+    "awslabs-ecs"
+  ]
+}

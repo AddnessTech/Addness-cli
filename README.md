@@ -422,10 +422,10 @@ addness goals update abc-123 --status COMPLETED --json
 - [x] 組織: `org list`, `org switch`, `org current`
 - [x] ゴール読み取り: `goals list`（ツリー表示 + JSON出力）
 - [x] 共通: `--json` フラグ
-- [ ] 認証: `auth set-key`（API Key対応）
+- [x] 認証: `auth set-key`（API Key対応）
 - [ ] ゴール読み取り: `goals get`, `goals search`, `goals tree`, `goals children`
-- [ ] ゴール書き込み: `goals create`, `goals update` (ステータス更新)
-- [ ] コメント: `comments list`, `comments create`（完了報告に必要）
+- [x] ゴール書き込み: `goals create`, `goals update` (ステータス更新)
+- [x] コメント: `comments list`, `comments create`（完了報告に必要）
 - [ ] 検索: `search`
 - [ ] エラーハンドリング改善
 - [ ] 配布: GitHub Releases + install.sh

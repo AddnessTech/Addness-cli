@@ -1,13 +1,14 @@
 use serde::{Deserialize, Serialize};
 
 /// Goal status values used by the API.
-/// API uses "NONE" for not-started, "IN_PROGRESS", "CANCELLED".
 /// "COMPLETED" is represented by `is_completed = true` rather than this enum.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum GoalStatus {
     None,
+    Active,
     InProgress,
+    Completed,
     Cancelled,
 }
 
@@ -78,11 +79,76 @@ pub struct Goal {
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
     pub status: Option<GoalStatus>,
     #[serde(default)]
     pub is_completed: bool,
     #[serde(default)]
     pub completed_at: Option<String>,
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    #[serde(default)]
+    pub organization_id: Option<String>,
+    #[serde(default)]
+    pub due_date: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    #[serde(default)]
+    pub owner: Option<Owner>,
+}
+
+// GET /api/v2/objectives/:id/children
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChildrenData {
+    pub children: Vec<ChildItem>,
+    #[serde(default)]
+    pub pagination: Option<TreePage>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChildItem {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    #[serde(default)]
+    pub status: Option<GoalStatus>,
+    #[serde(default)]
+    pub is_completed: bool,
+    #[serde(default)]
+    pub has_children: bool,
+    pub order_no: f64,
+    #[serde(default)]
+    pub owner: Option<Owner>,
+}
+
+// GET /api/v1/team/:org-id/objectives/search
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchResponse {
+    pub items: Vec<SearchItem>,
+    #[serde(default)]
+    pub total: i64,
+    #[serde(default)]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchItem {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub owner: Option<Owner>,
 }
 
 // GET /api/v1/team/organizations/my_organizations

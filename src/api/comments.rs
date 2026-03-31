@@ -1,10 +1,11 @@
-use crate::api::{ApiClient, Comment, CommentsResponse, CreateCommentRequest};
+use crate::api::{ApiClient, ApiResponse, Comment, CommentsResponse, CreateCommentRequest};
 use anyhow::Result;
 
 impl ApiClient {
     pub async fn list_comments(&self, goal_id: &str) -> Result<CommentsResponse> {
         let path = format!("/api/v2/objectives/{goal_id}/comments");
-        self.get(&path).await
+        let resp: ApiResponse<CommentsResponse> = self.get(&path).await?;
+        Ok(resp.data)
     }
 
     pub async fn create_comment(&self, goal_id: &str, body: &str) -> Result<Comment> {
@@ -14,6 +15,7 @@ impl ApiClient {
             content: body.to_string(),
             parent_id: None,
         };
-        self.post("/api/v1/team/comments", &req).await
+        let resp: ApiResponse<Comment> = self.post("/api/v1/team/comments", &req).await?;
+        Ok(resp.data)
     }
 }

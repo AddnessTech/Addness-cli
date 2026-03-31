@@ -129,6 +129,37 @@ pub struct ChildItem {
     pub owner: Option<Owner>,
 }
 
+// GET /api/v1/team/objectives/:id/deliverables
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliverableListData {
+    pub deliverables: Vec<Deliverable>,
+    pub total: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Deliverable {
+    pub id: String,
+    pub display_name: String,
+    pub node_type: String,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub link_url: Option<String>,
+    #[serde(default)]
+    pub file_name: Option<String>,
+    pub objective_id: String,
+    #[serde(default)]
+    pub parent_deliverable_id: Option<String>,
+    pub order_no: f64,
+    pub depth: i32,
+    pub is_root: bool,
+    pub has_children: bool,
+    #[serde(default)]
+    pub children_count: i64,
+}
+
 // GET /api/v1/team/:org-id/objectives/search
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

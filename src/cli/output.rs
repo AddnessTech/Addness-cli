@@ -63,7 +63,11 @@ pub fn print_goals_table(items: &[TreeItem]) {
             Some(pid) => !id_set.contains(pid.as_str()),
         })
         .collect();
-    roots.sort_by(|a, b| a.order_no.partial_cmp(&b.order_no).unwrap_or(std::cmp::Ordering::Equal));
+    roots.sort_by(|a, b| {
+        a.order_no
+            .partial_cmp(&b.order_no)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // Pass 1: collect rows in DFS order
     let mut rows: Vec<TreeRow> = Vec::new();
@@ -78,11 +82,7 @@ pub fn print_goals_table(items: &[TreeItem]) {
     ) {
         let (status_label, colored_status) =
             resolve_status(item.is_completed, item.status.as_ref());
-        let owner = item
-            .owner
-            .as_ref()
-            .map(|o| o.name.as_str())
-            .unwrap_or("-");
+        let owner = item.owner.as_ref().map(|o| o.name.as_str()).unwrap_or("-");
 
         let connector = if is_root {
             ""
@@ -117,7 +117,14 @@ pub fn print_goals_table(items: &[TreeItem]) {
             });
             let len = sorted.len();
             for (i, child) in sorted.iter().enumerate() {
-                collect_rows(child, &child_prefix, i == len - 1, false, children_map, rows);
+                collect_rows(
+                    child,
+                    &child_prefix,
+                    i == len - 1,
+                    false,
+                    children_map,
+                    rows,
+                );
             }
         }
     }

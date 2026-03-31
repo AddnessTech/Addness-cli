@@ -1,7 +1,9 @@
 use anyhow::{Result, bail};
 use clap::Subcommand;
 
-use crate::api::{ApiClient, ApiResponse, Goal, GoalStatus, TreeData, UpdateGoalRequest};
+use crate::api::{
+    ApiClient, ApiResponse, Deliverable, Goal, GoalStatus, TreeData, UpdateGoalRequest,
+};
 use crate::cli::commands::org::resolve_org_id;
 use crate::cli::output::{
     print_children_table, print_goal_detail, print_goals_table, print_search_results,
@@ -52,6 +54,28 @@ pub enum GoalsCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Get child goals with their deliverables and descriptions
+    Context {
+        /// Goal ID
+        id: String,
+        /// Max number of children to return (default: 50)
+        #[arg(long, default_value = "50")]
+        limit: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Get sibling goals with their deliverables and descriptions
+    Siblings {
+        /// Goal ID
+        id: String,
+        /// Max number of siblings to return (default: 50)
+        #[arg(long, default_value = "50")]
+        limit: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Search goals by keyword
     Search {
         /// Search query
@@ -77,6 +101,112 @@ pub enum GoalsCommands {
         #[arg(long)]
         json: bool,
     },
+}
+
+use crate::api::ChildItem;
+use colored::Colorize;
+use std::collections::HashMap;
+
+/// 各ゴールの成果物を並行取得してマップで返す
+async fn fetch_deliverables_map(
+    client: &ApiClient,
+    goals: &[ChildItem],
+) -> HashMap<String, Vec<Deliverable>> {
+    let futures: Vec<_> = goals
+        .iter()
+        .map(|g| client.get_goal_deliverables(&g.id))
+        .collect();
+    let results = futures::future::join_all(futures).await;
+
+    let mut map = HashMap::new();
+    for (i, result) in results.into_iter().enumerate() {
+        match result {
+            Ok(resp) => {
+                map.insert(goals[i].id.clone(), resp.data.deliverables);
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: failed to fetch deliverables for {}: {e}",
+                    goals[i].id
+                );
+            }
+        }
+    }
+    map
+}
+
+/// ゴール一覧+成果物マップをJSON出力
+fn print_goals_with_deliverables_json(
+    goals: &[ChildItem],
+    deliverables_map: &HashMap<String, Vec<Deliverable>>,
+) -> Result<()> {
+    let output: Vec<serde_json::Value> = goals
+        .iter()
+        .map(|g| {
+            let deliverables = deliverables_map.get(&g.id).cloned().unwrap_or_default();
+            serde_json::json!({
+                "id": g.id,
+                "title": g.title,
+                "description": g.description,
+                "status": g.status,
+                "is_completed": g.is_completed,
+                "deliverables": deliverables.iter().map(|d| {
+                    serde_json::json!({
+                        "id": d.id,
+                        "display_name": d.display_name,
+                        "node_type": d.node_type,
+                    })
+                }).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
+fn print_context_table(
+    children: &[ChildItem],
+    deliverables_map: &std::collections::HashMap<String, Vec<Deliverable>>,
+) {
+    for (i, child) in children.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        let (_, colored_status) = resolve_status(child.is_completed, child.status.as_ref());
+        println!(
+            "{} {} [{}]",
+            format!("{}.", i + 1).bold(),
+            child.title.bold(),
+            colored_status
+        );
+        println!("   {}: {}", "ID".dimmed(), child.id.dimmed());
+
+        if let Some(desc) = &child.description
+            && !desc.is_empty()
+        {
+            println!("   {}: {desc}", "完了条件".dimmed());
+        }
+
+        if let Some(deliverables) = deliverables_map.get(&child.id) {
+            if deliverables.is_empty() {
+                println!("   {}: {}", "成果物".dimmed(), "(なし)".dimmed());
+            } else {
+                println!("   {}:", "成果物".dimmed());
+                for d in deliverables {
+                    let type_icon = match d.node_type.as_str() {
+                        "folder" => "📁",
+                        "document" => "📄",
+                        "file" => "📎",
+                        "link" => "🔗",
+                        _ => "  ",
+                    };
+                    println!("     {type_icon} {}", d.display_name);
+                }
+            }
+        } else {
+            println!("   {}: {}", "成果物".dimmed(), "(取得失敗)".dimmed());
+        }
+    }
 }
 
 /// Parse CLI status into (is_completed, api_status) pair.
@@ -142,6 +272,70 @@ pub async fn handle_goals(cmd: &GoalsCommands, client: &ApiClient) -> Result<()>
                 println!("{}", serde_json::to_string_pretty(&resp.data.items)?);
             } else {
                 print_goals_table(&resp.data.items);
+            }
+            Ok(())
+        }
+        GoalsCommands::Context { id, limit, json } => {
+            let children_resp = client.get_goal_children(id, *limit, 0).await?;
+            let children = children_resp.data.children;
+
+            if children.is_empty() {
+                if *json {
+                    println!("[]");
+                } else {
+                    println!("No children found.");
+                }
+                return Ok(());
+            }
+
+            let deliverables_map = fetch_deliverables_map(client, &children).await;
+
+            if *json {
+                print_goals_with_deliverables_json(&children, &deliverables_map)?;
+            } else {
+                print_context_table(&children, &deliverables_map);
+            }
+            Ok(())
+        }
+        GoalsCommands::Siblings { id, limit, json } => {
+            // 1. 対象ゴールの詳細を取得して親IDを得る
+            let goal_resp: ApiResponse<Goal> = client.get_goal(id).await?;
+            let parent_id = match &goal_resp.data.parent_id {
+                Some(pid) => pid.clone(),
+                None => {
+                    if *json {
+                        println!("[]");
+                    } else {
+                        println!("This goal has no parent (root goal). No siblings.");
+                    }
+                    return Ok(());
+                }
+            };
+
+            // 2. 親の子ゴール一覧を取得（自分自身を除外）
+            let children_resp = client.get_goal_children(&parent_id, *limit, 0).await?;
+            let siblings: Vec<_> = children_resp
+                .data
+                .children
+                .into_iter()
+                .filter(|c| c.id != *id)
+                .collect();
+
+            if siblings.is_empty() {
+                if *json {
+                    println!("[]");
+                } else {
+                    println!("No sibling goals found.");
+                }
+                return Ok(());
+            }
+
+            let deliverables_map = fetch_deliverables_map(client, &siblings).await;
+
+            if *json {
+                print_goals_with_deliverables_json(&siblings, &deliverables_map)?;
+            } else {
+                print_context_table(&siblings, &deliverables_map);
             }
             Ok(())
         }

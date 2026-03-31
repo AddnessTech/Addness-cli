@@ -1,5 +1,6 @@
 use crate::api::{
-    ApiClient, ApiResponse, ChildrenData, Goal, SearchResponse, TreeData, UpdateGoalRequest,
+    ApiClient, ApiResponse, ChildrenData, DeliverableListData, Goal, SearchResponse, TreeData,
+    UpdateGoalRequest,
 };
 use anyhow::Result;
 
@@ -32,6 +33,14 @@ impl ApiClient {
 
     pub async fn get_goal_subtree(&self, goal_id: &str) -> Result<ApiResponse<TreeData>> {
         let path = format!("/api/v2/objectives/{goal_id}/subtree?include_owner=true");
+        self.get(&path).await
+    }
+
+    pub async fn get_goal_deliverables(
+        &self,
+        goal_id: &str,
+    ) -> Result<ApiResponse<DeliverableListData>> {
+        let path = format!("/api/v1/team/objectives/{goal_id}/deliverables");
         self.get(&path).await
     }
 

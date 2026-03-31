@@ -1,5 +1,4 @@
 use std::convert::Infallible;
-use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -83,8 +82,7 @@ pub async fn handle_login(api_url: &str, frontend_url: Option<&str>) -> Result<(
 
     // 1. Ed25519キーペア生成
     let (signing_key, public_key_pem) = generate_keypair();
-    let installation_id = uuid::Uuid::new_v4().to_string().replace("-", "");
-    let installation_id = &installation_id[..32];
+    let installation_id = uuid::Uuid::new_v4().simple().to_string();
 
     // 2. localhostサーバー起動（空きポートを自動取得）
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -98,15 +96,13 @@ pub async fn handle_login(api_url: &str, frontend_url: Option<&str>) -> Result<(
     let code_verifier = pkce_verifier.secret().to_string();
 
     // 4. State生成
-    let state = uuid::Uuid::new_v4().to_string().replace("-", "");
-    let state = &state[..32];
+    let state = uuid::Uuid::new_v4().simple().to_string();
 
     // 5. Installation登録
     let client = reqwest::Client::new();
     let register_resp = client
         .post(format!(
-            "{}/api/v1/public/desktop/auth/installations/register",
-            api_url
+            "{api_url}/api/v1/public/desktop/auth/installations/register"
         ))
         .json(&serde_json::json!({
             "installationId": installation_id,
@@ -117,22 +113,29 @@ pub async fn handle_login(api_url: &str, frontend_url: Option<&str>) -> Result<(
 
     if !register_resp.status().is_success() {
         let body = register_resp.text().await?;
-        bail!("Failed to register installation: {}", body);
+        bail!("Failed to register installation: {body}");
     }
     let _: RegisterResponse = register_resp.json().await?;
 
     // 6. StartSession作成
     let ts = timestamp();
     let start_message = format!(
-        "visiontodo-desktop-auth-start\ninstallation_id={}\nstate={}\nport={}\nnext_path={}\ncode_challenge={}\nauth_path={}\nreferral_code={}\ntimestamp={}",
-        installation_id, state, port, "/organization/set", code_challenge, "/sign-in", "", ts
+        r#"visiontodo-desktop-auth-start
+installation_id={installation_id}
+state={state}
+port={port}
+next_path={}
+code_challenge={code_challenge}
+auth_path={}
+referral_code={}
+timestamp={ts}"#,
+        "/organization/set", "/sign-in", ""
     );
     let start_signature = sign_message(&signing_key, &start_message);
 
     let start_resp = client
         .post(format!(
-            "{}/api/v1/public/desktop/auth/start-sessions",
-            api_url
+            "{api_url}/api/v1/public/desktop/auth/start-sessions"
         ))
         .json(&serde_json::json!({
             "installationId": installation_id,
@@ -149,7 +152,7 @@ pub async fn handle_login(api_url: &str, frontend_url: Option<&str>) -> Result<(
 
     if !start_resp.status().is_success() {
         let body = start_resp.text().await?;
-        bail!("Failed to create start session: {}", body);
+        bail!("Failed to create start session: {body}");
     }
 
     let start_data: StartSessionResponse = start_resp.json().await?;
@@ -159,15 +162,12 @@ pub async fn handle_login(api_url: &str, frontend_url: Option<&str>) -> Result<(
     let fe_url = frontend_url
         .map(|s| s.to_string())
         .unwrap_or_else(|| api_url.replace(":8080", ":3000").replace("api.", ""));
-    let browser_url = format!(
-        "{}/desktop/browser-auth?start_token={}",
-        fe_url.trim_end_matches('/'),
-        start_token
-    );
+    let fe_base = fe_url.trim_end_matches('/');
+    let browser_url = format!("{fe_base}/desktop/browser-auth?start_token={start_token}");
 
     println!("Opening browser for login...");
     println!("If the browser doesn't open, visit:");
-    println!("  {}", browser_url);
+    println!("  {browser_url}");
     println!();
 
     if open::that(&browser_url).is_err() {
@@ -189,15 +189,17 @@ pub async fn handle_login(api_url: &str, frontend_url: Option<&str>) -> Result<(
     // 9. Token Exchange（source=cli でAPI Key自動発行）
     let ts = timestamp();
     let exchange_message = format!(
-        "visiontodo-desktop-auth-exchange\ninstallation_id={}\nhandoff_id={}\ncode_verifier={}\ntimestamp={}",
-        installation_id, handoff_id, code_verifier, ts
+        r#"visiontodo-desktop-auth-exchange
+installation_id={installation_id}
+handoff_id={handoff_id}
+code_verifier={code_verifier}
+timestamp={ts}"#
     );
     let exchange_signature = sign_message(&signing_key, &exchange_message);
 
     let exchange_resp = client
         .post(format!(
-            "{}/api/v1/public/desktop/auth/token-exchange",
-            api_url
+            "{api_url}/api/v1/public/desktop/auth/token-exchange"
         ))
         .json(&serde_json::json!({
             "handoffId": handoff_id,
@@ -212,7 +214,7 @@ pub async fn handle_login(api_url: &str, frontend_url: Option<&str>) -> Result<(
 
     if !exchange_resp.status().is_success() {
         let body = exchange_resp.text().await?;
-        bail!("Token exchange failed: {}", body);
+        bail!("Token exchange failed: {body}");
     }
 
     let exchange_data: ExchangeResponse = exchange_resp.json().await?;
@@ -236,12 +238,14 @@ pub async fn handle_login(api_url: &str, frontend_url: Option<&str>) -> Result<(
     println!();
     println!("Login successful!");
     let masked = if api_key.len() >= 10 {
-        format!("{}...{}", &api_key[..6], &api_key[api_key.len() - 4..])
+        let prefix = &api_key[..6];
+        let suffix = &api_key[api_key.len() - 4..];
+        format!("{prefix}...{suffix}")
     } else {
         "[saved]".to_string()
     };
-    println!("  API Key: {}", masked);
-    println!("  API URL: {}", api_url);
+    println!("  API Key: {masked}");
+    println!("  API URL: {api_url}");
 
     if let Some(orgs) = &exchange_data.data.organizations {
         if !orgs.is_empty() {
@@ -260,58 +264,64 @@ pub async fn handle_login(api_url: &str, frontend_url: Option<&str>) -> Result<(
 }
 
 async fn wait_for_callback(listener: tokio::net::TcpListener) -> Result<(String, String)> {
-    let result: Arc<std::sync::Mutex<Option<(String, String)>>> =
-        Arc::new(std::sync::Mutex::new(None));
+    use tokio::sync::oneshot;
 
-    loop {
-        let (stream, _) = listener
-            .accept()
-            .await
-            .context("Failed to accept connection")?;
-        let io = hyper_util::rt::TokioIo::new(stream);
-        let result_clone = result.clone();
+    let (tx, rx) = oneshot::channel::<(String, String)>();
+    let tx = std::sync::Mutex::new(Some(tx));
 
-        let service = service_fn(move |req: Request<Incoming>| {
-            let result = result_clone.clone();
-            async move {
-                if !req.uri().path().starts_with("/callback") {
-                    return Ok::<_, Infallible>(
-                        Response::builder()
-                            .status(StatusCode::NOT_FOUND)
-                            .body(Full::new(Bytes::from("not found")))
-                            .unwrap(),
-                    );
-                }
+    let (stream, _) = listener
+        .accept()
+        .await
+        .context("Failed to accept connection")?;
+    let io = hyper_util::rt::TokioIo::new(stream);
 
-                let query = req.uri().query().unwrap_or("");
-                let params: std::collections::HashMap<String, String> =
-                    form_urlencoded::parse(query.as_bytes())
-                        .into_owned()
-                        .collect();
-
-                let handoff_id = params.get("handoff_id").cloned().unwrap_or_default();
-                let state = params.get("state").cloned().unwrap_or_default();
-
-                *result.lock().unwrap() = Some((handoff_id, state));
-
-                let body =
-                    "<html><body><h1>Login successful!</h1><p>You can close this tab.</p></body></html>";
-                Ok::<_, Infallible>(
+    let service = service_fn(move |req: Request<Incoming>| {
+        let tx = tx.lock().unwrap().take();
+        async move {
+            if req.uri().path() != "/callback" {
+                return Ok::<_, Infallible>(
                     Response::builder()
-                        .header("Content-Type", "text/html")
-                        .body(Full::new(Bytes::from(body)))
+                        .status(StatusCode::NOT_FOUND)
+                        .body(Full::new(Bytes::from("not found")))
                         .unwrap(),
-                )
+                );
             }
-        });
 
-        let _ = http1::Builder::new().serve_connection(io, service).await;
+            let query = req.uri().query().unwrap_or("");
+            let params: std::collections::HashMap<String, String> =
+                form_urlencoded::parse(query.as_bytes())
+                    .into_owned()
+                    .collect();
 
-        if let Some((handoff_id, state)) = result.lock().unwrap().take() {
-            if handoff_id.is_empty() {
-                bail!("No handoff_id in callback");
+            let handoff_id = params.get("handoff_id").cloned().unwrap_or_default();
+            let state = params.get("state").cloned().unwrap_or_default();
+
+            if let Some(tx) = tx {
+                let _ = tx.send((handoff_id, state));
             }
-            return Ok((handoff_id, state));
+
+            let body = include_str!("login_success.html");
+            Ok::<_, Infallible>(
+                Response::builder()
+                    .header("Content-Type", "text/html")
+                    .body(Full::new(Bytes::from(body)))
+                    .unwrap(),
+            )
         }
+    });
+
+    http1::Builder::new()
+        .serve_connection(io, service)
+        .await
+        .context("Failed to serve callback connection")?;
+
+    let (handoff_id, state) = rx
+        .await
+        .context("Callback handler did not produce a result")?;
+
+    if handoff_id.is_empty() {
+        bail!("No handoff_id in callback");
     }
+
+    Ok((handoff_id, state))
 }

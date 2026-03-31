@@ -1,6 +1,6 @@
 use colored::{ColoredString, Colorize};
 
-use crate::api::{GoalStatus, Organization, TreeItem};
+use crate::api::{Comment, GoalStatus, Organization, TreeItem};
 
 /// Resolve display status from is_completed + status fields.
 /// Returns (label, colored_label).
@@ -50,6 +50,52 @@ pub fn print_goals_table(items: &[TreeItem]) {
             children_mark.dimmed(),
             colored_status,
             owner.dimmed()
+        );
+    }
+}
+
+pub fn print_comments_table(comments: &[Comment]) {
+    if comments.is_empty() {
+        println!("{}", "No comments found.".dimmed());
+        return;
+    }
+
+    println!(
+        "{:<38} {:<20} {:<20} {}",
+        "ID".bold(),
+        "AUTHOR".bold(),
+        "DATE".bold(),
+        "CONTENT".bold()
+    );
+    println!("{}", "─".repeat(120));
+
+    for comment in comments {
+        let content = comment.content.replace('\n', " ");
+        let truncated = if content.chars().count() > 60 {
+            let end = content
+                .char_indices()
+                .nth(57)
+                .map(|(i, _)| i)
+                .unwrap_or(content.len());
+            format!("{}...", &content[..end])
+        } else {
+            content
+        };
+
+        let author_name = if comment.author.is_ai_agent {
+            format!("{} (AI)", comment.author.name)
+        } else {
+            comment.author.name.clone()
+        };
+
+        let date = &comment.created_at[..10.min(comment.created_at.len())];
+
+        println!(
+            "{:<38} {:<20} {:<20} {}",
+            comment.id.dimmed(),
+            author_name,
+            date.dimmed(),
+            truncated
         );
     }
 }

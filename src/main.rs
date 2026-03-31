@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 
 use crate::config::{Credentials, Settings};
 use api::ApiClient;
-use cli::commands::{auth, configure, goals, login, org};
+use cli::commands::{auth, comments, configure, goals, login, org};
 
 #[derive(Parser)]
 #[command(
@@ -51,6 +51,11 @@ enum Commands {
         #[command(subcommand)]
         command: goals::GoalsCommands,
     },
+    /// Manage comments on goals
+    Comments {
+        #[command(subcommand)]
+        command: comments::CommentsCommands,
+    },
 }
 
 fn build_client() -> Result<ApiClient> {
@@ -83,6 +88,10 @@ async fn main() -> Result<()> {
         Commands::Goals { command } => {
             let client = build_client()?;
             goals::handle_goals(command, &client).await
+        }
+        Commands::Comments { command } => {
+            let client = build_client()?;
+            comments::handle_comments(command, &client).await
         }
     }
 }

@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use clap::Subcommand;
 
 use crate::api::{
-    ApiClient, ApiResponse, Deliverable, Goal, GoalStatus, GoalTreeData, UpdateGoalRequest,
+    ApiClient, ApiResponse, Comment, Deliverable, Goal, GoalStatus, GoalTreeData, UpdateGoalRequest,
 };
 use crate::cli::commands::org::resolve_org_id;
 use crate::cli::output::{
@@ -36,6 +36,9 @@ pub enum GoalsCommands {
         /// With deliverables information
         #[arg(long)]
         with_deliverable: bool,
+        /// With comments information
+        #[arg(long)]
+        with_comment: bool,
     },
     /// List children of a goal
     Children {
@@ -104,7 +107,7 @@ pub enum GoalsCommands {
 struct GoalNode {
     goal: Goal,
     deliverables: Option<Vec<Deliverable>>,
-    // comments: Option<Vec<Comment>>
+    comments: Option<Vec<Comment>>,
     children: Option<Vec<GoalChildNode>>,
 }
 
@@ -162,7 +165,7 @@ impl GoalNode {
     fn build_tree(
         goal: Goal,
         deliverables: Option<Vec<Deliverable>>,
-        // comments: Option<Vec<Comment>>
+        comments: Option<Vec<Comment>>,
         children: Option<Vec<GoalChildItem>>,
         children_deliverables: HashMap<String, Vec<Deliverable>>,
     ) -> Self {
@@ -171,6 +174,7 @@ impl GoalNode {
 
         Self {
             goal,
+            comments,
             deliverables,
             children,
         }
@@ -291,11 +295,17 @@ pub async fn handle_goals(cmd: &GoalsCommands, client: &ApiClient) -> Result<()>
             limit,
             json,
             with_deliverable,
+            with_comment,
         } => {
             // id で指定されたゴール自身の情報を取得
             let resp: ApiResponse<Goal> = client.get_goal(id).await?;
             let deliverables = if *with_deliverable {
                 Some(client.get_goal_deliverables(id).await?.data.deliverables)
+            } else {
+                None
+            };
+            let comments = if *with_comment {
+                Some(client.list_comments(id).await?.comments)
             } else {
                 None
             };
@@ -312,6 +322,7 @@ pub async fn handle_goals(cmd: &GoalsCommands, client: &ApiClient) -> Result<()>
             let goal_tree = GoalNode::build_tree(
                 resp.data,
                 deliverables,
+                comments,
                 Some(children),
                 children_deliverables,
             );
@@ -550,6 +561,43 @@ impl GoalNode {
             }
         }
         let with_deliverable = self.deliverables.is_some();
+
+        // コメントも表示するオプションが立っているとき
+        if let Some(comments) = &self.comments {
+            if comments.is_empty() {
+                println!("   {}: {}", "コメント".dimmed(), "(なし)".dimmed());
+            } else {
+                println!("   {}:", "コメント".dimmed());
+                for comment in comments {
+                    let content = comment.content.replace('\n', " ");
+                    let truncated = if content.chars().count() > 30 {
+                        let end = content
+                            .char_indices()
+                            .nth(27)
+                            .map(|(i, _)| i)
+                            .unwrap_or(content.len());
+                        format!("{}...", &content[..end])
+                    } else {
+                        content
+                    };
+
+                    let author_name = if comment.author.is_ai_agent {
+                        format!("{} (AI)", comment.author.name)
+                    } else {
+                        comment.author.name.clone()
+                    };
+
+                    let date = &comment.created_at[..10.min(comment.created_at.len())];
+
+                    println!(
+                        "     \"{}\" {} {}",
+                        truncated,
+                        author_name.dimmed(),
+                        date.dimmed(),
+                    );
+                }
+            }
+        }
 
         // 子の階層を表示するオプションが立っているとき
         if let Some(children) = &self.children {

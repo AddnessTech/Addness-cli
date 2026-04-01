@@ -108,10 +108,7 @@ impl ApiClient {
                     map.insert(goal_ids[i].to_string(), resp.comments);
                 }
                 Err(e) => {
-                    eprintln!(
-                        "Warning: failed to fetch deliverables for {}: {e}",
-                        goal_ids[i]
-                    );
+                    eprintln!("Warning: failed to fetch comments for {}: {e}", goal_ids[i]);
                 }
             }
         }

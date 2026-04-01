@@ -516,8 +516,13 @@ impl GoalChildNode {
                             }
                             DeliverableType::Document => {
                                 if let Some(content) = &d.content {
-                                    let truncated = if content.len() > 30 {
-                                        &format!("{}...", &content[..27])
+                                    let truncated = if content.chars().count() > 30 {
+                                        let end = content
+                                            .char_indices()
+                                            .nth(27)
+                                            .map(|(i, _)| i)
+                                            .unwrap_or(content.len());
+                                        &format!("{}...", &content[..end])
                                     } else {
                                         content
                                     };
@@ -634,8 +639,13 @@ impl GoalNode {
                         }
                         DeliverableType::Document => {
                             if let Some(content) = &d.content {
-                                let truncated = if content.len() > 30 {
-                                    &format!("{}...", &content[..27])
+                                let truncated = if content.chars().count() > 30 {
+                                    let end = content
+                                        .char_indices()
+                                        .nth(27)
+                                        .map(|(i, _)| i)
+                                        .unwrap_or(content.len());
+                                    &format!("{}...", &content[..end])
                                 } else {
                                     content
                                 };

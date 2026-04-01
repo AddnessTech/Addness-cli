@@ -137,12 +137,22 @@ pub struct DeliverableListData {
     pub total: i64,
 }
 
+/// Deliverable node type
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliverableType {
+    Folder,
+    Document,
+    File,
+    Link,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Deliverable {
     pub id: String,
     pub display_name: String,
-    pub node_type: String,
+    pub node_type: DeliverableType,
     #[serde(default)]
     pub content: Option<String>,
     #[serde(default)]

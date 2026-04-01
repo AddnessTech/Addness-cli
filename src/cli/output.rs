@@ -1,7 +1,9 @@
 use colored::{ColoredString, Colorize};
 use unicode_width::UnicodeWidthStr;
 
-use crate::api::{Comment, GoalChildItem, GoalStatus, GoalTreeItem, Organization, SearchItem};
+use crate::api::{
+    Comment, DeliverableType, GoalChildItem, GoalStatus, GoalTreeItem, Organization, SearchItem,
+};
 
 /// Pad `s` with spaces so its display width reaches `target_width`.
 fn pad_to_width(s: &str, target_width: usize) -> String {
@@ -286,5 +288,16 @@ pub fn print_organizations_table(orgs: &[Organization], current_org_id: Option<&
             String::new()
         };
         println!("{:<38} {}{}", org.id.dimmed(), org.name, marker);
+    }
+}
+
+impl DeliverableType {
+    pub fn as_icon(&self) -> &str {
+        match self {
+            Self::Folder => "📁",
+            Self::Document => "📄",
+            Self::File => "📎",
+            Self::Link => "🔗",
+        }
     }
 }

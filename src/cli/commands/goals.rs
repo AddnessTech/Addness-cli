@@ -2,7 +2,8 @@ use anyhow::{Result, bail};
 use clap::Subcommand;
 
 use crate::api::{
-    ApiClient, ApiResponse, Comment, Deliverable, Goal, GoalStatus, GoalTreeData, UpdateGoalRequest,
+    ApiClient, ApiResponse, Comment, Deliverable, DeliverableType, Goal, GoalStatus, GoalTreeData,
+    UpdateGoalRequest,
 };
 use crate::cli::commands::org::resolve_org_id;
 use crate::cli::output::{
@@ -243,14 +244,7 @@ fn print_context_table(
             } else {
                 println!("   {}:", "成果物".dimmed());
                 for d in deliverables {
-                    let type_icon = match d.node_type.as_str() {
-                        "folder" => "📁",
-                        "document" => "📄",
-                        "file" => "📎",
-                        "link" => "🔗",
-                        _ => "  ",
-                    };
-                    println!("     {type_icon} {}", d.display_name);
+                    println!("     {} {}", d.node_type.as_icon(), d.display_name);
                 }
             }
         } else {
@@ -459,16 +453,6 @@ pub async fn handle_goals(cmd: &GoalsCommands, client: &ApiClient) -> Result<()>
     }
 }
 
-fn deliverable_type_icon(node_type: &str) -> &str {
-    match node_type {
-        "folder" => "📁",
-        "document" => "📄",
-        "file" => "📎",
-        "link" => "🔗",
-        _ => "  ",
-    }
-}
-
 impl GoalChildNode {
     fn print_goal_detail_subtree(&self, current_depth: usize, with_deliverable: bool) {
         let indent = " ".repeat(current_depth);
@@ -494,11 +478,7 @@ impl GoalChildNode {
                 } else {
                     println!("{indent}   {}:", "成果物".dimmed());
                     for d in deliverables {
-                        println!(
-                            "{indent}     {} {}",
-                            deliverable_type_icon(&d.node_type),
-                            d.display_name
-                        );
+                        println!("{indent}     {} {}", d.node_type.as_icon(), d.display_name);
                     }
                 }
             } else {
@@ -552,11 +532,27 @@ impl GoalNode {
             } else {
                 println!("   {}:", "成果物".dimmed());
                 for d in deliverables {
-                    println!(
-                        "     {} {}",
-                        deliverable_type_icon(&d.node_type),
-                        d.display_name
-                    );
+                    println!("     - {} {}", d.node_type.as_icon(), d.display_name);
+                    match &d.node_type {
+                        DeliverableType::Link => {
+                            if let Some(link) = &d.link_url {
+                                println!("       {link}");
+                            }
+                        }
+                        DeliverableType::Document => {
+                            if let Some(content) = &d.content {
+                                let truncated = if content.len() > 30 {
+                                    &format!("{}...", &content[..27])
+                                } else {
+                                    content
+                                };
+                                println!("       {truncated}");
+                            }
+                        }
+                        DeliverableType::File | DeliverableType::Folder => {
+                            // nothing to do
+                        }
+                    }
                 }
             }
         }
@@ -590,7 +586,7 @@ impl GoalNode {
                     let date = &comment.created_at[..10.min(comment.created_at.len())];
 
                     println!(
-                        "     \"{}\" {} {}",
+                        "     - \"{}\" {} {}",
                         truncated,
                         author_name.dimmed(),
                         date.dimmed(),

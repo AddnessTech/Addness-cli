@@ -16,7 +16,8 @@
       "Bash(rustc --version)",
       "Bash(cargo --version)",
       "Bash(cargo clippy:*)",
-      "Bash(git pull:*)"
+      "Bash(git pull:*)",
+      "Bash(grep:*)"
     ]
   },
   "enabledMcpjsonServers": [

@@ -3,7 +3,7 @@ use clap::Subcommand;
 
 use crate::api::{
     ApiClient, ApiResponse, Comment, Deliverable, DeliverableType, Goal, GoalStatus, GoalTreeData,
-    UpdateGoalRequest,
+    GoalTreeItem, UpdateGoalRequest,
 };
 use crate::cli::commands::org::resolve_org_id;
 use crate::cli::output::{
@@ -28,9 +28,6 @@ pub enum GoalsCommands {
     Get {
         /// Goal ID
         id: String,
-        /// Max number of children to return (default: 50)
-        #[arg(long, default_value = "50")]
-        limit: usize,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -114,7 +111,7 @@ struct GoalNode {
 
 #[derive(Debug, serde::Serialize)]
 struct GoalChildNode {
-    goal: GoalChildItem,
+    goal: GoalTreeItem,
     deliverables: Option<Vec<Deliverable>>,
     comments: Option<Vec<Comment>>,
     children: Option<Vec<Self>>,
@@ -123,7 +120,7 @@ struct GoalChildNode {
 impl GoalChildNode {
     fn build_children(
         parent_id: &str,
-        children_map: &mut HashMap<String, Vec<GoalChildItem>>,
+        children_map: &mut HashMap<String, Vec<GoalTreeItem>>,
         deliverables_map: &mut HashMap<String, Vec<Deliverable>>,
         comments_map: &mut HashMap<String, Vec<Comment>>,
     ) -> Vec<Self> {
@@ -157,11 +154,11 @@ impl GoalChildNode {
 impl GoalNode {
     fn build_forest(
         root_id: &str,
-        goals: Vec<GoalChildItem>,
+        goals: Vec<GoalTreeItem>,
         mut deliverables_map: HashMap<String, Vec<Deliverable>>,
         mut comments_map: HashMap<String, Vec<Comment>>,
     ) -> Vec<GoalChildNode> {
-        let mut children_map: HashMap<String, Vec<GoalChildItem>> = HashMap::new();
+        let mut children_map: HashMap<String, Vec<GoalTreeItem>> = HashMap::new();
 
         for goal in goals {
             if let Some(parent_id) = goal.parent_id.clone() {
@@ -181,7 +178,7 @@ impl GoalNode {
         goal: Goal,
         deliverables: Option<Vec<Deliverable>>,
         comments: Option<Vec<Comment>>,
-        children: Option<Vec<GoalChildItem>>,
+        children: Option<Vec<GoalTreeItem>>,
         children_deliverables: HashMap<String, Vec<Deliverable>>,
         children_comments: HashMap<String, Vec<Comment>>,
     ) -> Self {
@@ -302,7 +299,6 @@ pub async fn handle_goals(cmd: &GoalsCommands, client: &ApiClient) -> Result<()>
         }
         GoalsCommands::Get {
             id,
-            limit,
             json,
             with_deliverable,
             with_comment,
@@ -320,15 +316,30 @@ pub async fn handle_goals(cmd: &GoalsCommands, client: &ApiClient) -> Result<()>
                 None
             };
 
-            // 子ゴールの情報を取得
-            let children_resp = client.get_goal_children(id, *limit, 0).await?;
-            let children = children_resp.data.children;
+            // サブツリーの情報を取得（階層の終わりまで）
+            let subtree_resp: ApiResponse<GoalTreeData> = client.get_goal_subtree(id).await?;
+            let subtree_items: Vec<GoalTreeItem> = subtree_resp
+                .data
+                .items
+                .into_iter()
+                .filter(|item| item.id != *id)
+                .collect();
 
             let children_deliverables = client
-                .get_deliverables_map(&children.iter().map(|g| g.id.as_str()).collect::<Vec<_>>())
+                .get_deliverables_map(
+                    &subtree_items
+                        .iter()
+                        .map(|g| g.id.as_str())
+                        .collect::<Vec<_>>(),
+                )
                 .await;
             let children_comments = client
-                .get_comments_map(&children.iter().map(|g| g.id.as_str()).collect::<Vec<_>>())
+                .get_comments_map(
+                    &subtree_items
+                        .iter()
+                        .map(|g| g.id.as_str())
+                        .collect::<Vec<_>>(),
+                )
                 .await;
 
             // 階層構造を構成
@@ -336,7 +347,7 @@ pub async fn handle_goals(cmd: &GoalsCommands, client: &ApiClient) -> Result<()>
                 resp.data,
                 deliverables,
                 comments,
-                Some(children),
+                Some(subtree_items),
                 children_deliverables,
                 children_comments,
             );
@@ -488,12 +499,6 @@ impl GoalChildNode {
             self.goal.title.bold()
         );
         println!("{indent}   {}: {}", "ID".dimmed(), self.goal.id.dimmed());
-
-        if let Some(desc) = &self.goal.description
-            && !desc.is_empty()
-        {
-            println!("{indent}   {}: {desc}", "完了条件".dimmed());
-        }
 
         // 成果物も表示するオプションが立っているとき
         if with_deliverable {

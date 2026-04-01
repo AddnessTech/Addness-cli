@@ -2,12 +2,11 @@ use anyhow::{Result, bail};
 use clap::Subcommand;
 
 use crate::api::{
-    ApiClient, ApiResponse, Deliverable, Goal, GoalStatus, TreeData, UpdateGoalRequest,
+    ApiClient, ApiResponse, Deliverable, Goal, GoalStatus, GoalTreeData, UpdateGoalRequest,
 };
 use crate::cli::commands::org::resolve_org_id;
 use crate::cli::output::{
-    print_children_table, print_goal_detail, print_goals_table, print_search_results,
-    resolve_status,
+    print_children_table, print_goals_table, print_search_results, resolve_status,
 };
 
 #[derive(Subcommand)]
@@ -28,9 +27,15 @@ pub enum GoalsCommands {
     Get {
         /// Goal ID
         id: String,
+        /// Max number of children to return (default: 50)
+        #[arg(long, default_value = "50")]
+        limit: usize,
         /// Output as JSON
         #[arg(long)]
         json: bool,
+        /// With deliverables information
+        #[arg(long)]
+        with_deliverable: bool,
     },
     /// List children of a goal
     Children {
@@ -50,17 +55,6 @@ pub enum GoalsCommands {
     Tree {
         /// Goal ID
         id: String,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Get child goals with their deliverables and descriptions
-    Context {
-        /// Goal ID
-        id: String,
-        /// Max number of children to return (default: 50)
-        #[arg(long, default_value = "50")]
-        limit: usize,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -103,41 +97,93 @@ pub enum GoalsCommands {
     },
 }
 
-use crate::api::ChildItem;
+/// GoalInfo はゴールとその関連情報を保持するための
+/// 汎用的な構造体
+/// 木構造を表現できる
+#[derive(Debug, serde::Serialize)]
+struct GoalNode {
+    goal: Goal,
+    deliverables: Option<Vec<Deliverable>>,
+    // comments: Option<Vec<Comment>>
+    children: Option<Vec<GoalChildNode>>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct GoalChildNode {
+    goal: GoalChildItem,
+    deliverables: Option<Vec<Deliverable>>,
+    // comments: Option<Vec<Comment>>
+    children: Option<Vec<Self>>,
+}
+
+impl GoalChildNode {
+    fn build_children(
+        parent_id: &str,
+        children_map: &mut HashMap<String, Vec<GoalChildItem>>,
+        deliverables_map: &mut HashMap<String, Vec<Deliverable>>,
+    ) -> Vec<Self> {
+        match children_map.remove(parent_id) {
+            Some(goals) => goals
+                .into_iter()
+                .map(|goal| {
+                    let children = Self::build_children(&goal.id, children_map, deliverables_map);
+
+                    let deliverables = deliverables_map.remove(&goal.id);
+
+                    Self {
+                        goal,
+                        deliverables,
+                        children: Some(children),
+                    }
+                })
+                .collect(),
+            None => vec![],
+        }
+    }
+}
+
+impl GoalNode {
+    fn build_forest(
+        root_id: &str,
+        goals: Vec<GoalChildItem>,
+        mut deliverables_map: HashMap<String, Vec<Deliverable>>,
+    ) -> Vec<GoalChildNode> {
+        let mut children_map: HashMap<String, Vec<GoalChildItem>> = HashMap::new();
+
+        for goal in goals {
+            if let Some(parent_id) = goal.parent_id.clone() {
+                children_map.entry(parent_id).or_default().push(goal);
+            }
+        }
+
+        GoalChildNode::build_children(root_id, &mut children_map, &mut deliverables_map)
+    }
+
+    fn build_tree(
+        goal: Goal,
+        deliverables: Option<Vec<Deliverable>>,
+        // comments: Option<Vec<Comment>>
+        children: Option<Vec<GoalChildItem>>,
+        children_deliverables: HashMap<String, Vec<Deliverable>>,
+    ) -> Self {
+        let children =
+            children.map(|children| Self::build_forest(&goal.id, children, children_deliverables));
+
+        Self {
+            goal,
+            deliverables,
+            children,
+        }
+    }
+}
+
+use crate::api::GoalChildItem;
 use colored::Colorize;
 use std::collections::HashMap;
 
-/// 各ゴールの成果物を並行取得してマップで返す
-async fn fetch_deliverables_map(
-    client: &ApiClient,
-    goals: &[ChildItem],
-) -> HashMap<String, Vec<Deliverable>> {
-    let futures: Vec<_> = goals
-        .iter()
-        .map(|g| client.get_goal_deliverables(&g.id))
-        .collect();
-    let results = futures::future::join_all(futures).await;
-
-    let mut map = HashMap::new();
-    for (i, result) in results.into_iter().enumerate() {
-        match result {
-            Ok(resp) => {
-                map.insert(goals[i].id.clone(), resp.data.deliverables);
-            }
-            Err(e) => {
-                eprintln!(
-                    "Warning: failed to fetch deliverables for {}: {e}",
-                    goals[i].id
-                );
-            }
-        }
-    }
-    map
-}
-
 /// ゴール一覧+成果物マップをJSON出力
 fn print_goals_with_deliverables_json(
-    goals: &[ChildItem],
+    goals: &[GoalChildItem],
     deliverables_map: &HashMap<String, Vec<Deliverable>>,
 ) -> Result<()> {
     let output: Vec<serde_json::Value> = goals
@@ -165,7 +211,7 @@ fn print_goals_with_deliverables_json(
 }
 
 fn print_context_table(
-    children: &[ChildItem],
+    children: &[GoalChildItem],
     deliverables_map: &std::collections::HashMap<String, Vec<Deliverable>>,
 ) {
     for (i, child) in children.iter().enumerate() {
@@ -231,7 +277,7 @@ pub async fn handle_goals(cmd: &GoalsCommands, client: &ApiClient) -> Result<()>
     match cmd {
         GoalsCommands::List { org, depth, json } => {
             let org_id = resolve_org_id(org.as_deref())?;
-            let resp: ApiResponse<TreeData> = client.get_goal_tree(&org_id, *depth).await?;
+            let resp: ApiResponse<GoalTreeData> = client.get_goal_tree(&org_id, *depth).await?;
 
             if *json {
                 println!("{}", serde_json::to_string_pretty(&resp.data.items)?);
@@ -240,14 +286,50 @@ pub async fn handle_goals(cmd: &GoalsCommands, client: &ApiClient) -> Result<()>
             }
             Ok(())
         }
-        GoalsCommands::Get { id, json } => {
+        GoalsCommands::Get {
+            id,
+            limit,
+            json,
+            with_deliverable,
+        } => {
+            // id で指定されたゴール自身の情報
             let resp: ApiResponse<Goal> = client.get_goal(id).await?;
+            let deliverables = if *with_deliverable {
+                Some(client.get_goal_deliverables(id).await?.data.deliverables)
+            } else {
+                None
+            };
+
+            // 子ゴールの情報
+            let children_resp = client.get_goal_children(id, *limit, 0).await?;
+            let children = children_resp.data.children;
+
+            if children.is_empty() {
+                if *json {
+                    println!("[]");
+                } else {
+                    println!("No children found.");
+                }
+                return Ok(());
+            }
+
+            let children_deliverables = client
+                .get_deliverables_map(&children.iter().map(|g| g.id.as_str()).collect::<Vec<_>>())
+                .await;
+
+            let goal_tree = GoalNode::build_tree(
+                resp.data,
+                deliverables,
+                Some(children),
+                children_deliverables,
+            );
 
             if *json {
-                println!("{}", serde_json::to_string_pretty(&resp.data)?);
+                serde_json::json!(goal_tree);
             } else {
-                print_goal_detail(&resp.data);
+                goal_tree.print_goal_detail_tree();
             }
+
             Ok(())
         }
         GoalsCommands::Children {
@@ -266,34 +348,12 @@ pub async fn handle_goals(cmd: &GoalsCommands, client: &ApiClient) -> Result<()>
             Ok(())
         }
         GoalsCommands::Tree { id, json } => {
-            let resp: ApiResponse<TreeData> = client.get_goal_subtree(id).await?;
+            let resp: ApiResponse<GoalTreeData> = client.get_goal_subtree(id).await?;
 
             if *json {
                 println!("{}", serde_json::to_string_pretty(&resp.data.items)?);
             } else {
                 print_goals_table(&resp.data.items);
-            }
-            Ok(())
-        }
-        GoalsCommands::Context { id, limit, json } => {
-            let children_resp = client.get_goal_children(id, *limit, 0).await?;
-            let children = children_resp.data.children;
-
-            if children.is_empty() {
-                if *json {
-                    println!("[]");
-                } else {
-                    println!("No children found.");
-                }
-                return Ok(());
-            }
-
-            let deliverables_map = fetch_deliverables_map(client, &children).await;
-
-            if *json {
-                print_goals_with_deliverables_json(&children, &deliverables_map)?;
-            } else {
-                print_context_table(&children, &deliverables_map);
             }
             Ok(())
         }
@@ -330,7 +390,9 @@ pub async fn handle_goals(cmd: &GoalsCommands, client: &ApiClient) -> Result<()>
                 return Ok(());
             }
 
-            let deliverables_map = fetch_deliverables_map(client, &siblings).await;
+            let deliverables_map = client
+                .get_deliverables_map(&siblings.iter().map(|g| g.id.as_str()).collect::<Vec<_>>())
+                .await;
 
             if *json {
                 print_goals_with_deliverables_json(&siblings, &deliverables_map)?;
@@ -388,6 +450,99 @@ pub async fn handle_goals(cmd: &GoalsCommands, client: &ApiClient) -> Result<()>
                 println!("Updated goal: {} [{label}]", resp.data.title);
             }
             Ok(())
+        }
+    }
+}
+
+fn deliverable_type_icon(node_type: &str) -> &str {
+    match node_type {
+        "folder" => "📁",
+        "document" => "📄",
+        "file" => "📎",
+        "link" => "🔗",
+        _ => "  ",
+    }
+}
+
+impl GoalChildNode {
+    fn print_goal_detail_subtree(&self, current_depth: usize, with_deliverable: bool) {
+        let indent = " ".repeat(current_depth);
+        let (_, colored_status) = resolve_status(self.goal.is_completed, self.goal.status.as_ref());
+        println!("{indent}└─ {} [{colored_status}]", self.goal.title.bold());
+        println!("{indent}   {}: {}", "ID".dimmed(), self.goal.id.dimmed());
+
+        if let Some(desc) = &self.goal.description
+            && !desc.is_empty()
+        {
+            println!("{indent}   {}: {desc}", "完了条件".dimmed());
+        }
+
+        // 成果物も表示するオプションが立っているとき
+        if with_deliverable {
+            if let Some(deliverables) = &self.deliverables {
+                if deliverables.is_empty() {
+                    println!("{indent}   {}: {}", "成果物".dimmed(), "(なし)".dimmed());
+                } else {
+                    println!("{indent}   {}:", "成果物".dimmed());
+                    for d in deliverables {
+                        println!(
+                            "{indent}     {} {}",
+                            deliverable_type_icon(&d.node_type),
+                            d.display_name
+                        );
+                    }
+                }
+            } else {
+                println!(
+                    "{indent}   {}: {}",
+                    "成果物".dimmed(),
+                    "(取得失敗)".dimmed()
+                );
+            }
+        }
+
+        if let Some(children) = &self.children {
+            for c in children {
+                c.print_goal_detail_subtree(current_depth + 1, with_deliverable);
+            }
+        }
+    }
+}
+
+impl GoalNode {
+    fn print_goal_detail_tree(&self) {
+        let (_, colored_status) = resolve_status(self.goal.is_completed, self.goal.status.as_ref());
+        println!("{} [{colored_status}]", self.goal.title.bold());
+        println!("   {}: {}", "ID".dimmed(), self.goal.id.dimmed());
+
+        if let Some(desc) = &self.goal.description
+            && !desc.is_empty()
+        {
+            println!("   {}: {desc}", "完了条件".dimmed());
+        }
+
+        // 成果物も表示するオプションが立っているとき
+        if let Some(deliverables) = &self.deliverables {
+            if deliverables.is_empty() {
+                println!("   {}: {}", "成果物".dimmed(), "(なし)".dimmed());
+            } else {
+                println!("   {}:", "成果物".dimmed());
+                for d in deliverables {
+                    println!(
+                        "     {} {}",
+                        deliverable_type_icon(&d.node_type),
+                        d.display_name
+                    );
+                }
+            }
+        }
+        let with_deliverable = self.deliverables.is_some();
+
+        // 子の階層を表示するオプションが立っているとき
+        if let Some(children) = &self.children {
+            for c in children {
+                c.print_goal_detail_subtree(1, with_deliverable);
+            }
         }
     }
 }

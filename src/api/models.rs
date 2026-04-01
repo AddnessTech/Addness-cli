@@ -22,14 +22,14 @@ pub struct ApiResponse<T> {
 // Response: { "data": { "items": [...] } }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TreeData {
-    pub items: Vec<TreeItem>,
+pub struct GoalTreeData {
+    pub items: Vec<GoalTreeItem>,
     pub pagination: Option<TreePage>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TreeItem {
+pub struct GoalTreeItem {
     pub id: String,
     #[serde(default)]
     pub parent_id: Option<String>,
@@ -103,15 +103,15 @@ pub struct Goal {
 // GET /api/v2/objectives/:id/children
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ChildrenData {
-    pub children: Vec<ChildItem>,
+pub struct GoalChildrenData {
+    pub children: Vec<GoalChildItem>,
     #[serde(default)]
     pub pagination: Option<TreePage>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ChildItem {
+pub struct GoalChildItem {
     pub id: String,
     pub title: String,
     #[serde(default)]

@@ -1,11 +1,17 @@
+use std::collections::HashMap;
+
 use crate::api::{
-    ApiClient, ApiResponse, ChildrenData, DeliverableListData, Goal, SearchResponse, TreeData,
-    UpdateGoalRequest,
+    ApiClient, ApiResponse, Deliverable, DeliverableListData, Goal, GoalChildrenData, GoalTreeData,
+    SearchResponse, UpdateGoalRequest,
 };
 use anyhow::Result;
 
 impl ApiClient {
-    pub async fn get_goal_tree(&self, org_id: &str, depth: usize) -> Result<ApiResponse<TreeData>> {
+    pub async fn get_goal_tree(
+        &self,
+        org_id: &str,
+        depth: usize,
+    ) -> Result<ApiResponse<GoalTreeData>> {
         let path = format!(
             "/api/v2/organizations/{}/objectives/tree?depth={}&include_owner=true",
             org_id, depth
@@ -24,14 +30,14 @@ impl ApiClient {
         goal_id: &str,
         limit: usize,
         offset: usize,
-    ) -> Result<ApiResponse<ChildrenData>> {
+    ) -> Result<ApiResponse<GoalChildrenData>> {
         let path = format!(
             "/api/v2/objectives/{goal_id}/children?include_owner=true&limit={limit}&offset={offset}"
         );
         self.get(&path).await
     }
 
-    pub async fn get_goal_subtree(&self, goal_id: &str) -> Result<ApiResponse<TreeData>> {
+    pub async fn get_goal_subtree(&self, goal_id: &str) -> Result<ApiResponse<GoalTreeData>> {
         let path = format!("/api/v2/objectives/{goal_id}/subtree?include_owner=true");
         self.get(&path).await
     }
@@ -59,5 +65,34 @@ impl ApiClient {
         let path = format!("/api/v2/objectives/{goal_id}");
 
         self.patch(&path, req).await
+    }
+
+    /// 各ゴールの成果物を並行取得してマップで返す
+    pub async fn get_deliverables_map(
+        &self,
+        goal_ids: &[&str],
+    ) -> HashMap<String, Vec<Deliverable>> {
+        let futures: Vec<_> = goal_ids
+            .iter()
+            .map(|g| self.get_goal_deliverables(g))
+            .collect();
+        let results = futures::future::join_all(futures).await;
+
+        let mut map = HashMap::new();
+        for (i, result) in results.into_iter().enumerate() {
+            match result {
+                Ok(resp) => {
+                    map.insert(goal_ids[i].to_string(), resp.data.deliverables);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: failed to fetch deliverables for {}: {e}",
+                        goal_ids[i]
+                    );
+                }
+            }
+        }
+
+        map
     }
 }

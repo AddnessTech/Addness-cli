@@ -116,7 +116,7 @@ struct GoalNode {
 struct GoalChildNode {
     goal: GoalChildItem,
     deliverables: Option<Vec<Deliverable>>,
-    // comments: Option<Vec<Comment>>
+    comments: Option<Vec<Comment>>,
     children: Option<Vec<Self>>,
 }
 
@@ -125,18 +125,26 @@ impl GoalChildNode {
         parent_id: &str,
         children_map: &mut HashMap<String, Vec<GoalChildItem>>,
         deliverables_map: &mut HashMap<String, Vec<Deliverable>>,
+        comments_map: &mut HashMap<String, Vec<Comment>>,
     ) -> Vec<Self> {
         match children_map.remove(parent_id) {
             Some(goals) => goals
                 .into_iter()
                 .map(|goal| {
-                    let children = Self::build_children(&goal.id, children_map, deliverables_map);
+                    let children = Self::build_children(
+                        &goal.id,
+                        children_map,
+                        deliverables_map,
+                        comments_map,
+                    );
 
                     let deliverables = deliverables_map.remove(&goal.id);
+                    let comments = comments_map.remove(&goal.id);
 
                     Self {
                         goal,
                         deliverables,
+                        comments,
                         children: Some(children),
                     }
                 })
@@ -151,6 +159,7 @@ impl GoalNode {
         root_id: &str,
         goals: Vec<GoalChildItem>,
         mut deliverables_map: HashMap<String, Vec<Deliverable>>,
+        mut comments_map: HashMap<String, Vec<Comment>>,
     ) -> Vec<GoalChildNode> {
         let mut children_map: HashMap<String, Vec<GoalChildItem>> = HashMap::new();
 
@@ -160,7 +169,12 @@ impl GoalNode {
             }
         }
 
-        GoalChildNode::build_children(root_id, &mut children_map, &mut deliverables_map)
+        GoalChildNode::build_children(
+            root_id,
+            &mut children_map,
+            &mut deliverables_map,
+            &mut comments_map,
+        )
     }
 
     fn build_tree(
@@ -169,9 +183,11 @@ impl GoalNode {
         comments: Option<Vec<Comment>>,
         children: Option<Vec<GoalChildItem>>,
         children_deliverables: HashMap<String, Vec<Deliverable>>,
+        children_comments: HashMap<String, Vec<Comment>>,
     ) -> Self {
-        let children =
-            children.map(|children| Self::build_forest(&goal.id, children, children_deliverables));
+        let children = children.map(|children| {
+            Self::build_forest(&goal.id, children, children_deliverables, children_comments)
+        });
 
         Self {
             goal,
@@ -311,6 +327,9 @@ pub async fn handle_goals(cmd: &GoalsCommands, client: &ApiClient) -> Result<()>
             let children_deliverables = client
                 .get_deliverables_map(&children.iter().map(|g| g.id.as_str()).collect::<Vec<_>>())
                 .await;
+            let children_comments = client
+                .get_comments_map(&children.iter().map(|g| g.id.as_str()).collect::<Vec<_>>())
+                .await;
 
             // 階層構造を構成
             let goal_tree = GoalNode::build_tree(
@@ -319,6 +338,7 @@ pub async fn handle_goals(cmd: &GoalsCommands, client: &ApiClient) -> Result<()>
                 comments,
                 Some(children),
                 children_deliverables,
+                children_comments,
             );
 
             // 出力
@@ -454,7 +474,12 @@ pub async fn handle_goals(cmd: &GoalsCommands, client: &ApiClient) -> Result<()>
 }
 
 impl GoalChildNode {
-    fn print_goal_detail_subtree(&self, current_depth: usize, with_deliverable: bool) {
+    fn print_goal_detail_subtree(
+        &self,
+        current_depth: usize,
+        with_deliverable: bool,
+        with_comment: bool,
+    ) {
         let indent = " ".repeat(current_depth * 2);
         let (_, colored_status) = resolve_status(self.goal.is_completed, self.goal.status.as_ref());
         println!(
@@ -514,9 +539,53 @@ impl GoalChildNode {
             }
         }
 
+        if with_comment {
+            if let Some(comments) = &self.comments {
+                if comments.is_empty() {
+                    println!("{indent}   {}: {}", "コメント".dimmed(), "(なし)".dimmed());
+                } else {
+                    println!("{indent}   {}:", "コメント".dimmed());
+                    for comment in comments {
+                        let content = comment.content.replace('\n', " ");
+                        let truncated = if content.chars().count() > 30 {
+                            let end = content
+                                .char_indices()
+                                .nth(27)
+                                .map(|(i, _)| i)
+                                .unwrap_or(content.len());
+                            format!("{}...", &content[..end])
+                        } else {
+                            content
+                        };
+
+                        let author_name = if comment.author.is_ai_agent {
+                            format!("{} (AI)", comment.author.name)
+                        } else {
+                            comment.author.name.clone()
+                        };
+
+                        let date = &comment.created_at[..10.min(comment.created_at.len())];
+
+                        println!(
+                            "{indent}     - \"{}\" {} {}",
+                            truncated,
+                            author_name.dimmed(),
+                            date.dimmed(),
+                        );
+                    }
+                }
+            } else {
+                println!(
+                    "{indent}   {}: {}",
+                    "コメント".dimmed(),
+                    "(取得失敗)".dimmed()
+                );
+            }
+        }
+
         if let Some(children) = &self.children {
             for c in children {
-                c.print_goal_detail_subtree(current_depth + 1, with_deliverable);
+                c.print_goal_detail_subtree(current_depth + 1, with_deliverable, with_comment);
             }
         }
     }
@@ -618,11 +687,12 @@ impl GoalNode {
                 }
             }
         }
+        let with_comment = self.comments.is_some();
 
         // 子の階層を表示するオプションが立っているとき
         if let Some(children) = &self.children {
             for c in children {
-                c.print_goal_detail_subtree(1, with_deliverable);
+                c.print_goal_detail_subtree(1, with_deliverable, with_comment);
             }
         }
     }

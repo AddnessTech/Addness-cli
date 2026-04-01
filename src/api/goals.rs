@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use crate::api::{
-    ApiClient, ApiResponse, Deliverable, DeliverableListData, Goal, GoalChildrenData, GoalTreeData,
-    SearchResponse, UpdateGoalRequest,
+    ApiClient, ApiResponse, Comment, Deliverable, DeliverableListData, Goal, GoalChildrenData,
+    GoalTreeData, SearchResponse, UpdateGoalRequest,
 };
 use anyhow::Result;
 
@@ -83,6 +83,29 @@ impl ApiClient {
             match result {
                 Ok(resp) => {
                     map.insert(goal_ids[i].to_string(), resp.data.deliverables);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: failed to fetch deliverables for {}: {e}",
+                        goal_ids[i]
+                    );
+                }
+            }
+        }
+
+        map
+    }
+
+    /// 各ゴールのコメントを並行取得してマップで返す
+    pub async fn get_comments_map(&self, goal_ids: &[&str]) -> HashMap<String, Vec<Comment>> {
+        let futures: Vec<_> = goal_ids.iter().map(|g| self.list_comments(g)).collect();
+        let results = futures::future::join_all(futures).await;
+
+        let mut map = HashMap::new();
+        for (i, result) in results.into_iter().enumerate() {
+            match result {
+                Ok(resp) => {
+                    map.insert(goal_ids[i].to_string(), resp.comments);
                 }
                 Err(e) => {
                     eprintln!(

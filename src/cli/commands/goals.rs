@@ -292,7 +292,7 @@ pub async fn handle_goals(cmd: &GoalsCommands, client: &ApiClient) -> Result<()>
             json,
             with_deliverable,
         } => {
-            // id で指定されたゴール自身の情報
+            // id で指定されたゴール自身の情報を取得
             let resp: ApiResponse<Goal> = client.get_goal(id).await?;
             let deliverables = if *with_deliverable {
                 Some(client.get_goal_deliverables(id).await?.data.deliverables)
@@ -300,23 +300,15 @@ pub async fn handle_goals(cmd: &GoalsCommands, client: &ApiClient) -> Result<()>
                 None
             };
 
-            // 子ゴールの情報
+            // 子ゴールの情報を取得
             let children_resp = client.get_goal_children(id, *limit, 0).await?;
             let children = children_resp.data.children;
-
-            if children.is_empty() {
-                if *json {
-                    println!("[]");
-                } else {
-                    println!("No children found.");
-                }
-                return Ok(());
-            }
 
             let children_deliverables = client
                 .get_deliverables_map(&children.iter().map(|g| g.id.as_str()).collect::<Vec<_>>())
                 .await;
 
+            // 階層構造を構成
             let goal_tree = GoalNode::build_tree(
                 resp.data,
                 deliverables,
@@ -324,8 +316,10 @@ pub async fn handle_goals(cmd: &GoalsCommands, client: &ApiClient) -> Result<()>
                 children_deliverables,
             );
 
+            // 出力
             if *json {
-                serde_json::json!(goal_tree);
+                let output = serde_json::json!(goal_tree);
+                println!("{}", serde_json::to_string_pretty(&output)?);
             } else {
                 goal_tree.print_goal_detail_tree();
             }
@@ -468,7 +462,11 @@ impl GoalChildNode {
     fn print_goal_detail_subtree(&self, current_depth: usize, with_deliverable: bool) {
         let indent = " ".repeat(current_depth);
         let (_, colored_status) = resolve_status(self.goal.is_completed, self.goal.status.as_ref());
-        println!("{indent}└─ {} [{colored_status}]", self.goal.title.bold());
+        println!(
+            "{}└─ {} [{colored_status}]",
+            &indent[3.min(indent.len())..],
+            self.goal.title.bold()
+        );
         println!("{indent}   {}: {}", "ID".dimmed(), self.goal.id.dimmed());
 
         if let Some(desc) = &self.goal.description
@@ -519,6 +517,21 @@ impl GoalNode {
             && !desc.is_empty()
         {
             println!("   {}: {desc}", "完了条件".dimmed());
+        }
+        if let Some(parent_id) = &self.goal.parent_id {
+            println!("   {}: {}", "Parent".dimmed(), parent_id.dimmed());
+        }
+        if let Some(owner) = &self.goal.owner {
+            println!("   {}: {}", "Owner".dimmed(), owner.name);
+        }
+        if let Some(due) = &self.goal.due_date {
+            println!("   {}: {}", "Due".dimmed(), &due[..10.min(due.len())]);
+        }
+        if let Some(body) = &self.goal.body
+            && !body.is_empty()
+        {
+            println!("\n   {}", "Body".dimmed());
+            println!("{body}");
         }
 
         // 成果物も表示するオプションが立っているとき

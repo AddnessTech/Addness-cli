@@ -1,9 +1,7 @@
 use colored::{ColoredString, Colorize};
 use unicode_width::UnicodeWidthStr;
 
-use crate::api::{
-    Comment, Goal, GoalChildItem, GoalStatus, GoalTreeItem, Organization, SearchItem,
-};
+use crate::api::{Comment, GoalChildItem, GoalStatus, GoalTreeItem, Organization, SearchItem};
 
 /// Pad `s` with spaces so its display width reaches `target_width`.
 fn pad_to_width(s: &str, target_width: usize) -> String {
@@ -167,35 +165,6 @@ pub fn print_goals_table(items: &[GoalTreeItem]) {
             row.colored_status,
             row.owner.dimmed()
         );
-    }
-}
-
-pub fn print_goal_detail(goal: &Goal) {
-    let (_, colored_status) = resolve_status(goal.is_completed, goal.status.as_ref());
-
-    println!("{}: {}", "Title".bold(), goal.title);
-    println!("{}: {}", "ID".bold(), goal.id.dimmed());
-    println!("{}: {colored_status}", "Status".bold());
-
-    if let Some(parent_id) = &goal.parent_id {
-        println!("{}: {}", "Parent".bold(), parent_id.dimmed());
-    }
-    if let Some(owner) = &goal.owner {
-        println!("{}: {}", "Owner".bold(), owner.name);
-    }
-    if let Some(due) = &goal.due_date {
-        println!("{}: {}", "Due".bold(), &due[..10.min(due.len())]);
-    }
-    if let Some(desc) = &goal.description
-        && !desc.is_empty()
-    {
-        println!("{}: {desc}", "Description".bold());
-    }
-    if let Some(body) = &goal.body
-        && !body.is_empty()
-    {
-        println!("\n{}", "Body".bold());
-        println!("{body}");
     }
 }
 

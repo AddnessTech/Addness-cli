@@ -455,7 +455,7 @@ pub async fn handle_goals(cmd: &GoalsCommands, client: &ApiClient) -> Result<()>
 
 impl GoalChildNode {
     fn print_goal_detail_subtree(&self, current_depth: usize, with_deliverable: bool) {
-        let indent = " ".repeat(current_depth);
+        let indent = " ".repeat(current_depth * 2);
         let (_, colored_status) = resolve_status(self.goal.is_completed, self.goal.status.as_ref());
         println!(
             "{}└─ {} [{colored_status}]",
@@ -478,7 +478,31 @@ impl GoalChildNode {
                 } else {
                     println!("{indent}   {}:", "成果物".dimmed());
                     for d in deliverables {
-                        println!("{indent}     {} {}", d.node_type.as_icon(), d.display_name);
+                        println!(
+                            "{indent}     - {} {}",
+                            d.node_type.as_icon(),
+                            d.display_name
+                        );
+                        match &d.node_type {
+                            DeliverableType::Link => {
+                                if let Some(link) = &d.link_url {
+                                    println!("       {link}");
+                                }
+                            }
+                            DeliverableType::Document => {
+                                if let Some(content) = &d.content {
+                                    let truncated = if content.len() > 30 {
+                                        &format!("{}...", &content[..27])
+                                    } else {
+                                        content
+                                    };
+                                    println!("       {truncated}");
+                                }
+                            }
+                            DeliverableType::File | DeliverableType::Folder => {
+                                // nothing to do
+                            }
+                        }
                     }
                 }
             } else {

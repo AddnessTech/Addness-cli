@@ -5,7 +5,7 @@ use crate::api::ApiClient;
 use crate::cli::output::print_comments_table;
 
 #[derive(Subcommand)]
-pub enum CommentsCommands {
+pub enum CommentCommands {
     /// List comments on a goal
     List {
         /// Goal ID
@@ -29,9 +29,9 @@ pub enum CommentsCommands {
     },
 }
 
-pub async fn handle_comments(cmd: &CommentsCommands, client: &ApiClient) -> Result<()> {
+pub async fn handle_comments(cmd: &CommentCommands, client: &ApiClient) -> Result<()> {
     match cmd {
-        CommentsCommands::List { goal, json } => {
+        CommentCommands::List { goal, json } => {
             let resp = client.list_comments(goal).await?;
 
             if *json {
@@ -41,7 +41,7 @@ pub async fn handle_comments(cmd: &CommentsCommands, client: &ApiClient) -> Resu
             }
             Ok(())
         }
-        CommentsCommands::Create { goal, body, json } => {
+        CommentCommands::Create { goal, body, json } => {
             let comment = client.create_comment(goal, body).await?;
 
             if *json {

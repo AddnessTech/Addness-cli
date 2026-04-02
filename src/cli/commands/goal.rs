@@ -11,7 +11,7 @@ use crate::cli::output::{
 };
 
 #[derive(Subcommand)]
-pub enum GoalsCommands {
+pub enum GoalCommands {
     /// List goals in the organization tree
     List {
         /// Organization ID (uses default if not specified)
@@ -284,9 +284,9 @@ fn parse_status(status: &str) -> Result<(Option<bool>, Option<GoalStatus>)> {
     }
 }
 
-pub async fn handle_goals(cmd: &GoalsCommands, client: &ApiClient) -> Result<()> {
+pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> {
     match cmd {
-        GoalsCommands::List { org, depth, json } => {
+        GoalCommands::List { org, depth, json } => {
             let org_id = resolve_org_id(org.as_deref())?;
             let resp: ApiResponse<GoalTreeData> = client.get_goal_tree(&org_id, *depth).await?;
 
@@ -297,7 +297,7 @@ pub async fn handle_goals(cmd: &GoalsCommands, client: &ApiClient) -> Result<()>
             }
             Ok(())
         }
-        GoalsCommands::Get {
+        GoalCommands::Get {
             id,
             json,
             with_deliverable,
@@ -362,7 +362,7 @@ pub async fn handle_goals(cmd: &GoalsCommands, client: &ApiClient) -> Result<()>
 
             Ok(())
         }
-        GoalsCommands::Children {
+        GoalCommands::Children {
             id,
             limit,
             offset,
@@ -377,7 +377,7 @@ pub async fn handle_goals(cmd: &GoalsCommands, client: &ApiClient) -> Result<()>
             }
             Ok(())
         }
-        GoalsCommands::Tree { id, json } => {
+        GoalCommands::Tree { id, json } => {
             let resp: ApiResponse<GoalTreeData> = client.get_goal_subtree(id).await?;
 
             if *json {
@@ -387,7 +387,7 @@ pub async fn handle_goals(cmd: &GoalsCommands, client: &ApiClient) -> Result<()>
             }
             Ok(())
         }
-        GoalsCommands::Siblings { id, limit, json } => {
+        GoalCommands::Siblings { id, limit, json } => {
             // 1. 対象ゴールの詳細を取得して親IDを得る
             let goal_resp: ApiResponse<Goal> = client.get_goal(id).await?;
             let parent_id = match &goal_resp.data.parent_id {
@@ -431,7 +431,7 @@ pub async fn handle_goals(cmd: &GoalsCommands, client: &ApiClient) -> Result<()>
             }
             Ok(())
         }
-        GoalsCommands::Search { query, json } => {
+        GoalCommands::Search { query, json } => {
             let resp = client.search_goals(query).await?;
 
             if *json {
@@ -441,7 +441,7 @@ pub async fn handle_goals(cmd: &GoalsCommands, client: &ApiClient) -> Result<()>
             }
             Ok(())
         }
-        GoalsCommands::Update {
+        GoalCommands::Update {
             id,
             org,
             status,

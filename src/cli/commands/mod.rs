@@ -1,6 +1,5 @@
-pub mod auth;
-pub mod comments;
+pub mod comment;
 pub mod configure;
-pub mod goals;
+pub mod goal;
 pub mod login;
 pub mod org;

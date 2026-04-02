@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 
 use crate::config::{Credentials, DEFAULT_API_URL, Settings};
 use api::ApiClient;
-use cli::commands::{comments, configure, goals, login, org};
+use cli::commands::{comment, configure, goal, login, org};
 
 #[derive(Parser)]
 #[command(
@@ -42,14 +42,14 @@ enum Commands {
         command: org::OrgCommands,
     },
     /// Manage goals
-    Goals {
+    Goal {
         #[command(subcommand)]
-        command: goals::GoalsCommands,
+        command: goal::GoalCommands,
     },
     /// Manage comments on goals
-    Comments {
+    Comment {
         #[command(subcommand)]
-        command: comments::CommentsCommands,
+        command: comment::CommentCommands,
     },
 }
 
@@ -79,13 +79,13 @@ async fn main() -> Result<()> {
             let client = build_client()?;
             org::handle_org(command, &client).await
         }
-        Commands::Goals { command } => {
+        Commands::Goal { command } => {
             let client = build_client()?;
-            goals::handle_goals(command, &client).await
+            goal::handle_goals(command, &client).await
         }
-        Commands::Comments { command } => {
+        Commands::Comment { command } => {
             let client = build_client()?;
-            comments::handle_comments(command, &client).await
+            comment::handle_comments(command, &client).await
         }
     }
 }

@@ -23,11 +23,11 @@ Addness SaaSの全操作をターミナルから実行するRust製CLI/TUIアプ
 
 ### AI連携の段階的アプローチ
 
-| Phase | 方式 | 説明 | 安全性 |
-|-------|------|------|--------|
-| **Phase 1** | 人間起動 | 人間がClaude Codeを起動し「Addnessのタスクやって」と指示 | 高（人間が判断） |
+| Phase       | 方式        | 説明                                                      | 安全性           |
+| ----------- | ----------- | --------------------------------------------------------- | ---------------- |
+| **Phase 1** | 人間起動    | 人間がClaude Codeを起動し「Addnessのタスクやって」と指示  | 高（人間が判断） |
 | **Phase 2** | TUI選択実行 | TUIでゴール一覧を見て、選択→Claude Codeに自動で指示が渡る | 高（人間が選択） |
-| Phase 3 | 自動実行 | 新タスク検知→自動で実行（既存のAI Delegationと統合） | 要検討 |
+| Phase 3     | 自動実行    | 新タスク検知→自動で実行（既存のAI Delegationと統合）      | 要検討           |
 
 Phase 1・2を先に実装する。Phase 3は既にバックエンドのAI Delegation機能がカバーしている領域であり、
 安全面のハードルも高いため後回しにする。
@@ -41,12 +41,12 @@ Claude Codeを人間が起動し、自然言語で指示する。CLAUDE.mdにCLI
 > Addnessの自分に割り当てられた未着手タスクを確認して、一番上のやつを実装して
 
 # Claude Codeが実行する流れ
-addness goals list --assigned-to me --status NOT_STARTED --json   # タスク取得
+addness goal list --assigned-to me --status NOT_STARTED --json   # タスク取得
 # → 内容を読んで実装
-addness goals update <id> --status IN_PROGRESS --json             # 着手報告
+addness goal update <id> --status IN_PROGRESS --json             # 着手報告
 # → コード実装、PR作成
-addness comments create --goal <id> --body "PR: https://..." --json  # 結果報告
-addness goals update <id> --status COMPLETED --json               # 完了報告
+addness comment create --goal <id> --body "PR: https://..." --json  # 結果報告
+addness goal update <id> --status COMPLETED --json               # 完了報告
 ```
 
 ### Phase 2: TUI選択実行ワークフロー
@@ -67,14 +67,14 @@ addness  # TUI起動
 
 ## 技術スタック
 
-| カテゴリ | 選定 | 理由 |
-|----------|------|------|
-| 言語 | Rust | シングルバイナリ配布、TUI性能 |
-| CLIフレームワーク | clap | Rustの標準的なCLI引数パーサー |
-| TUIフレームワーク | ratatui | Rust TUIのデファクト |
-| 非同期ランタイム | tokio | API呼び出し、SSEストリーミング |
-| HTTPクライアント | reqwest | tokio対応、Rustの標準的なHTTPクライアント |
-| JSON | serde + serde_json | Rustの標準的なシリアライズ |
+| カテゴリ          | 選定               | 理由                                      |
+| ----------------- | ------------------ | ----------------------------------------- |
+| 言語              | Rust               | シングルバイナリ配布、TUI性能             |
+| CLIフレームワーク | clap               | Rustの標準的なCLI引数パーサー             |
+| TUIフレームワーク | ratatui            | Rust TUIのデファクト                      |
+| 非同期ランタイム  | tokio              | API呼び出し、SSEストリーミング            |
+| HTTPクライアント  | reqwest            | tokio対応、Rustの標準的なHTTPクライアント |
+| JSON              | serde + serde_json | Rustの標準的なシリアライズ                |
 
 ## 配布方法
 
@@ -101,12 +101,12 @@ brew install addness/tap/addness
 
 ### 対応プラットフォーム
 
-| Target | OS | Arch |
-|--------|----|------|
-| `aarch64-apple-darwin` | macOS | Apple Silicon |
-| `x86_64-apple-darwin` | macOS | Intel |
-| `x86_64-unknown-linux-gnu` | Linux | x64 |
-| `x86_64-pc-windows-msvc` | Windows | x64 |
+| Target                     | OS      | Arch          |
+| -------------------------- | ------- | ------------- |
+| `aarch64-apple-darwin`     | macOS   | Apple Silicon |
+| `x86_64-apple-darwin`      | macOS   | Intel         |
+| `x86_64-unknown-linux-gnu` | Linux   | x64           |
+| `x86_64-pc-windows-msvc`   | Windows | x64           |
 
 ## 認証方式
 
@@ -114,12 +114,14 @@ AWS CLI / GitHub CLI と同じ段階的アプローチを採用する。
 
 ### Phase 1: API Key（初期リリース）
 
+Phase 1は終了し、`auth`サブコマンドは役目を終えたので廃止された
+
 ```bash
 # Web UIでAPI Keyを発行 → CLIに設定
 addness auth set-key sk-xxxxx
 
 # 環境変数でも可（CI/CD向け）
-ADDNESS_API_KEY=sk-xxxxx addness goals list
+ADDNESS_API_KEY=sk-xxxxx addness goal list
 ```
 
 - Web UIにAPI Key発行画面を新設
@@ -130,7 +132,7 @@ ADDNESS_API_KEY=sk-xxxxx addness goals list
 ### Phase 2: ブラウザログイン（後日追加）
 
 ```bash
-addness auth login
+addness login
 → ブラウザが開く → Clerkでログイン → CLIにセッションが返る
 ```
 
@@ -161,22 +163,18 @@ addness-cli/
 │   ├── api/                  # APIクライアント（共通層）
 │   │   ├── mod.rs
 │   │   ├── client.rs         # HTTPクライアント、認証、エラーハンドリング
+│   │   ├── client/
+│   │   │   └── <entity>.rs   # 各エンティティのAPIリクエストのためのクライアントの実装
 │   │   ├── models.rs         # APIレスポンスの型定義
-│   │   ├── goals.rs          # 目標関連API
-│   │   ├── search.rs         # 検索API
-│   │   ├── comments.rs       # コメントAPI
-│   │   ├── organizations.rs  # 組織API
-│   │   ├── members.rs        # メンバーAPI
-│   │   ├── threads.rs        # AIスレッドAPI
-│   │   └── auth.rs           # 認証API
+│   │   └── models/
+│   │       └── <entity>.rs   # 各エンティティのAPIモデルの定義
 │   ├── cli/                  # CLIインターフェース
 │   │   ├── mod.rs
 │   │   ├── commands/         # サブコマンド定義
-│   │   │   ├── auth.rs       # addness auth {login, set-key, status}
-│   │   │   ├── goals.rs      # addness goals {list, get, create, update, search, ...}
+│   │   │   ├── goal.rs       # addness goal {list, get, create, update, search, ...}
 │   │   │   ├── org.rs        # addness org {list, switch}
 │   │   │   ├── search.rs     # addness search <query>
-│   │   │   ├── comments.rs   # addness comments {list, create, ...}
+│   │   │   ├── comment.rs    # addness comment {list, create, ...}
 │   │   │   ├── members.rs    # addness members {list, get}
 │   │   │   └── ai.rs         # addness ai {threads, chat, ...}
 │   │   └── output.rs         # 出力フォーマッタ（テーブル / --json）
@@ -186,7 +184,7 @@ addness-cli/
 │   │   ├── event.rs          # キーイベントハンドリング
 │   │   ├── ui.rs             # レイアウト・描画
 │   │   └── views/            # 各画面
-│   │       ├── goals.rs      # ゴールツリー表示
+│   │       ├── goal.rs       # ゴールツリー表示
 │   │       ├── search.rs     # インタラクティブ検索
 │   │       └── detail.rs     # ゴール詳細
 │   └── config/               # 設定管理
@@ -204,10 +202,10 @@ addness-cli/
 ### 認証
 
 ```bash
-addness auth set-key <key>     # API Keyを設定
-addness auth login             # ブラウザログイン（Phase 2）
-addness auth status            # 認証状態を表示
-addness auth logout            # 認証情報を削除
+addness login             # ブラウザログイン（Phase 2）
+addness status            # 認証状態を表示
+addness configure         # 手動で設定をする
+addness logout            # 認証情報を削除
 ```
 
 ### 組織
@@ -221,33 +219,33 @@ addness org current            # 現在の組織を表示
 ### ゴール（目標）
 
 ```bash
-addness goals list                            # ゴール一覧（ルート階層）
-addness goals list --assigned-to me           # 自分に割り当てられたゴール
-addness goals list --status NOT_STARTED       # ステータスフィルタ
-addness goals get <id>                        # ゴール詳細
-addness goals create <title>                  # ゴール作成
-addness goals create <title> --parent <id>    # 子ゴール作成
-addness goals update <id> --status COMPLETED  # ステータス更新
-addness goals update <id> --title "新しい名前" # タイトル更新
-addness goals delete <id>                     # ゴール削除
-addness goals search <query>                  # ゴール検索
-addness goals tree <id>                       # サブゴールツリー表示
-addness goals children <id>                   # 子ゴール一覧
+addness goal list                            # ゴール一覧（ルート階層）
+addness goal list --assigned-to me           # 自分に割り当てられたゴール
+addness goal list --status NOT_STARTED       # ステータスフィルタ
+addness goal get <id>                        # ゴール詳細
+addness goal create <title>                  # ゴール作成
+addness goal create <title> --parent <id>    # 子ゴール作成
+addness goal update <id> --status COMPLETED  # ステータス更新
+addness goal update <id> --title "新しい名前" # タイトル更新
+addness goal delete <id>                     # ゴール削除
+addness goal search <query>                  # ゴール検索
+addness goal tree <id>                       # サブゴールツリー表示
+addness goal children <id>                   # 子ゴール一覧
 ```
 
 ### 検索
 
 ```bash
 addness search <query>                  # 統合検索（ゴール+コメント+メンバー）
-addness search <query> --type goals     # ゴールのみ
-addness search <query> --type comments  # コメントのみ
+addness search <query> --type goal      # ゴールのみ
+addness search <query> --type comment   # コメントのみ
 ```
 
 ### コメント
 
 ```bash
-addness comments list --goal <id>                    # ゴールのコメント一覧
-addness comments create --goal <id> --body "内容"    # コメント作成
+addness comment list --goal <id>                    # ゴールのコメント一覧
+addness comment create --goal <id> --body "内容"    # コメント作成
 ```
 
 ### メンバー
@@ -291,16 +289,16 @@ Always use `--json` flag for structured output.
 
 ## Workflow: タスク実行
 
-1. 未着手タスクを確認: `addness goals list --assigned-to me --status NOT_STARTED --json`
-2. タスク詳細を読む: `addness goals get <id> --json`
-3. 着手報告: `addness goals update <id> --status IN_PROGRESS --json`
-4. 実装完了後に報告: `addness comments create --goal <id> --body "PR: <url>" --json`
-5. 完了: `addness goals update <id> --status COMPLETED --json`
+1. 未着手タスクを確認: `addness goal list --assigned-to me --status NOT_STARTED --json`
+2. タスク詳細を読む: `addness goal get <id> --json`
+3. 着手報告: `addness goal update <id> --status IN_PROGRESS --json`
+4. 実装完了後に報告: `addness comment create --goal <id> --body "PR: <url>" --json`
+5. 完了: `addness goal update <id> --status COMPLETED --json`
 
 ## Quick Reference
 
-- ゴール検索: `addness goals search "<keyword>" --json`
-- ゴールツリー: `addness goals tree <id> --json`
+- ゴール検索: `addness goal search "<keyword>" --json`
+- ゴールツリー: `addness goal tree <id> --json`
 - 統合検索: `addness search "<keyword>" --json`
 ```
 
@@ -310,21 +308,21 @@ Always use `--json` flag for structured output.
 # 人間の指示: 「Addnessの自分のタスクを確認して、一番上のやつを実装して」
 
 # Step 1: タスク取得
-addness goals list --assigned-to me --status NOT_STARTED --json
+addness goal list --assigned-to me --status NOT_STARTED --json
 # → [{"id": "abc-123", "title": "認証にGoogle OAuth追加", "description": "..."}]
 
 # Step 2: 着手報告
-addness goals update abc-123 --status IN_PROGRESS --json
+addness goal update abc-123 --status IN_PROGRESS --json
 
 # Step 3: 詳細確認（サブゴールも）
-addness goals get abc-123 --json
-addness goals children abc-123 --json
+addness goal get abc-123 --json
+addness goal children abc-123 --json
 
 # Step 4: 実装 ... (Claude Codeが通常のコーディング)
 
 # Step 5: 結果報告
-addness comments create --goal abc-123 --body "実装完了。PR: https://github.com/..." --json
-addness goals update abc-123 --status COMPLETED --json
+addness comment create --goal abc-123 --body "実装完了。PR: https://github.com/..." --json
+addness goal update abc-123 --status COMPLETED --json
 ```
 
 ## バックエンド変更（必要）
@@ -380,26 +378,28 @@ addness goals update abc-123 --status COMPLETED --json
 以下の機能を実装し、ローカル環境で動作確認済み。
 
 #### 実装済み機能
-- **認証**: `addness auth set-token <JWT>`, `auth status`, `auth logout`
-  - `~/.addness/credentials.json` にトークンとAPI URLを保存（permission 600）
-  - 現時点ではClerk JWTを直接設定する方式（API Key対応は未実装）
+
+- **認証**: `addness login`, `status`, `logout`
+  - ブラウザを開き認証する。発行されたAPI keyが保存される。
 - **組織管理**: `addness org list`, `org switch <id>`, `org current`
   - `~/.addness/config.json` にデフォルト組織IDを保存
   - テーブル表示 + `--json` 出力対応
-- **ゴール一覧**: `addness goals list [--depth N] [--json]`
+- **ゴール一覧**: `addness goal list [--depth N] [--json]`
   - V2 API (`/api/v2/organizations/:id/objectives/tree`) を使用
   - `X-Organization-ID` ヘッダーを自動付与
   - テーブル表示（ID, タイトル, ステータス, オーナー）+ JSON出力対応
 
 #### 動作確認結果
+
 - バックエンド: Docker Compose（localhost:8080）
 - 認証: Clerk Backend API (`/v1/sessions/:id/tokens`) でJWTを発行
 - ngrok経由でClerkログイン → セッション確立 → JWT取得 → CLI動作確認
 - `addness org list` → 4組織表示 ✅
-- `addness goals list` → ゴールツリー表示 ✅
-- `addness goals list --json` → JSON出力 ✅
+- `addness goal list` → ゴールツリー表示 ✅
+- `addness goal list --json` → JSON出力 ✅
 
 #### 技術的な発見
+
 - APIレスポンスは `{ "data": T, "message": "..." }` のラッパー形式
 - 組織一覧は `{ "data": [...] }` で直接配列を返す
 - ゴールツリーは `{ "data": { "items": [...] } }` でネストされたオブジェクト
@@ -407,6 +407,7 @@ addness goals update abc-123 --status COMPLETED --json
 - Clerk JWTは60秒で期限切れ → 実運用にはAPI Key機能が必須
 
 #### リポジトリ
+
 - https://github.com/AddnessTech/Addness-TUI (Private)
 
 ---
@@ -418,14 +419,13 @@ addness goals update abc-123 --status COMPLETED --json
 最小限だがClaude Code連携に必要な機能を揃える。
 
 - [x] プロジェクトセットアップ（Cargo.toml、CI）
-- [x] 認証: `auth set-token`, `auth status`, `auth logout`
+- [x] 認証: `login`, `configure`, `status`, `logout`
 - [x] 組織: `org list`, `org switch`, `org current`
-- [x] ゴール読み取り: `goals list`（ツリー表示 + JSON出力）
+- [x] ゴール読み取り: `goal list`（ツリー表示 + JSON出力）
 - [x] 共通: `--json` フラグ
-- [x] 認証: `auth set-key`（API Key対応）
-- [ ] ゴール読み取り: `goals get`, `goals search`, `goals tree`, `goals children`
-- [x] ゴール書き込み: `goals create`, `goals update` (ステータス更新)
-- [x] コメント: `comments list`, `comments create`（完了報告に必要）
+- [x] ゴール読み取り: `goal get`, `goal search`, `goal tree`, `goal children`
+- [x] ゴール書き込み: `goal create`, `goal update` (ステータス更新)
+- [x] コメント: `comment list`, `comment create`（完了報告に必要）
 - [ ] 検索: `search`
 - [ ] エラーハンドリング改善
 - [ ] 配布: GitHub Releases + install.sh

@@ -2,7 +2,7 @@ use colored::{ColoredString, Colorize};
 use unicode_width::UnicodeWidthStr;
 
 use crate::api::{
-    Comment, DeliverableType, GoalChildItem, GoalStatus, GoalTreeItem, Organization, SearchItem,
+    Comment, DeliverableType, GoalChildItem, GoalSearchItem, GoalStatus, GoalTreeItem, Organization,
 };
 
 /// Pad `s` with spaces so its display width reaches `target_width`.
@@ -201,7 +201,7 @@ pub fn print_children_table(children: &[GoalChildItem]) {
     }
 }
 
-pub fn print_search_results(items: &[SearchItem]) {
+pub fn print_search_results(items: &[GoalSearchItem]) {
     if items.is_empty() {
         println!("{}", "No results found.".dimmed());
         return;

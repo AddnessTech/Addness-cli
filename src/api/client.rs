@@ -1,3 +1,8 @@
+mod comment;
+mod deliverable;
+mod goal;
+mod org;
+
 use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};

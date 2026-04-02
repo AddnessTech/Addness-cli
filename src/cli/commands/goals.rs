@@ -491,7 +491,7 @@ impl GoalChildNode {
         with_deliverable: bool,
         with_comment: bool,
     ) {
-        let indent = " ".repeat(current_depth * 2);
+        let indent = " ".repeat(current_depth * 4);
         let (_, colored_status) = resolve_status(self.goal.is_completed, self.goal.status.as_ref());
         println!(
             "{}└─ {} [{colored_status}]",

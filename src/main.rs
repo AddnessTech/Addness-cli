@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 
 use crate::config::{Credentials, DEFAULT_API_URL, Settings};
 use api::ApiClient;
-use cli::commands::{auth, comments, configure, goals, login, org};
+use cli::commands::{comments, configure, goals, login, org};
 
 #[derive(Parser)]
 #[command(
@@ -36,11 +36,6 @@ enum Commands {
     Status,
     /// Remove saved credentials
     Logout,
-    /// Manage authentication (legacy)
-    Auth {
-        #[command(subcommand)]
-        command: auth::AuthCommands,
-    },
     /// Manage organizations
     Org {
         #[command(subcommand)]
@@ -80,7 +75,6 @@ async fn main() -> Result<()> {
         Commands::Configure => configure::handle_configure(),
         Commands::Status => configure::handle_status(),
         Commands::Logout => configure::handle_logout(),
-        Commands::Auth { command } => auth::handle_auth(command),
         Commands::Org { command } => {
             let client = build_client()?;
             org::handle_org(command, &client).await

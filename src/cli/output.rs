@@ -1,7 +1,9 @@
 use colored::{ColoredString, Colorize};
 use unicode_width::UnicodeWidthStr;
 
-use crate::api::{ChildItem, Comment, Goal, GoalStatus, Organization, SearchItem, TreeItem};
+use crate::api::{
+    Comment, DeliverableType, GoalChildItem, GoalStatus, GoalTreeItem, Organization, SearchItem,
+};
 
 /// Pad `s` with spaces so its display width reaches `target_width`.
 fn pad_to_width(s: &str, target_width: usize) -> String {
@@ -38,7 +40,7 @@ struct TreeRow {
     owner: String,
 }
 
-pub fn print_goals_table(items: &[TreeItem]) {
+pub fn print_goals_table(items: &[GoalTreeItem]) {
     if items.is_empty() {
         println!("{}", "No goals found.".dimmed());
         return;
@@ -46,7 +48,7 @@ pub fn print_goals_table(items: &[TreeItem]) {
 
     use std::collections::HashMap;
 
-    let mut children_map: HashMap<Option<&str>, Vec<&TreeItem>> = HashMap::new();
+    let mut children_map: HashMap<Option<&str>, Vec<&GoalTreeItem>> = HashMap::new();
     for item in items {
         children_map
             .entry(item.parent_id.as_deref())
@@ -56,7 +58,7 @@ pub fn print_goals_table(items: &[TreeItem]) {
 
     let id_set: std::collections::HashSet<&str> = items.iter().map(|i| i.id.as_str()).collect();
 
-    let mut roots: Vec<&TreeItem> = items
+    let mut roots: Vec<&GoalTreeItem> = items
         .iter()
         .filter(|i| match &i.parent_id {
             None => true,
@@ -73,11 +75,11 @@ pub fn print_goals_table(items: &[TreeItem]) {
     let mut rows: Vec<TreeRow> = Vec::new();
 
     fn collect_rows<'a>(
-        item: &'a TreeItem,
+        item: &'a GoalTreeItem,
         prefix: &str,
         is_last: bool,
         is_root: bool,
-        children_map: &HashMap<Option<&str>, Vec<&'a TreeItem>>,
+        children_map: &HashMap<Option<&str>, Vec<&'a GoalTreeItem>>,
         rows: &mut Vec<TreeRow>,
     ) {
         let (status_label, colored_status) =
@@ -168,36 +170,7 @@ pub fn print_goals_table(items: &[TreeItem]) {
     }
 }
 
-pub fn print_goal_detail(goal: &Goal) {
-    let (_, colored_status) = resolve_status(goal.is_completed, goal.status.as_ref());
-
-    println!("{}: {}", "Title".bold(), goal.title);
-    println!("{}: {}", "ID".bold(), goal.id.dimmed());
-    println!("{}: {colored_status}", "Status".bold());
-
-    if let Some(parent_id) = &goal.parent_id {
-        println!("{}: {}", "Parent".bold(), parent_id.dimmed());
-    }
-    if let Some(owner) = &goal.owner {
-        println!("{}: {}", "Owner".bold(), owner.name);
-    }
-    if let Some(due) = &goal.due_date {
-        println!("{}: {}", "Due".bold(), &due[..10.min(due.len())]);
-    }
-    if let Some(desc) = &goal.description
-        && !desc.is_empty()
-    {
-        println!("{}: {desc}", "Description".bold());
-    }
-    if let Some(body) = &goal.body
-        && !body.is_empty()
-    {
-        println!("\n{}", "Body".bold());
-        println!("{body}");
-    }
-}
-
-pub fn print_children_table(children: &[ChildItem]) {
+pub fn print_children_table(children: &[GoalChildItem]) {
     if children.is_empty() {
         println!("{}", "No children found.".dimmed());
         return;
@@ -315,5 +288,16 @@ pub fn print_organizations_table(orgs: &[Organization], current_org_id: Option<&
             String::new()
         };
         println!("{:<38} {}{}", org.id.dimmed(), org.name, marker);
+    }
+}
+
+impl DeliverableType {
+    pub fn as_icon(&self) -> &str {
+        match self {
+            Self::Folder => "📁",
+            Self::Document => "📄",
+            Self::File => "📎",
+            Self::Link => "🔗",
+        }
     }
 }

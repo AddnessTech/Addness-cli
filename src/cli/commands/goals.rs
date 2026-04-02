@@ -2,12 +2,12 @@ use anyhow::{Result, bail};
 use clap::Subcommand;
 
 use crate::api::{
-    ApiClient, ApiResponse, Deliverable, Goal, GoalStatus, TreeData, UpdateGoalRequest,
+    ApiClient, ApiResponse, Comment, Deliverable, DeliverableType, Goal, GoalStatus, GoalTreeData,
+    GoalTreeItem, UpdateGoalRequest,
 };
 use crate::cli::commands::org::resolve_org_id;
 use crate::cli::output::{
-    print_children_table, print_goal_detail, print_goals_table, print_search_results,
-    resolve_status,
+    print_children_table, print_goals_table, print_search_results, resolve_status,
 };
 
 #[derive(Subcommand)]
@@ -31,6 +31,12 @@ pub enum GoalsCommands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+        /// With deliverables information
+        #[arg(long)]
+        with_deliverable: bool,
+        /// With comments information
+        #[arg(long)]
+        with_comment: bool,
     },
     /// List children of a goal
     Children {
@@ -50,17 +56,6 @@ pub enum GoalsCommands {
     Tree {
         /// Goal ID
         id: String,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Get child goals with their deliverables and descriptions
-    Context {
-        /// Goal ID
-        id: String,
-        /// Max number of children to return (default: 50)
-        #[arg(long, default_value = "50")]
-        limit: usize,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -103,41 +98,110 @@ pub enum GoalsCommands {
     },
 }
 
-use crate::api::ChildItem;
+/// GoalInfo はゴールとその関連情報を保持するための
+/// 汎用的な構造体
+/// 木構造を表現できる
+#[derive(Debug, serde::Serialize)]
+struct GoalNode {
+    goal: Goal,
+    deliverables: Option<Vec<Deliverable>>,
+    comments: Option<Vec<Comment>>,
+    children: Option<Vec<GoalChildNode>>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct GoalChildNode {
+    goal: GoalTreeItem,
+    deliverables: Option<Vec<Deliverable>>,
+    comments: Option<Vec<Comment>>,
+    children: Option<Vec<Self>>,
+}
+
+impl GoalChildNode {
+    fn build_children(
+        parent_id: &str,
+        children_map: &mut HashMap<String, Vec<GoalTreeItem>>,
+        deliverables_map: &mut HashMap<String, Vec<Deliverable>>,
+        comments_map: &mut HashMap<String, Vec<Comment>>,
+    ) -> Vec<Self> {
+        match children_map.remove(parent_id) {
+            Some(goals) => goals
+                .into_iter()
+                .map(|goal| {
+                    let children = Self::build_children(
+                        &goal.id,
+                        children_map,
+                        deliverables_map,
+                        comments_map,
+                    );
+
+                    let deliverables = deliverables_map.remove(&goal.id);
+                    let comments = comments_map.remove(&goal.id);
+
+                    Self {
+                        goal,
+                        deliverables,
+                        comments,
+                        children: Some(children),
+                    }
+                })
+                .collect(),
+            None => vec![],
+        }
+    }
+}
+
+impl GoalNode {
+    fn build_forest(
+        root_id: &str,
+        goals: Vec<GoalTreeItem>,
+        mut deliverables_map: HashMap<String, Vec<Deliverable>>,
+        mut comments_map: HashMap<String, Vec<Comment>>,
+    ) -> Vec<GoalChildNode> {
+        let mut children_map: HashMap<String, Vec<GoalTreeItem>> = HashMap::new();
+
+        for goal in goals {
+            if let Some(parent_id) = goal.parent_id.clone() {
+                children_map.entry(parent_id).or_default().push(goal);
+            }
+        }
+
+        GoalChildNode::build_children(
+            root_id,
+            &mut children_map,
+            &mut deliverables_map,
+            &mut comments_map,
+        )
+    }
+
+    fn build_tree(
+        goal: Goal,
+        deliverables: Option<Vec<Deliverable>>,
+        comments: Option<Vec<Comment>>,
+        children: Option<Vec<GoalTreeItem>>,
+        children_deliverables: HashMap<String, Vec<Deliverable>>,
+        children_comments: HashMap<String, Vec<Comment>>,
+    ) -> Self {
+        let children = children.map(|children| {
+            Self::build_forest(&goal.id, children, children_deliverables, children_comments)
+        });
+
+        Self {
+            goal,
+            comments,
+            deliverables,
+            children,
+        }
+    }
+}
+
+use crate::api::GoalChildItem;
 use colored::Colorize;
 use std::collections::HashMap;
 
-/// 各ゴールの成果物を並行取得してマップで返す
-async fn fetch_deliverables_map(
-    client: &ApiClient,
-    goals: &[ChildItem],
-) -> HashMap<String, Vec<Deliverable>> {
-    let futures: Vec<_> = goals
-        .iter()
-        .map(|g| client.get_goal_deliverables(&g.id))
-        .collect();
-    let results = futures::future::join_all(futures).await;
-
-    let mut map = HashMap::new();
-    for (i, result) in results.into_iter().enumerate() {
-        match result {
-            Ok(resp) => {
-                map.insert(goals[i].id.clone(), resp.data.deliverables);
-            }
-            Err(e) => {
-                eprintln!(
-                    "Warning: failed to fetch deliverables for {}: {e}",
-                    goals[i].id
-                );
-            }
-        }
-    }
-    map
-}
-
 /// ゴール一覧+成果物マップをJSON出力
 fn print_goals_with_deliverables_json(
-    goals: &[ChildItem],
+    goals: &[GoalChildItem],
     deliverables_map: &HashMap<String, Vec<Deliverable>>,
 ) -> Result<()> {
     let output: Vec<serde_json::Value> = goals
@@ -165,7 +229,7 @@ fn print_goals_with_deliverables_json(
 }
 
 fn print_context_table(
-    children: &[ChildItem],
+    children: &[GoalChildItem],
     deliverables_map: &std::collections::HashMap<String, Vec<Deliverable>>,
 ) {
     for (i, child) in children.iter().enumerate() {
@@ -193,14 +257,7 @@ fn print_context_table(
             } else {
                 println!("   {}:", "成果物".dimmed());
                 for d in deliverables {
-                    let type_icon = match d.node_type.as_str() {
-                        "folder" => "📁",
-                        "document" => "📄",
-                        "file" => "📎",
-                        "link" => "🔗",
-                        _ => "  ",
-                    };
-                    println!("     {type_icon} {}", d.display_name);
+                    println!("     {} {}", d.node_type.as_icon(), d.display_name);
                 }
             }
         } else {
@@ -231,7 +288,7 @@ pub async fn handle_goals(cmd: &GoalsCommands, client: &ApiClient) -> Result<()>
     match cmd {
         GoalsCommands::List { org, depth, json } => {
             let org_id = resolve_org_id(org.as_deref())?;
-            let resp: ApiResponse<TreeData> = client.get_goal_tree(&org_id, *depth).await?;
+            let resp: ApiResponse<GoalTreeData> = client.get_goal_tree(&org_id, *depth).await?;
 
             if *json {
                 println!("{}", serde_json::to_string_pretty(&resp.data.items)?);
@@ -240,14 +297,69 @@ pub async fn handle_goals(cmd: &GoalsCommands, client: &ApiClient) -> Result<()>
             }
             Ok(())
         }
-        GoalsCommands::Get { id, json } => {
+        GoalsCommands::Get {
+            id,
+            json,
+            with_deliverable,
+            with_comment,
+        } => {
+            // id で指定されたゴール自身の情報を取得
             let resp: ApiResponse<Goal> = client.get_goal(id).await?;
-
-            if *json {
-                println!("{}", serde_json::to_string_pretty(&resp.data)?);
+            let deliverables = if *with_deliverable {
+                Some(client.get_goal_deliverables(id).await?.data.deliverables)
             } else {
-                print_goal_detail(&resp.data);
+                None
+            };
+            let comments = if *with_comment {
+                Some(client.list_comments(id).await?.comments)
+            } else {
+                None
+            };
+
+            // サブツリーの情報を取得（階層の終わりまで）
+            let subtree_resp: ApiResponse<GoalTreeData> = client.get_goal_subtree(id).await?;
+            let subtree_items: Vec<GoalTreeItem> = subtree_resp
+                .data
+                .items
+                .into_iter()
+                .filter(|item| item.id != *id)
+                .collect();
+
+            let children_deliverables = client
+                .get_deliverables_map(
+                    &subtree_items
+                        .iter()
+                        .map(|g| g.id.as_str())
+                        .collect::<Vec<_>>(),
+                )
+                .await;
+            let children_comments = client
+                .get_comments_map(
+                    &subtree_items
+                        .iter()
+                        .map(|g| g.id.as_str())
+                        .collect::<Vec<_>>(),
+                )
+                .await;
+
+            // 階層構造を構成
+            let goal_tree = GoalNode::build_tree(
+                resp.data,
+                deliverables,
+                comments,
+                Some(subtree_items),
+                children_deliverables,
+                children_comments,
+            );
+
+            // 出力
+            if *json {
+                let output = serde_json::json!(goal_tree);
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else {
+                goal_tree.print_goal_detail_tree();
             }
+
             Ok(())
         }
         GoalsCommands::Children {
@@ -266,34 +378,12 @@ pub async fn handle_goals(cmd: &GoalsCommands, client: &ApiClient) -> Result<()>
             Ok(())
         }
         GoalsCommands::Tree { id, json } => {
-            let resp: ApiResponse<TreeData> = client.get_goal_subtree(id).await?;
+            let resp: ApiResponse<GoalTreeData> = client.get_goal_subtree(id).await?;
 
             if *json {
                 println!("{}", serde_json::to_string_pretty(&resp.data.items)?);
             } else {
                 print_goals_table(&resp.data.items);
-            }
-            Ok(())
-        }
-        GoalsCommands::Context { id, limit, json } => {
-            let children_resp = client.get_goal_children(id, *limit, 0).await?;
-            let children = children_resp.data.children;
-
-            if children.is_empty() {
-                if *json {
-                    println!("[]");
-                } else {
-                    println!("No children found.");
-                }
-                return Ok(());
-            }
-
-            let deliverables_map = fetch_deliverables_map(client, &children).await;
-
-            if *json {
-                print_goals_with_deliverables_json(&children, &deliverables_map)?;
-            } else {
-                print_context_table(&children, &deliverables_map);
             }
             Ok(())
         }
@@ -330,7 +420,9 @@ pub async fn handle_goals(cmd: &GoalsCommands, client: &ApiClient) -> Result<()>
                 return Ok(());
             }
 
-            let deliverables_map = fetch_deliverables_map(client, &siblings).await;
+            let deliverables_map = client
+                .get_deliverables_map(&siblings.iter().map(|g| g.id.as_str()).collect::<Vec<_>>())
+                .await;
 
             if *json {
                 print_goals_with_deliverables_json(&siblings, &deliverables_map)?;
@@ -388,6 +480,235 @@ pub async fn handle_goals(cmd: &GoalsCommands, client: &ApiClient) -> Result<()>
                 println!("Updated goal: {} [{label}]", resp.data.title);
             }
             Ok(())
+        }
+    }
+}
+
+impl GoalChildNode {
+    fn print_goal_detail_subtree(
+        &self,
+        current_depth: usize,
+        with_deliverable: bool,
+        with_comment: bool,
+    ) {
+        let indent = " ".repeat(current_depth * 4);
+        let (_, colored_status) = resolve_status(self.goal.is_completed, self.goal.status.as_ref());
+        println!(
+            "{}└─ {} [{colored_status}]",
+            &indent[3.min(indent.len())..],
+            self.goal.title.bold()
+        );
+        println!("{indent}   {}: {}", "ID".dimmed(), self.goal.id.dimmed());
+
+        // 成果物も表示するオプションが立っているとき
+        if with_deliverable {
+            if let Some(deliverables) = &self.deliverables {
+                if deliverables.is_empty() {
+                    println!("{indent}   {}: {}", "成果物".dimmed(), "(なし)".dimmed());
+                } else {
+                    println!("{indent}   {}:", "成果物".dimmed());
+                    for d in deliverables {
+                        println!(
+                            "{indent}     - {} {}",
+                            d.node_type.as_icon(),
+                            d.display_name
+                        );
+                        match &d.node_type {
+                            DeliverableType::Link => {
+                                if let Some(link) = &d.link_url {
+                                    println!("       {link}");
+                                }
+                            }
+                            DeliverableType::Document => {
+                                if let Some(content) = &d.content {
+                                    let truncated = if content.chars().count() > 30 {
+                                        let end = content
+                                            .char_indices()
+                                            .nth(27)
+                                            .map(|(i, _)| i)
+                                            .unwrap_or(content.len());
+                                        &format!("{}...", &content[..end])
+                                    } else {
+                                        content
+                                    };
+                                    println!("       {truncated}");
+                                }
+                            }
+                            DeliverableType::File | DeliverableType::Folder => {
+                                // nothing to do
+                            }
+                        }
+                    }
+                }
+            } else {
+                println!(
+                    "{indent}   {}: {}",
+                    "成果物".dimmed(),
+                    "(取得失敗)".dimmed()
+                );
+            }
+        }
+
+        if with_comment {
+            if let Some(comments) = &self.comments {
+                if comments.is_empty() {
+                    println!("{indent}   {}: {}", "コメント".dimmed(), "(なし)".dimmed());
+                } else {
+                    println!("{indent}   {}:", "コメント".dimmed());
+                    for comment in comments {
+                        let content = comment.content.replace('\n', " ");
+                        let truncated = if content.chars().count() > 30 {
+                            let end = content
+                                .char_indices()
+                                .nth(27)
+                                .map(|(i, _)| i)
+                                .unwrap_or(content.len());
+                            format!("{}...", &content[..end])
+                        } else {
+                            content
+                        };
+
+                        let author_name = if comment.author.is_ai_agent {
+                            format!("{} (AI)", comment.author.name)
+                        } else {
+                            comment.author.name.clone()
+                        };
+
+                        let date = &comment.created_at[..10.min(comment.created_at.len())];
+
+                        println!(
+                            "{indent}     - \"{}\" {} {}",
+                            truncated,
+                            author_name.dimmed(),
+                            date.dimmed(),
+                        );
+                    }
+                }
+            } else {
+                println!(
+                    "{indent}   {}: {}",
+                    "コメント".dimmed(),
+                    "(取得失敗)".dimmed()
+                );
+            }
+        }
+
+        if let Some(children) = &self.children {
+            for c in children {
+                c.print_goal_detail_subtree(current_depth + 1, with_deliverable, with_comment);
+            }
+        }
+    }
+}
+
+impl GoalNode {
+    fn print_goal_detail_tree(&self) {
+        let (_, colored_status) = resolve_status(self.goal.is_completed, self.goal.status.as_ref());
+        println!("{} [{colored_status}]", self.goal.title.bold());
+        println!("   {}: {}", "ID".dimmed(), self.goal.id.dimmed());
+
+        if let Some(desc) = &self.goal.description
+            && !desc.is_empty()
+        {
+            println!("   {}: {desc}", "完了条件".dimmed());
+        }
+        if let Some(parent_id) = &self.goal.parent_id {
+            println!("   {}: {}", "Parent".dimmed(), parent_id.dimmed());
+        }
+        if let Some(owner) = &self.goal.owner {
+            println!("   {}: {}", "Owner".dimmed(), owner.name);
+        }
+        if let Some(due) = &self.goal.due_date {
+            println!("   {}: {}", "Due".dimmed(), &due[..10.min(due.len())]);
+        }
+        if let Some(body) = &self.goal.body
+            && !body.is_empty()
+        {
+            println!("\n   {}", "Body".dimmed());
+            println!("{body}");
+        }
+
+        // 成果物も表示するオプションが立っているとき
+        if let Some(deliverables) = &self.deliverables {
+            if deliverables.is_empty() {
+                println!("   {}: {}", "成果物".dimmed(), "(なし)".dimmed());
+            } else {
+                println!("   {}:", "成果物".dimmed());
+                for d in deliverables {
+                    println!("     - {} {}", d.node_type.as_icon(), d.display_name);
+                    match &d.node_type {
+                        DeliverableType::Link => {
+                            if let Some(link) = &d.link_url {
+                                println!("       {link}");
+                            }
+                        }
+                        DeliverableType::Document => {
+                            if let Some(content) = &d.content {
+                                let truncated = if content.chars().count() > 30 {
+                                    let end = content
+                                        .char_indices()
+                                        .nth(27)
+                                        .map(|(i, _)| i)
+                                        .unwrap_or(content.len());
+                                    &format!("{}...", &content[..end])
+                                } else {
+                                    content
+                                };
+                                println!("       {truncated}");
+                            }
+                        }
+                        DeliverableType::File | DeliverableType::Folder => {
+                            // nothing to do
+                        }
+                    }
+                }
+            }
+        }
+        let with_deliverable = self.deliverables.is_some();
+
+        // コメントも表示するオプションが立っているとき
+        if let Some(comments) = &self.comments {
+            if comments.is_empty() {
+                println!("   {}: {}", "コメント".dimmed(), "(なし)".dimmed());
+            } else {
+                println!("   {}:", "コメント".dimmed());
+                for comment in comments {
+                    let content = comment.content.replace('\n', " ");
+                    let truncated = if content.chars().count() > 30 {
+                        let end = content
+                            .char_indices()
+                            .nth(27)
+                            .map(|(i, _)| i)
+                            .unwrap_or(content.len());
+                        format!("{}...", &content[..end])
+                    } else {
+                        content
+                    };
+
+                    let author_name = if comment.author.is_ai_agent {
+                        format!("{} (AI)", comment.author.name)
+                    } else {
+                        comment.author.name.clone()
+                    };
+
+                    let date = &comment.created_at[..10.min(comment.created_at.len())];
+
+                    println!(
+                        "     - \"{}\" {} {}",
+                        truncated,
+                        author_name.dimmed(),
+                        date.dimmed(),
+                    );
+                }
+            }
+        }
+        let with_comment = self.comments.is_some();
+
+        // 子の階層を表示するオプションが立っているとき
+        if let Some(children) = &self.children {
+            for c in children {
+                c.print_goal_detail_subtree(1, with_deliverable, with_comment);
+            }
         }
     }
 }

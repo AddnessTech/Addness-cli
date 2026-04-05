@@ -1,6 +1,7 @@
 mod api;
 mod cli;
 mod config;
+mod update_check;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
@@ -72,7 +73,9 @@ fn build_client() -> Result<ApiClient> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    match &cli.command {
+    let update_handle = tokio::spawn(update_check::check_for_update());
+
+    let result = match &cli.command {
         Commands::Login {
             api_url,
             frontend_url,
@@ -92,5 +95,9 @@ async fn main() -> Result<()> {
             let client = build_client()?;
             comment::handle_comments(command, &client).await
         }
-    }
+    };
+
+    let _ = update_handle.await;
+
+    result
 }

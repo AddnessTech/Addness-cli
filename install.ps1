@@ -8,29 +8,39 @@ $InstallDir = if ($env:ADDNESS_INSTALL_DIR) { $env:ADDNESS_INSTALL_DIR } else { 
 $Version = if ($env:ADDNESS_VERSION) { $env:ADDNESS_VERSION } else { "latest" }
 
 function Write-Banner {
-    $esc = [char]27
+    $logo = @(
+        "                                            ."
+        "                       .:=+*###***+=:.    =:"
+        "                   .=*%@@%*=:.    .:=**+#="
+        "                .:*@@@@*:.            :#%*:"
+        "              .+@@@@@*.            :+%%=. .+="
+        "             =@@@@@@:          .=*%%+.     ::"
+        "           .*@@@@@@.      .:+*%%%#=.        :"
+        "          .@@@@@@@:  =+*#%%%%%%+:"
+        "         .@@@@@@@+ .*%%%%%%#+:"
+        "        .@@@@@@@@. *%%%%*=."
+        "        *@@@@@@@+ .%%*=."
+        "       :@@@@@@@@."
+        "       #@@@@@@@*"
+        "       ++==::..`n"
+    )
+    $text = @(
+        "   _         _            _       _     _                       _ _   _ "
+        "  | |    ___| |_ ___     / \   __| | __| |_ __   ___  ___ ___  (_) |_| |"
+        "  | |   / _ \ __/ __|   / _ \ / _`` |/ _`` | '_ \ / _ \/ __/ __| | | __| |"
+        "  | |__|  __/ |_\__ \  / ___ \ (_| | (_| | | | |  __/\__ \__ \ | | |_|_|"
+        "  |_____\___|\__|___/ /_/   \_\__,_|\__,_|_| |_|\___||___/___/ |_|\__(_)"
+    )
 
     Write-Host ""
-    Write-Host "  ${esc}[1;34m                                        ."
-    Write-Host "  ${esc}[1;34m                   .:=+*###***+=:.    =:"
-    Write-Host "  ${esc}[1;34m               .=*%@@%*=:.    .:=**+#="
-    Write-Host "  ${esc}[1;34m            .:*@@@@*:.            :#%*:"
-    Write-Host "  ${esc}[1;34m          .+@@@@@*.            :+%%=. .+="
-    Write-Host "  ${esc}[1;34m         =@@@@@@:          .=*%%+.     ::"
-    Write-Host "  ${esc}[1;34m       .*@@@@@@.      .:+*%%%#=.        :"
-    Write-Host "  ${esc}[1;34m      .@@@@@@@:  =+*#%%%%%%+:"
-    Write-Host "  ${esc}[1;34m     .@@@@@@@+ .*%%%%%%#+:"
-    Write-Host "  ${esc}[1;34m    .@@@@@@@@. *%%%%*=."
-    Write-Host "  ${esc}[1;34m    *@@@@@@@+ .%%*=."
-    Write-Host "  ${esc}[1;34m   :@@@@@@@@."
-    Write-Host "  ${esc}[1;34m   #@@@@@@@*"
-    Write-Host "  ${esc}[1;34m   ++==::..${esc}[0m"
-    Write-Host ""
-    Write-Host "  ${esc}[1m _         _            _       _     _                       _ _   _ "
-    Write-Host "  | |    ___| |_ ___     / \   __| | __| |_ __   ___  ___ ___  (_) |_| |"
-    Write-Host "  | |   / _ \ __/ __|   / _ \ / _`` |/ _`` | '_ \ / _ \/ __/ __| | | __| |"
-    Write-Host "  | |__|  __/ |_\__ \  / ___ \ (_| | (_| | | | |  __/\__ \__ \ | | |_|_|"
-    Write-Host "  |_____\___|\__|___/ /_/   \_\__,_|\__,_|_| |_|\___||___/___/ |_|\__(_)${esc}[0m"
+    foreach ($line in $logo) {
+        Write-Host $line -ForegroundColor Blue
+        Start-Sleep -Milliseconds 30
+    }
+    foreach ($line in $text) {
+        Write-Host $line -ForegroundColor White
+        Start-Sleep -Milliseconds 30
+    }
     Write-Host ""
 }
 

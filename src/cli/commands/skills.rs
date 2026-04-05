@@ -101,6 +101,21 @@ addness comment create --goal <GOAL_ID> --body "進捗報告です"
 addness comment create --goal <GOAL_ID> --body "完了しました" --json
 ```
 
+## PRリンク・進捗記録
+
+```bash
+# PRをゴールにリンク（成果物として登録）
+addness link pr --goal <GOAL_ID> --url https://github.com/org/repo/pull/42
+addness link pr --goal <GOAL_ID> --url <PR_URL> --name "PR #42: 機能追加"
+addness link pr --goal <GOAL_ID> --url <PR_URL> --comment "実装完了"
+addness link pr --goal <GOAL_ID> --url <PR_URL> --json
+
+# 進捗を記録（コメント + オプションでステータス更新）
+addness link progress --goal <GOAL_ID> --message "設計レビュー完了"
+addness link progress --goal <GOAL_ID> --message "実装完了" --status COMPLETED
+addness link progress --goal <GOAL_ID> --message "着手開始" --status IN_PROGRESS --json
+```
+
 ## AIエージェント向けガイドライン
 
 - データ取得時は必ず `--json` フラグを使用してください。構造化データとして処理できます。
@@ -109,6 +124,8 @@ addness comment create --goal <GOAL_ID> --body "完了しました" --json
 - ゴールの全体像を把握するには `addness goal list --json --depth 5` を使用してください。
 - 特定のゴールの詳細を調べるには `addness goal get <ID> --json --with-deliverable --with-comment` を使用してください。
 - ゴールの更新後は `addness goal get <ID> --json` で結果を確認してください。
+- 作業完了時は `addness link progress --goal <ID> --message "内容" --status COMPLETED` で進捗を記録してください。
+- PRを作成した場合は `addness link pr --goal <ID> --url <PR_URL>` でゴールに紐づけてください。
 "#;
 
 pub fn handle_skills() -> Result<()> {

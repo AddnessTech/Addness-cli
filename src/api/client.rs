@@ -6,6 +6,7 @@ mod org;
 use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
+use reqwest::multipart;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -82,6 +83,38 @@ impl ApiClient {
     ) -> Result<T> {
         let url = format!("{}{}", self.base_url, path);
         let mut req = self.client.post(&url).json(body);
+
+        if let Some(org_id) = &self.org_id {
+            req = req.header(
+                HeaderName::from_static("x-organization-id"),
+                HeaderValue::from_str(org_id).context("Invalid organization ID")?,
+            );
+        }
+
+        let response = req
+            .send()
+            .await
+            .with_context(|| format!("Failed to send request to {url}"))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            bail!("API error ({status}): {body}");
+        }
+
+        response
+            .json::<T>()
+            .await
+            .with_context(|| format!("Failed to parse response from {url}"))
+    }
+
+    pub(super) async fn post_multipart<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        form: multipart::Form,
+    ) -> Result<T> {
+        let url = format!("{}{}", self.base_url, path);
+        let mut req = self.client.post(&url).multipart(form);
 
         if let Some(org_id) = &self.org_id {
             req = req.header(

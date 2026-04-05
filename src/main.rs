@@ -8,7 +8,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 
 use crate::config::{Credentials, DEFAULT_API_URL, Settings};
 use api::ApiClient;
-use cli::commands::{comment, configure, goal, login, org, skills};
+use cli::commands::{comment, configure, goal, link, login, org, skills};
 
 #[derive(Parser)]
 #[command(
@@ -57,6 +57,11 @@ enum Commands {
         #[command(subcommand)]
         command: comment::CommentCommands,
     },
+    /// Link PRs/URLs to goals and track progress
+    Link {
+        #[command(subcommand)]
+        command: link::LinkCommands,
+    },
     /// Output AI skills prompt for this CLI
     Skills,
     /// Generate shell completions
@@ -101,6 +106,10 @@ async fn main() -> Result<()> {
         Commands::Comment { command } => {
             let client = build_client()?;
             comment::handle_comments(command, &client).await
+        }
+        Commands::Link { command } => {
+            let client = build_client()?;
+            link::handle_link(command, &client).await
         }
         Commands::Skills => skills::handle_skills(),
         Commands::Completions { shell } => {

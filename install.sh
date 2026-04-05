@@ -66,7 +66,8 @@ download_and_install() {
   elif command -v shasum >/dev/null 2>&1; then
     shasum -a 256 -c "${ARCHIVE}.sha256"
   else
-    echo "Warning: no sha256 tool found, skipping checksum verification" >&2
+    echo "Error: no sha256 tool found. Cannot verify binary integrity." >&2
+    exit 1
   fi
 
   echo "Installing to ${INSTALL_DIR}/addness..."

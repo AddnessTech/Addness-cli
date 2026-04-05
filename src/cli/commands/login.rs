@@ -112,8 +112,7 @@ pub async fn handle_login(api_url: &str, frontend_url: Option<&str>) -> Result<(
         .await?;
 
     if !register_resp.status().is_success() {
-        let body = register_resp.text().await?;
-        bail!("Failed to register installation: {body}");
+        bail!("Failed to register installation. Please try again.");
     }
     let _: RegisterResponse = register_resp.json().await?;
 
@@ -151,8 +150,7 @@ timestamp={ts}"#,
         .await?;
 
     if !start_resp.status().is_success() {
-        let body = start_resp.text().await?;
-        bail!("Failed to create start session: {body}");
+        bail!("Failed to create login session. Please try again.");
     }
 
     let start_data: StartSessionResponse = start_resp.json().await?;
@@ -213,8 +211,7 @@ timestamp={ts}"#
         .await?;
 
     if !exchange_resp.status().is_success() {
-        let body = exchange_resp.text().await?;
-        bail!("Token exchange failed: {body}");
+        bail!("Login failed. Please try again.");
     }
 
     let exchange_data: ExchangeResponse = exchange_resp.json().await?;

@@ -80,10 +80,26 @@ function Main {
     New-Item -ItemType Directory -Path $TmpDir -Force | Out-Null
 
     try {
-        Write-Step "Downloading"
-        Invoke-WebRequest -Uri $Url -OutFile (Join-Path $TmpDir $Archive) -UseBasicParsing
+        # ダウンロード（プログレス表示）
+        $archivePath = Join-Path $TmpDir $Archive
+        Write-Host -NoNewline "  > Downloading...  0%"
+        $webClient = New-Object System.Net.WebClient
+        $downloadComplete = $false
+        $eventHandler = Register-ObjectEvent -InputObject $webClient -EventName DownloadProgressChanged -Action {
+            $pct = $EventArgs.ProgressPercentage
+            Write-Host -NoNewline "`r  > Downloading...  ${pct}%  "
+        }
+        $completedHandler = Register-ObjectEvent -InputObject $webClient -EventName DownloadFileCompleted -Action {
+            $script:downloadComplete = $true
+        }
+        $webClient.DownloadFileAsync([Uri]$Url, $archivePath)
+        while (-not $downloadComplete) { Start-Sleep -Milliseconds 100 }
+        Unregister-Event -SourceIdentifier $eventHandler.Name
+        Unregister-Event -SourceIdentifier $completedHandler.Name
+        $webClient.Dispose()
+        Write-Host "`r  > Downloading...  " -NoNewline
+        Write-Host "100%" -ForegroundColor Green
         Invoke-WebRequest -Uri $ShaUrl -OutFile (Join-Path $TmpDir "${Archive}.sha256") -UseBasicParsing
-        Write-StepOk
 
         Write-Step "Verifying checksum"
         $expectedLine = (Get-Content (Join-Path $TmpDir "${Archive}.sha256") -Raw).Trim()
@@ -128,6 +144,10 @@ function Main {
         Write-Host "  Get started:"
         Write-Host "    addness login       Log in to your account"
         Write-Host "    addness goal list   View your goals"
+        Write-Host ""
+        Write-Host "  AI integration:"
+        Write-Host "    addness skills      Output AI skills prompt"
+        Write-Host "    addness skills >> CLAUDE.md  Add to your project" -ForegroundColor DarkGray
         Write-Host ""
         Write-Host "  Note: Restart your terminal for PATH changes to take effect." -ForegroundColor Yellow
         Write-Host ""

@@ -129,16 +129,16 @@ download_and_install() {
   TMPDIR="$(mktemp -d)"
   trap 'rm -rf "${TMPDIR}"' EXIT
 
-  step "Downloading"
+  # ダウンロード（プログレスバー付き）
   if [ -t 1 ]; then
-    printf "\n"
+    printf "  ${DIM}>${RESET} Downloading\n"
     curl -fSL --progress-bar "${URL}" -o "${TMPDIR}/${ARCHIVE}"
-    # cursor up one line to keep it tidy
     printf "\033[1A\033[2K"
-    printf "  ${DIM}>${RESET} Downloading... ${GREEN}done${RESET}\n"
+    printf "  ${DIM}>${RESET} Downloading     ${GREEN}100%%${RESET}\n"
   else
+    printf "  > Downloading..."
     curl -fsSL "${URL}" -o "${TMPDIR}/${ARCHIVE}"
-    step_ok
+    printf " done\n"
   fi
   curl -fsSL "${SHA_URL}" -o "${TMPDIR}/${ARCHIVE}.sha256"
 
@@ -191,6 +191,10 @@ verify_installation() {
   printf "  ${DIM}Get started:${RESET}\n"
   printf "  ${BOLD}  addness login${RESET}      ${DIM}Log in to your account${RESET}\n"
   printf "  ${BOLD}  addness goal list${RESET}  ${DIM}View your goals${RESET}\n"
+  printf "\n"
+  printf "  ${DIM}AI integration:${RESET}\n"
+  printf "  ${BOLD}  addness skills${RESET}     ${DIM}Output AI skills prompt${RESET}\n"
+  printf "  ${BOLD}  addness skills >> CLAUDE.md${RESET}  ${DIM}Add to your project${RESET}\n"
   printf "\n"
 }
 

@@ -161,7 +161,8 @@ timestamp={ts}"#,
         .map(|s| s.to_string())
         .unwrap_or_else(|| api_url.replace(":8080", ":3000").replace("api.", ""));
     let fe_base = fe_url.trim_end_matches('/');
-    let browser_url = format!("{fe_base}/desktop/browser-auth?start_token={start_token}&source=cli");
+    let browser_url =
+        format!("{fe_base}/desktop/browser-auth?start_token={start_token}&source=cli");
 
     println!("Opening browser for login...");
     println!("If the browser doesn't open, visit:");

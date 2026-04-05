@@ -4,7 +4,7 @@ set -eu
 # Addness CLI installer
 # Usage: curl -fsSL https://cli.addness.co/install.sh | sh
 
-CDN_BASE="${ADDNESS_CDN_BASE:-https://cli.addness.co}"
+CDN_BASE="${ADDNESS_CDN_BASE:-https://cli.addness.com}"
 INSTALL_DIR="${ADDNESS_INSTALL_DIR:-/usr/local/bin}"
 VERSION="${ADDNESS_VERSION:-latest}"
 

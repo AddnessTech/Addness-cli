@@ -50,6 +50,18 @@ pub struct Owner {
     pub name: String,
 }
 
+// POST /api/v2/objectives
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateGoalRequest {
+    pub organization_id: String,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_objective_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
 // PATCH /api/v2/organizations/:org_id/objectives/:id
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

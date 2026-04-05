@@ -2,8 +2,8 @@ use anyhow::{Result, bail};
 use clap::Subcommand;
 
 use crate::api::{
-    ApiClient, ApiResponse, Comment, Deliverable, DeliverableType, Goal, GoalStatus, GoalTreeData,
-    GoalTreeItem, UpdateGoalRequest,
+    ApiClient, ApiResponse, Comment, CreateGoalRequest, Deliverable, DeliverableType, Goal,
+    GoalStatus, GoalTreeData, GoalTreeItem, UpdateGoalRequest,
 };
 use crate::cli::commands::org::resolve_org_id;
 use crate::cli::output::{
@@ -75,6 +75,24 @@ pub enum GoalCommands {
     Search {
         /// Search query
         query: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create a new goal
+    Create {
+        /// Goal title
+        #[arg(long)]
+        title: String,
+        /// Parent goal ID (omit to create as root goal)
+        #[arg(long)]
+        parent: Option<String>,
+        /// Organization ID (uses default if not specified)
+        #[arg(long)]
+        org: Option<String>,
+        /// Description
+        #[arg(long)]
+        description: Option<String>,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -438,6 +456,28 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
                 println!("{}", serde_json::to_string_pretty(&resp.data.items)?);
             } else {
                 print_search_results(&resp.data.items);
+            }
+            Ok(())
+        }
+        GoalCommands::Create {
+            title,
+            parent,
+            org,
+            description,
+            json,
+        } => {
+            let org_id = resolve_org_id(org.as_deref())?;
+            let req = CreateGoalRequest {
+                organization_id: org_id,
+                title: title.clone(),
+                parent_objective_id: parent.clone(),
+                description: description.clone(),
+            };
+            let resp: ApiResponse<Goal> = client.create_goal(&req).await?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&resp.data)?);
+            } else {
+                println!("Created goal: {} ({})", resp.data.title, resp.data.id);
             }
             Ok(())
         }

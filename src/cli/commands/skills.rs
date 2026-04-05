@@ -51,6 +51,12 @@ addness goal list --depth 5
 addness goal list --org <ORGANIZATION_ID>
 addness goal list --json
 
+# ゴールを作成
+addness goal create --title "新しいゴール"
+addness goal create --title "サブゴール" --parent <PARENT_GOAL_ID>
+addness goal create --title "説明付き" --description "完了条件の説明"
+addness goal create --title "新しいゴール" --json
+
 # ゴールの詳細を取得
 addness goal get <GOAL_ID>
 addness goal get <GOAL_ID> --with-deliverable --with-comment

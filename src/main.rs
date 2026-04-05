@@ -4,7 +4,7 @@ mod config;
 mod update_check;
 
 use anyhow::{Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 use crate::config::{Credentials, DEFAULT_API_URL, Settings};
 use api::ApiClient;
@@ -59,6 +59,11 @@ enum Commands {
     },
     /// Output AI skills prompt for this CLI
     Skills,
+    /// Generate shell completions
+    Completions {
+        /// Shell: bash, zsh, fish, powershell
+        shell: clap_complete::Shell,
+    },
 }
 
 fn build_client() -> Result<ApiClient> {
@@ -98,6 +103,15 @@ async fn main() -> Result<()> {
             comment::handle_comments(command, &client).await
         }
         Commands::Skills => skills::handle_skills(),
+        Commands::Completions { shell } => {
+            clap_complete::generate(
+                *shell,
+                &mut Cli::command(),
+                "addness",
+                &mut std::io::stdout(),
+            );
+            Ok(())
+        }
     };
 
     let _ = update_handle.await;

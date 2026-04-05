@@ -47,13 +47,8 @@ detect_platform() {
 }
 
 download_and_install() {
-  if [ "${VERSION}" = "latest" ]; then
-    BASE_URL="${CDN_BASE}/releases/latest"
-  else
-    BASE_URL="${CDN_BASE}/releases/${VERSION}"
-  fi
-
-  ARCHIVE="addness-${VERSION}-${TARGET}.tar.gz"
+  BASE_URL="${CDN_BASE}/releases/${VERSION}"
+  ARCHIVE="addness-${TARGET}.tar.gz"
   URL="${BASE_URL}/${ARCHIVE}"
   SHA_URL="${URL}.sha256"
 

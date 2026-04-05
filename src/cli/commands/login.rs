@@ -100,7 +100,7 @@ pub async fn handle_login(api_url: &str, frontend_url: Option<&str>) -> Result<(
 
     // 5. Installation登録
     let client = reqwest::Client::builder()
-        .user_agent("addness-cli/0.1.0")
+        .user_agent(format!("addness-cli/{}", env!("CARGO_PKG_VERSION")))
         .build()?;
     let register_resp = client
         .post(format!(
@@ -154,7 +154,9 @@ timestamp={ts}"#,
         .await?;
 
     if !start_resp.status().is_success() {
-        bail!("Failed to create login session. Please try again.");
+        let status = start_resp.status();
+        let body = start_resp.text().await.unwrap_or_default();
+        bail!("Failed to create login session (HTTP {status}): {body}");
     }
 
     let start_data: StartSessionResponse = start_resp.json().await?;
@@ -216,7 +218,9 @@ timestamp={ts}"#
         .await?;
 
     if !exchange_resp.status().is_success() {
-        bail!("Login failed. Please try again.");
+        let status = exchange_resp.status();
+        let body = exchange_resp.text().await.unwrap_or_default();
+        bail!("Login failed (HTTP {status}): {body}");
     }
 
     let exchange_data: ExchangeResponse = exchange_resp.json().await?;

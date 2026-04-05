@@ -8,7 +8,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 
 use crate::config::{Credentials, DEFAULT_API_URL, Settings};
 use api::ApiClient;
-use cli::commands::{comment, configure, detect, goal, link, login, org, skills};
+use cli::commands::{comment, configure, detect, goal, link, login, org, skills, summary};
 
 #[derive(Parser)]
 #[command(
@@ -61,6 +61,18 @@ enum Commands {
     Link {
         #[command(subcommand)]
         command: link::LinkCommands,
+    },
+    /// Show progress summary of all goals
+    Summary {
+        /// Organization ID (uses default if not specified)
+        #[arg(long)]
+        org: Option<String>,
+        /// Tree depth (default: 5)
+        #[arg(long, default_value = "5")]
+        depth: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Detect goal ID from current git branch name
     DetectGoal {
@@ -116,6 +128,10 @@ async fn main() -> Result<()> {
         Commands::Link { command } => {
             let client = build_client()?;
             link::handle_link(command, &client).await
+        }
+        Commands::Summary { org, depth, json } => {
+            let client = build_client()?;
+            summary::handle_summary(org.as_deref(), *depth, *json, &client).await
         }
         Commands::DetectGoal { json } => detect::handle_detect_goal(*json),
         Commands::Skills => skills::handle_skills(),

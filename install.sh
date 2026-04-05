@@ -12,35 +12,54 @@ VERSION="${ADDNESS_VERSION:-latest}"
 if [ -t 1 ]; then
   BOLD='\033[1m'
   GREEN='\033[1;32m'
+  BLUE='\033[1;34m'
   RED='\033[1;31m'
   DIM='\033[2m'
   RESET='\033[0m'
 else
   BOLD=''
   GREEN=''
+  BLUE=''
   RED=''
   DIM=''
   RESET=''
 fi
 
+banner() {
+  printf "\n"
+  printf "  ${BLUE}  _          _   _          _       _                        _ _   _ \n"
+  printf "  | |    ___| |_( )___    / \\   __| | __| |_ __   ___  ___ ___  (_) |_| |\n"
+  printf "  | |   / _ \\ __|// __|  / _ \\ / _\` |/ _\` | '_ \\ / _ \\/ __/ __| | | __| |\n"
+  printf "  | |__|  __/ |_  \\__ \\ / ___ \\ (_| | (_| | | | |  __/\\__ \\__ \\ | | |_|_|\n"
+  printf "  |_____\\___|\\__| |___//_/   \\_\\__,_|\\__,_|_| |_|\\___||___/___/ |_|\\__(_)\n"
+  printf "  ${RESET}\n"
+  printf "\n"
+}
+
 info() {
-  printf "  %b\n" "$1"
+  printf "  ${DIM}>${RESET} %b\n" "$1"
+}
+
+step() {
+  printf "  ${DIM}>${RESET} %b..." "$1"
+}
+
+step_ok() {
+  printf " ${GREEN}done${RESET}\n"
 }
 
 ok() {
-  printf "  ${GREEN}ok${RESET} %b\n" "$1"
+  printf "  ${GREEN}*${RESET} %b\n" "$1"
 }
 
 err() {
-  printf "  ${RED}error${RESET} %s\n" "$1" >&2
+  printf "  ${RED}!${RESET} %s\n" "$1" >&2
 }
 
 main() {
-  printf "\n"
-  info "${BOLD}Addness CLI Installer${RESET}"
-  printf "\n"
-
+  banner
   detect_platform
+  printf "\n"
   download_and_install
   verify_installation
 }
@@ -73,7 +92,8 @@ detect_platform() {
   fi
 
   TARGET="${ARCH}-${OS}"
-  info "Platform: ${BOLD}${TARGET}${RESET}"
+  info "Platform  ${BOLD}${TARGET}${RESET}"
+  info "Version   ${BOLD}${VERSION}${RESET}"
 }
 
 download_and_install() {
@@ -85,27 +105,33 @@ download_and_install() {
   TMPDIR="$(mktemp -d)"
   trap 'rm -rf "${TMPDIR}"' EXIT
 
-  info "Downloading ${DIM}${URL}${RESET}"
+  step "Downloading"
   if [ -t 1 ]; then
+    printf "\n"
     curl -fSL --progress-bar "${URL}" -o "${TMPDIR}/${ARCHIVE}"
+    # cursor up one line to keep it tidy
+    printf "\033[1A\033[2K"
+    printf "  ${DIM}>${RESET} Downloading... ${GREEN}done${RESET}\n"
   else
     curl -fsSL "${URL}" -o "${TMPDIR}/${ARCHIVE}"
+    step_ok
   fi
   curl -fsSL "${SHA_URL}" -o "${TMPDIR}/${ARCHIVE}.sha256"
 
-  info "Verifying checksum..."
+  step "Verifying checksum"
   cd "${TMPDIR}"
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum -c "${ARCHIVE}.sha256" >/dev/null
   elif command -v shasum >/dev/null 2>&1; then
     shasum -a 256 -c "${ARCHIVE}.sha256" >/dev/null
   else
+    printf " ${RED}failed${RESET}\n"
     err "No sha256 tool found. Cannot verify binary integrity."
     exit 1
   fi
-  ok "Checksum verified"
+  step_ok
 
-  info "Installing to ${BOLD}${INSTALL_DIR}/addness${RESET}"
+  step "Installing to ${INSTALL_DIR}"
   tar -xzf "${ARCHIVE}"
 
   if [ -w "${INSTALL_DIR}" ]; then
@@ -115,23 +141,23 @@ download_and_install() {
   fi
 
   chmod +x "${INSTALL_DIR}/addness"
-  ok "Installed"
+  step_ok
 }
 
 verify_installation() {
   printf "\n"
   if command -v addness >/dev/null 2>&1; then
     INSTALLED_VERSION="$(addness --version 2>/dev/null || printf "unknown")"
-    info "${GREEN}Addness CLI installed successfully!${RESET} ${DIM}(${INSTALLED_VERSION})${RESET}"
+    ok "${GREEN}Addness CLI installed successfully!${RESET} ${DIM}${INSTALLED_VERSION}${RESET}"
   else
-    info "Installed to ${INSTALL_DIR}/addness"
+    ok "Installed to ${BOLD}${INSTALL_DIR}/addness${RESET}"
     info "${DIM}Make sure ${INSTALL_DIR} is in your PATH${RESET}"
   fi
 
   printf "\n"
-  info "Get started:"
-  info "  ${BOLD}addness login${RESET}       Log in to your account"
-  info "  ${BOLD}addness goals list${RESET}  View your goals"
+  printf "  ${DIM}Get started:${RESET}\n"
+  printf "  ${BOLD}  addness login${RESET}       ${DIM}Log in to your account${RESET}\n"
+  printf "  ${BOLD}  addness goals list${RESET}  ${DIM}View your goals${RESET}\n"
   printf "\n"
 }
 

@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 
 use crate::config::{Credentials, DEFAULT_API_URL, Settings};
 use api::ApiClient;
-use cli::commands::{comment, configure, goal, login, org};
+use cli::commands::{comment, configure, goal, login, org, skills};
 
 #[derive(Parser)]
 #[command(
@@ -57,6 +57,8 @@ enum Commands {
         #[command(subcommand)]
         command: comment::CommentCommands,
     },
+    /// Output AI skills prompt for this CLI
+    Skills,
 }
 
 fn build_client() -> Result<ApiClient> {
@@ -95,6 +97,7 @@ async fn main() -> Result<()> {
             let client = build_client()?;
             comment::handle_comments(command, &client).await
         }
+        Commands::Skills => skills::handle_skills(),
     };
 
     let _ = update_handle.await;

@@ -10,7 +10,7 @@ pub struct Credentials {
     api_url: String,
 }
 
-pub const DEFAULT_API_URL: &str = "https://api.addness.app";
+pub const DEFAULT_API_URL: &str = "https://vt.api.addness.com";
 
 fn default_api_url() -> String {
     DEFAULT_API_URL.to_string()

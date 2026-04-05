@@ -56,27 +56,25 @@ pub async fn handle_summary(
     let mut completed_goals = Vec::new();
     let mut in_progress_goals = Vec::new();
     let mut not_started_goals = Vec::new();
+    let mut stalled_goals = Vec::new();
     let mut cancelled = 0usize;
 
     for item in items {
         match classify(item) {
             "completed" => completed_goals.push(to_summary_item(item)),
             "in_progress" => in_progress_goals.push(to_summary_item(item)),
-            "not_started" => not_started_goals.push(to_summary_item(item)),
+            "not_started" => {
+                // 停滞 = not_started かつ子ゴールがあるのに進んでないもの
+                if item.has_children {
+                    stalled_goals.push(to_summary_item(item));
+                } else {
+                    not_started_goals.push(to_summary_item(item));
+                }
+            }
             "cancelled" => cancelled += 1,
             _ => {}
         }
     }
-
-    // 停滞 = in_progressでもnot_startedでもない、かつ子ゴールがあるのに進んでないもの
-    // 簡易的に: has_children=true かつ not_started のものを「停滞候補」とする
-    let stalled_goals: Vec<GoalSummaryItem> = items
-        .iter()
-        .filter(|item| {
-            !item.is_completed && item.has_children && matches!(classify(item), "not_started")
-        })
-        .map(to_summary_item)
-        .collect();
 
     let summary = SummaryData {
         total: items.len(),

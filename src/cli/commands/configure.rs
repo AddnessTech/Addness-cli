@@ -116,6 +116,7 @@ pub fn handle_status(json: bool) -> Result<()> {
 
 pub fn handle_logout() -> Result<()> {
     Credentials::delete()?;
-    println!("Logged out. Credentials removed.");
+    Settings::delete()?;
+    println!("Logged out. Credentials and settings removed.");
     Ok(())
 }

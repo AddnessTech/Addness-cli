@@ -41,6 +41,9 @@ runs:
         if [ -z "$GOAL_ID" ]; then
           echo "No goal ID found in PR title, body, or branch name."
           echo "skip=true" >> "$GITHUB_OUTPUT"
+        elif ! echo "$GOAL_ID" | grep -qE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+          echo "::warning::Extracted goal ID is not a valid UUID: $GOAL_ID"
+          echo "skip=true" >> "$GITHUB_OUTPUT"
         else
           echo "goal_id=$GOAL_ID" >> "$GITHUB_OUTPUT"
           echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -67,9 +70,8 @@ runs:
       run: |
         # Configure CLI via credentials file
         mkdir -p "$HOME/.addness"
-        cat > "$HOME/.addness/credentials.json" <<CREDS
-        {"token":"${ADDNESS_API_KEY}","api_url":"${ADDNESS_API_URL}"}
-        CREDS
+        jq -n --arg token "$ADDNESS_API_KEY" --arg url "$ADDNESS_API_URL" \
+          '{"token": $token, "api_url": $url}' > "$HOME/.addness/credentials.json"
 
         # Link PR to goal
         addness link pr --goal "$GOAL_ID" --url "$PR_URL" --name "$PR_TITLE" \

@@ -38,8 +38,28 @@ impl Settings {
                 .with_context(|| format!("Failed to create directory {}", parent.display()))?;
         }
         let content = serde_json::to_string_pretty(self)?;
-        fs::write(&path, &content)
-            .with_context(|| format!("Failed to write {}", path.display()))?;
+
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&path)
+                .with_context(|| format!("Failed to create {}", path.display()))?;
+            file.write_all(content.as_bytes())
+                .with_context(|| format!("Failed to write {}", path.display()))?;
+        }
+
+        #[cfg(not(unix))]
+        {
+            fs::write(&path, &content)
+                .with_context(|| format!("Failed to write {}", path.display()))?;
+        }
+
         Ok(())
     }
 
@@ -50,5 +70,14 @@ impl Settings {
     pub fn set_current_organization_id(&mut self, org_id: String) -> Result<()> {
         self.current_organization_id = Some(org_id);
         self.save()
+    }
+
+    pub fn delete() -> Result<()> {
+        let path = settings_path()?;
+        if path.exists() {
+            fs::remove_file(&path)
+                .with_context(|| format!("Failed to delete {}", path.display()))?;
+        }
+        Ok(())
     }
 }

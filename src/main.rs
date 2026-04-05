@@ -8,7 +8,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 
 use crate::config::{Credentials, DEFAULT_API_URL, Settings};
 use api::ApiClient;
-use cli::commands::{comment, configure, goal, link, login, org, skills};
+use cli::commands::{comment, configure, detect, goal, link, login, org, skills};
 
 #[derive(Parser)]
 #[command(
@@ -62,6 +62,12 @@ enum Commands {
         #[command(subcommand)]
         command: link::LinkCommands,
     },
+    /// Detect goal ID from current git branch name
+    DetectGoal {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Output AI skills prompt for this CLI
     Skills,
     /// Generate shell completions
@@ -111,6 +117,7 @@ async fn main() -> Result<()> {
             let client = build_client()?;
             link::handle_link(command, &client).await
         }
+        Commands::DetectGoal { json } => detect::handle_detect_goal(*json),
         Commands::Skills => skills::handle_skills(),
         Commands::Completions { shell } => {
             clap_complete::generate(

@@ -116,16 +116,34 @@ addness link progress --goal <GOAL_ID> --message "実装完了" --status COMPLET
 addness link progress --goal <GOAL_ID> --message "着手開始" --status IN_PROGRESS --json
 ```
 
+## ゴール検出
+
+```bash
+# 現在のブランチからゴールIDを自動検出
+addness detect-goal
+addness detect-goal --json
+```
+
+ブランチ命名規則: `goal/<GOAL_ID>/description`
+
+例: `goal/19453a2d-6524-4bbb-8e4f-f8fd69f3fce4/add-email-notifications`
+
 ## AIエージェント向けガイドライン
 
+### 作業開始時（必須）
+1. `addness detect-goal --json` でブランチに紐づくゴールを確認してください。
+2. ゴールが検出された場合、`addness goal get <ID> --json --with-deliverable --with-comment` で詳細を確認してから作業を開始してください。
+3. ゴールが検出されない場合、`addness goal list --json --depth 3` で全体を確認し、関連するゴールを特定してください。
+
+### 作業中
 - データ取得時は必ず `--json` フラグを使用してください。構造化データとして処理できます。
 - 最初に `addness status --json` で認証状態を確認してください。
 - 組織が未設定の場合は `addness org list --json` で一覧を取得し、`addness org switch <ID>` で設定してください。
-- ゴールの全体像を把握するには `addness goal list --json --depth 5` を使用してください。
-- 特定のゴールの詳細を調べるには `addness goal get <ID> --json --with-deliverable --with-comment` を使用してください。
-- ゴールの更新後は `addness goal get <ID> --json` で結果を確認してください。
+
+### 作業完了時
 - 作業完了時は `addness link progress --goal <ID> --message "内容" --status COMPLETED` で進捗を記録してください。
 - PRを作成した場合は `addness link pr --goal <ID> --url <PR_URL>` でゴールに紐づけてください。
+- ゴールの更新後は `addness goal get <ID> --json` で結果を確認してください。
 "#;
 
 pub fn handle_skills() -> Result<()> {

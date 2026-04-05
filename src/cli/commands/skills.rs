@@ -116,6 +116,15 @@ addness link progress --goal <GOAL_ID> --message "実装完了" --status COMPLET
 addness link progress --goal <GOAL_ID> --message "着手開始" --status IN_PROGRESS --json
 ```
 
+## 進捗サマリー
+
+```bash
+# ゴール全体の進捗サマリーを表示
+addness summary
+addness summary --depth 5
+addness summary --json
+```
+
 ## ゴール検出
 
 ```bash

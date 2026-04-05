@@ -8,7 +8,38 @@ CDN_BASE="${ADDNESS_CDN_BASE:-https://cli.addness.co}"
 INSTALL_DIR="${ADDNESS_INSTALL_DIR:-/usr/local/bin}"
 VERSION="${ADDNESS_VERSION:-latest}"
 
+# Colors (disabled when not a TTY)
+if [ -t 1 ]; then
+  BOLD='\033[1m'
+  GREEN='\033[1;32m'
+  RED='\033[1;31m'
+  DIM='\033[2m'
+  RESET='\033[0m'
+else
+  BOLD=''
+  GREEN=''
+  RED=''
+  DIM=''
+  RESET=''
+fi
+
+info() {
+  printf "  %b\n" "$1"
+}
+
+ok() {
+  printf "  ${GREEN}ok${RESET} %b\n" "$1"
+}
+
+err() {
+  printf "  ${RED}error${RESET} %s\n" "$1" >&2
+}
+
 main() {
+  printf "\n"
+  info "${BOLD}Addness CLI Installer${RESET}"
+  printf "\n"
+
   detect_platform
   download_and_install
   verify_installation
@@ -22,7 +53,7 @@ detect_platform() {
     Darwin) OS="apple-darwin" ;;
     Linux)  OS="unknown-linux-gnu" ;;
     *)
-      echo "Error: unsupported OS: ${OS}" >&2
+      err "Unsupported OS: ${OS}"
       exit 1
       ;;
   esac
@@ -31,19 +62,18 @@ detect_platform() {
     x86_64)  ARCH="x86_64" ;;
     aarch64|arm64) ARCH="aarch64" ;;
     *)
-      echo "Error: unsupported architecture: ${ARCH}" >&2
+      err "Unsupported architecture: ${ARCH}"
       exit 1
       ;;
   esac
 
-  # Linux aarch64 は未サポート
   if [ "${OS}" = "unknown-linux-gnu" ] && [ "${ARCH}" = "aarch64" ]; then
-    echo "Error: Linux aarch64 is not yet supported" >&2
+    err "Linux aarch64 is not yet supported"
     exit 1
   fi
 
   TARGET="${ARCH}-${OS}"
-  echo "Detected platform: ${TARGET}"
+  info "Platform: ${BOLD}${TARGET}${RESET}"
 }
 
 download_and_install() {
@@ -55,22 +85,27 @@ download_and_install() {
   TMPDIR="$(mktemp -d)"
   trap 'rm -rf "${TMPDIR}"' EXIT
 
-  echo "Downloading ${URL}..."
-  curl -fsSL "${URL}" -o "${TMPDIR}/${ARCHIVE}"
+  info "Downloading ${DIM}${URL}${RESET}"
+  if [ -t 1 ]; then
+    curl -fSL --progress-bar "${URL}" -o "${TMPDIR}/${ARCHIVE}"
+  else
+    curl -fsSL "${URL}" -o "${TMPDIR}/${ARCHIVE}"
+  fi
   curl -fsSL "${SHA_URL}" -o "${TMPDIR}/${ARCHIVE}.sha256"
 
-  echo "Verifying checksum..."
+  info "Verifying checksum..."
   cd "${TMPDIR}"
   if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum -c "${ARCHIVE}.sha256"
+    sha256sum -c "${ARCHIVE}.sha256" >/dev/null
   elif command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 -c "${ARCHIVE}.sha256"
+    shasum -a 256 -c "${ARCHIVE}.sha256" >/dev/null
   else
-    echo "Error: no sha256 tool found. Cannot verify binary integrity." >&2
+    err "No sha256 tool found. Cannot verify binary integrity."
     exit 1
   fi
+  ok "Checksum verified"
 
-  echo "Installing to ${INSTALL_DIR}/addness..."
+  info "Installing to ${BOLD}${INSTALL_DIR}/addness${RESET}"
   tar -xzf "${ARCHIVE}"
 
   if [ -w "${INSTALL_DIR}" ]; then
@@ -80,18 +115,24 @@ download_and_install() {
   fi
 
   chmod +x "${INSTALL_DIR}/addness"
+  ok "Installed"
 }
 
 verify_installation() {
+  printf "\n"
   if command -v addness >/dev/null 2>&1; then
-    echo ""
-    echo "Addness CLI installed successfully!"
-    addness --version 2>/dev/null || true
+    INSTALLED_VERSION="$(addness --version 2>/dev/null || printf "unknown")"
+    info "${GREEN}Addness CLI installed successfully!${RESET} ${DIM}(${INSTALLED_VERSION})${RESET}"
   else
-    echo ""
-    echo "Installed to ${INSTALL_DIR}/addness"
-    echo "Make sure ${INSTALL_DIR} is in your PATH"
+    info "Installed to ${INSTALL_DIR}/addness"
+    info "${DIM}Make sure ${INSTALL_DIR} is in your PATH${RESET}"
   fi
+
+  printf "\n"
+  info "Get started:"
+  info "  ${BOLD}addness login${RESET}       Log in to your account"
+  info "  ${BOLD}addness goals list${RESET}  View your goals"
+  printf "\n"
 }
 
 main

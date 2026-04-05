@@ -26,6 +26,7 @@ impl ApiClient {
 
         let client = Client::builder()
             .default_headers(headers)
+            .user_agent(format!("addness-cli/{}", env!("CARGO_PKG_VERSION")))
             .build()
             .context("Failed to create HTTP client")?;
 

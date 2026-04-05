@@ -12,7 +12,8 @@ use cli::commands::{comment, configure, goal, login, org};
 #[derive(Parser)]
 #[command(
     name = "addness",
-    about = "Addness CLI - Manage your goals from the terminal"
+    about = "Addness CLI - Manage your goals from the terminal",
+    version
 )]
 struct Cli {
     #[command(subcommand)]

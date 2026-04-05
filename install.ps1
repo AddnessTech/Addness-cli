@@ -1,38 +1,36 @@
 # Addness CLI installer for Windows
-# Usage: irm https://cli.addness.co/install.ps1 | iex
+# Usage: irm https://cli.addness.com/install.ps1 | iex
 
 $ErrorActionPreference = "Stop"
 
-$CdnBase = if ($env:ADDNESS_CDN_BASE) { $env:ADDNESS_CDN_BASE } else { "https://cli.addness.co" }
+$CdnBase = if ($env:ADDNESS_CDN_BASE) { $env:ADDNESS_CDN_BASE } else { "https://cli.addness.com" }
 $InstallDir = if ($env:ADDNESS_INSTALL_DIR) { $env:ADDNESS_INSTALL_DIR } else { "$env:LOCALAPPDATA\addness\bin" }
 $Version = if ($env:ADDNESS_VERSION) { $env:ADDNESS_VERSION } else { "latest" }
 
 function Write-Banner {
-    $blue = "`e[1;34m"
-    $bold = "`e[1m"
-    $reset = "`e[0m"
+    $esc = [char]27
 
     Write-Host ""
-    Write-Host "  ${blue}                                        ."
-    Write-Host "  ${blue}                   .:=+*###***+=:.    =:"
-    Write-Host "  ${blue}               .=*%@@%*=:.    .:=**+#="
-    Write-Host "  ${blue}            .:*@@@@*:.            :#%*:"
-    Write-Host "  ${blue}          .+@@@@@*.            :+%%=. .+="
-    Write-Host "  ${blue}         =@@@@@@:          .=*%%+.     ::"
-    Write-Host "  ${blue}       .*@@@@@@.      .:+*%%%#=.        :"
-    Write-Host "  ${blue}      .@@@@@@@:  =+*#%%%%%%+:"
-    Write-Host "  ${blue}     .@@@@@@@+ .*%%%%%%#+:"
-    Write-Host "  ${blue}    .@@@@@@@@. *%%%%*=."
-    Write-Host "  ${blue}    *@@@@@@@+ .%%*=."
-    Write-Host "  ${blue}   :@@@@@@@@."
-    Write-Host "  ${blue}   #@@@@@@@*"
-    Write-Host "  ${blue}   ++==::..${reset}"
+    Write-Host "  ${esc}[1;34m                                        ."
+    Write-Host "  ${esc}[1;34m                   .:=+*###***+=:.    =:"
+    Write-Host "  ${esc}[1;34m               .=*%@@%*=:.    .:=**+#="
+    Write-Host "  ${esc}[1;34m            .:*@@@@*:.            :#%*:"
+    Write-Host "  ${esc}[1;34m          .+@@@@@*.            :+%%=. .+="
+    Write-Host "  ${esc}[1;34m         =@@@@@@:          .=*%%+.     ::"
+    Write-Host "  ${esc}[1;34m       .*@@@@@@.      .:+*%%%#=.        :"
+    Write-Host "  ${esc}[1;34m      .@@@@@@@:  =+*#%%%%%%+:"
+    Write-Host "  ${esc}[1;34m     .@@@@@@@+ .*%%%%%%#+:"
+    Write-Host "  ${esc}[1;34m    .@@@@@@@@. *%%%%*=."
+    Write-Host "  ${esc}[1;34m    *@@@@@@@+ .%%*=."
+    Write-Host "  ${esc}[1;34m   :@@@@@@@@."
+    Write-Host "  ${esc}[1;34m   #@@@@@@@*"
+    Write-Host "  ${esc}[1;34m   ++==::..${esc}[0m"
     Write-Host ""
-    Write-Host "  ${bold} _         _            _       _     _                       _ _   _ "
+    Write-Host "  ${esc}[1m _         _            _       _     _                       _ _   _ "
     Write-Host "  | |    ___| |_ ___     / \   __| | __| |_ __   ___  ___ ___  (_) |_| |"
     Write-Host "  | |   / _ \ __/ __|   / _ \ / _`` |/ _`` | '_ \ / _ \/ __/ __| | | __| |"
     Write-Host "  | |__|  __/ |_\__ \  / ___ \ (_| | (_| | | | |  __/\__ \__ \ | | |_|_|"
-    Write-Host "  |_____\___|\__|___/ /_/   \_\__,_|\__,_|_| |_|\___||___/___/ |_|\__(_)${reset}"
+    Write-Host "  |_____\___|\__|___/ /_/   \_\__,_|\__,_|_| |_|\___||___/___/ |_|\__(_)${esc}[0m"
     Write-Host ""
 }
 
@@ -119,7 +117,7 @@ function Main {
         Write-Host ""
         Write-Host "  Get started:"
         Write-Host "    addness login       Log in to your account"
-        Write-Host "    addness goals list  View your goals"
+        Write-Host "    addness goal list   View your goals"
         Write-Host ""
         Write-Host "  Note: Restart your terminal for PATH changes to take effect." -ForegroundColor Yellow
         Write-Host ""

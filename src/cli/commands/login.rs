@@ -99,7 +99,9 @@ pub async fn handle_login(api_url: &str, frontend_url: Option<&str>) -> Result<(
     let state = uuid::Uuid::new_v4().simple().to_string();
 
     // 5. Installation登録
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .user_agent("addness-cli/0.1.0")
+        .build()?;
     let register_resp = client
         .post(format!(
             "{api_url}/api/v1/public/desktop/auth/installations/register"
@@ -112,7 +114,9 @@ pub async fn handle_login(api_url: &str, frontend_url: Option<&str>) -> Result<(
         .await?;
 
     if !register_resp.status().is_success() {
-        bail!("Failed to register installation. Please try again.");
+        let status = register_resp.status();
+        let body = register_resp.text().await.unwrap_or_default();
+        bail!("Failed to register installation (HTTP {status}): {body}");
     }
     let _: RegisterResponse = register_resp.json().await?;
 

@@ -33,7 +33,11 @@ enum Commands {
     /// Configure API Key, URL, and default organization manually
     Configure,
     /// Show current configuration status
-    Status,
+    Status {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Remove saved credentials
     Logout,
     /// Manage organizations
@@ -73,7 +77,7 @@ async fn main() -> Result<()> {
             frontend_url,
         } => login::handle_login(api_url, frontend_url.as_deref()).await,
         Commands::Configure => configure::handle_configure(),
-        Commands::Status => configure::handle_status(),
+        Commands::Status { json } => configure::handle_status(*json),
         Commands::Logout => configure::handle_logout(),
         Commands::Org { command } => {
             let client = build_client()?;

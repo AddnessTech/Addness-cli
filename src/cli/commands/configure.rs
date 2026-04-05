@@ -81,19 +81,34 @@ pub fn handle_configure() -> Result<()> {
     Ok(())
 }
 
-pub fn handle_status() -> Result<()> {
+pub fn handle_status(json: bool) -> Result<()> {
     match Credentials::load()? {
         Some(creds) => {
             let settings = Settings::load()?;
-            println!("Authenticated");
-            println!("  API Key: {}", mask_key(creds.token()));
-            println!("  API URL: {}", creds.api_url());
-            if let Some(org_id) = settings.current_organization_id() {
-                println!("  Organization: {}", org_id);
+            if json {
+                let output = serde_json::json!({
+                    "authenticated": true,
+                    "api_key": mask_key(creds.token()),
+                    "api_url": creds.api_url(),
+                    "organization_id": settings.current_organization_id(),
+                });
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else {
+                println!("Authenticated");
+                println!("  API Key: {}", mask_key(creds.token()));
+                println!("  API URL: {}", creds.api_url());
+                if let Some(org_id) = settings.current_organization_id() {
+                    println!("  Organization: {}", org_id);
+                }
             }
         }
         None => {
-            println!("Not configured. Run: addness configure");
+            if json {
+                let output = serde_json::json!({ "authenticated": false });
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else {
+                println!("Not configured. Run: addness configure");
+            }
         }
     }
     Ok(())

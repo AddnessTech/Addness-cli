@@ -5,7 +5,7 @@ set -eu
 # Usage: curl -fsSL https://cli.addness.com/install.sh | sh
 
 CDN_BASE="${ADDNESS_CDN_BASE:-https://cli.addness.com}"
-INSTALL_DIR="${ADDNESS_INSTALL_DIR:-/usr/local/bin}"
+INSTALL_DIR="${ADDNESS_INSTALL_DIR:-${HOME}/.addness/bin}"
 VERSION="${ADDNESS_VERSION:-latest}"
 
 # Colors (disabled when not a TTY)
@@ -148,12 +148,8 @@ download_and_install() {
   step "Installing to ${INSTALL_DIR}"
   tar -xzf "${ARCHIVE}"
 
-  if [ -w "${INSTALL_DIR}" ]; then
-    mv addness "${INSTALL_DIR}/addness"
-  else
-    sudo mv addness "${INSTALL_DIR}/addness"
-  fi
-
+  mkdir -p "${INSTALL_DIR}"
+  mv addness "${INSTALL_DIR}/addness"
   chmod +x "${INSTALL_DIR}/addness"
   step_ok
 }
@@ -161,17 +157,30 @@ download_and_install() {
 verify_installation() {
   printf "\n"
   if command -v addness >/dev/null 2>&1; then
-    INSTALLED_VERSION="$(addness --version 2>/dev/null || printf "unknown")"
-    ok "${GREEN}Addness CLI installed successfully!${RESET} ${DIM}${INSTALLED_VERSION}${RESET}"
+    ok "${GREEN}Addness CLI installed successfully!${RESET}"
   else
     ok "Installed to ${BOLD}${INSTALL_DIR}/addness${RESET}"
-    info "${DIM}Make sure ${INSTALL_DIR} is in your PATH${RESET}"
+    printf "\n"
+    printf "  ${DIM}Add to your PATH:${RESET}\n"
+    SHELL_NAME="$(basename "${SHELL:-/bin/sh}")"
+    case "${SHELL_NAME}" in
+      zsh)  RC_FILE="\$HOME/.zshrc" ;;
+      bash) RC_FILE="\$HOME/.bashrc" ;;
+      fish) RC_FILE="\$HOME/.config/fish/config.fish" ;;
+      *)    RC_FILE="your shell config" ;;
+    esac
+    if [ "${SHELL_NAME}" = "fish" ]; then
+      printf "  ${BOLD}  fish_add_path %s${RESET}\n" "${INSTALL_DIR}"
+    else
+      printf "  ${BOLD}  echo 'export PATH=\"%s:\$PATH\"' >> %s${RESET}\n" "${INSTALL_DIR}" "${RC_FILE}"
+    fi
+    printf "  ${DIM}Then restart your terminal or run: source %s${RESET}\n" "${RC_FILE}"
   fi
 
   printf "\n"
   printf "  ${DIM}Get started:${RESET}\n"
-  printf "  ${BOLD}  addness login${RESET}       ${DIM}Log in to your account${RESET}\n"
-  printf "  ${BOLD}  addness goals list${RESET}  ${DIM}View your goals${RESET}\n"
+  printf "  ${BOLD}  addness login${RESET}      ${DIM}Log in to your account${RESET}\n"
+  printf "  ${BOLD}  addness goal list${RESET}  ${DIM}View your goals${RESET}\n"
   printf "\n"
 }
 

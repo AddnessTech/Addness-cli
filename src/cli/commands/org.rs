@@ -19,7 +19,11 @@ pub enum OrgCommands {
         id: String,
     },
     /// Show current organization
-    Current,
+    Current {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub async fn handle_org(cmd: &OrgCommands, client: &ApiClient) -> Result<()> {
@@ -40,10 +44,21 @@ pub async fn handle_org(cmd: &OrgCommands, client: &ApiClient) -> Result<()> {
             println!("Switched to organization: {}", id);
             Ok(())
         }
-        OrgCommands::Current => {
+        OrgCommands::Current { json } => {
             let settings = Settings::load()?;
             match settings.current_organization_id() {
-                Some(id) => println!("{}", id),
+                Some(id) => {
+                    if *json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "organization_id": id
+                            }))?
+                        );
+                    } else {
+                        println!("{id}");
+                    }
+                }
                 None => bail!("No current organization set. Run: addness org switch <id>"),
             }
             Ok(())

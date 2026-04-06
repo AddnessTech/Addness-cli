@@ -29,7 +29,7 @@ fn classify(item: &GoalTreeItem) -> &'static str {
         return "completed";
     }
     match &item.status {
-        Some(GoalStatus::InProgress) | Some(GoalStatus::Active) => "in_progress",
+        Some(GoalStatus::InProgress) => "in_progress",
         Some(GoalStatus::Cancelled) => "cancelled",
         _ => "not_started",
     }

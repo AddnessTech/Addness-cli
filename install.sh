@@ -5,7 +5,7 @@ set -eu
 # Usage: curl -fsSL https://cli.addness.com/install.sh | sh
 
 CDN_BASE="${ADDNESS_CDN_BASE:-https://cli.addness.com}"
-INSTALL_DIR="${ADDNESS_INSTALL_DIR:-${HOME}/.addness/bin}"
+INSTALL_DIR="${ADDNESS_INSTALL_DIR:-/usr/local/bin}"
 VERSION="${ADDNESS_VERSION:-latest}"
 
 # Colors (disabled when not a TTY)

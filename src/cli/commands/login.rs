@@ -165,7 +165,7 @@ timestamp={ts}"#,
     // 7. ブラウザを開く
     let fe_url = frontend_url
         .map(|s| s.to_string())
-        .unwrap_or_else(|| api_url.replace(":8080", ":3000").replace("api.", ""));
+        .unwrap_or_else(|| "https://www.addness.com".to_string());
     let fe_base = fe_url.trim_end_matches('/');
     let browser_url =
         format!("{fe_base}/desktop/browser-auth?start_token={start_token}&source=cli");

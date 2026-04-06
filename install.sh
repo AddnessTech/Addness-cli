@@ -5,7 +5,7 @@ set -eu
 # Usage: curl -fsSL https://cli.addness.com/install.sh | sh
 
 CDN_BASE="${ADDNESS_CDN_BASE:-https://cli.addness.com}"
-INSTALL_DIR="${ADDNESS_INSTALL_DIR:-/usr/local/bin}"
+INSTALL_DIR="${ADDNESS_INSTALL_DIR:-${HOME}/.local/bin}"
 VERSION="${ADDNESS_VERSION:-latest}"
 
 # Colors (disabled when not a TTY)
@@ -85,6 +85,7 @@ main() {
   detect_platform
   printf "\n"
   download_and_install
+  ensure_path
   verify_installation
 }
 
@@ -129,7 +130,6 @@ download_and_install() {
   TMPDIR="$(mktemp -d)"
   trap 'rm -rf "${TMPDIR}"' EXIT
 
-  # ダウンロード（プログレスバー付き）
   if [ -t 1 ]; then
     printf "  ${DIM}>${RESET} Downloading\n"
     curl -fSL --progress-bar "${URL}" -o "${TMPDIR}/${ARCHIVE}"
@@ -164,27 +164,61 @@ download_and_install() {
   step_ok
 }
 
+ensure_path() {
+  # Already in PATH — nothing to do
+  case ":${PATH}:" in
+    *":${INSTALL_DIR}:"*) return ;;
+  esac
+
+  SHELL_NAME="$(basename "${SHELL:-/bin/sh}")"
+
+  case "${SHELL_NAME}" in
+    fish)
+      RC_FILE="${HOME}/.config/fish/config.fish"
+      PATH_LINE="fish_add_path ${INSTALL_DIR}"
+      ;;
+    zsh)
+      RC_FILE="${HOME}/.zshrc"
+      PATH_LINE="export PATH=\"${INSTALL_DIR}:\$PATH\""
+      ;;
+    bash)
+      # Prefer .bashrc, fall back to .bash_profile on macOS
+      if [ -f "${HOME}/.bashrc" ]; then
+        RC_FILE="${HOME}/.bashrc"
+      else
+        RC_FILE="${HOME}/.bash_profile"
+      fi
+      PATH_LINE="export PATH=\"${INSTALL_DIR}:\$PATH\""
+      ;;
+    *)
+      RC_FILE=""
+      PATH_LINE="export PATH=\"${INSTALL_DIR}:\$PATH\""
+      ;;
+  esac
+
+  if [ -n "${RC_FILE}" ]; then
+    # Don't add twice
+    if [ -f "${RC_FILE}" ] && grep -qF "${INSTALL_DIR}" "${RC_FILE}" 2>/dev/null; then
+      return
+    fi
+
+    printf "\n%s\n" "${PATH_LINE}" >> "${RC_FILE}"
+    info "Added ${BOLD}${INSTALL_DIR}${RESET} to PATH in ${DIM}${RC_FILE}${RESET}"
+    # Also export for current script so verify_installation works
+    export PATH="${INSTALL_DIR}:${PATH}"
+  else
+    info "${DIM}Add to your PATH manually:${RESET}"
+    info "  ${BOLD}${PATH_LINE}${RESET}"
+  fi
+}
+
 verify_installation() {
   printf "\n"
   if command -v addness >/dev/null 2>&1; then
     ok "${GREEN}Addness CLI installed successfully!${RESET}"
   else
     ok "Installed to ${BOLD}${INSTALL_DIR}/addness${RESET}"
-    printf "\n"
-    printf "  ${DIM}Add to your PATH:${RESET}\n"
-    SHELL_NAME="$(basename "${SHELL:-/bin/sh}")"
-    case "${SHELL_NAME}" in
-      zsh)  RC_FILE="\$HOME/.zshrc" ;;
-      bash) RC_FILE="\$HOME/.bashrc" ;;
-      fish) RC_FILE="\$HOME/.config/fish/config.fish" ;;
-      *)    RC_FILE="your shell config" ;;
-    esac
-    if [ "${SHELL_NAME}" = "fish" ]; then
-      printf "  ${BOLD}  fish_add_path %s${RESET}\n" "${INSTALL_DIR}"
-    else
-      printf "  ${BOLD}  echo 'export PATH=\"%s:\$PATH\"' >> %s${RESET}\n" "${INSTALL_DIR}" "${RC_FILE}"
-    fi
-    printf "  ${DIM}Then restart your terminal or run: source %s${RESET}\n" "${RC_FILE}"
+    info "${DIM}Restart your terminal to use the addness command${RESET}"
   fi
 
   printf "\n"

@@ -92,18 +92,21 @@ pub async fn handle_link(cmd: &LinkCommands, client: &ApiClient) -> Result<()> {
 
             if let Some(status_str) = status {
                 use crate::api::{ApiResponse, Goal, GoalStatus, UpdateGoalRequest};
-                let (is_completed, goal_status) = match status_str.to_uppercase().as_str() {
-                    "NOT_STARTED" => (Some(false), Some(GoalStatus::None)),
-                    "IN_PROGRESS" => (Some(false), Some(GoalStatus::InProgress)),
-                    "COMPLETED" => (Some(true), Some(GoalStatus::None)),
-                    "CANCELLED" => (Some(false), Some(GoalStatus::Cancelled)),
+                let (completed_at, goal_status) = match status_str.to_uppercase().as_str() {
+                    "NOT_STARTED" => (Some(None), Some(GoalStatus::None)),
+                    "IN_PROGRESS" => (Some(None), Some(GoalStatus::InProgress)),
+                    "COMPLETED" => {
+                        let now = chrono::Utc::now().to_rfc3339();
+                        (Some(Some(now)), None)
+                    }
+                    "CANCELLED" => (Some(None), Some(GoalStatus::Cancelled)),
                     _ => bail!(
                         "Invalid status: '{status_str}'. Use one of: NOT_STARTED, IN_PROGRESS, COMPLETED, CANCELLED"
                     ),
                 };
                 let req = UpdateGoalRequest {
                     status: goal_status,
-                    is_completed,
+                    completed_at,
                     title: None,
                     description: None,
                 };

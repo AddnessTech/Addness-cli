@@ -68,8 +68,9 @@ pub struct CreateGoalRequest {
 pub struct UpdateGoalRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<GoalStatus>,
+    /// Set to Some(timestamp) to mark completed, Some(None) to uncomplete
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub is_completed: Option<bool>,
+    pub completed_at: Option<Option<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

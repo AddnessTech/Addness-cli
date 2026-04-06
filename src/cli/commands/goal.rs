@@ -284,18 +284,18 @@ fn print_context_table(
     }
 }
 
-/// Parse CLI status into (is_completed, api_status) pair.
-/// CLI status      → is_completed  | API status
-/// NOT_STARTED     → false         | NONE
-/// IN_PROGRESS     → false         | IN_PROGRESS
-/// COMPLETED       → true          | (unchanged)
-/// CANCELLED       → false         | CANCELLED
-fn parse_status(status: &str) -> Result<(Option<bool>, Option<GoalStatus>)> {
+/// Parse CLI status into (completed_at, api_status) pair.
+/// COMPLETED sets completed_at to current UTC timestamp.
+/// Others clear completed_at (null).
+fn parse_status(status: &str) -> Result<(Option<Option<String>>, Option<GoalStatus>)> {
     match status.to_uppercase().as_str() {
-        "NOT_STARTED" => Ok((Some(false), Some(GoalStatus::None))),
-        "IN_PROGRESS" => Ok((Some(false), Some(GoalStatus::InProgress))),
-        "COMPLETED" => Ok((Some(true), Some(GoalStatus::None))),
-        "CANCELLED" => Ok((Some(false), Some(GoalStatus::Cancelled))),
+        "NOT_STARTED" => Ok((Some(None), Some(GoalStatus::None))),
+        "IN_PROGRESS" => Ok((Some(None), Some(GoalStatus::InProgress))),
+        "COMPLETED" => {
+            let now = chrono::Utc::now().to_rfc3339();
+            Ok((Some(Some(now)), None))
+        }
+        "CANCELLED" => Ok((Some(None), Some(GoalStatus::Cancelled))),
         _ => bail!(
             "Invalid status: '{status}'. Use one of: NOT_STARTED, IN_PROGRESS, COMPLETED, CANCELLED"
         ),
@@ -490,7 +490,7 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
         } => {
             let org_id = resolve_org_id(org.as_deref())?;
 
-            let (is_completed, goal_status) = if let Some(s) = status {
+            let (completed_at, goal_status) = if let Some(s) = status {
                 parse_status(s)?
             } else {
                 (None, None)
@@ -498,7 +498,7 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
 
             let mut req = UpdateGoalRequest {
                 status: goal_status,
-                is_completed,
+                completed_at,
                 title: None,
                 description: None,
             };
@@ -507,7 +507,7 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
                 req.title = Some(t.clone());
             }
 
-            if req.status.is_none() && req.is_completed.is_none() && req.title.is_none() {
+            if req.status.is_none() && req.completed_at.is_none() && req.title.is_none() {
                 bail!("Nothing to update. Specify --status or --title.");
             }
 

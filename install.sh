@@ -162,6 +162,14 @@ download_and_install() {
   mv addness "${INSTALL_DIR}/addness"
   chmod +x "${INSTALL_DIR}/addness"
   step_ok
+
+  # Clean up legacy install location
+  LEGACY_BIN="${HOME}/.addness/bin/addness"
+  if [ -x "${LEGACY_BIN}" ] && [ "${INSTALL_DIR}/addness" != "${LEGACY_BIN}" ]; then
+    step "Removing old binary at ${LEGACY_BIN}"
+    rm -f "${LEGACY_BIN}"
+    step_ok
+  fi
 }
 
 ensure_path() {

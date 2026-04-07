@@ -120,6 +120,15 @@ function Main {
         Copy-Item (Join-Path $TmpDir "addness.exe") (Join-Path $InstallDir "addness.exe") -Force
         Write-StepOk
 
+        # Clean up legacy install location
+        $LegacyBin = Join-Path $env:USERPROFILE ".addness\bin\addness.exe"
+        $CurrentBin = Join-Path $InstallDir "addness.exe"
+        if ((Test-Path $LegacyBin) -and ($LegacyBin -ne $CurrentBin)) {
+            Write-Step "Removing old binary at $LegacyBin"
+            Remove-Item -Force $LegacyBin -ErrorAction SilentlyContinue
+            Write-StepOk
+        }
+
         # Add to PATH if not already present
         $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
         if ($userPath -notlike "*${InstallDir}*") {

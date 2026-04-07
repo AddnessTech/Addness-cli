@@ -1,10 +1,12 @@
 mod comment;
 mod deliverable;
 mod goal;
+mod member;
 mod org;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use reqwest::Client;
+use reqwest::StatusCode;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use reqwest::multipart;
 use serde::Serialize;
@@ -43,6 +45,41 @@ impl ApiClient {
         self
     }
 
+    fn api_error(status: StatusCode, body: &str) -> anyhow::Error {
+        if status == StatusCode::FORBIDDEN && body.contains("ORG_NOT_MEMBER") {
+            return anyhow::anyhow!(
+                "API error ({status}): {body}\n\n\
+                 Hint: Your current organization may be invalid.\n\
+                 Run `addness org list` to see available organizations,\n\
+                 then `addness org switch <id>` to switch."
+            );
+        }
+        anyhow::anyhow!("API error ({status}): {body}")
+    }
+
+    /// x-organization-id ヘッダーなしでGETリクエストを発行する。
+    /// 組織に依存しないエンドポイント（org list等）で使用。
+    pub(super) async fn get_without_org<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+        let url = format!("{}{}", self.base_url, path);
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("Failed to send request to {url}"))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(Self::api_error(status, &body));
+        }
+
+        response
+            .json::<T>()
+            .await
+            .with_context(|| format!("Failed to parse response from {url}"))
+    }
+
     /// ApiClient::get() は与えられた path をURLパスとして
     /// GET path リクエストをAPIに発行して
     /// レスポンスを返す
@@ -67,7 +104,7 @@ impl ApiClient {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            bail!("API error ({status}): {body}");
+            return Err(Self::api_error(status, &body));
         }
 
         response
@@ -99,7 +136,7 @@ impl ApiClient {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            bail!("API error ({status}): {body}");
+            return Err(Self::api_error(status, &body));
         }
 
         response
@@ -131,7 +168,7 @@ impl ApiClient {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            bail!("API error ({status}): {body}");
+            return Err(Self::api_error(status, &body));
         }
 
         response
@@ -163,7 +200,7 @@ impl ApiClient {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            bail!("API error ({status}): {body}");
+            return Err(Self::api_error(status, &body));
         }
 
         response

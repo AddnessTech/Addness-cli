@@ -20,6 +20,12 @@ pub enum GoalCommands {
         /// Tree depth (default: 3)
         #[arg(long, default_value = "3")]
         depth: usize,
+        /// Filter by owner name (use "me" for yourself)
+        #[arg(long)]
+        assigned_to: Option<String>,
+        /// Filter by status: NOT_STARTED, IN_PROGRESS, COMPLETED, CANCELLED
+        #[arg(long)]
+        status: Option<String>,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -304,14 +310,62 @@ fn parse_status(status: &str) -> Result<(Option<Option<String>>, Option<GoalStat
 
 pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> {
     match cmd {
-        GoalCommands::List { org, depth, json } => {
+        GoalCommands::List {
+            org,
+            depth,
+            assigned_to,
+            status,
+            json,
+        } => {
             let org_id = resolve_org_id(org.as_deref())?;
             let resp: ApiResponse<GoalTreeData> = client.get_goal_tree(&org_id, *depth).await?;
 
+            let mut items = resp.data.items;
+
+            // --assigned-to filter
+            if let Some(filter) = assigned_to {
+                let owner_name = if filter.eq_ignore_ascii_case("me") {
+                    let members_resp = client.get_members(&org_id).await?;
+                    members_resp
+                        .data
+                        .members
+                        .iter()
+                        .find(|m| m.is_current_user)
+                        .map(|m| m.name.clone())
+                        .ok_or_else(|| anyhow::anyhow!("Could not determine current user. Try using your name instead of 'me'."))?
+                } else {
+                    filter.clone()
+                };
+                let name_lower = owner_name.to_lowercase();
+                items.retain(|item| {
+                    item.owner
+                        .as_ref()
+                        .is_some_and(|o| o.name.to_lowercase().contains(&name_lower))
+                });
+            }
+
+            // --status filter
+            if let Some(status_filter) = status {
+                items.retain(|item| match status_filter.to_uppercase().as_str() {
+                    "COMPLETED" => item.is_completed,
+                    "NOT_STARTED" => {
+                        !item.is_completed
+                            && item.status.as_ref().is_none_or(|s| *s == GoalStatus::None)
+                    }
+                    "IN_PROGRESS" => {
+                        !item.is_completed && item.status.as_ref() == Some(&GoalStatus::InProgress)
+                    }
+                    "CANCELLED" => {
+                        !item.is_completed && item.status.as_ref() == Some(&GoalStatus::Cancelled)
+                    }
+                    _ => true,
+                });
+            }
+
             if *json {
-                println!("{}", serde_json::to_string_pretty(&resp.data.items)?);
+                println!("{}", serde_json::to_string_pretty(&items)?);
             } else {
-                print_goals_table(&resp.data.items);
+                print_goals_table(&items);
             }
             Ok(())
         }

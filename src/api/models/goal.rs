@@ -18,9 +18,7 @@ pub enum GoalStatus {
 
 /// Deserialize Option<GoalStatus> that tolerates empty strings.
 /// Backend may return "" for status (Go string zero value).
-pub fn deserialize_optional_status<'de, D>(
-    deserializer: D,
-) -> Result<Option<GoalStatus>, D::Error>
+pub fn deserialize_optional_status<'de, D>(deserializer: D) -> Result<Option<GoalStatus>, D::Error>
 where
     D: Deserializer<'de>,
 {

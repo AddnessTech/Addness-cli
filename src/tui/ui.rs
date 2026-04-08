@@ -3,12 +3,14 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
 
 use super::app::{ActivePane, App};
+use super::goal_tree::TreeRow;
+use crate::api::{DeliverableType, GoalStatus};
 
-pub fn draw(frame: &mut Frame, app: &App) {
+pub fn draw(frame: &mut Frame, app: &mut App) {
     let main_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -136,7 +138,7 @@ fn draw_navigation(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(nav, area);
 }
 
-fn draw_content(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_content(frame: &mut Frame, area: Rect, app: &mut App) {
     let border_color = if app.active_pane == ActivePane::Content {
         Color::Cyan
     } else {
@@ -144,71 +146,246 @@ fn draw_content(frame: &mut Frame, area: Rect, app: &App) {
     };
 
     match app.sidebar_index {
-        0 => draw_goals(frame, area, border_color),
+        0 => draw_goals(frame, area, app, border_color),
         1 => draw_comments(frame, area, border_color),
         _ => {}
     }
 }
 
-fn draw_goals(frame: &mut Frame, area: Rect, border_color: Color) {
-    let rows = vec![
-        Row::new(vec![
-            Cell::from("G-001"),
-            Cell::from("Launch MVP"),
-            Cell::from("In Progress").style(Style::default().fg(Color::Yellow)),
-            Cell::from("2025-06-01"),
-        ]),
-        Row::new(vec![
-            Cell::from("G-002"),
-            Cell::from("Setup CI/CD Pipeline"),
-            Cell::from("Done").style(Style::default().fg(Color::Green)),
-            Cell::from("2025-04-15"),
-        ]),
-        Row::new(vec![
-            Cell::from("G-003"),
-            Cell::from("Write API Documentation"),
-            Cell::from("Not Started").style(Style::default().fg(Color::Red)),
-            Cell::from("2025-07-01"),
-        ]),
-        Row::new(vec![
-            Cell::from("G-004"),
-            Cell::from("User Authentication"),
-            Cell::from("In Progress").style(Style::default().fg(Color::Yellow)),
-            Cell::from("2025-05-20"),
-        ]),
-        Row::new(vec![
-            Cell::from("G-005"),
-            Cell::from("Performance Optimization"),
-            Cell::from("Not Started").style(Style::default().fg(Color::Red)),
-            Cell::from("2025-08-01"),
-        ]),
-    ];
+// ---------------------------------------------------------------------------
+// Goal tree rendering
+// ---------------------------------------------------------------------------
 
-    let widths = [
-        Constraint::Length(8),
-        Constraint::Min(25),
-        Constraint::Length(14),
-        Constraint::Length(12),
-    ];
+fn draw_goals(frame: &mut Frame, area: Rect, app: &mut App, border_color: Color) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .title(" Goals ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
-    let table = Table::new(rows, widths)
-        .header(
-            Row::new(vec!["ID", "Title", "Status", "Due Date"])
-                .style(
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )
-                .bottom_margin(1),
-        )
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border_color))
-                .title(" Goals (mock) "),
-        );
-    frame.render_widget(table, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let viewport_h = inner.height as usize;
+    app.content_height = viewport_h;
+    app.goal_tree.adjust_scroll(viewport_h);
+
+    let rows = app.goal_tree.flatten();
+    let scroll = app.goal_tree.scroll_offset;
+
+    let visible = rows
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(viewport_h);
+
+    for (i, row) in visible {
+        let y = inner.y + (i - scroll) as u16;
+        if y >= inner.y + inner.height {
+            break;
+        }
+        let line_area = Rect::new(inner.x, y, inner.width, 1);
+        let is_cursor = i == app.goal_tree.cursor;
+
+        let line = render_tree_row(row, is_cursor, inner.width as usize);
+        frame.render_widget(Paragraph::new(line), line_area);
+    }
 }
+
+fn render_tree_row(row: &TreeRow, is_cursor: bool, width: usize) -> Line<'static> {
+    let bg = if is_cursor {
+        Color::DarkGray
+    } else {
+        Color::Reset
+    };
+
+    match row {
+        TreeRow::Goal { node, depth } => {
+            let indent = "  ".repeat(*depth);
+            let icon = if node.summary.has_children() || node.children.is_some() {
+                if node.expanded { "▼ " } else { "▶ " }
+            } else {
+                "  "
+            };
+
+            let title = node.summary.title();
+            let status_str = format_status(node.summary.status());
+            let owner_str = node
+                .summary
+                .owner()
+                .map(|o| o.name.as_str())
+                .unwrap_or("");
+
+            let completed = node.summary.is_completed();
+            let title_style = if completed {
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::CROSSED_OUT)
+                    .bg(bg)
+            } else {
+                Style::default().fg(Color::White).bg(bg)
+            };
+
+            let mut spans = vec![
+                Span::styled(format!("{indent}{icon}"), Style::default().fg(Color::Cyan).bg(bg)),
+                Span::styled(title.to_string(), title_style),
+            ];
+
+            // Append status + owner inline if there's room
+            let meta = format_goal_meta(&status_str, owner_str);
+            if !meta.is_empty() {
+                spans.push(Span::styled(
+                    format!("  {meta}"),
+                    Style::default().fg(Color::DarkGray).bg(bg),
+                ));
+            }
+
+            // Pad to full width for cursor highlight
+            if is_cursor {
+                let content_len: usize = spans.iter().map(|s| s.content.len()).sum();
+                if content_len < width {
+                    spans.push(Span::styled(
+                        " ".repeat(width - content_len),
+                        Style::default().bg(bg),
+                    ));
+                }
+            }
+
+            Line::from(spans)
+        }
+        TreeRow::Detail { goal, depth } => {
+            let indent = "  ".repeat(*depth);
+            let status_str = format_status(goal.status.as_ref());
+            let owner_str = goal.owner.as_ref().map(|o| o.name.as_str()).unwrap_or("-");
+            let due = goal.due_date.as_deref().unwrap_or("-");
+
+            let text = format!("{indent}  {status_str} | {owner_str} | Due: {due}");
+
+            let mut spans = vec![Span::styled(
+                text.clone(),
+                Style::default().fg(Color::DarkGray).bg(bg),
+            )];
+            if is_cursor {
+                pad_line(&mut spans, text.len(), width, bg);
+            }
+            Line::from(spans)
+        }
+        TreeRow::CommentHeader { count, depth } => {
+            let indent = "  ".repeat(*depth);
+            let text = format!("{indent}  \u{1F4DD} {count} comment{}", if *count != 1 { "s" } else { "" });
+
+            let mut spans = vec![Span::styled(
+                text.clone(),
+                Style::default().fg(Color::Yellow).bg(bg),
+            )];
+            if is_cursor {
+                pad_line(&mut spans, text.len(), width, bg);
+            }
+            Line::from(spans)
+        }
+        TreeRow::CommentItem { comment, depth } => {
+            let indent = "  ".repeat(*depth);
+            let author = &comment.author.name;
+            let content = truncate_str(&comment.content, width.saturating_sub(indent.len() + author.len() + 4));
+            let text_len = indent.len() + author.len() + 2 + content.len();
+
+            let mut spans = vec![
+                Span::styled(format!("{indent}  "), Style::default().bg(bg)),
+                Span::styled(
+                    format!("{author}:"),
+                    Style::default().fg(Color::Cyan).bg(bg),
+                ),
+                Span::styled(
+                    format!(" {content}"),
+                    Style::default().fg(Color::White).bg(bg),
+                ),
+            ];
+            if is_cursor {
+                pad_line(&mut spans, text_len + 1, width, bg);
+            }
+            Line::from(spans)
+        }
+        TreeRow::DeliverableHeader { count, depth } => {
+            let indent = "  ".repeat(*depth);
+            let text = format!(
+                "{indent}  \u{1F4CE} {count} deliverable{}",
+                if *count != 1 { "s" } else { "" }
+            );
+
+            let mut spans = vec![Span::styled(
+                text.clone(),
+                Style::default().fg(Color::Magenta).bg(bg),
+            )];
+            if is_cursor {
+                pad_line(&mut spans, text.len(), width, bg);
+            }
+            Line::from(spans)
+        }
+        TreeRow::DeliverableItem { deliverable, depth } => {
+            let indent = "  ".repeat(*depth);
+            let icon = match deliverable.node_type {
+                DeliverableType::Document => "\u{1F4C4}",
+                DeliverableType::Folder => "\u{1F4C1}",
+                DeliverableType::File => "\u{1F4CE}",
+                DeliverableType::Link => "\u{1F517}",
+            };
+            let text = format!("{indent}  {icon} {}", deliverable.display_name);
+
+            let mut spans = vec![Span::styled(
+                text.clone(),
+                Style::default().fg(Color::White).bg(bg),
+            )];
+            if is_cursor {
+                pad_line(&mut spans, text.len(), width, bg);
+            }
+            Line::from(spans)
+        }
+    }
+}
+
+fn format_status(status: Option<&GoalStatus>) -> &'static str {
+    match status {
+        Some(GoalStatus::Active) => "Active",
+        Some(GoalStatus::InProgress) => "InProgress",
+        Some(GoalStatus::Completed) => "Completed",
+        Some(GoalStatus::Cancelled) => "Cancelled",
+        Some(GoalStatus::None) | None => "-",
+    }
+}
+
+fn format_goal_meta(status: &str, owner: &str) -> String {
+    match (status, owner) {
+        ("-", "") => String::new(),
+        (s, "") => s.to_string(),
+        ("-", o) => o.to_string(),
+        (s, o) => format!("{s} | {o}"),
+    }
+}
+
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else if max > 3 {
+        format!("{}...", &s[..max - 3])
+    } else {
+        s.chars().take(max).collect()
+    }
+}
+
+fn pad_line(spans: &mut Vec<Span<'static>>, content_len: usize, width: usize, bg: Color) {
+    if content_len < width {
+        spans.push(Span::styled(
+            " ".repeat(width - content_len),
+            Style::default().bg(bg),
+        ));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Comments (unchanged mock)
+// ---------------------------------------------------------------------------
 
 fn draw_comments(frame: &mut Frame, area: Rect, border_color: Color) {
     let text = vec![
@@ -255,6 +432,10 @@ fn draw_comments(frame: &mut Frame, area: Rect, border_color: Color) {
     frame.render_widget(paragraph, area);
 }
 
+// ---------------------------------------------------------------------------
+// Status bar
+// ---------------------------------------------------------------------------
+
 fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
     let current_section = app.sidebar_items[app.sidebar_index];
     let pane_label = match app.active_pane {
@@ -262,7 +443,8 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
         ActivePane::Navigation => "Nav",
         ActivePane::Content => "Content",
     };
-    let status = Paragraph::new(Line::from(vec![
+
+    let mut hints = vec![
         Span::styled(
             " q",
             Style::default()
@@ -278,19 +460,38 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
         ),
         Span::raw(": Switch Pane  "),
         Span::styled(
-            "↑↓/jk",
+            "\u{2191}\u{2193}/jk",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(": Navigate  "),
-        Span::styled("|", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            format!(" [{pane_label}] {current_section} "),
-            Style::default().fg(Color::Yellow),
-        ),
-    ]))
-    .block(
+    ];
+
+    if app.active_pane == ActivePane::Content && app.sidebar_index == 0 {
+        hints.push(Span::styled(
+            "Enter/l",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        hints.push(Span::raw(": Expand  "));
+        hints.push(Span::styled(
+            "h",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        hints.push(Span::raw(": Collapse  "));
+    }
+
+    hints.push(Span::styled("|", Style::default().fg(Color::DarkGray)));
+    hints.push(Span::styled(
+        format!(" [{pane_label}] {current_section} "),
+        Style::default().fg(Color::Yellow),
+    ));
+
+    let status = Paragraph::new(Line::from(hints)).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray))

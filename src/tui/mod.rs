@@ -1,4 +1,5 @@
 mod app;
+mod goal_tree;
 mod ui;
 
 use anyhow::Result;

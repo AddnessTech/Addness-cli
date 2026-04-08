@@ -210,6 +210,7 @@ fn render_tree_row(row: &TreeRow, is_cursor: bool, width: usize) -> Line<'static
             is_completed,
             expanded,
             depth,
+            ..
         } => {
             let indent = "  ".repeat(*depth);
             let icon = if *expanded { "- " } else { "+ " };
@@ -457,6 +458,25 @@ fn draw_comments(frame: &mut Frame, area: Rect, border_color: Color) {
 // ---------------------------------------------------------------------------
 
 fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
+    // Show error message if present
+    if let Some(ref err) = app.error_message {
+        let status = Paragraph::new(Line::from(vec![
+            Span::styled(
+                " ERROR: ",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(err.clone(), Style::default().fg(Color::Red)),
+        ]))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red))
+                .title(" Error "),
+        );
+        frame.render_widget(status, area);
+        return;
+    }
+
     let current_section = app.sidebar_items[app.sidebar_index];
     let pane_label = match app.active_pane {
         ActivePane::OrgSelector => "Org",

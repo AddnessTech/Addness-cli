@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, List, ListItem, Paragraph, Row, Table},
+    widgets::{Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table},
 };
 
 use super::app::{ActivePane, App};
@@ -25,9 +25,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
         .constraints([Constraint::Length(24), Constraint::Min(0)])
         .split(main_layout[1]);
 
-    draw_sidebar(frame, content_layout[0], app);
+    draw_left_panel(frame, content_layout[0], app);
     draw_content(frame, content_layout[1], app);
     draw_status_bar(frame, main_layout[2], app);
+
+    if app.show_org_popup {
+        draw_org_popup(frame, app);
+    }
 }
 
 fn draw_title_bar(frame: &mut Frame, area: Rect) {
@@ -52,13 +56,54 @@ fn draw_title_bar(frame: &mut Frame, area: Rect) {
     frame.render_widget(title, area);
 }
 
-fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App) {
-    let is_active = app.active_pane == ActivePane::Sidebar;
-    let highlight_color = if is_active {
-        Color::Cyan
+/// Left panel: org selector (top) + navigation (bottom)
+fn draw_left_panel(frame: &mut Frame, area: Rect, app: &App) {
+    let panel_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .split(area);
+
+    draw_org_pane(frame, panel_layout[0], app);
+    draw_navigation(frame, panel_layout[1], app);
+}
+
+fn draw_org_pane(frame: &mut Frame, area: Rect, app: &App) {
+    let is_active = app.active_pane == ActivePane::OrgSelector;
+    let border_color = if is_active { Color::Cyan } else { Color::DarkGray };
+
+    let org_name = app.current_org_name();
+    let content = if is_active {
+        Line::from(vec![
+            Span::styled(
+                format!(" {org_name} "),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " <Enter>",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
     } else {
-        Color::DarkGray
+        Line::from(Span::styled(
+            format!(" {org_name}"),
+            Style::default().fg(Color::White),
+        ))
     };
+
+    let pane = Paragraph::new(content).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border_color))
+            .title(" Org "),
+    );
+    frame.render_widget(pane, area);
+}
+
+fn draw_navigation(frame: &mut Frame, area: Rect, app: &App) {
+    let is_active = app.active_pane == ActivePane::Navigation;
+    let highlight_color = if is_active { Color::Cyan } else { Color::DarkGray };
 
     let items: Vec<ListItem> = app
         .sidebar_items
@@ -78,7 +123,7 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
 
-    let sidebar = List::new(items).block(
+    let nav = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(if is_active {
@@ -88,7 +133,7 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App) {
             }))
             .title(" Navigation "),
     );
-    frame.render_widget(sidebar, area);
+    frame.render_widget(nav, area);
 }
 
 fn draw_content(frame: &mut Frame, area: Rect, app: &App) {
@@ -99,53 +144,10 @@ fn draw_content(frame: &mut Frame, area: Rect, app: &App) {
     };
 
     match app.sidebar_index {
-        0 => draw_organizations(frame, area, border_color),
-        1 => draw_goals(frame, area, border_color),
-        2 => draw_comments(frame, area, border_color),
+        0 => draw_goals(frame, area, border_color),
+        1 => draw_comments(frame, area, border_color),
         _ => {}
     }
-}
-
-fn draw_organizations(frame: &mut Frame, area: Rect, border_color: Color) {
-    let rows = vec![
-        Row::new(vec![
-            Cell::from("org-001"),
-            Cell::from("Addness Inc."),
-            Cell::from("5 members"),
-            Cell::from("Active"),
-        ]),
-        Row::new(vec![
-            Cell::from("org-002"),
-            Cell::from("Side Project"),
-            Cell::from("2 members"),
-            Cell::from("Active"),
-        ]),
-    ];
-
-    let widths = [
-        Constraint::Length(10),
-        Constraint::Min(20),
-        Constraint::Length(12),
-        Constraint::Length(10),
-    ];
-
-    let table = Table::new(rows, widths)
-        .header(
-            Row::new(vec!["ID", "Name", "Members", "Status"])
-                .style(
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )
-                .bottom_margin(1),
-        )
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border_color))
-                .title(" Organizations (mock) "),
-        );
-    frame.render_widget(table, area);
 }
 
 fn draw_goals(frame: &mut Frame, area: Rect, border_color: Color) {
@@ -255,6 +257,11 @@ fn draw_comments(frame: &mut Frame, area: Rect, border_color: Color) {
 
 fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
     let current_section = app.sidebar_items[app.sidebar_index];
+    let pane_label = match app.active_pane {
+        ActivePane::OrgSelector => "Org",
+        ActivePane::Navigation => "Nav",
+        ActivePane::Content => "Content",
+    };
     let status = Paragraph::new(Line::from(vec![
         Span::styled(
             " q",
@@ -264,22 +271,22 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
         ),
         Span::raw(": Quit  "),
         Span::styled(
+            "Tab/S-Tab",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(": Switch Pane  "),
+        Span::styled(
             "↑↓/jk",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(": Navigate  "),
-        Span::styled(
-            "Tab",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(": Switch Pane  "),
         Span::styled("|", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            format!(" Section: {current_section} "),
+            format!(" [{pane_label}] {current_section} "),
             Style::default().fg(Color::Yellow),
         ),
     ]))
@@ -290,4 +297,59 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
             .title(" Help "),
     );
     frame.render_widget(status, area);
+}
+
+// ---------------------------------------------------------------------------
+// Org selection popup
+// ---------------------------------------------------------------------------
+
+fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
+    let popup_width = area.width * percent_x / 100;
+    let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    Rect::new(x, y, popup_width, height.min(area.height))
+}
+
+fn draw_org_popup(frame: &mut Frame, app: &App) {
+    let item_count = app.orgs.len() as u16;
+    // border(2) + header(1) + items
+    let popup_height = item_count + 3;
+    let area = centered_rect(40, popup_height, frame.area());
+
+    frame.render_widget(Clear, area);
+
+    let items: Vec<ListItem> = app
+        .orgs
+        .iter()
+        .enumerate()
+        .map(|(i, org)| {
+            let selected = i == app.org_popup_index;
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let prefix = if selected { " > " } else { "   " };
+            let marker = if i == app.current_org_index {
+                " *"
+            } else {
+                ""
+            };
+            ListItem::new(Line::from(Span::styled(
+                format!("{prefix}{}{marker}", org.name),
+                style,
+            )))
+        })
+        .collect();
+
+    let popup = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(" Select Organization ")
+            .title_bottom(Line::from(" Enter: select | Esc: cancel ").style(Style::default().fg(Color::DarkGray))),
+    );
+    frame.render_widget(popup, area);
 }

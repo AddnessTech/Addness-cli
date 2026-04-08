@@ -37,21 +37,45 @@ pub trait GoalItemAccessor {
 }
 
 impl GoalItemAccessor for GoalTreeItem {
-    fn id(&self) -> &str { &self.id }
-    fn title(&self) -> &str { &self.title }
-    fn description(&self) -> Option<&str> { None }
-    fn status(&self) -> Option<&GoalStatus> { self.status.as_ref() }
-    fn is_completed(&self) -> bool { self.is_completed }
-    fn owner(&self) -> Option<&Owner> { self.owner.as_ref() }
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn title(&self) -> &str {
+        &self.title
+    }
+    fn description(&self) -> Option<&str> {
+        None
+    }
+    fn status(&self) -> Option<&GoalStatus> {
+        self.status.as_ref()
+    }
+    fn is_completed(&self) -> bool {
+        self.is_completed
+    }
+    fn owner(&self) -> Option<&Owner> {
+        self.owner.as_ref()
+    }
 }
 
 impl GoalItemAccessor for GoalChildItem {
-    fn id(&self) -> &str { &self.id }
-    fn title(&self) -> &str { &self.title }
-    fn description(&self) -> Option<&str> { self.description.as_deref() }
-    fn status(&self) -> Option<&GoalStatus> { self.status.as_ref() }
-    fn is_completed(&self) -> bool { self.is_completed }
-    fn owner(&self) -> Option<&Owner> { self.owner.as_ref() }
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn title(&self) -> &str {
+        &self.title
+    }
+    fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+    fn status(&self) -> Option<&GoalStatus> {
+        self.status.as_ref()
+    }
+    fn is_completed(&self) -> bool {
+        self.is_completed
+    }
+    fn owner(&self) -> Option<&Owner> {
+        self.owner.as_ref()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -95,6 +119,7 @@ pub enum TreeRow<'a> {
     Detail {
         status: Option<&'a GoalStatus>,
         owner_name: Option<&'a str>,
+        is_completed: bool,
         description: Option<&'a str>,
         depth: usize,
     },
@@ -230,6 +255,7 @@ fn flatten_node<'a, S: GoalItemAccessor>(
     rows.push(TreeRow::Detail {
         status: node.node.status(),
         owner_name: node.node.owner().map(|o| o.name.as_str()),
+        is_completed: node.node.is_completed(),
         description: node.node.description(),
         depth: child_depth,
     });
@@ -310,7 +336,7 @@ impl GoalTree {
                 id: "goal-001".into(),
                 parent_id: None,
                 title: "Company Strategy".into(),
-                status: Some(GoalStatus::Active),
+                status: Some(GoalStatus::InProgress),
                 order_no: 1.0,
                 is_completed: false,
                 has_children: true,
@@ -376,7 +402,7 @@ impl GoalTree {
                         title: "Q1 Goals".into(),
                         description: Some("First quarter objectives".into()),
                         parent_id: Some("goal-001".into()),
-                        status: Some(GoalStatus::Completed),
+                        status: None,
                         is_completed: true,
                         has_children: true,
                         order_no: 1.0,
@@ -429,7 +455,7 @@ impl GoalTree {
                                         parent_id: None,
                                         title: "Personal Development".into(),
                                         description: None,
-                                        status: Some(GoalStatus::Active),
+                                        status: Some(GoalStatus::InProgress),
                                         order_no: 2.0,
                                         is_completed: false,
                                         has_children: true,
@@ -448,9 +474,7 @@ impl GoalTree {
                                         id: "goal-007".into(),
                                         parent_id: None,
                                         title: "Infrastructure Upgrade".into(),
-                                        description: Some(
-                                            "Migrate to new cloud provider".into(),
-                                        ),
+                                        description: Some("Migrate to new cloud provider".into()),
                                         status: Some(GoalStatus::InProgress),
                                         order_no: 3.0,
                                         is_completed: false,
@@ -476,7 +500,7 @@ impl GoalTree {
                                 title: "Customer Acquisition".into(),
                                 description: Some("Acquire 500 new customers".into()),
                                 parent_id: Some("goal-003".into()),
-                                status: Some(GoalStatus::Active),
+                                status: Some(GoalStatus::InProgress),
                                 is_completed: false,
                                 has_children: false,
                                 order_no: 2.0,

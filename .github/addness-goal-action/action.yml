@@ -1,0 +1,85 @@
+name: "Addness Goal Tracker"
+description: "Automatically link merged PRs to Addness goals and update progress"
+
+inputs:
+  api-key:
+    description: "Addness API key"
+    required: true
+  api-url:
+    description: "Addness API URL"
+    required: false
+    default: "https://vt.api.addness.com"
+  on-merge-status:
+    description: "Status to set on goal when PR is merged (e.g., COMPLETED, IN_PROGRESS). Leave empty to skip."
+    required: false
+    default: ""
+
+runs:
+  using: "composite"
+  steps:
+    - name: Extract goal ID from PR
+      id: extract
+      shell: bash
+      env:
+        PR_TITLE: ${{ github.event.pull_request.title }}
+        PR_BODY: ${{ github.event.pull_request.body }}
+        BRANCH: ${{ github.event.pull_request.head.ref }}
+      run: |
+        # Look for [goal:UUID] pattern in PR title, body, or branch name
+        extract_goal() {
+          echo "$1" | grep -oE '\[goal:[a-f0-9-]+\]' | head -1 | sed 's/\[goal://;s/\]//'
+        }
+
+        GOAL_ID=$(extract_goal "$PR_TITLE")
+        if [ -z "$GOAL_ID" ]; then
+          GOAL_ID=$(extract_goal "$PR_BODY")
+        fi
+        if [ -z "$GOAL_ID" ]; then
+          GOAL_ID=$(echo "$BRANCH" | grep -oE 'goal/[a-f0-9-]+' | head -1 | sed 's|goal/||')
+        fi
+
+        if [ -z "$GOAL_ID" ]; then
+          echo "No goal ID found in PR title, body, or branch name."
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+        elif ! echo "$GOAL_ID" | grep -qE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+          echo "::warning::Extracted goal ID is not a valid UUID: $GOAL_ID"
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "goal_id=$GOAL_ID" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "Found goal ID: $GOAL_ID"
+        fi
+
+    - name: Install Addness CLI
+      if: steps.extract.outputs.skip != 'true'
+      shell: bash
+      run: |
+        curl -fsSL https://cli.addness.com/install.sh | ADDNESS_INSTALL_DIR="$RUNNER_TEMP/addness" sh
+        echo "$RUNNER_TEMP/addness" >> "$GITHUB_PATH"
+
+    - name: Link PR and update goal
+      if: steps.extract.outputs.skip != 'true'
+      shell: bash
+      env:
+        ADDNESS_API_KEY: ${{ inputs.api-key }}
+        ADDNESS_API_URL: ${{ inputs.api-url }}
+        GOAL_ID: ${{ steps.extract.outputs.goal_id }}
+        PR_URL: ${{ github.event.pull_request.html_url }}
+        PR_TITLE: ${{ github.event.pull_request.title }}
+        MERGE_STATUS: ${{ inputs.on-merge-status }}
+      run: |
+        # Configure CLI via credentials file
+        mkdir -p "$HOME/.addness"
+        jq -n --arg token "$ADDNESS_API_KEY" --arg url "$ADDNESS_API_URL" \
+          '{"token": $token, "api_url": $url}' > "$HOME/.addness/credentials.json"
+
+        # Link PR to goal
+        addness link pr --goal "$GOAL_ID" --url "$PR_URL" --name "$PR_TITLE" \
+          --comment "PR merged: $PR_TITLE"
+
+        # Update status if configured
+        if [ -n "$MERGE_STATUS" ]; then
+          addness link progress --goal "$GOAL_ID" \
+            --message "PR merged, updating status to $MERGE_STATUS" \
+            --status "$MERGE_STATUS"
+        fi

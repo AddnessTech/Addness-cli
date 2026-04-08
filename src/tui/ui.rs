@@ -214,7 +214,7 @@ fn render_tree_row(row: &TreeRow, is_cursor: bool, width: usize) -> Line<'static
             let indent = "  ".repeat(*depth);
             let icon = if *expanded { "- " } else { "+ " };
 
-            let status_str = format_status(*status);
+            let status_str = format_status(*is_completed, *status);
             let owner_str = owner_name.unwrap_or("");
 
             let completed = *is_completed;
@@ -261,10 +261,11 @@ fn render_tree_row(row: &TreeRow, is_cursor: bool, width: usize) -> Line<'static
             status,
             owner_name,
             description,
+            is_completed,
             depth,
         } => {
             let indent = "  ".repeat(*depth);
-            let status_str = format_status(*status);
+            let status_str = format_status(*is_completed, *status);
             let owner_str = owner_name.unwrap_or("-");
             let desc = description.unwrap_or("");
 
@@ -362,13 +363,15 @@ fn render_tree_row(row: &TreeRow, is_cursor: bool, width: usize) -> Line<'static
     }
 }
 
-fn format_status(status: Option<&GoalStatus>) -> &'static str {
-    match status {
-        Some(GoalStatus::Active) => "Active",
-        Some(GoalStatus::InProgress) => "InProgress",
-        Some(GoalStatus::Completed) => "Completed",
-        Some(GoalStatus::Cancelled) => "Cancelled",
-        Some(GoalStatus::None) | None => "-",
+fn format_status(is_completed: bool, status: Option<&GoalStatus>) -> &'static str {
+    if is_completed {
+        "Completed"
+    } else {
+        match status {
+            Some(GoalStatus::InProgress) => "InProgress",
+            Some(GoalStatus::Cancelled) => "Cancelled",
+            _ => "NotStarted",
+        }
     }
 }
 

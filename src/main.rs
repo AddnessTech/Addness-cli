@@ -1,6 +1,7 @@
 mod api;
 mod cli;
 mod config;
+mod tui;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
@@ -16,7 +17,7 @@ use cli::commands::{comment, configure, goal, login, org};
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -68,22 +69,23 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Login {
+        None => tui::run(),
+        Some(Commands::Login {
             api_url,
             frontend_url,
-        } => login::handle_login(api_url, frontend_url.as_deref()).await,
-        Commands::Configure => configure::handle_configure(),
-        Commands::Status => configure::handle_status(),
-        Commands::Logout => configure::handle_logout(),
-        Commands::Org { command } => {
+        }) => login::handle_login(api_url, frontend_url.as_deref()).await,
+        Some(Commands::Configure) => configure::handle_configure(),
+        Some(Commands::Status) => configure::handle_status(),
+        Some(Commands::Logout) => configure::handle_logout(),
+        Some(Commands::Org { command }) => {
             let client = build_client()?;
             org::handle_org(command, &client).await
         }
-        Commands::Goal { command } => {
+        Some(Commands::Goal { command }) => {
             let client = build_client()?;
             goal::handle_goals(command, &client).await
         }
-        Commands::Comment { command } => {
+        Some(Commands::Comment { command }) => {
             let client = build_client()?;
             comment::handle_comments(command, &client).await
         }

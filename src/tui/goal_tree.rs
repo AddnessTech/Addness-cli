@@ -94,7 +94,7 @@ pub struct GoalNode {
 // ---------------------------------------------------------------------------
 
 pub struct GoalTree {
-    pub roots: Timestamped<Vec<GoalNode>>,
+    pub root: Timestamped<GoalNode>,
     pub cursor: usize,
     pub scroll_offset: usize,
 }
@@ -150,9 +150,8 @@ impl<'a> TreeRow<'a> {
 impl GoalTree {
     pub fn flatten(&self) -> Vec<TreeRow<'_>> {
         let mut rows = Vec::new();
-        for node in &self.roots.data {
-            Self::flatten_node(node, 0, &mut rows);
-        }
+        Self::flatten_node(&self.root.data, 0, &mut rows);
+
         rows
     }
 
@@ -214,39 +213,40 @@ impl GoalTree {
         if let Some(TreeRow::Goal { .. }) = rows.get(self.cursor) {
             // We need to find and mutate the corresponding node
             let mut idx = 0;
-            Self::toggle_at(&mut self.roots.data, self.cursor, &mut idx);
+            Self::toggle_at(&mut self.root.data, self.cursor, &mut idx);
         }
     }
 
-    fn toggle_at(nodes: &mut [GoalNode], target: usize, idx: &mut usize) -> bool {
-        for node in nodes.iter_mut() {
-            if *idx == target {
-                node.expanded = !node.expanded;
-                return true;
-            }
-            *idx += 1;
+    fn toggle_at(node: &mut GoalNode, target: usize, idx: &mut usize) -> bool {
+        if *idx == target {
+            node.expanded = !node.expanded;
+            return true;
+        }
+        *idx += 1;
 
-            if node.expanded {
-                // Skip detail row
-                if node.detail.is_some() {
-                    *idx += 1;
-                }
-                // Skip comments
-                if let Some(ref ts) = node.comments {
-                    *idx += 1 + ts.data.len(); // header + items
-                }
-                // Skip deliverables
-                if let Some(ref ts) = node.deliverables {
-                    *idx += 1 + ts.data.len(); // header + items
-                }
-                // Recurse into children
-                if let Some(ref mut ts) = node.children
-                    && Self::toggle_at(&mut ts.data, target, idx)
-                {
-                    return true;
+        if node.expanded {
+            // Skip detail row
+            if node.detail.is_some() {
+                *idx += 1;
+            }
+            // Skip comments
+            if let Some(ts) = &node.comments {
+                *idx += 1 + ts.data.len(); // header + items
+            }
+            // Skip deliverables
+            if let Some(ts) = &node.deliverables {
+                *idx += 1 + ts.data.len(); // header + items
+            }
+            // Recurse into children
+            if let Some(ts) = &mut node.children {
+                for t in &mut ts.data {
+                    if Self::toggle_at(t, target, idx) {
+                        return true;
+                    }
                 }
             }
         }
+
         false
     }
 
@@ -309,226 +309,224 @@ impl GoalTree {
 
 impl GoalTree {
     pub fn mock() -> Self {
-        let roots = vec![
-            // Root 1: Company Strategy – expanded with detail, comments, deliverables, children
-            GoalNode {
-                summary: GoalSummary::Root(GoalTreeItem {
-                    id: "goal-001".into(),
-                    parent_id: None,
-                    title: "Company Strategy".into(),
-                    status: Some(GoalStatus::Active),
-                    order_no: 1.0,
-                    is_completed: false,
-                    has_children: true,
-                    owner: Some(Owner {
-                        id: "user-001".into(),
-                        name: "Alice".into(),
-                    }),
+        let root = GoalNode {
+            summary: GoalSummary::Root(GoalTreeItem {
+                id: "goal-001".into(),
+                parent_id: None,
+                title: "Company Strategy".into(),
+                status: Some(GoalStatus::Active),
+                order_no: 1.0,
+                is_completed: false,
+                has_children: true,
+                owner: Some(Owner {
+                    id: "user-001".into(),
+                    name: "Alice".into(),
                 }),
-                detail: Some(Timestamped::now(Goal {
-                    id: "goal-001".into(),
-                    title: "Company Strategy".into(),
-                    description: Some("Overall company strategy for 2025".into()),
-                    body: None,
-                    status: Some(GoalStatus::Active),
-                    is_completed: false,
-                    completed_at: None,
+            }),
+            detail: Some(Timestamped::now(Goal {
+                id: "goal-001".into(),
+                title: "Company Strategy".into(),
+                description: Some("Overall company strategy for 2025".into()),
+                body: None,
+                status: Some(GoalStatus::Active),
+                is_completed: false,
+                completed_at: None,
+                parent_id: None,
+                organization_id: Some("org-001".into()),
+                due_date: Some("2025-12-31".into()),
+                created_at: Some("2025-01-01".into()),
+                updated_at: Some("2025-04-01".into()),
+                owner: Some(Owner {
+                    id: "user-001".into(),
+                    name: "Alice".into(),
+                }),
+            })),
+            comments: Some(Timestamped::now(vec![
+                Comment {
+                    id: "comment-001".into(),
+                    content: "Great progress so far".into(),
+                    commentable_type: "Objective".into(),
+                    commentable_id: "goal-001".into(),
                     parent_id: None,
-                    organization_id: Some("org-001".into()),
-                    due_date: Some("2025-12-31".into()),
-                    created_at: Some("2025-01-01".into()),
-                    updated_at: Some("2025-04-01".into()),
-                    owner: Some(Owner {
+                    author: CommentAuthor {
                         id: "user-001".into(),
                         name: "Alice".into(),
-                    }),
-                })),
-                comments: Some(Timestamped::now(vec![
-                    Comment {
-                        id: "comment-001".into(),
-                        content: "Great progress so far".into(),
-                        commentable_type: "Objective".into(),
-                        commentable_id: "goal-001".into(),
-                        parent_id: None,
-                        author: CommentAuthor {
-                            id: "user-001".into(),
-                            name: "Alice".into(),
-                            is_ai_agent: false,
-                        },
-                        reply_count: 0,
-                        resolved_at: None,
-                        created_at: "2025-04-01T10:30:00Z".into(),
-                        updated_at: "2025-04-01T10:30:00Z".into(),
+                        is_ai_agent: false,
                     },
-                    Comment {
-                        id: "comment-002".into(),
-                        content: "Need to revisit Q3 targets".into(),
-                        commentable_type: "Objective".into(),
-                        commentable_id: "goal-001".into(),
-                        parent_id: None,
-                        author: CommentAuthor {
-                            id: "user-002".into(),
-                            name: "Bob".into(),
-                            is_ai_agent: false,
-                        },
-                        reply_count: 0,
-                        resolved_at: None,
-                        created_at: "2025-04-02T14:15:00Z".into(),
-                        updated_at: "2025-04-02T14:15:00Z".into(),
-                    },
-                ])),
-                deliverables: Some(Timestamped::now(vec![Deliverable {
-                    id: "del-001".into(),
-                    display_name: "Strategy Document".into(),
-                    node_type: DeliverableType::Document,
-                    content: None,
-                    link_url: None,
-                    file_name: Some("strategy-2025.pdf".into()),
-                    objective_id: "goal-001".into(),
-                    parent_deliverable_id: None,
-                    order_no: 1.0,
-                    depth: 0,
-                    is_root: true,
-                    has_children: false,
-                    children_count: 0,
-                }])),
-                children: Some(Timestamped::now(vec![
-                    // Child: Q1 Goals – collapsed, no detail fetched
-                    GoalNode {
-                        summary: GoalSummary::Child(GoalChildItem {
-                            id: "goal-002".into(),
-                            title: "Q1 Goals".into(),
-                            description: None,
-                            parent_id: Some("goal-001".into()),
-                            status: Some(GoalStatus::Completed),
-                            is_completed: true,
-                            has_children: true,
-                            order_no: 1.0,
-                            owner: Some(Owner {
-                                id: "user-001".into(),
-                                name: "Alice".into(),
-                            }),
-                        }),
-                        detail: None,
-                        children: None,
-                        comments: None,
-                        deliverables: None,
-                        expanded: false,
-                    },
-                    // Child: Q2 Goals – expanded with children
-                    GoalNode {
-                        summary: GoalSummary::Child(GoalChildItem {
-                            id: "goal-003".into(),
-                            title: "Q2 Goals".into(),
-                            description: Some("Q2 objectives".into()),
-                            parent_id: Some("goal-001".into()),
-                            status: Some(GoalStatus::InProgress),
-                            is_completed: false,
-                            has_children: true,
-                            order_no: 2.0,
-                            owner: Some(Owner {
-                                id: "user-002".into(),
-                                name: "Bob".into(),
-                            }),
-                        }),
-                        detail: None,
-                        children: Some(Timestamped::now(vec![
-                            GoalNode {
-                                summary: GoalSummary::Child(GoalChildItem {
-                                    id: "goal-004".into(),
-                                    title: "Revenue Target".into(),
-                                    description: None,
-                                    parent_id: Some("goal-003".into()),
-                                    status: Some(GoalStatus::InProgress),
-                                    is_completed: false,
-                                    has_children: false,
-                                    order_no: 1.0,
-                                    owner: Some(Owner {
-                                        id: "user-003".into(),
-                                        name: "Charlie".into(),
-                                    }),
-                                }),
-                                detail: None,
-                                children: None,
-                                comments: None,
-                                deliverables: None,
-                                expanded: false,
-                            },
-                            GoalNode {
-                                summary: GoalSummary::Child(GoalChildItem {
-                                    id: "goal-005".into(),
-                                    title: "Customer Acquisition".into(),
-                                    description: None,
-                                    parent_id: Some("goal-003".into()),
-                                    status: Some(GoalStatus::Active),
-                                    is_completed: false,
-                                    has_children: false,
-                                    order_no: 2.0,
-                                    owner: Some(Owner {
-                                        id: "user-004".into(),
-                                        name: "Diana".into(),
-                                    }),
-                                }),
-                                detail: None,
-                                children: None,
-                                comments: None,
-                                deliverables: None,
-                                expanded: false,
-                            },
-                        ])),
-                        comments: None,
-                        deliverables: None,
-                        expanded: true,
-                    },
-                ])),
-                expanded: true,
-            },
-            // Root 2: Personal Development – collapsed
-            GoalNode {
-                summary: GoalSummary::Root(GoalTreeItem {
-                    id: "goal-006".into(),
+                    reply_count: 0,
+                    resolved_at: None,
+                    created_at: "2025-04-01T10:30:00Z".into(),
+                    updated_at: "2025-04-01T10:30:00Z".into(),
+                },
+                Comment {
+                    id: "comment-002".into(),
+                    content: "Need to revisit Q3 targets".into(),
+                    commentable_type: "Objective".into(),
+                    commentable_id: "goal-001".into(),
                     parent_id: None,
-                    title: "Personal Development".into(),
-                    status: Some(GoalStatus::Active),
-                    order_no: 2.0,
-                    is_completed: false,
-                    has_children: true,
-                    owner: Some(Owner {
+                    author: CommentAuthor {
                         id: "user-002".into(),
                         name: "Bob".into(),
+                        is_ai_agent: false,
+                    },
+                    reply_count: 0,
+                    resolved_at: None,
+                    created_at: "2025-04-02T14:15:00Z".into(),
+                    updated_at: "2025-04-02T14:15:00Z".into(),
+                },
+            ])),
+            deliverables: Some(Timestamped::now(vec![Deliverable {
+                id: "del-001".into(),
+                display_name: "Strategy Document".into(),
+                node_type: DeliverableType::Document,
+                content: None,
+                link_url: None,
+                file_name: Some("strategy-2025.pdf".into()),
+                objective_id: "goal-001".into(),
+                parent_deliverable_id: None,
+                order_no: 1.0,
+                depth: 0,
+                is_root: true,
+                has_children: false,
+                children_count: 0,
+            }])),
+            children: Some(Timestamped::now(vec![
+                // Child: Q1 Goals – collapsed, no detail fetched
+                GoalNode {
+                    summary: GoalSummary::Child(GoalChildItem {
+                        id: "goal-002".into(),
+                        title: "Q1 Goals".into(),
+                        description: None,
+                        parent_id: Some("goal-001".into()),
+                        status: Some(GoalStatus::Completed),
+                        is_completed: true,
+                        has_children: true,
+                        order_no: 1.0,
+                        owner: Some(Owner {
+                            id: "user-001".into(),
+                            name: "Alice".into(),
+                        }),
                     }),
-                }),
-                detail: None,
-                children: None,
-                comments: None,
-                deliverables: None,
-                expanded: false,
-            },
-            // Root 3: Infrastructure – collapsed, no children
-            GoalNode {
-                summary: GoalSummary::Root(GoalTreeItem {
-                    id: "goal-007".into(),
-                    parent_id: None,
-                    title: "Infrastructure Upgrade".into(),
-                    status: Some(GoalStatus::InProgress),
-                    order_no: 3.0,
-                    is_completed: false,
-                    has_children: false,
-                    owner: Some(Owner {
-                        id: "user-003".into(),
-                        name: "Charlie".into(),
+                    detail: None,
+                    children: None,
+                    comments: None,
+                    deliverables: None,
+                    expanded: false,
+                },
+                // Child: Q2 Goals – expanded with children
+                GoalNode {
+                    summary: GoalSummary::Child(GoalChildItem {
+                        id: "goal-003".into(),
+                        title: "Q2 Goals".into(),
+                        description: Some("Q2 objectives".into()),
+                        parent_id: Some("goal-001".into()),
+                        status: Some(GoalStatus::InProgress),
+                        is_completed: false,
+                        has_children: true,
+                        order_no: 2.0,
+                        owner: Some(Owner {
+                            id: "user-002".into(),
+                            name: "Bob".into(),
+                        }),
                     }),
-                }),
-                detail: None,
-                children: None,
-                comments: None,
-                deliverables: None,
-                expanded: false,
-            },
-        ];
+                    detail: None,
+                    children: Some(Timestamped::now(vec![
+                        GoalNode {
+                            summary: GoalSummary::Child(GoalChildItem {
+                                id: "goal-004".into(),
+                                title: "Revenue Target".into(),
+                                description: None,
+                                parent_id: Some("goal-003".into()),
+                                status: Some(GoalStatus::InProgress),
+                                is_completed: false,
+                                has_children: false,
+                                order_no: 1.0,
+                                owner: Some(Owner {
+                                    id: "user-003".into(),
+                                    name: "Charlie".into(),
+                                }),
+                            }),
+                            detail: None,
+                            children: Some(Timestamped::now(vec![
+                                GoalNode {
+                                    summary: GoalSummary::Child(GoalChildItem {
+                                        id: "goal-006".into(),
+                                        parent_id: None,
+                                        title: "Personal Development".into(),
+                                        description: None,
+                                        status: Some(GoalStatus::Active),
+                                        order_no: 2.0,
+                                        is_completed: false,
+                                        has_children: true,
+                                        owner: Some(Owner {
+                                            id: "user-002".into(),
+                                            name: "Bob".into(),
+                                        }),
+                                    }),
+                                    detail: None,
+                                    children: None,
+                                    comments: None,
+                                    deliverables: None,
+                                    expanded: false,
+                                },
+                                GoalNode {
+                                    summary: GoalSummary::Child(GoalChildItem {
+                                        id: "goal-007".into(),
+                                        parent_id: None,
+                                        title: "Infrastructure Upgrade".into(),
+                                        description: None,
+                                        status: Some(GoalStatus::InProgress),
+                                        order_no: 3.0,
+                                        is_completed: false,
+                                        has_children: false,
+                                        owner: Some(Owner {
+                                            id: "user-003".into(),
+                                            name: "Charlie".into(),
+                                        }),
+                                    }),
+                                    detail: None,
+                                    children: None,
+                                    comments: None,
+                                    deliverables: None,
+                                    expanded: false,
+                                },
+                            ])),
+                            comments: None,
+                            deliverables: None,
+                            expanded: false,
+                        },
+                        GoalNode {
+                            summary: GoalSummary::Child(GoalChildItem {
+                                id: "goal-005".into(),
+                                title: "Customer Acquisition".into(),
+                                description: None,
+                                parent_id: Some("goal-003".into()),
+                                status: Some(GoalStatus::Active),
+                                is_completed: false,
+                                has_children: false,
+                                order_no: 2.0,
+                                owner: Some(Owner {
+                                    id: "user-004".into(),
+                                    name: "Diana".into(),
+                                }),
+                            }),
+                            detail: None,
+                            children: None,
+                            comments: None,
+                            deliverables: None,
+                            expanded: false,
+                        },
+                    ])),
+                    comments: None,
+                    deliverables: None,
+                    expanded: true,
+                },
+            ])),
+            expanded: true,
+        };
 
         GoalTree {
-            roots: Timestamped::now(roots),
+            root: Timestamped::now(root),
             cursor: 0,
             scroll_offset: 0,
         }

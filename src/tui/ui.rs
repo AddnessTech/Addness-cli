@@ -71,7 +71,11 @@ fn draw_left_panel(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_org_pane(frame: &mut Frame, area: Rect, app: &App) {
     let is_active = app.active_pane == ActivePane::OrgSelector;
-    let border_color = if is_active { Color::Cyan } else { Color::DarkGray };
+    let border_color = if is_active {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
 
     let org_name = app.current_org_name();
     let content = if is_active {
@@ -82,10 +86,7 @@ fn draw_org_pane(frame: &mut Frame, area: Rect, app: &App) {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                " <Enter>",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(" <Enter>", Style::default().fg(Color::DarkGray)),
         ])
     } else {
         Line::from(Span::styled(
@@ -105,7 +106,11 @@ fn draw_org_pane(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_navigation(frame: &mut Frame, area: Rect, app: &App) {
     let is_active = app.active_pane == ActivePane::Navigation;
-    let highlight_color = if is_active { Color::Cyan } else { Color::DarkGray };
+    let highlight_color = if is_active {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
 
     let items: Vec<ListItem> = app
         .sidebar_items
@@ -175,11 +180,7 @@ fn draw_goals(frame: &mut Frame, area: Rect, app: &mut App, border_color: Color)
     let rows = app.goal_tree.flatten();
     let scroll = app.goal_tree.scroll_offset;
 
-    let visible = rows
-        .iter()
-        .enumerate()
-        .skip(scroll)
-        .take(viewport_h);
+    let visible = rows.iter().enumerate().skip(scroll).take(viewport_h);
 
     for (i, row) in visible {
         let y = inner.y + (i - scroll) as u16;
@@ -202,23 +203,21 @@ fn render_tree_row(row: &TreeRow, is_cursor: bool, width: usize) -> Line<'static
     };
 
     match row {
-        TreeRow::Goal { node, depth } => {
+        TreeRow::Goal {
+            title,
+            status,
+            owner_name,
+            is_completed,
+            expanded,
+            depth,
+        } => {
             let indent = "  ".repeat(*depth);
-            let icon = if node.summary.has_children() || node.children.is_some() {
-                if node.expanded { "▼ " } else { "▶ " }
-            } else {
-                "  "
-            };
+            let icon = if *expanded { "- " } else { "+ " };
 
-            let title = node.summary.title();
-            let status_str = format_status(node.summary.status());
-            let owner_str = node
-                .summary
-                .owner()
-                .map(|o| o.name.as_str())
-                .unwrap_or("");
+            let status_str = format_status(*status);
+            let owner_str = owner_name.unwrap_or("");
 
-            let completed = node.summary.is_completed();
+            let completed = *is_completed;
             let title_style = if completed {
                 Style::default()
                     .fg(Color::Green)
@@ -229,12 +228,15 @@ fn render_tree_row(row: &TreeRow, is_cursor: bool, width: usize) -> Line<'static
             };
 
             let mut spans = vec![
-                Span::styled(format!("{indent}{icon}"), Style::default().fg(Color::Cyan).bg(bg)),
+                Span::styled(
+                    format!("{indent}{icon}"),
+                    Style::default().fg(Color::Cyan).bg(bg),
+                ),
                 Span::styled(title.to_string(), title_style),
             ];
 
             // Append status + owner inline if there's room
-            let meta = format_goal_meta(&status_str, owner_str);
+            let meta = format_goal_meta(status_str, owner_str);
             if !meta.is_empty() {
                 spans.push(Span::styled(
                     format!("  {meta}"),
@@ -255,13 +257,22 @@ fn render_tree_row(row: &TreeRow, is_cursor: bool, width: usize) -> Line<'static
 
             Line::from(spans)
         }
-        TreeRow::Detail { goal, depth } => {
+        TreeRow::Detail {
+            status,
+            owner_name,
+            description,
+            depth,
+        } => {
             let indent = "  ".repeat(*depth);
-            let status_str = format_status(goal.status.as_ref());
-            let owner_str = goal.owner.as_ref().map(|o| o.name.as_str()).unwrap_or("-");
-            let due = goal.due_date.as_deref().unwrap_or("-");
+            let status_str = format_status(*status);
+            let owner_str = owner_name.unwrap_or("-");
+            let desc = description.unwrap_or("");
 
-            let text = format!("{indent}  {status_str} | {owner_str} | Due: {due}");
+            let text = if desc.is_empty() {
+                format!("{indent}  {status_str} | {owner_str}")
+            } else {
+                format!("{indent}  {status_str} | {owner_str} | {desc}")
+            };
 
             let mut spans = vec![Span::styled(
                 text.clone(),
@@ -274,7 +285,10 @@ fn render_tree_row(row: &TreeRow, is_cursor: bool, width: usize) -> Line<'static
         }
         TreeRow::CommentHeader { count, depth } => {
             let indent = "  ".repeat(*depth);
-            let text = format!("{indent}  \u{1F4DD} {count} comment{}", if *count != 1 { "s" } else { "" });
+            let text = format!(
+                "{indent}  \u{1F4DD} {count} comment{}",
+                if *count != 1 { "s" } else { "" }
+            );
 
             let mut spans = vec![Span::styled(
                 text.clone(),
@@ -288,7 +302,10 @@ fn render_tree_row(row: &TreeRow, is_cursor: bool, width: usize) -> Line<'static
         TreeRow::CommentItem { comment, depth } => {
             let indent = "  ".repeat(*depth);
             let author = &comment.author.name;
-            let content = truncate_str(&comment.content, width.saturating_sub(indent.len() + author.len() + 4));
+            let content = truncate_str(
+                &comment.content,
+                width.saturating_sub(indent.len() + author.len() + 4),
+            );
             let text_len = indent.len() + author.len() + 2 + content.len();
 
             let mut spans = vec![
@@ -533,11 +550,7 @@ fn draw_org_popup(frame: &mut Frame, app: &App) {
                 Style::default().fg(Color::White)
             };
             let prefix = if selected { " > " } else { "   " };
-            let marker = if i == app.current_org_index {
-                " *"
-            } else {
-                ""
-            };
+            let marker = if i == app.current_org_index { " *" } else { "" };
             ListItem::new(Line::from(Span::styled(
                 format!("{prefix}{}{marker}", org.name),
                 style,
@@ -550,7 +563,10 @@ fn draw_org_popup(frame: &mut Frame, app: &App) {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan))
             .title(" Select Organization ")
-            .title_bottom(Line::from(" Enter: select | Esc: cancel ").style(Style::default().fg(Color::DarkGray))),
+            .title_bottom(
+                Line::from(" Enter: select | Esc: cancel ")
+                    .style(Style::default().fg(Color::DarkGray)),
+            ),
     );
     frame.render_widget(popup, area);
 }

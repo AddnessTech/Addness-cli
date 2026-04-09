@@ -158,13 +158,14 @@ impl ApiClient {
                 }
             }
             // 429 Too Many Requests
-            StatusCode::TOO_MANY_REQUESTS => {
-                Some("リクエスト数の上限に達しました。しばらく待ってから再試行してください。".to_string())
-            }
+            StatusCode::TOO_MANY_REQUESTS => Some(
+                "リクエスト数の上限に達しました。しばらく待ってから再試行してください。"
+                    .to_string(),
+            ),
             // 5xx Server Errors
-            s if s.is_server_error() => {
-                Some("サーバーエラーが発生しました。しばらく待ってから再試行してください。".to_string())
-            }
+            s if s.is_server_error() => Some(
+                "サーバーエラーが発生しました。しばらく待ってから再試行してください。".to_string(),
+            ),
             _ => None,
         }
     }

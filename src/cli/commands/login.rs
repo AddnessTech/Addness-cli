@@ -230,16 +230,25 @@ timestamp={ts}"#
         .api_key
         .context("Server did not return an API key. Is the API Key feature enabled?")?;
 
-    // 10. 保存
-    Credentials::new(api_key.clone(), api_url.to_string()).save()?;
+    // 10. 保存（org別にAPIキーを保存）
+    let mut creds = Credentials::load()?.unwrap_or_else(|| Credentials::new(api_url.to_string()));
+    creds.set_api_url(api_url.to_string());
 
-    // 組織が返ってきた場合、最初の組織をデフォルトに設定
     if let Some(orgs) = &exchange_data.data.organizations
         && !orgs.is_empty()
     {
+        creds.set_token(orgs[0].id.clone(), api_key.clone());
+        // _defaultキーがあれば削除（マイグレーション済み）
+        creds.remove_token("_default");
+
         let mut settings = Settings::load()?;
         settings.set_current_organization_id(orgs[0].id.clone())?;
+    } else {
+        // orgが返らない場合は_defaultに保存
+        creds.set_token("_default".to_string(), api_key.clone());
     }
+
+    creds.save()?;
 
     println!();
     println!("Login successful!");

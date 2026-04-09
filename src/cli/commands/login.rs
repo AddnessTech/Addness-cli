@@ -77,6 +77,14 @@ fn timestamp() -> i64 {
 }
 
 pub async fn handle_login(api_url: &str, frontend_url: Option<&str>) -> Result<()> {
+    // 現在選択中のorgを取得（あれば）
+    let current_org_id = Settings::load()
+        .ok()
+        .and_then(|s| s.current_organization_id().map(|id| id.to_string()));
+
+    if let Some(org_id) = &current_org_id {
+        println!("Authenticating for organization: {org_id}");
+    }
     println!("Logging in to Addness...");
     println!();
 
@@ -202,18 +210,32 @@ timestamp={ts}"#
     );
     let exchange_signature = sign_message(&signing_key, &exchange_message);
 
-    let exchange_resp = client
-        .post(format!(
-            "{api_url}/api/v1/public/desktop/auth/token-exchange"
-        ))
-        .json(&serde_json::json!({
+    let exchange_body = if let Some(org_id) = &current_org_id {
+        serde_json::json!({
             "handoffId": handoff_id,
             "codeVerifier": code_verifier,
             "installationId": installation_id,
             "timestamp": ts,
             "signature": exchange_signature,
             "source": "cli",
-        }))
+            "organizationId": org_id,
+        })
+    } else {
+        serde_json::json!({
+            "handoffId": handoff_id,
+            "codeVerifier": code_verifier,
+            "installationId": installation_id,
+            "timestamp": ts,
+            "signature": exchange_signature,
+            "source": "cli",
+        })
+    };
+
+    let exchange_resp = client
+        .post(format!(
+            "{api_url}/api/v1/public/desktop/auth/token-exchange"
+        ))
+        .json(&exchange_body)
         .send()
         .await?;
 
@@ -237,12 +259,17 @@ timestamp={ts}"#
     if let Some(orgs) = &exchange_data.data.organizations
         && !orgs.is_empty()
     {
-        creds.set_token(orgs[0].id.clone(), api_key.clone());
+        if let Some(org_id) = &current_org_id {
+            // current orgが指定されている場合 → そのorg IDの下にキーを保存
+            creds.set_token(org_id.clone(), api_key.clone());
+        } else {
+            // current orgなし（初回login等） → orgs[0]を使用しcurrent_organization_idを設定
+            creds.set_token(orgs[0].id.clone(), api_key.clone());
+            let mut settings = Settings::load()?;
+            settings.set_current_organization_id(orgs[0].id.clone())?;
+        }
         // _defaultキーがあれば削除（マイグレーション済み）
         creds.remove_token("_default");
-
-        let mut settings = Settings::load()?;
-        settings.set_current_organization_id(orgs[0].id.clone())?;
     } else {
         // orgが返らない場合は_defaultに保存
         creds.set_token("_default".to_string(), api_key.clone());
@@ -265,7 +292,13 @@ timestamp={ts}"#
     if let Some(orgs) = &exchange_data.data.organizations
         && !orgs.is_empty()
     {
-        println!("  Organization: {} ({})", orgs[0].name, orgs[0].id);
+        // 認証対象orgの情報を表示
+        let target_org = if let Some(org_id) = &current_org_id {
+            orgs.iter().find(|o| o.id == *org_id).unwrap_or(&orgs[0])
+        } else {
+            &orgs[0]
+        };
+        println!("  Organization: {} ({})", target_org.name, target_org.id);
         if orgs.len() > 1 {
             println!();
             println!(

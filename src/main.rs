@@ -105,8 +105,7 @@ fn build_client() -> Result<ApiClient> {
                     anyhow::anyhow!("Not configured. Run: addness login")
                 })?,
             };
-            Ok(ApiClient::new(token, c.api_url())?
-                .with_org_id(org_id.map(|id| id.to_string())))
+            Ok(ApiClient::new(token, c.api_url())?.with_org_id(org_id.map(|id| id.to_string())))
         }
         None => bail!("Not configured. Run: addness login"),
     }
@@ -121,14 +120,11 @@ fn build_client_for_org_commands() -> Result<ApiClient> {
         Some(c) => {
             let org_id = settings.current_organization_id();
             let token = match org_id {
-                Some(id) => c
-                    .token_for_org(id)
-                    .or_else(|| c.any_token()),
+                Some(id) => c.token_for_org(id).or_else(|| c.any_token()),
                 None => c.any_token(),
             }
             .ok_or_else(|| anyhow::anyhow!("Not configured. Run: addness login"))?;
-            Ok(ApiClient::new(token, c.api_url())?
-                .with_org_id(org_id.map(|id| id.to_string())))
+            Ok(ApiClient::new(token, c.api_url())?.with_org_id(org_id.map(|id| id.to_string())))
         }
         None => bail!("Not configured. Run: addness login"),
     }

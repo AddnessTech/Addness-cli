@@ -3,7 +3,7 @@ use clap::Subcommand;
 
 use crate::api::{ApiClient, OrganizationsResponse};
 use crate::cli::output::print_organizations_table;
-use crate::config::Settings;
+use crate::config::{Credentials, Settings};
 
 #[derive(Subcommand)]
 pub enum OrgCommands {
@@ -47,6 +47,16 @@ pub async fn handle_org(cmd: &OrgCommands, client: &ApiClient) -> Result<()> {
                     let mut settings = Settings::load()?;
                     settings.set_current_organization_id(id.clone())?;
                     println!("Switched to organization: {} ({})", org.name, id);
+
+                    // Warn if no API key stored for this org
+                    if let Some(creds) = Credentials::load()?
+                        && !creds.has_token_for_org(id)
+                    {
+                        println!();
+                        println!(
+                            "Warning: No API key stored for this organization. Run `addness login` to authenticate."
+                        );
+                    }
                 }
                 None => {
                     bail!(

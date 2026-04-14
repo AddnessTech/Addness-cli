@@ -550,10 +550,7 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
             if !force {
                 // Fetch goal title for confirmation
                 let resp: ApiResponse<Goal> = client.get_goal(id).await?;
-                eprint!(
-                    "Delete goal \"{}\" ({id})? [y/N] ",
-                    resp.data.title
-                );
+                eprint!("Delete goal \"{}\" ({id})? [y/N] ", resp.data.title);
                 let mut input = String::new();
                 std::io::stdin().read_line(&mut input)?;
                 if !input.trim().eq_ignore_ascii_case("y") {

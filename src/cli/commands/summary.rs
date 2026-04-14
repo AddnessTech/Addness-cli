@@ -50,7 +50,8 @@ pub async fn handle_summary(
     client: &ApiClient,
 ) -> Result<()> {
     let org_id = resolve_org_id(org)?;
-    let resp: ApiResponse<GoalTreeData> = client.get_goal_tree_with_completed(&org_id, depth).await?;
+    let resp: ApiResponse<GoalTreeData> =
+        client.get_goal_tree_with_completed(&org_id, depth).await?;
     let items = &resp.data.items;
 
     let mut completed_goals = Vec::new();

@@ -157,13 +157,14 @@ impl ApiClient {
                 }
             }
             // 429 Too Many Requests
-            StatusCode::TOO_MANY_REQUESTS => {
-                Some("リクエスト数の上限に達しました。しばらく待ってから再試行してください。".to_string())
-            }
+            StatusCode::TOO_MANY_REQUESTS => Some(
+                "リクエスト数の上限に達しました。しばらく待ってから再試行してください。"
+                    .to_string(),
+            ),
             // 5xx Server Errors
-            s if s.is_server_error() => {
-                Some("サーバーエラーが発生しました。しばらく待ってから再試行してください。".to_string())
-            }
+            s if s.is_server_error() => Some(
+                "サーバーエラーが発生しました。しばらく待ってから再試行してください。".to_string(),
+            ),
             _ => None,
         }
     }
@@ -257,11 +258,7 @@ impl ApiClient {
     }
 
     /// DELETE with JSON body. Returns no response body (204 No Content).
-    pub(super) async fn delete_with_body<B: Serialize>(
-        &self,
-        path: &str,
-        body: &B,
-    ) -> Result<()> {
+    pub(super) async fn delete_with_body<B: Serialize>(&self, path: &str, body: &B) -> Result<()> {
         let url = format!("{}{}", self.base_url, path);
         let mut req = self.client.delete(&url).json(body);
 

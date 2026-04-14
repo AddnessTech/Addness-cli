@@ -46,7 +46,7 @@ fn pr_display_name(url: &str) -> String {
     if parts.len() >= 5 {
         let idx = parts.len();
         if parts[idx - 2] == "pull" || parts[idx - 2] == "pulls" {
-            return format!("{}{}#{}", parts[idx - 4], "/", parts[idx - 3],);
+            return format!("{}/{}#{}", parts[idx - 4], parts[idx - 3], parts[idx - 1]);
         }
     }
     url.to_string()

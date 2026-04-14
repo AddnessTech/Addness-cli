@@ -120,6 +120,17 @@ pub enum GoalCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Delete a goal (soft delete)
+    Delete {
+        /// Goal ID
+        id: String,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// GoalInfo はゴールとその関連情報を保持するための
@@ -532,6 +543,37 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
                 println!("{}", serde_json::to_string_pretty(&resp.data)?);
             } else {
                 println!("Created goal: {} ({})", resp.data.title, resp.data.id);
+            }
+            Ok(())
+        }
+        GoalCommands::Delete { id, force, json } => {
+            if !force {
+                // Fetch goal title for confirmation
+                let resp: ApiResponse<Goal> = client.get_goal(id).await?;
+                eprint!(
+                    "Delete goal \"{}\" ({id})? [y/N] ",
+                    resp.data.title
+                );
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                if !input.trim().eq_ignore_ascii_case("y") {
+                    println!("Cancelled.");
+                    return Ok(());
+                }
+            }
+
+            client.delete_goal(id).await?;
+
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "deleted": true,
+                        "id": id
+                    }))?
+                );
+            } else {
+                println!("Deleted goal {id}");
             }
             Ok(())
         }

@@ -121,6 +121,8 @@ pub enum TreeRow<'a> {
         expanded: bool,
         has_children: bool,
         children_loaded: bool,
+        comments_loaded: bool,
+        deliverables_loaded: bool,
         depth: usize,
     },
     Detail {
@@ -234,6 +236,30 @@ impl GoalTree {
         }
     }
 
+    /// Insert fetched comments into the Goal node at the current cursor position.
+    pub fn set_comments_at_cursor(&mut self, comments: Vec<Comment>) {
+        let target = self.cursor;
+        let mut idx = 0;
+        let mut comments = Some(comments);
+        for root in &mut self.roots {
+            if set_comments_at(root, target, &mut idx, &mut comments) {
+                return;
+            }
+        }
+    }
+
+    /// Insert fetched deliverables into the Goal node at the current cursor position.
+    pub fn set_deliverables_at_cursor(&mut self, deliverables: Vec<Deliverable>) {
+        let target = self.cursor;
+        let mut idx = 0;
+        let mut deliverables = Some(deliverables);
+        for root in &mut self.roots {
+            if set_deliverables_at(root, target, &mut idx, &mut deliverables) {
+                return;
+            }
+        }
+    }
+
     pub fn cursor_up(&mut self) {
         if self.cursor > 0 {
             self.cursor -= 1;
@@ -302,6 +328,8 @@ fn flatten_node<'a, S: GoalItemAccessor>(
         expanded: node.expanded,
         has_children: node.node.has_children(),
         children_loaded: node.children.is_some(),
+        comments_loaded: node.comments.is_some(),
+        deliverables_loaded: node.deliverables.is_some(),
         depth,
     });
 
@@ -418,6 +446,74 @@ fn set_children_at<S: GoalItemAccessor>(
         if let Some(ts) = &mut node.children {
             for child in &mut ts.data {
                 if set_children_at(child, target, idx, children) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn set_comments_at<S: GoalItemAccessor>(
+    node: &mut GoalNodeInner<S>,
+    target: usize,
+    idx: &mut usize,
+    comments: &mut Option<Vec<Comment>>,
+) -> bool {
+    if *idx == target {
+        if let Some(items) = comments.take() {
+            node.comments = Some(Timestamped::now(items));
+        }
+        return true;
+    }
+    *idx += 1;
+
+    if node.expanded {
+        *idx += 1; // detail row
+        if let Some(ts) = &node.comments {
+            *idx += 1 + ts.data.len();
+        }
+        if let Some(ts) = &node.deliverables {
+            *idx += 1 + ts.data.len();
+        }
+        if let Some(ts) = &mut node.children {
+            for child in &mut ts.data {
+                if set_comments_at(child, target, idx, comments) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn set_deliverables_at<S: GoalItemAccessor>(
+    node: &mut GoalNodeInner<S>,
+    target: usize,
+    idx: &mut usize,
+    deliverables: &mut Option<Vec<Deliverable>>,
+) -> bool {
+    if *idx == target {
+        if let Some(items) = deliverables.take() {
+            node.deliverables = Some(Timestamped::now(items));
+        }
+        return true;
+    }
+    *idx += 1;
+
+    if node.expanded {
+        *idx += 1; // detail row
+        if let Some(ts) = &node.comments {
+            *idx += 1 + ts.data.len();
+        }
+        if let Some(ts) = &node.deliverables {
+            *idx += 1 + ts.data.len();
+        }
+        if let Some(ts) = &mut node.children {
+            for child in &mut ts.data {
+                if set_deliverables_at(child, target, idx, deliverables) {
                     return true;
                 }
             }

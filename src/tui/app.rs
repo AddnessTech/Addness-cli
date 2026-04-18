@@ -250,24 +250,90 @@ impl App {
                     goal_id,
                     has_children,
                     children_loaded,
+                    comments_loaded,
+                    deliverables_loaded,
                     ..
-                }) => Some((goal_id.to_string(), *has_children, *children_loaded)),
+                }) => Some((
+                    goal_id.to_string(),
+                    *has_children,
+                    *children_loaded,
+                    *comments_loaded,
+                    *deliverables_loaded,
+                )),
                 _ => None,
             }
         };
 
-        let Some((goal_id, has_children, children_loaded)) = info else {
+        let Some((goal_id, has_children, children_loaded, comments_loaded, deliverables_loaded)) =
+            info
+        else {
             return;
         };
 
-        // Lazy-load children if needed
-        if has_children && !children_loaded {
-            match self.api_call(self.client.get_goal_children(&goal_id, 100, 0)) {
-                Ok(resp) => {
-                    self.goal_tree.set_children_at_cursor(resp.data.children);
+        // Determine what needs to be loaded
+        let need_children = has_children && !children_loaded;
+        let need_comments = !comments_loaded;
+        let need_deliverables = !deliverables_loaded;
+
+        // Lazy-load data if needed
+        if need_comments || need_deliverables || need_children {
+            let goal_id_ref = &goal_id;
+            let client = &self.client;
+            let result = self.api_call(async {
+                tokio::try_join!(
+                    async {
+                        if need_comments {
+                            client.list_comments(goal_id_ref).await
+                        } else {
+                            Ok(crate::api::CommentsResponse {
+                                comments: vec![],
+                                total_count: 0,
+                            })
+                        }
+                    },
+                    async {
+                        if need_deliverables {
+                            client.get_goal_deliverables(goal_id_ref).await
+                        } else {
+                            Ok(crate::api::ApiResponse {
+                                data: crate::api::DeliverableListData {
+                                    deliverables: vec![],
+                                    total: 0,
+                                },
+                            })
+                        }
+                    },
+                    async {
+                        if need_children {
+                            client.get_goal_children(goal_id_ref, 100, 0).await
+                        } else {
+                            Ok(crate::api::ApiResponse {
+                                data: crate::api::GoalChildrenData {
+                                    children: vec![],
+                                    pagination: None,
+                                },
+                            })
+                        }
+                    }
+                )
+            });
+
+            match result {
+                Ok((comments_resp, deliverables_resp, children_resp)) => {
+                    if need_comments {
+                        self.goal_tree.set_comments_at_cursor(comments_resp.comments);
+                    }
+                    if need_deliverables {
+                        self.goal_tree
+                            .set_deliverables_at_cursor(deliverables_resp.data.deliverables);
+                    }
+                    if need_children {
+                        self.goal_tree
+                            .set_children_at_cursor(children_resp.data.children);
+                    }
                 }
                 Err(e) => {
-                    self.error_message = Some(format!("Failed to load children: {e}"));
+                    self.error_message = Some(format!("Failed to load data: {e}"));
                     return;
                 }
             }

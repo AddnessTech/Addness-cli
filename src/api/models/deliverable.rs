@@ -1,5 +1,14 @@
 use serde::{Deserialize, Serialize};
 
+// POST /api/v1/team/objectives/:id/deliverables
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateLinkDeliverableRequest {
+    pub node_type: String,
+    pub link_url: String,
+    pub display_name: String,
+}
+
 // GET /api/v1/team/objectives/:id/deliverables
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

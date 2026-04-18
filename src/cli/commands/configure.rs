@@ -35,19 +35,32 @@ pub fn handle_configure() -> Result<()> {
     println!("Addness CLI Configuration");
     println!();
 
-    // 既存の設定を読み込み
-    let existing_creds = Credentials::load()?.unwrap_or(Credentials::default());
+    let existing_creds = Credentials::load()?.unwrap_or_default();
     let existing_settings = Settings::load()?;
 
-    // API Key
-    let key_hint = if existing_creds.token().is_empty() {
+    // Organization ID (ask first so we know where to store the key)
+    let default_org = existing_settings
+        .current_organization_id()
+        .unwrap_or_default();
+    let org_id = prompt("Organization ID", default_org)?;
+
+    // API Key — show current key for this org as default
+    let current_key = if !org_id.is_empty() {
+        existing_creds
+            .token_for_org(&org_id)
+            .unwrap_or_default()
+            .to_string()
+    } else {
+        existing_creds.any_token().unwrap_or_default().to_string()
+    };
+    let key_hint = if current_key.is_empty() {
         String::new()
     } else {
-        mask_key(existing_creds.token())
+        mask_key(&current_key)
     };
     let api_key = prompt("API Key", &key_hint)?;
     let api_key = if api_key == key_hint {
-        existing_creds.token().to_string()
+        current_key
     } else {
         api_key
     };
@@ -55,14 +68,16 @@ pub fn handle_configure() -> Result<()> {
     // API URL
     let api_url = prompt("API URL", existing_creds.api_url())?;
 
-    // Organization ID
-    let default_org = existing_settings
-        .current_organization_id()
-        .unwrap_or_default();
-    let org_id = prompt("Default Organization ID", default_org)?;
+    // Save credentials
+    let mut creds = Credentials::load()?.unwrap_or_else(|| Credentials::new(api_url.clone()));
+    creds.set_api_url(api_url.clone());
 
-    // 保存
-    let creds = Credentials::new(api_key, api_url.clone());
+    let store_org = if org_id.is_empty() {
+        "_default".to_string()
+    } else {
+        org_id.clone()
+    };
+    creds.set_token(store_org, api_key.clone());
     creds.save()?;
 
     if !org_id.is_empty() {
@@ -72,7 +87,7 @@ pub fn handle_configure() -> Result<()> {
 
     println!();
     println!("Configuration saved.");
-    println!("  API Key: {}", mask_key(creds.token()));
+    println!("  API Key: {}", mask_key(&api_key));
     println!("  API URL: {}", api_url);
     if !org_id.is_empty() {
         println!("  Organization: {}", org_id);
@@ -85,20 +100,43 @@ pub fn handle_status(json: bool) -> Result<()> {
     match Credentials::load()? {
         Some(creds) => {
             let settings = Settings::load()?;
+            let org_id = settings.current_organization_id();
+
+            // Resolve the token for the current org
+            let current_token = org_id
+                .and_then(|id| creds.token_for_org(id))
+                .or_else(|| creds.any_token());
+
             if json {
                 let output = serde_json::json!({
-                    "authenticated": true,
-                    "api_key": mask_key(creds.token()),
+                    "authenticated": current_token.is_some(),
+                    "api_key": current_token.map(mask_key),
                     "api_url": creds.api_url(),
-                    "organization_id": settings.current_organization_id(),
+                    "organization_id": org_id,
+                    "stored_organizations": creds.organization_count(),
                 });
                 println!("{}", serde_json::to_string_pretty(&output)?);
             } else {
-                println!("Authenticated");
-                println!("  API Key: {}", mask_key(creds.token()));
+                if let Some(token) = &current_token {
+                    println!("Authenticated");
+                    println!("  API Key: {}", mask_key(token));
+                } else {
+                    println!("Not authenticated for current organization");
+                }
                 println!("  API URL: {}", creds.api_url());
-                if let Some(org_id) = settings.current_organization_id() {
-                    println!("  Organization: {}", org_id);
+                if let Some(id) = org_id {
+                    println!("  Organization: {}", id);
+                    if creds.token_for_org(id).is_none() {
+                        println!(
+                            "  Warning: No API key for this organization. Run 'addness login' to authenticate."
+                        );
+                    }
+                }
+                if creds.organization_count() > 1 {
+                    println!(
+                        "  Stored keys: {} organization(s)",
+                        creds.organization_count()
+                    );
                 }
             }
         }

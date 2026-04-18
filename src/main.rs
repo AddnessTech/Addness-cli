@@ -94,8 +94,39 @@ fn build_client() -> Result<ApiClient> {
     let creds = Credentials::load()?;
     let settings = Settings::load()?;
     match creds {
-        Some(c) => Ok(ApiClient::new(c.token(), c.api_url())?
-            .with_org_id(settings.current_organization_id().map(|id| id.to_string()))),
+        Some(c) => {
+            let org_id = settings.current_organization_id();
+            let token = match org_id {
+                Some(id) => c.token_for_org(id).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "No API key stored for organization '{id}'. Run `addness login` to authenticate."
+                    )
+                })?,
+                None => c.any_token().ok_or_else(|| {
+                    anyhow::anyhow!("Not configured. Run: addness login")
+                })?,
+            };
+            Ok(ApiClient::new(token, c.api_url())?.with_org_id(org_id.map(|id| id.to_string())))
+        }
+        None => bail!("Not configured. Run: addness login"),
+    }
+}
+
+/// Build a client for org-level commands (org list, org current, etc.)
+/// Falls back to any available token when the current org has no key stored.
+fn build_client_for_org_commands() -> Result<ApiClient> {
+    let creds = Credentials::load()?;
+    let settings = Settings::load()?;
+    match creds {
+        Some(c) => {
+            let org_id = settings.current_organization_id();
+            let token = match org_id {
+                Some(id) => c.token_for_org(id).or_else(|| c.any_token()),
+                None => c.any_token(),
+            }
+            .ok_or_else(|| anyhow::anyhow!("Not configured. Run: addness login"))?;
+            Ok(ApiClient::new(token, c.api_url())?.with_org_id(org_id.map(|id| id.to_string())))
+        }
         None => bail!("Not configured. Run: addness login"),
     }
 }
@@ -119,7 +150,7 @@ async fn main() -> Result<()> {
         Some(Commands::Status { json }) => configure::handle_status(*json),
         Some(Commands::Logout) => configure::handle_logout(),
         Some(Commands::Org { command }) => {
-            let client = build_client()?;
+            let client = build_client_for_org_commands()?;
             org::handle_org(command, &client).await
         }
         Some(Commands::Goal { command }) => {

@@ -16,6 +16,11 @@ pub fn detect_goal_id() -> Result<Option<String>> {
         _ => return Ok(None),
     };
 
+    // Before any commits exist, git rev-parse --abbrev-ref HEAD returns "HEAD"
+    if branch == "HEAD" {
+        return Ok(None);
+    }
+
     Ok(extract_goal_id(&branch))
 }
 
@@ -104,5 +109,11 @@ mod tests {
     #[test]
     fn test_main_branch() {
         assert_eq!(extract_goal_id("main"), None);
+    }
+
+    #[test]
+    fn test_head_literal() {
+        // git rev-parse --abbrev-ref HEAD returns "HEAD" when no commits exist
+        assert_eq!(extract_goal_id("HEAD"), None);
     }
 }

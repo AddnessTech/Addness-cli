@@ -152,7 +152,6 @@ fn draw_content(frame: &mut Frame, area: Rect, app: &mut App) {
 
     match app.sidebar_index {
         0 => draw_goals(frame, area, app, border_color),
-        1 => draw_comments(frame, area, border_color),
         _ => {}
     }
 }
@@ -423,55 +422,6 @@ fn pad_line(spans: &mut Vec<Span<'static>>, content_len: usize, width: usize, bg
             Style::default().bg(bg),
         ));
     }
-}
-
-// ---------------------------------------------------------------------------
-// Comments (unchanged mock)
-// ---------------------------------------------------------------------------
-
-fn draw_comments(frame: &mut Frame, area: Rect, border_color: Color) {
-    let text = vec![
-        Line::from(vec![
-            Span::styled(
-                "user1",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" - 2025-04-01 10:30", Style::default().fg(Color::DarkGray)),
-        ]),
-        Line::from("  Initial project setup looks great. Let's proceed."),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(
-                "user2",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" - 2025-04-02 14:15", Style::default().fg(Color::DarkGray)),
-        ]),
-        Line::from("  Agreed. I'll start working on the API endpoints."),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(
-                "user1",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" - 2025-04-03 09:00", Style::default().fg(Color::DarkGray)),
-        ]),
-        Line::from("  Don't forget to add error handling for edge cases."),
-    ];
-
-    let paragraph = Paragraph::new(text).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(border_color))
-            .title(" Comments (mock) "),
-    );
-    frame.render_widget(paragraph, area);
 }
 
 // ---------------------------------------------------------------------------

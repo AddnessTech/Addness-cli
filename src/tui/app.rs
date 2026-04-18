@@ -49,7 +49,7 @@ impl App {
             running: true,
             active_pane: ActivePane::Navigation,
             sidebar_index: 0,
-            sidebar_items: vec!["Goals", "Comments"],
+            sidebar_items: vec!["Goals"],
             orgs: vec![],
             current_org_index: 0,
             show_org_popup: false,
@@ -200,6 +200,9 @@ impl App {
                     self.org_popup_index = self.current_org_index;
                     self.show_org_popup = true;
                 }
+                ActivePane::Navigation => {
+                    self.active_pane = ActivePane::Content;
+                }
                 ActivePane::Content if self.sidebar_index == 0 => {
                     self.handle_goal_expand();
                 }
@@ -227,11 +230,15 @@ impl App {
                 }
                 _ => {}
             },
-            KeyCode::Right | KeyCode::Char('l') => {
-                if self.active_pane == ActivePane::Content && self.sidebar_index == 0 {
+            KeyCode::Right | KeyCode::Char('l') => match self.active_pane {
+                ActivePane::Navigation => {
+                    self.active_pane = ActivePane::Content;
+                }
+                ActivePane::Content if self.sidebar_index == 0 => {
                     self.handle_goal_expand();
                 }
-            }
+                _ => {}
+            },
             KeyCode::Left | KeyCode::Char('h') => {
                 if self.active_pane == ActivePane::Content && self.sidebar_index == 0 {
                     self.goal_tree.collapse_or_parent();

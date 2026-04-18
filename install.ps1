@@ -80,26 +80,14 @@ function Main {
     New-Item -ItemType Directory -Path $TmpDir -Force | Out-Null
 
     try {
-        # ダウンロード（プログレス表示）
+        # ダウンロード
         $archivePath = Join-Path $TmpDir $Archive
-        Write-Host -NoNewline "  > Downloading...  0%"
-        $webClient = New-Object System.Net.WebClient
-        $downloadComplete = $false
-        $eventHandler = Register-ObjectEvent -InputObject $webClient -EventName DownloadProgressChanged -Action {
-            $pct = $EventArgs.ProgressPercentage
-            Write-Host -NoNewline "`r  > Downloading...  ${pct}%  "
-        }
-        $completedHandler = Register-ObjectEvent -InputObject $webClient -EventName DownloadFileCompleted -Action {
-            $script:downloadComplete = $true
-        }
-        $webClient.DownloadFileAsync([Uri]$Url, $archivePath)
-        while (-not $downloadComplete) { Start-Sleep -Milliseconds 100 }
-        Unregister-Event -SourceIdentifier $eventHandler.Name
-        Unregister-Event -SourceIdentifier $completedHandler.Name
-        $webClient.Dispose()
-        Write-Host "`r  > Downloading...  " -NoNewline
-        Write-Host "100%" -ForegroundColor Green
+        Write-Step "Downloading"
+        $ProgressPreference = 'SilentlyContinue'
+        Invoke-WebRequest -Uri $Url -OutFile $archivePath -UseBasicParsing
         Invoke-WebRequest -Uri $ShaUrl -OutFile (Join-Path $TmpDir "${Archive}.sha256") -UseBasicParsing
+        $ProgressPreference = 'Continue'
+        Write-StepOk
 
         Write-Step "Verifying checksum"
         $expectedLine = (Get-Content (Join-Path $TmpDir "${Archive}.sha256") -Raw).Trim()

@@ -18,6 +18,19 @@ impl ApiClient {
         self.get(&path).await
     }
 
+    pub async fn get_goal_tree_with_completed(
+        &self,
+        org_id: &str,
+        depth: usize,
+    ) -> Result<ApiResponse<GoalTreeData>> {
+        let path = format!(
+            "/api/v2/organizations/{}/objectives/tree?depth={}&include_owner=true&include_completed=true",
+            org_id, depth
+        );
+
+        self.get(&path).await
+    }
+
     pub async fn get_goal(&self, goal_id: &str) -> Result<ApiResponse<Goal>> {
         let path = format!("/api/v2/objectives/{goal_id}");
         self.get(&path).await
@@ -59,5 +72,11 @@ impl ApiClient {
         let path = format!("/api/v2/objectives/{goal_id}");
 
         self.patch(&path, req).await
+    }
+
+    pub async fn delete_goal(&self, goal_id: &str) -> Result<()> {
+        let body = serde_json::json!({ "objectiveIds": [goal_id] });
+        self.delete_with_body("/api/v2/objectives/delete", &body)
+            .await
     }
 }

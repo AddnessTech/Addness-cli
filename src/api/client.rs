@@ -8,7 +8,6 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 use reqwest::StatusCode;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
-use reqwest::multipart;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -258,13 +257,10 @@ impl ApiClient {
             .with_context(|| format!("Failed to parse response from {url}"))
     }
 
-    pub(super) async fn post_multipart<T: DeserializeOwned>(
-        &self,
-        path: &str,
-        form: multipart::Form,
-    ) -> Result<T> {
+    /// DELETE with JSON body. Returns no response body (204 No Content).
+    pub(super) async fn delete_with_body<B: Serialize>(&self, path: &str, body: &B) -> Result<()> {
         let url = format!("{}{}", self.base_url, path);
-        let mut req = self.client.post(&url).multipart(form);
+        let mut req = self.client.delete(&url).json(body);
 
         if let Some(org_id) = &self.org_id {
             req = req.header(
@@ -284,10 +280,7 @@ impl ApiClient {
             return Err(Self::api_error(status, &body));
         }
 
-        response
-            .json::<T>()
-            .await
-            .with_context(|| format!("Failed to parse response from {url}"))
+        Ok(())
     }
 
     pub(super) async fn patch<T: DeserializeOwned, B: Serialize>(

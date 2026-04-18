@@ -242,6 +242,15 @@ impl App {
     }
 
     fn handle_goal_expand(&mut self) {
+        // Check if cursor is on CommentOmitted row - if so, increase display limit
+        {
+            let rows = self.goal_tree.flatten();
+            if matches!(rows.get(self.goal_tree.cursor), Some(TreeRow::CommentOmitted { .. })) {
+                self.goal_tree.increase_comment_limit();
+                return;
+            }
+        }
+
         // Extract info from the cursor row before mutating
         let info = {
             let rows = self.goal_tree.flatten();

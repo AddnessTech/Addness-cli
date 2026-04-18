@@ -3,11 +3,21 @@ use chrono::{DateTime, Utc};
 use crate::api::{Comment, Deliverable, GoalChildItem, GoalStatus, GoalTreeItem, Owner};
 
 // ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const INITIAL_COMMENT_DISPLAY_LIMIT: usize = 20;
+const COMMENT_DISPLAY_INCREMENT: usize = 20;
+
+// ---------------------------------------------------------------------------
 // Timestamped wrapper
 // ---------------------------------------------------------------------------
 
 pub struct Timestamped<T> {
     pub data: T,
+
+    // 将来的にfetch時刻からのキャッシュTTLの実装に用いる
+    #[allow(dead_code)]
     pub fetched_at: DateTime<Utc>,
 }
 
@@ -92,6 +102,7 @@ pub struct GoalNodeInner<S> {
     pub comments: Option<Timestamped<Vec<Comment>>>,
     pub deliverables: Option<Timestamped<Vec<Deliverable>>>,
     pub expanded: bool,
+    pub comment_display_limit: usize,
 }
 
 pub type GoalRootNode = GoalNodeInner<GoalTreeItem>;
@@ -194,6 +205,7 @@ impl GoalTree {
                 comments: None,
                 deliverables: None,
                 expanded: false,
+                comment_display_limit: INITIAL_COMMENT_DISPLAY_LIMIT,
             })
             .collect();
         GoalTree {
@@ -265,6 +277,18 @@ impl GoalTree {
         }
     }
 
+    /// Increase the comment display limit for the goal containing the cursor.
+    /// Used when user expands on CommentOmitted row to show more comments.
+    pub fn increase_comment_limit(&mut self) {
+        let target = self.cursor;
+        let mut idx = 0;
+        for root in &mut self.roots {
+            if increase_comment_limit_at(root, target, &mut idx) {
+                return;
+            }
+        }
+    }
+
     pub fn cursor_up(&mut self) {
         if self.cursor > 0 {
             self.cursor -= 1;
@@ -320,13 +344,14 @@ impl GoalTree {
 // ---------------------------------------------------------------------------
 
 /// Calculate the number of rows occupied by comments when expanded.
-/// Includes header, up to 20 most recent items, and omitted row if total > 20.
-fn comment_row_count(comments: &Option<Timestamped<Vec<Comment>>>) -> usize {
+/// Only counts unresolved comments (resolved_at is None).
+/// Includes header, up to `limit` most recent items, and omitted row if total > limit.
+fn comment_row_count(comments: &Option<Timestamped<Vec<Comment>>>, limit: usize) -> usize {
     match comments {
         Some(ts) => {
-            let total = ts.data.len();
-            let displayed = total.min(20);
-            let has_omitted = total > 20;
+            let unresolved_count = ts.data.iter().filter(|c| c.resolved_at.is_none()).count();
+            let displayed = unresolved_count.min(limit);
+            let has_omitted = unresolved_count > limit;
             1 + displayed + if has_omitted { 1 } else { 0 } // header + items + omitted row
         }
         None => 0,
@@ -367,19 +392,22 @@ fn flatten_node<'a, S: GoalItemAccessor>(
     });
 
     if let Some(ref ts) = node.comments {
-        let total_count = ts.data.len();
+        // Filter to only unresolved comments (resolved_at is None)
+        let mut unresolved_comments: Vec<&Comment> =
+            ts.data.iter().filter(|c| c.resolved_at.is_none()).collect();
+
+        let total_unresolved = unresolved_comments.len();
+
         rows.push(TreeRow::CommentHeader {
-            count: total_count,
+            count: total_unresolved,
             depth: child_depth,
         });
 
-        // Sort by created_at descending (newest first), then take latest 20
-        let mut sorted_comments: Vec<&Comment> = ts.data.iter().collect();
-        sorted_comments.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        // Sort by created_at descending (newest first)
+        unresolved_comments.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
-        const MAX_DISPLAY: usize = 20;
-        let display_count = total_count.min(MAX_DISPLAY);
-        let omitted_count = total_count.saturating_sub(MAX_DISPLAY);
+        let display_count = total_unresolved.min(node.comment_display_limit);
+        let omitted_count = total_unresolved.saturating_sub(node.comment_display_limit);
 
         if omitted_count > 0 {
             rows.push(TreeRow::CommentOmitted {
@@ -388,7 +416,7 @@ fn flatten_node<'a, S: GoalItemAccessor>(
             });
         }
 
-        for comment in sorted_comments.iter().take(display_count) {
+        for comment in unresolved_comments.iter().take(display_count) {
             rows.push(TreeRow::CommentItem {
                 comment,
                 depth: child_depth + 1,
@@ -429,7 +457,7 @@ fn toggle_at<S: GoalItemAccessor>(
 
     if node.expanded {
         *idx += 1; // detail row
-        *idx += comment_row_count(&node.comments);
+        *idx += comment_row_count(&node.comments, node.comment_display_limit);
         if let Some(ts) = &node.deliverables {
             *idx += 1 + ts.data.len();
         }
@@ -461,6 +489,7 @@ fn set_children_at<S: GoalItemAccessor>(
                     comments: None,
                     deliverables: None,
                     expanded: false,
+                    comment_display_limit: INITIAL_COMMENT_DISPLAY_LIMIT,
                 })
                 .collect();
             node.children = Some(Timestamped::now(child_nodes));
@@ -471,7 +500,7 @@ fn set_children_at<S: GoalItemAccessor>(
 
     if node.expanded {
         *idx += 1; // detail row
-        *idx += comment_row_count(&node.comments);
+        *idx += comment_row_count(&node.comments, node.comment_display_limit);
         if let Some(ts) = &node.deliverables {
             *idx += 1 + ts.data.len();
         }
@@ -503,7 +532,7 @@ fn set_comments_at<S: GoalItemAccessor>(
 
     if node.expanded {
         *idx += 1; // detail row
-        *idx += comment_row_count(&node.comments);
+        *idx += comment_row_count(&node.comments, node.comment_display_limit);
         if let Some(ts) = &node.deliverables {
             *idx += 1 + ts.data.len();
         }
@@ -535,13 +564,51 @@ fn set_deliverables_at<S: GoalItemAccessor>(
 
     if node.expanded {
         *idx += 1; // detail row
-        *idx += comment_row_count(&node.comments);
+        *idx += comment_row_count(&node.comments, node.comment_display_limit);
         if let Some(ts) = &node.deliverables {
             *idx += 1 + ts.data.len();
         }
         if let Some(ts) = &mut node.children {
             for child in &mut ts.data {
                 if set_deliverables_at(child, target, idx, deliverables) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn increase_comment_limit_at<S: GoalItemAccessor>(
+    node: &mut GoalNodeInner<S>,
+    target: usize,
+    idx: &mut usize,
+) -> bool {
+    *idx += 1;
+
+    if node.expanded {
+        *idx += 1; // detail row
+
+        // Calculate comment section indices
+        let comment_start = *idx;
+        let comment_rows = comment_row_count(&node.comments, node.comment_display_limit);
+        let comment_end = comment_start + comment_rows;
+
+        // If target is within comment section, increase this node's limit
+        if target >= comment_start && target < comment_end {
+            node.comment_display_limit += COMMENT_DISPLAY_INCREMENT;
+            return true;
+        }
+
+        *idx += comment_rows;
+
+        if let Some(ts) = &node.deliverables {
+            *idx += 1 + ts.data.len();
+        }
+        if let Some(ts) = &mut node.children {
+            for child in &mut ts.data {
+                if increase_comment_limit_at(child, target, idx) {
                     return true;
                 }
             }

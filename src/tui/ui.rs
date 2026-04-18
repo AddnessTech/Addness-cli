@@ -301,6 +301,22 @@ fn render_tree_row(row: &TreeRow, is_cursor: bool, width: usize) -> Line<'static
             }
             Line::from(spans)
         }
+        TreeRow::CommentOmitted { count, depth } => {
+            let indent = "  ".repeat(*depth);
+            let text = format!(
+                "{indent}  ... {count} older comment{} hidden",
+                if *count != 1 { "s" } else { "" }
+            );
+
+            let mut spans = vec![Span::styled(
+                text.clone(),
+                Style::default().fg(Color::DarkGray).bg(bg),
+            )];
+            if is_cursor {
+                pad_line(&mut spans, text.len(), width, bg);
+            }
+            Line::from(spans)
+        }
         TreeRow::CommentItem { comment, depth } => {
             let indent = "  ".repeat(*depth);
             let author = &comment.author.name;

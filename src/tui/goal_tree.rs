@@ -136,6 +136,10 @@ pub enum TreeRow<'a> {
         count: usize,
         depth: usize,
     },
+    CommentOmitted {
+        count: usize,
+        depth: usize,
+    },
     CommentItem {
         comment: &'a Comment,
         depth: usize,
@@ -156,6 +160,7 @@ impl<'a> TreeRow<'a> {
             TreeRow::Goal { depth, .. }
             | TreeRow::Detail { depth, .. }
             | TreeRow::CommentHeader { depth, .. }
+            | TreeRow::CommentOmitted { depth, .. }
             | TreeRow::CommentItem { depth, .. }
             | TreeRow::DeliverableHeader { depth, .. }
             | TreeRow::DeliverableItem { depth, .. } => *depth,
@@ -314,6 +319,20 @@ impl GoalTree {
 // Generic helpers (no duplication between Root and Child)
 // ---------------------------------------------------------------------------
 
+/// Calculate the number of rows occupied by comments when expanded.
+/// Includes header, up to 20 most recent items, and omitted row if total > 20.
+fn comment_row_count(comments: &Option<Timestamped<Vec<Comment>>>) -> usize {
+    match comments {
+        Some(ts) => {
+            let total = ts.data.len();
+            let displayed = total.min(20);
+            let has_omitted = total > 20;
+            1 + displayed + if has_omitted { 1 } else { 0 } // header + items + omitted row
+        }
+        None => 0,
+    }
+}
+
 fn flatten_node<'a, S: GoalItemAccessor>(
     node: &'a GoalNodeInner<S>,
     depth: usize,
@@ -348,11 +367,28 @@ fn flatten_node<'a, S: GoalItemAccessor>(
     });
 
     if let Some(ref ts) = node.comments {
+        let total_count = ts.data.len();
         rows.push(TreeRow::CommentHeader {
-            count: ts.data.len(),
+            count: total_count,
             depth: child_depth,
         });
-        for comment in &ts.data {
+
+        // Sort by created_at descending (newest first), then take latest 20
+        let mut sorted_comments: Vec<&Comment> = ts.data.iter().collect();
+        sorted_comments.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+        const MAX_DISPLAY: usize = 20;
+        let display_count = total_count.min(MAX_DISPLAY);
+        let omitted_count = total_count.saturating_sub(MAX_DISPLAY);
+
+        if omitted_count > 0 {
+            rows.push(TreeRow::CommentOmitted {
+                count: omitted_count,
+                depth: child_depth + 1,
+            });
+        }
+
+        for comment in sorted_comments.iter().take(display_count) {
             rows.push(TreeRow::CommentItem {
                 comment,
                 depth: child_depth + 1,
@@ -393,9 +429,7 @@ fn toggle_at<S: GoalItemAccessor>(
 
     if node.expanded {
         *idx += 1; // detail row
-        if let Some(ts) = &node.comments {
-            *idx += 1 + ts.data.len();
-        }
+        *idx += comment_row_count(&node.comments);
         if let Some(ts) = &node.deliverables {
             *idx += 1 + ts.data.len();
         }
@@ -437,9 +471,7 @@ fn set_children_at<S: GoalItemAccessor>(
 
     if node.expanded {
         *idx += 1; // detail row
-        if let Some(ts) = &node.comments {
-            *idx += 1 + ts.data.len();
-        }
+        *idx += comment_row_count(&node.comments);
         if let Some(ts) = &node.deliverables {
             *idx += 1 + ts.data.len();
         }
@@ -471,9 +503,7 @@ fn set_comments_at<S: GoalItemAccessor>(
 
     if node.expanded {
         *idx += 1; // detail row
-        if let Some(ts) = &node.comments {
-            *idx += 1 + ts.data.len();
-        }
+        *idx += comment_row_count(&node.comments);
         if let Some(ts) = &node.deliverables {
             *idx += 1 + ts.data.len();
         }
@@ -505,9 +535,7 @@ fn set_deliverables_at<S: GoalItemAccessor>(
 
     if node.expanded {
         *idx += 1; // detail row
-        if let Some(ts) = &node.comments {
-            *idx += 1 + ts.data.len();
-        }
+        *idx += comment_row_count(&node.comments);
         if let Some(ts) = &node.deliverables {
             *idx += 1 + ts.data.len();
         }

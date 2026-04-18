@@ -1,14 +1,41 @@
-use serde::{Deserialize, Serialize};
-/// Goal status values used by the API.
-/// "COMPLETED" is represented by `is_completed = true` rather than this enum.
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// Goal status values used by the backend API.
+/// Backend uses: "NONE", "IN_PROGRESS", "CANCELLED".
+/// Completion is tracked via `completedAt`, not status.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum GoalStatus {
+    #[serde(rename = "NONE")]
     None,
-    Active,
+    #[serde(rename = "IN_PROGRESS")]
     InProgress,
-    Completed,
+    #[serde(rename = "CANCELLED")]
     Cancelled,
+    /// Catch-all for any unknown status value from the backend
+    #[serde(untagged)]
+    Other(String),
+}
+
+/// Deserialize Option<GoalStatus> that tolerates empty strings.
+/// Backend may return "" for status (Go string zero value).
+pub fn deserialize_optional_status<'de, D>(deserializer: D) -> Result<Option<GoalStatus>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    match opt {
+        Some(s) if s.is_empty() => Ok(Some(GoalStatus::None)),
+        Some(s) => {
+            let status = match s.as_str() {
+                "NONE" => GoalStatus::None,
+                "IN_PROGRESS" => GoalStatus::InProgress,
+                "CANCELLED" => GoalStatus::Cancelled,
+                other => GoalStatus::Other(other.to_string()),
+            };
+            Ok(Some(status))
+        }
+        None => Ok(None),
+    }
 }
 
 // GET /api/v2/organizations/:id/objectives/tree
@@ -27,7 +54,7 @@ pub struct GoalTreeItem {
     #[serde(default)]
     pub parent_id: Option<String>,
     pub title: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_status")]
     pub status: Option<GoalStatus>,
     pub order_no: f64,
     pub is_completed: bool,
@@ -50,14 +77,27 @@ pub struct Owner {
     pub name: String,
 }
 
+// POST /api/v2/objectives
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateGoalRequest {
+    pub organization_id: String,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_objective_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
 // PATCH /api/v2/organizations/:org_id/objectives/:id
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateGoalRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<GoalStatus>,
+    /// Set to Some(timestamp) to mark completed, Some(None) to uncomplete
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub is_completed: Option<bool>,
+    pub completed_at: Option<Option<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -73,7 +113,7 @@ pub struct Goal {
     pub description: Option<String>,
     #[serde(default)]
     pub body: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_status")]
     pub status: Option<GoalStatus>,
     #[serde(default)]
     pub is_completed: bool,
@@ -111,7 +151,7 @@ pub struct GoalChildItem {
     pub description: Option<String>,
     #[serde(default)]
     pub parent_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_status")]
     pub status: Option<GoalStatus>,
     #[serde(default)]
     pub is_completed: bool,

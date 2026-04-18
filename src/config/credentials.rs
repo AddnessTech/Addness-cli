@@ -10,7 +10,7 @@ pub struct Credentials {
     api_url: String,
 }
 
-pub const DEFAULT_API_URL: &str = "https://api.addness.app";
+pub const DEFAULT_API_URL: &str = "https://vt.api.addness.com";
 
 fn default_api_url() -> String {
     DEFAULT_API_URL.to_string()
@@ -59,14 +59,26 @@ impl Credentials {
                 .with_context(|| format!("Failed to create directory {}", parent.display()))?;
         }
         let content = serde_json::to_string_pretty(self)?;
-        fs::write(&path, &content)
-            .with_context(|| format!("Failed to write {}", path.display()))?;
 
-        // Set file permissions to 600 on Unix
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&path)
+                .with_context(|| format!("Failed to create {}", path.display()))?;
+            file.write_all(content.as_bytes())
+                .with_context(|| format!("Failed to write {}", path.display()))?;
+        }
+
+        #[cfg(not(unix))]
+        {
+            fs::write(&path, &content)
+                .with_context(|| format!("Failed to write {}", path.display()))?;
         }
 
         Ok(())

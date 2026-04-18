@@ -2,8 +2,8 @@ use anyhow::{Result, bail};
 use clap::Subcommand;
 
 use crate::api::{
-    ApiClient, ApiResponse, Comment, Deliverable, DeliverableType, Goal, GoalStatus, GoalTreeData,
-    GoalTreeItem, UpdateGoalRequest,
+    ApiClient, ApiResponse, Comment, CreateGoalRequest, Deliverable, DeliverableType, Goal,
+    GoalStatus, GoalTreeData, GoalTreeItem, UpdateGoalRequest,
 };
 use crate::cli::commands::org::resolve_org_id;
 use crate::cli::output::{
@@ -20,6 +20,12 @@ pub enum GoalCommands {
         /// Tree depth (default: 3)
         #[arg(long, default_value = "3")]
         depth: usize,
+        /// Filter by owner name (use "me" for yourself)
+        #[arg(long)]
+        assigned_to: Option<String>,
+        /// Filter by status: NOT_STARTED, IN_PROGRESS, COMPLETED, CANCELLED
+        #[arg(long)]
+        status: Option<String>,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -75,6 +81,24 @@ pub enum GoalCommands {
     Search {
         /// Search query
         query: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create a new goal
+    Create {
+        /// Goal title
+        #[arg(long)]
+        title: String,
+        /// Parent goal ID (omit to create as root goal)
+        #[arg(long)]
+        parent: Option<String>,
+        /// Organization ID (uses default if not specified)
+        #[arg(long)]
+        org: Option<String>,
+        /// Description
+        #[arg(long)]
+        description: Option<String>,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -266,18 +290,18 @@ fn print_context_table(
     }
 }
 
-/// Parse CLI status into (is_completed, api_status) pair.
-/// CLI status      → is_completed  | API status
-/// NOT_STARTED     → false         | NONE
-/// IN_PROGRESS     → false         | IN_PROGRESS
-/// COMPLETED       → true          | (unchanged)
-/// CANCELLED       → false         | CANCELLED
-fn parse_status(status: &str) -> Result<(Option<bool>, Option<GoalStatus>)> {
+/// Parse CLI status into (completed_at, api_status) pair.
+/// COMPLETED sets completed_at to current UTC timestamp.
+/// Others clear completed_at (null).
+fn parse_status(status: &str) -> Result<(Option<Option<String>>, Option<GoalStatus>)> {
     match status.to_uppercase().as_str() {
-        "NOT_STARTED" => Ok((Some(false), Some(GoalStatus::None))),
-        "IN_PROGRESS" => Ok((Some(false), Some(GoalStatus::InProgress))),
-        "COMPLETED" => Ok((Some(true), Some(GoalStatus::None))),
-        "CANCELLED" => Ok((Some(false), Some(GoalStatus::Cancelled))),
+        "NOT_STARTED" => Ok((Some(None), Some(GoalStatus::None))),
+        "IN_PROGRESS" => Ok((Some(None), Some(GoalStatus::InProgress))),
+        "COMPLETED" => {
+            let now = chrono::Utc::now().to_rfc3339();
+            Ok((Some(Some(now)), None))
+        }
+        "CANCELLED" => Ok((Some(None), Some(GoalStatus::Cancelled))),
         _ => bail!(
             "Invalid status: '{status}'. Use one of: NOT_STARTED, IN_PROGRESS, COMPLETED, CANCELLED"
         ),
@@ -286,14 +310,62 @@ fn parse_status(status: &str) -> Result<(Option<bool>, Option<GoalStatus>)> {
 
 pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> {
     match cmd {
-        GoalCommands::List { org, depth, json } => {
+        GoalCommands::List {
+            org,
+            depth,
+            assigned_to,
+            status,
+            json,
+        } => {
             let org_id = resolve_org_id(org.as_deref())?;
             let resp: ApiResponse<GoalTreeData> = client.get_goal_tree(&org_id, *depth).await?;
 
+            let mut items = resp.data.items;
+
+            // --assigned-to filter
+            if let Some(filter) = assigned_to {
+                let owner_name = if filter.eq_ignore_ascii_case("me") {
+                    let members_resp = client.get_members(&org_id).await?;
+                    members_resp
+                        .data
+                        .members
+                        .iter()
+                        .find(|m| m.is_current_user)
+                        .map(|m| m.name.clone())
+                        .ok_or_else(|| anyhow::anyhow!("Could not determine current user. Try using your name instead of 'me'."))?
+                } else {
+                    filter.clone()
+                };
+                let name_lower = owner_name.to_lowercase();
+                items.retain(|item| {
+                    item.owner
+                        .as_ref()
+                        .is_some_and(|o| o.name.to_lowercase().contains(&name_lower))
+                });
+            }
+
+            // --status filter
+            if let Some(status_filter) = status {
+                items.retain(|item| match status_filter.to_uppercase().as_str() {
+                    "COMPLETED" => item.is_completed,
+                    "NOT_STARTED" => {
+                        !item.is_completed
+                            && item.status.as_ref().is_none_or(|s| *s == GoalStatus::None)
+                    }
+                    "IN_PROGRESS" => {
+                        !item.is_completed && item.status.as_ref() == Some(&GoalStatus::InProgress)
+                    }
+                    "CANCELLED" => {
+                        !item.is_completed && item.status.as_ref() == Some(&GoalStatus::Cancelled)
+                    }
+                    _ => true,
+                });
+            }
+
             if *json {
-                println!("{}", serde_json::to_string_pretty(&resp.data.items)?);
+                println!("{}", serde_json::to_string_pretty(&items)?);
             } else {
-                print_goals_table(&resp.data.items);
+                print_goals_table(&items);
             }
             Ok(())
         }
@@ -441,6 +513,28 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
             }
             Ok(())
         }
+        GoalCommands::Create {
+            title,
+            parent,
+            org,
+            description,
+            json,
+        } => {
+            let org_id = resolve_org_id(org.as_deref())?;
+            let req = CreateGoalRequest {
+                organization_id: org_id,
+                title: title.clone(),
+                parent_objective_id: parent.clone(),
+                description: description.clone(),
+            };
+            let resp: ApiResponse<Goal> = client.create_goal(&req).await?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&resp.data)?);
+            } else {
+                println!("Created goal: {} ({})", resp.data.title, resp.data.id);
+            }
+            Ok(())
+        }
         GoalCommands::Update {
             id,
             org,
@@ -450,7 +544,7 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
         } => {
             let org_id = resolve_org_id(org.as_deref())?;
 
-            let (is_completed, goal_status) = if let Some(s) = status {
+            let (completed_at, goal_status) = if let Some(s) = status {
                 parse_status(s)?
             } else {
                 (None, None)
@@ -458,7 +552,7 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
 
             let mut req = UpdateGoalRequest {
                 status: goal_status,
-                is_completed,
+                completed_at,
                 title: None,
                 description: None,
             };
@@ -467,7 +561,7 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
                 req.title = Some(t.clone());
             }
 
-            if req.status.is_none() && req.is_completed.is_none() && req.title.is_none() {
+            if req.status.is_none() && req.completed_at.is_none() && req.title.is_none() {
                 bail!("Nothing to update. Specify --status or --title.");
             }
 

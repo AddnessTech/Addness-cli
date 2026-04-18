@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write # Required for OIDC
 
 env:
   CARGO_TERM_COLOR: always
@@ -20,13 +21,12 @@ jobs:
         include:
           - target: x86_64-apple-darwin
             os: macos-latest
-            archive: tar.gz
           - target: aarch64-apple-darwin
             os: macos-latest
-            archive: tar.gz
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
 
     runs-on: ${{ matrix.os }}
 
@@ -44,14 +44,23 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
         run: |
-          VERSION="${GITHUB_REF_NAME}"
-          ARCHIVE_NAME="addness-${VERSION}-${{ matrix.target }}.tar.gz"
+          ARCHIVE_NAME="addness-${{ matrix.target }}.tar.gz"
           tar -czf "${ARCHIVE_NAME}" -C target/${{ matrix.target }}/release addness
           shasum -a 256 "${ARCHIVE_NAME}" > "${ARCHIVE_NAME}.sha256"
           echo "ARCHIVE_NAME=${ARCHIVE_NAME}" >> "$GITHUB_ENV"
-          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ARCHIVE_NAME = "addness-${{ matrix.target }}.zip"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/addness.exe" -DestinationPath $ARCHIVE_NAME
+          $hash = (Get-FileHash -Algorithm SHA256 $ARCHIVE_NAME).Hash.ToLower()
+          "$hash  $ARCHIVE_NAME" | Out-File -Encoding ascii "${ARCHIVE_NAME}.sha256"
+          "ARCHIVE_NAME=$ARCHIVE_NAME" | Out-File -Append -Encoding ascii $env:GITHUB_ENV
 
       - uses: actions/upload-artifact@v4
         with:
@@ -59,12 +68,21 @@ jobs:
           path: |
             addness-*.tar.gz
             addness-*.tar.gz.sha256
+            addness-*.zip
+            addness-*.zip.sha256
 
   upload:
     needs: build
     runs-on: ubuntu-latest
 
     steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            install.sh
+            install.ps1
+          sparse-checkout-cone-mode: false
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -72,14 +90,8 @@ jobs:
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: ${{ vars.CLI_RELEASE_ROLE_ARN }}
           aws-region: ap-northeast-1
-
-      - uses: actions/checkout@v4
-        with:
-          sparse-checkout: install.sh
-          sparse-checkout-cone-mode: false
 
       - name: Upload to S3
         run: |
@@ -89,9 +101,13 @@ jobs:
           # latest にもコピー
           aws s3 cp artifacts/ "s3://${S3_BUCKET}/releases/latest/" --recursive
 
-      - name: Upload install script
+      - name: Upload install scripts and version file
         run: |
           aws s3 cp install.sh "s3://${S3_BUCKET}/install.sh" \
+            --content-type "text/plain"
+          aws s3 cp install.ps1 "s3://${S3_BUCKET}/install.ps1" \
+            --content-type "text/plain"
+          echo "${GITHUB_REF_NAME}" | aws s3 cp - "s3://${S3_BUCKET}/releases/latest/version.txt" \
             --content-type "text/plain"
 
       - name: Invalidate CDN cache
@@ -99,4 +115,4 @@ jobs:
         run: |
           aws cloudfront create-invalidation \
             --distribution-id "${CDN_DISTRIBUTION_ID}" \
-            --paths "/releases/latest/*" "/install.sh"
+            --paths "/releases/latest/*" "/install.sh" "/install.ps1"

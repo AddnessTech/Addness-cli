@@ -2,8 +2,24 @@ use std::collections::HashMap;
 
 use crate::api::{ApiClient, ApiResponse, Deliverable, DeliverableListData};
 use anyhow::Result;
+use reqwest::multipart;
 
 impl ApiClient {
+    pub async fn create_link_deliverable(
+        &self,
+        goal_id: &str,
+        url: &str,
+        display_name: &str,
+    ) -> Result<ApiResponse<Deliverable>> {
+        let form = multipart::Form::new()
+            .text("nodeType", "link")
+            .text("linkUrl", url.to_string())
+            .text("displayName", display_name.to_string());
+
+        let path = format!("/api/v1/team/objectives/{goal_id}/deliverables");
+        self.post_multipart(&path, form).await
+    }
+
     pub async fn get_goal_deliverables(
         &self,
         goal_id: &str,

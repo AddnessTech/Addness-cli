@@ -99,7 +99,9 @@ pub async fn handle_login(api_url: &str, frontend_url: Option<&str>) -> Result<(
     let state = uuid::Uuid::new_v4().simple().to_string();
 
     // 5. Installation登録
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .user_agent(format!("addness-cli/{}", env!("CARGO_PKG_VERSION")))
+        .build()?;
     let register_resp = client
         .post(format!(
             "{api_url}/api/v1/public/desktop/auth/installations/register"
@@ -112,8 +114,9 @@ pub async fn handle_login(api_url: &str, frontend_url: Option<&str>) -> Result<(
         .await?;
 
     if !register_resp.status().is_success() {
-        let body = register_resp.text().await?;
-        bail!("Failed to register installation: {body}");
+        let status = register_resp.status();
+        let body = register_resp.text().await.unwrap_or_default();
+        bail!("Failed to register installation (HTTP {status}): {body}");
     }
     let _: RegisterResponse = register_resp.json().await?;
 
@@ -151,8 +154,9 @@ timestamp={ts}"#,
         .await?;
 
     if !start_resp.status().is_success() {
-        let body = start_resp.text().await?;
-        bail!("Failed to create start session: {body}");
+        let status = start_resp.status();
+        let body = start_resp.text().await.unwrap_or_default();
+        bail!("Failed to create login session (HTTP {status}): {body}");
     }
 
     let start_data: StartSessionResponse = start_resp.json().await?;
@@ -161,9 +165,10 @@ timestamp={ts}"#,
     // 7. ブラウザを開く
     let fe_url = frontend_url
         .map(|s| s.to_string())
-        .unwrap_or_else(|| api_url.replace(":8080", ":3000").replace("api.", ""));
+        .unwrap_or_else(|| "https://www.addness.com".to_string());
     let fe_base = fe_url.trim_end_matches('/');
-    let browser_url = format!("{fe_base}/desktop/browser-auth?start_token={start_token}");
+    let browser_url =
+        format!("{fe_base}/desktop/browser-auth?start_token={start_token}&source=cli");
 
     println!("Opening browser for login...");
     println!("If the browser doesn't open, visit:");
@@ -213,8 +218,9 @@ timestamp={ts}"#
         .await?;
 
     if !exchange_resp.status().is_success() {
-        let body = exchange_resp.text().await?;
-        bail!("Token exchange failed: {body}");
+        let status = exchange_resp.status();
+        let body = exchange_resp.text().await.unwrap_or_default();
+        bail!("Login failed (HTTP {status}): {body}");
     }
 
     let exchange_data: ExchangeResponse = exchange_resp.json().await?;

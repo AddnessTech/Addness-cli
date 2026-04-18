@@ -1,18 +1,20 @@
 mod api;
 mod cli;
 mod config;
+mod update_check;
 
 use anyhow::{Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 use crate::config::{Credentials, DEFAULT_API_URL, Settings};
 use api::ApiClient;
-use cli::commands::{comment, configure, goal, login, org};
+use cli::commands::{comment, configure, detect, goal, link, login, org, skills, summary};
 
 #[derive(Parser)]
 #[command(
     name = "addness",
-    about = "Addness CLI - Manage your goals from the terminal"
+    about = "Addness CLI - Manage your goals from the terminal",
+    version
 )]
 struct Cli {
     #[command(subcommand)]
@@ -33,7 +35,11 @@ enum Commands {
     /// Configure API Key, URL, and default organization manually
     Configure,
     /// Show current configuration status
-    Status,
+    Status {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Remove saved credentials
     Logout,
     /// Manage organizations
@@ -51,6 +57,36 @@ enum Commands {
         #[command(subcommand)]
         command: comment::CommentCommands,
     },
+    /// Link PRs/URLs to goals and track progress
+    Link {
+        #[command(subcommand)]
+        command: link::LinkCommands,
+    },
+    /// Show progress summary of all goals
+    Summary {
+        /// Organization ID (uses default if not specified)
+        #[arg(long)]
+        org: Option<String>,
+        /// Tree depth (default: 5)
+        #[arg(long, default_value = "5")]
+        depth: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Detect goal ID from current git branch name
+    DetectGoal {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Output AI skills prompt for this CLI
+    Skills,
+    /// Generate shell completions
+    Completions {
+        /// Shell: bash, zsh, fish, powershell
+        shell: clap_complete::Shell,
+    },
 }
 
 fn build_client() -> Result<ApiClient> {
@@ -67,13 +103,15 @@ fn build_client() -> Result<ApiClient> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    match &cli.command {
+    let update_handle = tokio::spawn(update_check::check_for_update());
+
+    let result = match &cli.command {
         Commands::Login {
             api_url,
             frontend_url,
         } => login::handle_login(api_url, frontend_url.as_deref()).await,
         Commands::Configure => configure::handle_configure(),
-        Commands::Status => configure::handle_status(),
+        Commands::Status { json } => configure::handle_status(*json),
         Commands::Logout => configure::handle_logout(),
         Commands::Org { command } => {
             let client = build_client()?;
@@ -87,5 +125,28 @@ async fn main() -> Result<()> {
             let client = build_client()?;
             comment::handle_comments(command, &client).await
         }
-    }
+        Commands::Link { command } => {
+            let client = build_client()?;
+            link::handle_link(command, &client).await
+        }
+        Commands::Summary { org, depth, json } => {
+            let client = build_client()?;
+            summary::handle_summary(org.as_deref(), *depth, *json, &client).await
+        }
+        Commands::DetectGoal { json } => detect::handle_detect_goal(*json),
+        Commands::Skills => skills::handle_skills(),
+        Commands::Completions { shell } => {
+            clap_complete::generate(
+                *shell,
+                &mut Cli::command(),
+                "addness",
+                &mut std::io::stdout(),
+            );
+            Ok(())
+        }
+    };
+
+    let _ = update_handle.await;
+
+    result
 }

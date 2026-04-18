@@ -1,6 +1,6 @@
 use crate::api::{
-    ApiClient, ApiResponse, Goal, GoalChildrenData, GoalSearchResponse, GoalTreeData,
-    UpdateGoalRequest,
+    ApiClient, ApiResponse, CreateGoalRequest, Goal, GoalChildrenData, GoalSearchResponse,
+    GoalTreeData, UpdateGoalRequest,
 };
 use anyhow::Result;
 
@@ -44,6 +44,10 @@ impl ApiClient {
         let encoded: String = form_urlencoded::byte_serialize(query.as_bytes()).collect();
         let path = format!("/api/v1/team/objectives/search?title={encoded}&permission=read");
         self.get(&path).await
+    }
+
+    pub async fn create_goal(&self, req: &CreateGoalRequest) -> Result<ApiResponse<Goal>> {
+        self.post("/api/v2/objectives", req).await
     }
 
     pub async fn update_goal(

@@ -1,1 +1,134 @@
-<html><body><h1>Login successful!</h1><p>You can close this tab.</p></body></html>
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Addness CLI - Login Successful</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Noto Sans JP', sans-serif;
+      background: #fff;
+      color: #333;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      overflow: hidden;
+      position: relative;
+      padding: 24px;
+    }
+    .bg-wave {
+      position: absolute;
+      top: 50%;
+      right: 0;
+      height: 100%;
+      width: auto;
+      transform: translateY(-50%);
+      color: #F3F4F6;
+      pointer-events: none;
+    }
+    .card {
+      position: relative;
+      z-index: 1;
+      background: #fff;
+      border: 1px solid #e1e5eb;
+      border-radius: 16px;
+      padding: 32px 24px;
+      max-width: 420px;
+      width: 100%;
+      text-align: center;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 20px;
+    }
+    @media (min-width: 640px) {
+      .card { padding: 40px; }
+    }
+    .logo { color: #333; }
+    .logo svg { width: 48px; height: auto; }
+    .check-circle {
+      width: 52px;
+      height: 52px;
+      border-radius: 50%;
+      background: #ecfdf5;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      animation: scaleIn 0.3s ease-out;
+    }
+    .check-circle svg {
+      width: 26px;
+      height: 26px;
+      color: #64c465;
+      stroke-dasharray: 30;
+      stroke-dashoffset: 30;
+      animation: draw 0.4s ease-out 0.2s forwards;
+    }
+    h1 {
+      font-size: 20px;
+      font-weight: 700;
+      color: #333;
+    }
+    .body-text {
+      font-size: 14px;
+      color: #909398;
+      line-height: 1.7;
+    }
+    .hint {
+      font-size: 12px;
+      color: #909398;
+      padding-top: 16px;
+      border-top: 1px solid #f3f4f6;
+      width: 100%;
+    }
+    .hint code {
+      display: inline-block;
+      background: #f3f4f6;
+      border-radius: 6px;
+      padding: 2px 10px;
+      font-family: 'Geist Mono', 'SF Mono', 'Fira Code', monospace;
+      font-size: 12px;
+      color: #333;
+      font-weight: 500;
+    }
+    @keyframes scaleIn {
+      from { transform: scale(0); opacity: 0; }
+      to { transform: scale(1); opacity: 1; }
+    }
+    @keyframes draw {
+      to { stroke-dashoffset: 0; }
+    }
+  </style>
+</head>
+<body>
+  <svg class="bg-wave" viewBox="0 0 39 30" fill="none" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid meet">
+    <path d="M0 29.036C0 29.036 5.83667 28.3019 6.87392 28.1384C7.91116 27.9759 8.29978 27.5779 8.5607 26.9517C8.82162 26.3247 9.43992 16.0437 14.5251 10.6192C17.3731 7.58101 20.5933 5.6999 24.9609 5.6999C31.245 5.6999 37.5291 10.4373 38.4019 17.2802C37.8782 10.6128 33.1651 4.47168 23.3899 4.47168C19.6378 4.47168 14.6381 5.62325 9.28374 10.2618C1.15392 17.307 0 29.036 0 29.036Z" fill="currentColor"/>
+    <path d="M13.9647 17.4561C11.87 20.2634 11.6743 23.1724 11.6743 23.1724C11.6743 23.1724 11.5208 23.7726 12.2191 23.7726C13.6266 23.7726 22.518 19.3935 28.2784 14.2978C32.6424 10.4377 34.2134 8.50765 37.0063 0.962891C34.2134 7.4549 30.2656 10.2586 26.1828 12.7362C22.1 15.2139 16.9322 16.7543 13.9647 17.4561Z" fill="currentColor"/>
+  </svg>
+  <div class="card">
+    <div class="logo">
+      <svg viewBox="0 0 39 30" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M0 29.036C0 29.036 5.83667 28.3019 6.87392 28.1384C7.91116 27.9759 8.29978 27.5779 8.5607 26.9517C8.82162 26.3247 9.43992 16.0437 14.5251 10.6192C17.3731 7.58101 20.5933 5.6999 24.9609 5.6999C31.245 5.6999 37.5291 10.4373 38.4019 17.2802C37.8782 10.6128 33.1651 4.47168 23.3899 4.47168C19.6378 4.47168 14.6381 5.62325 9.28374 10.2618C1.15392 17.307 0 29.036 0 29.036Z" fill="currentColor"/>
+        <path d="M13.9647 17.4561C11.87 20.2634 11.6743 23.1724 11.6743 23.1724C11.6743 23.1724 11.5208 23.7726 12.2191 23.7726C13.6266 23.7726 22.518 19.3935 28.2784 14.2978C32.6424 10.4377 34.2134 8.50765 37.0063 0.962891C34.2134 7.4549 30.2656 10.2586 26.1828 12.7362C22.1 15.2139 16.9322 16.7543 13.9647 17.4561Z" fill="currentColor"/>
+      </svg>
+    </div>
+    <div class="check-circle">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="20 6 9 17 4 12"/>
+      </svg>
+    </div>
+    <h1>ログイン完了</h1>
+    <p class="body-text">
+      Addness CLI へのログインが完了しました。<br>
+      このタブは閉じて、ターミナルに戻ってください。
+    </p>
+    <div class="hint">
+      <code>addness</code> コマンドで操作を開始できます
+    </div>
+  </div>
+  <script>setTimeout(function(){ window.close(); }, 3000);</script>
+</body>
+</html>

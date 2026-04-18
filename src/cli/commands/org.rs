@@ -19,7 +19,11 @@ pub enum OrgCommands {
         id: String,
     },
     /// Show current organization
-    Current,
+    Current {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub async fn handle_org(cmd: &OrgCommands, client: &ApiClient) -> Result<()> {
@@ -35,15 +39,39 @@ pub async fn handle_org(cmd: &OrgCommands, client: &ApiClient) -> Result<()> {
             Ok(())
         }
         OrgCommands::Switch { id } => {
-            let mut settings = Settings::load()?;
-            settings.set_current_organization_id(id.clone())?;
-            println!("Switched to organization: {}", id);
+            // 所属確認: APIで組織一覧を取得し、指定IDが含まれるか検証
+            let resp: OrganizationsResponse = client.list_organizations().await?;
+            let found = resp.data.iter().find(|org| org.id == *id);
+            match found {
+                Some(org) => {
+                    let mut settings = Settings::load()?;
+                    settings.set_current_organization_id(id.clone())?;
+                    println!("Switched to organization: {} ({})", org.name, id);
+                }
+                None => {
+                    bail!(
+                        "Organization '{id}' not found in your account.\n\
+                         Use `addness org list` to see available organizations."
+                    );
+                }
+            }
             Ok(())
         }
-        OrgCommands::Current => {
+        OrgCommands::Current { json } => {
             let settings = Settings::load()?;
             match settings.current_organization_id() {
-                Some(id) => println!("{}", id),
+                Some(id) => {
+                    if *json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "organization_id": id
+                            }))?
+                        );
+                    } else {
+                        println!("{id}");
+                    }
+                }
                 None => bail!("No current organization set. Run: addness org switch <id>"),
             }
             Ok(())

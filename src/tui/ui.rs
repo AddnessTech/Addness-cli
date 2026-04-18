@@ -53,7 +53,7 @@ fn draw_title_bar(frame: &mut Frame, area: Rect) {
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan))
-            .title(" addness v0.1.0 "),
+            .title(format!(" addness v{} ", env!("CARGO_PKG_VERSION"))),
     );
     frame.render_widget(title, area);
 }
@@ -389,7 +389,12 @@ fn truncate_str(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else if max > 3 {
-        format!("{}...", &s[..max - 3])
+        let end = s
+            .char_indices()
+            .nth(max - 3)
+            .map(|(i, _)| i)
+            .unwrap_or(s.len());
+        format!("{}...", &s[..end])
     } else {
         s.chars().take(max).collect()
     }

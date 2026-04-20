@@ -5,7 +5,7 @@ use ratatui::{
 };
 use tokio::runtime::Handle;
 
-use crate::api::{ApiClient, Organization};
+use crate::api::{ApiClient, CreateGoalRequest, GoalStatus, Organization, UpdateGoalRequest};
 
 use super::goal_tree::{GoalTree, TreeRow};
 use super::ui;
@@ -15,6 +15,30 @@ pub enum ActivePane {
     OrgSelector,
     Navigation,
     Content,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FormField {
+    Title,
+    Description,
+    Status,
+}
+
+pub enum ModalState {
+    CreateGoal {
+        title: String,
+        description: String,
+        parent_goal_id: Option<String>,
+        parent_goal_title: Option<String>,
+        current_field: FormField,
+    },
+    EditGoal {
+        goal_id: String,
+        title: String,
+        description: String,
+        status: GoalStatus,
+        current_field: FormField,
+    },
 }
 
 pub struct App {
@@ -39,6 +63,12 @@ pub struct App {
 
     /// Error message to display in status bar (cleared on next key press)
     pub error_message: Option<String>,
+
+    /// Modal state for create/edit goal dialogs
+    pub modal_state: Option<ModalState>,
+
+    /// Success message to display in status bar (cleared on next key press)
+    pub success_message: Option<String>,
 }
 
 impl App {
@@ -57,6 +87,8 @@ impl App {
             goal_tree: GoalTree::empty(),
             content_height: 0,
             error_message: None,
+            modal_state: None,
+            success_message: None,
         }
     }
 
@@ -139,10 +171,13 @@ impl App {
                 return Ok(());
             }
 
-            // Clear error on any key press
+            // Clear error and success messages on any key press
             self.error_message = None;
+            self.success_message = None;
 
-            if self.show_org_popup {
+            if self.modal_state.is_some() {
+                self.handle_modal_input(key.code);
+            } else if self.show_org_popup {
                 self.handle_org_popup(key.code);
             } else {
                 self.handle_normal(key.code);
@@ -244,6 +279,16 @@ impl App {
                     self.goal_tree.collapse_or_parent();
                 }
             }
+            KeyCode::Char('c') => {
+                if self.active_pane == ActivePane::Content && self.sidebar_index == 0 {
+                    self.start_create_goal_modal();
+                }
+            }
+            KeyCode::Char('e') => {
+                if self.active_pane == ActivePane::Content && self.sidebar_index == 0 {
+                    self.start_edit_goal_modal();
+                }
+            }
             _ => {}
         }
     }
@@ -252,7 +297,10 @@ impl App {
         // Check if cursor is on CommentOmitted row - if so, increase display limit
         {
             let rows = self.goal_tree.flatten();
-            if matches!(rows.get(self.goal_tree.cursor), Some(TreeRow::CommentOmitted { .. })) {
+            if matches!(
+                rows.get(self.goal_tree.cursor),
+                Some(TreeRow::CommentOmitted { .. })
+            ) {
                 self.goal_tree.increase_comment_limit();
                 return;
             }
@@ -337,7 +385,8 @@ impl App {
             match result {
                 Ok((comments_resp, deliverables_resp, children_resp)) => {
                     if need_comments {
-                        self.goal_tree.set_comments_at_cursor(comments_resp.comments);
+                        self.goal_tree
+                            .set_comments_at_cursor(comments_resp.comments);
                     }
                     if need_deliverables {
                         self.goal_tree
@@ -356,5 +405,360 @@ impl App {
         }
 
         self.goal_tree.toggle_expand();
+    }
+
+    // -----------------------------------------------------------------------
+    // Modal handling - Create/Edit Goal
+    // -----------------------------------------------------------------------
+
+    fn start_create_goal_modal(&mut self) {
+        // Get parent goal info from cursor position
+        let rows = self.goal_tree.flatten();
+        let (parent_goal_id, parent_goal_title) = match rows.get(self.goal_tree.cursor) {
+            Some(TreeRow::Goal { goal_id, title, .. }) => {
+                (Some(goal_id.to_string()), Some(title.to_string()))
+            }
+            _ => (None, None),
+        };
+
+        self.modal_state = Some(ModalState::CreateGoal {
+            title: String::new(),
+            description: String::new(),
+            parent_goal_id,
+            parent_goal_title,
+            current_field: FormField::Title,
+        });
+    }
+
+    fn start_edit_goal_modal(&mut self) {
+        // Get goal info from cursor position
+        let rows = self.goal_tree.flatten();
+        let goal_info = match rows.get(self.goal_tree.cursor) {
+            Some(TreeRow::Goal {
+                goal_id,
+                title,
+                status,
+                is_completed,
+                ..
+            }) => {
+                let status = if *is_completed {
+                    GoalStatus::None // Will be marked completed via completed_at
+                } else {
+                    status.cloned().unwrap_or(GoalStatus::None)
+                };
+                Some((goal_id.to_string(), title.to_string(), status))
+            }
+            _ => None,
+        };
+
+        if let Some((goal_id, _title, status)) = goal_info {
+            // Fetch full goal details to get description
+            match self.api_call(self.client.get_goal(&goal_id)) {
+                Ok(resp) => {
+                    let goal = resp.data;
+                    self.modal_state = Some(ModalState::EditGoal {
+                        goal_id: goal.id,
+                        title: goal.title,
+                        description: goal.description.unwrap_or_default(),
+                        status: goal.status.unwrap_or(status),
+                        current_field: FormField::Title,
+                    });
+                }
+                Err(e) => {
+                    self.error_message = Some(format!("Failed to load goal: {e}"));
+                }
+            }
+        } else {
+            self.error_message = Some("Please select a goal to edit".to_string());
+        }
+    }
+
+    fn handle_modal_input(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => {
+                self.modal_state = None;
+            }
+            KeyCode::Tab => {
+                self.modal_next_field();
+            }
+            KeyCode::BackTab => {
+                self.modal_prev_field();
+            }
+            KeyCode::Enter => {
+                self.modal_submit();
+            }
+            KeyCode::Char(c) => {
+                self.modal_input_char(c);
+            }
+            KeyCode::Backspace => {
+                self.modal_backspace();
+            }
+            KeyCode::Up => {
+                // For status field in edit modal
+                if let Some(ModalState::EditGoal {
+                    current_field: FormField::Status,
+                    ..
+                }) = &self.modal_state
+                {
+                    self.modal_prev_status();
+                }
+            }
+            KeyCode::Down => {
+                // For status field in edit modal
+                if let Some(ModalState::EditGoal {
+                    current_field: FormField::Status,
+                    ..
+                }) = &self.modal_state
+                {
+                    self.modal_next_status();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn modal_next_field(&mut self) {
+        if let Some(ref mut modal) = self.modal_state {
+            match modal {
+                ModalState::CreateGoal { current_field, .. } => {
+                    *current_field = match current_field {
+                        FormField::Title => FormField::Description,
+                        FormField::Description => FormField::Title,
+                        _ => FormField::Title,
+                    };
+                }
+                ModalState::EditGoal { current_field, .. } => {
+                    *current_field = match current_field {
+                        FormField::Title => FormField::Description,
+                        FormField::Description => FormField::Status,
+                        FormField::Status => FormField::Title,
+                    };
+                }
+            }
+        }
+    }
+
+    fn modal_prev_field(&mut self) {
+        if let Some(ref mut modal) = self.modal_state {
+            match modal {
+                ModalState::CreateGoal { current_field, .. } => {
+                    *current_field = match current_field {
+                        FormField::Title => FormField::Description,
+                        FormField::Description => FormField::Title,
+                        _ => FormField::Title,
+                    };
+                }
+                ModalState::EditGoal { current_field, .. } => {
+                    *current_field = match current_field {
+                        FormField::Title => FormField::Status,
+                        FormField::Description => FormField::Title,
+                        FormField::Status => FormField::Description,
+                    };
+                }
+            }
+        }
+    }
+
+    fn modal_input_char(&mut self, c: char) {
+        if let Some(ref mut modal) = self.modal_state {
+            match modal {
+                ModalState::CreateGoal {
+                    title,
+                    description,
+                    current_field,
+                    ..
+                } => match current_field {
+                    FormField::Title => title.push(c),
+                    FormField::Description => description.push(c),
+                    _ => {}
+                },
+                ModalState::EditGoal {
+                    title,
+                    description,
+                    current_field,
+                    ..
+                } => match current_field {
+                    FormField::Title => title.push(c),
+                    FormField::Description => description.push(c),
+                    _ => {}
+                },
+            }
+        }
+    }
+
+    fn modal_backspace(&mut self) {
+        if let Some(ref mut modal) = self.modal_state {
+            match modal {
+                ModalState::CreateGoal {
+                    title,
+                    description,
+                    current_field,
+                    ..
+                } => match current_field {
+                    FormField::Title => {
+                        title.pop();
+                    }
+                    FormField::Description => {
+                        description.pop();
+                    }
+                    _ => {}
+                },
+                ModalState::EditGoal {
+                    title,
+                    description,
+                    current_field,
+                    ..
+                } => match current_field {
+                    FormField::Title => {
+                        title.pop();
+                    }
+                    FormField::Description => {
+                        description.pop();
+                    }
+                    _ => {}
+                },
+            }
+        }
+    }
+
+    fn modal_submit(&mut self) {
+        match self.modal_state.take() {
+            Some(ModalState::CreateGoal {
+                title,
+                description,
+                parent_goal_id,
+                ..
+            }) => {
+                self.modal_submit_create(title, description, parent_goal_id);
+            }
+            Some(ModalState::EditGoal {
+                goal_id,
+                title,
+                description,
+                status,
+                ..
+            }) => {
+                self.modal_submit_edit(goal_id, title, description, status);
+            }
+            None => {}
+        }
+    }
+
+    fn modal_submit_create(
+        &mut self,
+        title: String,
+        description: String,
+        parent_goal_id: Option<String>,
+    ) {
+        // Validate
+        if title.trim().is_empty() {
+            self.error_message = Some("Title is required".to_string());
+            return;
+        }
+
+        let Some(org_id) = self.current_org_id().map(|s| s.to_string()) else {
+            self.error_message = Some("No organization selected".to_string());
+            return;
+        };
+
+        let req = CreateGoalRequest {
+            organization_id: org_id,
+            title,
+            parent_objective_id: parent_goal_id,
+            description: if description.is_empty() {
+                None
+            } else {
+                Some(description)
+            },
+        };
+
+        match self.api_call(self.client.create_goal(&req)) {
+            Ok(_) => {
+                self.success_message = Some("Goal created successfully".to_string());
+                self.load_goal_tree();
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Failed to create goal: {e}"));
+            }
+        }
+    }
+
+    fn modal_submit_edit(
+        &mut self,
+        goal_id: String,
+        title: String,
+        description: String,
+        status: GoalStatus,
+    ) {
+        // Validate
+        if title.trim().is_empty() {
+            self.error_message = Some("Title is required".to_string());
+            return;
+        }
+
+        let Some(org_id) = self.current_org_id().map(|s| s.to_string()) else {
+            self.error_message = Some("No organization selected".to_string());
+            return;
+        };
+
+        // Fetch current goal to check if we need to update completed_at
+        let current_goal = match self.api_call(self.client.get_goal(&goal_id)) {
+            Ok(resp) => resp.data,
+            Err(e) => {
+                self.error_message = Some(format!("Failed to load goal: {e}"));
+                return;
+            }
+        };
+
+        // Determine completed_at based on status
+        let completed_at = match status {
+            GoalStatus::None | GoalStatus::InProgress | GoalStatus::Cancelled => {
+                if current_goal.is_completed {
+                    Some(None) // Uncomplete
+                } else {
+                    None // No change
+                }
+            }
+            _ => None,
+        };
+
+        let req = UpdateGoalRequest {
+            title: Some(title),
+            description: Some(description),
+            status: Some(status),
+            completed_at,
+        };
+
+        match self.api_call(self.client.update_goal(&org_id, &goal_id, &req)) {
+            Ok(_) => {
+                self.success_message = Some("Goal updated successfully".to_string());
+                self.load_goal_tree();
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Failed to update goal: {e}"));
+            }
+        }
+    }
+
+    fn modal_next_status(&mut self) {
+        if let Some(ModalState::EditGoal { status, .. }) = &mut self.modal_state {
+            *status = match status {
+                GoalStatus::None => GoalStatus::InProgress,
+                GoalStatus::InProgress => GoalStatus::Cancelled,
+                GoalStatus::Cancelled => GoalStatus::None,
+                _ => GoalStatus::None,
+            };
+        }
+    }
+
+    fn modal_prev_status(&mut self) {
+        if let Some(ModalState::EditGoal { status, .. }) = &mut self.modal_state {
+            *status = match status {
+                GoalStatus::None => GoalStatus::Cancelled,
+                GoalStatus::InProgress => GoalStatus::None,
+                GoalStatus::Cancelled => GoalStatus::InProgress,
+                _ => GoalStatus::None,
+            };
+        }
     }
 }

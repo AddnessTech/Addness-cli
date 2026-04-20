@@ -108,6 +108,11 @@ pub enum ModalState {
         allowed_statuses: Vec<GoalDisplayStatus>,
         current_field: FormField,
     },
+    DeleteGoal {
+        goal_id: String,
+        goal_title: String,
+        confirm_index: usize, // 0 = Cancel (default), 1 = Delete
+    },
 }
 
 pub struct App {
@@ -358,6 +363,11 @@ impl App {
                     self.start_edit_goal_modal();
                 }
             }
+            KeyCode::Char('d') => {
+                if self.active_pane == ActivePane::Content && self.sidebar_index == 0 {
+                    self.start_delete_goal_modal();
+                }
+            }
             _ => {}
         }
     }
@@ -541,6 +551,27 @@ impl App {
         }
     }
 
+    fn start_delete_goal_modal(&mut self) {
+        // Get goal info from cursor position
+        let rows = self.goal_tree.flatten();
+        let goal_info = match rows.get(self.goal_tree.cursor) {
+            Some(TreeRow::Goal { goal_id, title, .. }) => {
+                Some((goal_id.to_string(), title.to_string()))
+            }
+            _ => None,
+        };
+
+        if let Some((goal_id, goal_title)) = goal_info {
+            self.modal_state = Some(ModalState::DeleteGoal {
+                goal_id,
+                goal_title,
+                confirm_index: 0, // Default to Cancel
+            });
+        } else {
+            self.error_message = Some("Please select a goal to delete".to_string());
+        }
+    }
+
     fn handle_modal_input(&mut self, code: KeyCode) {
         match code {
             KeyCode::Esc => {
@@ -554,12 +585,6 @@ impl App {
             }
             KeyCode::Enter => {
                 self.modal_submit();
-            }
-            KeyCode::Char(c) => {
-                self.modal_input_char(c);
-            }
-            KeyCode::Backspace => {
-                self.modal_backspace();
             }
             KeyCode::Up => {
                 // For status field in edit modal
@@ -580,6 +605,35 @@ impl App {
                 {
                     self.modal_next_status();
                 }
+            }
+            KeyCode::Left => {
+                // For delete confirmation modal
+                if let Some(ModalState::DeleteGoal { confirm_index, .. }) = &mut self.modal_state
+                {
+                    *confirm_index = 0; // Cancel
+                }
+            }
+            KeyCode::Right => {
+                // For delete confirmation modal
+                if let Some(ModalState::DeleteGoal { confirm_index, .. }) = &mut self.modal_state
+                {
+                    *confirm_index = 1; // Delete
+                }
+            }
+            KeyCode::Char(c) => {
+                // For delete confirmation modal, handle h/l as left/right
+                if let Some(ModalState::DeleteGoal { confirm_index, .. }) = &mut self.modal_state {
+                    match c {
+                        'h' => *confirm_index = 0, // Cancel
+                        'l' => *confirm_index = 1, // Delete
+                        _ => {}
+                    }
+                } else {
+                    self.modal_input_char(c);
+                }
+            }
+            KeyCode::Backspace => {
+                self.modal_backspace();
             }
             _ => {}
         }
@@ -602,6 +656,9 @@ impl App {
                         FormField::Status => FormField::Title,
                     };
                 }
+                ModalState::DeleteGoal { .. } => {
+                    // No fields to navigate in delete modal
+                }
             }
         }
     }
@@ -622,6 +679,9 @@ impl App {
                         FormField::Description => FormField::Title,
                         FormField::Status => FormField::Description,
                     };
+                }
+                ModalState::DeleteGoal { .. } => {
+                    // No fields to navigate in delete modal
                 }
             }
         }
@@ -650,6 +710,9 @@ impl App {
                     FormField::Description => description.push(c),
                     _ => {}
                 },
+                ModalState::DeleteGoal { .. } => {
+                    // No text input in delete modal
+                }
             }
         }
     }
@@ -685,6 +748,9 @@ impl App {
                     }
                     _ => {}
                 },
+                ModalState::DeleteGoal { .. } => {
+                    // No text input in delete modal
+                }
             }
         }
     }
@@ -714,6 +780,17 @@ impl App {
                     .cloned()
                     .unwrap_or(current_status);
                 self.modal_submit_edit(goal_id, title, description, new_status);
+            }
+            Some(ModalState::DeleteGoal {
+                goal_id,
+                confirm_index,
+                ..
+            }) => {
+                if confirm_index == 1 {
+                    // User confirmed deletion
+                    self.modal_submit_delete(goal_id);
+                }
+                // confirm_index == 0 means cancel, do nothing
             }
             None => {}
         }
@@ -802,6 +879,18 @@ impl App {
             }
             Err(e) => {
                 self.error_message = Some(format!("Failed to update goal: {e}"));
+            }
+        }
+    }
+
+    fn modal_submit_delete(&mut self, goal_id: String) {
+        match self.api_call(self.client.delete_goal(&goal_id)) {
+            Ok(_) => {
+                self.success_message = Some("Goal deleted successfully".to_string());
+                self.load_goal_tree();
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Failed to delete goal: {e}"));
             }
         }
     }

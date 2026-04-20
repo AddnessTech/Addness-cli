@@ -40,6 +40,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         match modal {
             ModalState::CreateGoal { .. } => draw_create_goal_modal(frame, app),
             ModalState::EditGoal { .. } => draw_edit_goal_modal(frame, app),
+            ModalState::DeleteGoal { .. } => draw_delete_goal_modal(frame, app),
         }
     }
 }
@@ -537,6 +538,13 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ));
         hints.push(Span::raw(": Edit  "));
+        hints.push(Span::styled(
+            "d",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        hints.push(Span::raw(": Delete  "));
     }
 
     hints.push(Span::styled("|", Style::default().fg(Color::DarkGray)));
@@ -823,4 +831,91 @@ fn draw_edit_goal_modal(frame: &mut Frame, app: &App) {
             .title(" Status (↑↓で選択) "),
     );
     frame.render_widget(status_widget, field_layout[2]);
+}
+
+fn draw_delete_goal_modal(frame: &mut Frame, app: &App) {
+    let Some(ModalState::DeleteGoal {
+        goal_title,
+        confirm_index,
+        ..
+    }) = &app.modal_state
+    else {
+        return;
+    };
+
+    let area = centered_rect(60, 10, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .title(" ⚠️  削除の確認 ")
+        .title_bottom(
+            Line::from(" ←→/hl: 選択 | Enter: 実行 | Esc: キャンセル ")
+                .style(Style::default().fg(Color::DarkGray)),
+        );
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2), // Goal title
+            Constraint::Length(2), // Warning message
+            Constraint::Length(1), // Spacer
+            Constraint::Length(1), // Buttons
+            Constraint::Min(0),    // Spacer
+        ])
+        .split(inner);
+
+    // Goal title
+    let title_text = Paragraph::new(Line::from(vec![
+        Span::styled("削除するゴール: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            goal_title.as_str(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    frame.render_widget(title_text, layout[0]);
+
+    // Warning message
+    let warning = Paragraph::new(Line::from(vec![
+        Span::styled("⚠️  ", Style::default().fg(Color::Red)),
+        Span::styled(
+            "この操作は取り消せません。本当に削除しますか？",
+            Style::default().fg(Color::Red),
+        ),
+    ]));
+    frame.render_widget(warning, layout[1]);
+
+    // Buttons
+    let cancel_style = if *confirm_index == 0 {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+
+    let delete_style = if *confirm_index == 1 {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Red)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Red)
+    };
+
+    let buttons = Line::from(vec![
+        Span::raw("  "),
+        Span::styled("[ キャンセル ]", cancel_style),
+        Span::raw("    "),
+        Span::styled("[ 削除 ]", delete_style),
+    ]);
+
+    frame.render_widget(Paragraph::new(buttons), layout[3]);
 }

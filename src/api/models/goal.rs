@@ -3,6 +3,11 @@ use serde::{Deserialize, Deserializer, Serialize};
 /// Goal status values used by the backend API.
 /// Backend uses: "NONE", "IN_PROGRESS", "CANCELLED".
 /// Completion is tracked via `completedAt`, not status.
+///
+/// Only these transitions are allowed.
+/// None => InProgress or Cancelled,
+/// InProgress => None or Cancelled,
+/// Cancelled => None or InProgress,
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GoalStatus {
     #[serde(rename = "NONE")]

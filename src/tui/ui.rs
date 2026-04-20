@@ -389,12 +389,12 @@ fn render_tree_row(row: &TreeRow, is_cursor: bool, width: usize) -> Line<'static
 
 fn format_status(is_completed: bool, status: Option<&GoalStatus>) -> &'static str {
     if is_completed {
-        "Completed"
+        "✅ 完了"
     } else {
         match status {
-            Some(GoalStatus::InProgress) => "InProgress",
-            Some(GoalStatus::Cancelled) => "Cancelled",
-            _ => "NotStarted",
+            Some(GoalStatus::InProgress) => "⏩ 進行中",
+            Some(GoalStatus::Cancelled) => "⏸ 停止中",
+            _ => "🔵 未着手",
         }
     }
 }
@@ -701,7 +701,9 @@ fn draw_edit_goal_modal(frame: &mut Frame, app: &App) {
     let Some(ModalState::EditGoal {
         title,
         description,
-        status,
+        current_status,
+        selected_status_index,
+        allowed_statuses,
         current_field,
         ..
     }) = &app.modal_state
@@ -709,7 +711,19 @@ fn draw_edit_goal_modal(frame: &mut Frame, app: &App) {
         return;
     };
 
-    let area = centered_rect(60, 16, frame.area());
+    // Calculate status field height
+    // "現在: ..." (1) + empty line (1) + transitions (n) + borders (2) = 4 + n
+    let status_field_height = if !allowed_statuses.is_empty() {
+        4 + allowed_statuses.len() as u16
+    } else {
+        4 // just "現在: ..." + borders
+    };
+
+    // Calculate total modal height
+    // outer borders (2) + title field (3) + description field (3) + status field (status_field_height)
+    let modal_height = 2 + 3 + 3 + status_field_height;
+
+    let area = centered_rect(60, modal_height, frame.area());
     frame.render_widget(Clear, area);
 
     let block = Block::default()
@@ -717,21 +731,22 @@ fn draw_edit_goal_modal(frame: &mut Frame, app: &App) {
         .border_style(Style::default().fg(Color::Cyan))
         .title(" Edit Goal ")
         .title_bottom(
-            Line::from(" Tab: Next Field | \u{2191}\u{2193}: Change Status | Enter: Save | Esc: Cancel ")
-                .style(Style::default().fg(Color::DarkGray)),
+            Line::from(
+                " Tab: Next Field | \u{2191}\u{2193}: Change Status | Enter: Save | Esc: Cancel ",
+            )
+            .style(Style::default().fg(Color::DarkGray)),
         );
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Split into fields
     let field_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Title
-            Constraint::Length(3), // Description
-            Constraint::Length(3), // Status
-            Constraint::Min(0),    // Spacer
+            Constraint::Length(3),                   // Title
+            Constraint::Length(3),                   // Description
+            Constraint::Length(status_field_height), // Status
+            Constraint::Min(0),                      // Spacer
         ])
         .split(inner);
 
@@ -765,28 +780,47 @@ fn draw_edit_goal_modal(frame: &mut Frame, app: &App) {
     );
     frame.render_widget(desc_widget, field_layout[1]);
 
-    // Status field
+    // Status field - show current status and allowed transitions
     let status_focused = *current_field == FormField::Status;
     let status_border = if status_focused {
         Color::Cyan
     } else {
         Color::DarkGray
     };
-    let status_text = format_status_for_modal(status);
-    let status_widget = Paragraph::new(status_text).block(
+
+    // Build status display
+    let mut status_lines = vec![Line::from(vec![
+        Span::styled("現在: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            current_status.to_emoji_string(),
+            Style::default().fg(Color::White),
+        ),
+    ])];
+
+    if !allowed_statuses.is_empty() {
+        status_lines.push(Line::from(""));
+        for (i, status_option) in allowed_statuses.iter().enumerate() {
+            let is_selected = i == *selected_status_index;
+            let prefix = if is_selected { " > " } else { "   " };
+            let style = if is_selected {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            status_lines.push(Line::from(Span::styled(
+                format!("{}{}", prefix, status_option.to_emoji_string()),
+                style,
+            )));
+        }
+    }
+
+    let status_widget = Paragraph::new(status_lines).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(status_border))
-            .title(" Status "),
+            .title(" Status (↑↓で選択) "),
     );
     frame.render_widget(status_widget, field_layout[2]);
-}
-
-fn format_status_for_modal(status: &GoalStatus) -> String {
-    match status {
-        GoalStatus::None => "Not Started".to_string(),
-        GoalStatus::InProgress => "In Progress".to_string(),
-        GoalStatus::Cancelled => "Cancelled".to_string(),
-        GoalStatus::Other(s) => s.clone(),
-    }
 }

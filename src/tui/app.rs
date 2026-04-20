@@ -1,4 +1,5 @@
 use anyhow::Result;
+use chrono::Utc;
 use ratatui::{
     DefaultTerminal,
     crossterm::event::{self, Event, KeyCode, KeyEventKind},
@@ -24,6 +25,72 @@ pub enum FormField {
     Status,
 }
 
+/// Display status combining GoalStatus and completed_at
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GoalDisplayStatus {
+    NotStarted, // GoalStatus::None + not completed
+    InProgress, // GoalStatus::InProgress + not completed
+    Cancelled,  // GoalStatus::Cancelled + not completed
+    Completed,  // completed_at.is_some()
+}
+
+impl GoalDisplayStatus {
+    /// Get allowed transitions from current status
+    pub fn allowed_transitions(&self) -> Vec<GoalDisplayStatus> {
+        match self {
+            GoalDisplayStatus::NotStarted => vec![
+                GoalDisplayStatus::InProgress,
+                GoalDisplayStatus::Cancelled,
+                GoalDisplayStatus::Completed,
+            ],
+            GoalDisplayStatus::InProgress => vec![
+                GoalDisplayStatus::NotStarted,
+                GoalDisplayStatus::Cancelled,
+                GoalDisplayStatus::Completed,
+            ],
+            GoalDisplayStatus::Cancelled => vec![
+                GoalDisplayStatus::NotStarted,
+                GoalDisplayStatus::InProgress,
+                GoalDisplayStatus::Completed,
+            ],
+            GoalDisplayStatus::Completed => vec![
+                // Completed is final state - no transitions allowed
+            ],
+        }
+    }
+
+    pub fn to_emoji_string(&self) -> String {
+        match self {
+            GoalDisplayStatus::NotStarted => "🔵 未着手".to_string(),
+            GoalDisplayStatus::InProgress => "⏩ 進行中".to_string(),
+            GoalDisplayStatus::Cancelled => "⏸ 停止中".to_string(),
+            GoalDisplayStatus::Completed => "✅ 完了".to_string(),
+        }
+    }
+
+    /// Convert to GoalStatus for API (Completed is handled separately via completed_at)
+    pub fn to_goal_status(&self) -> GoalStatus {
+        match self {
+            GoalDisplayStatus::NotStarted => GoalStatus::None,
+            GoalDisplayStatus::InProgress => GoalStatus::InProgress,
+            GoalDisplayStatus::Cancelled => GoalStatus::Cancelled,
+            GoalDisplayStatus::Completed => GoalStatus::None, // Will set completed_at instead
+        }
+    }
+
+    /// Create from GoalStatus and is_completed flag
+    pub fn from_goal_state(status: Option<&GoalStatus>, is_completed: bool) -> Self {
+        if is_completed {
+            return GoalDisplayStatus::Completed;
+        }
+        match status {
+            Some(GoalStatus::InProgress) => GoalDisplayStatus::InProgress,
+            Some(GoalStatus::Cancelled) => GoalDisplayStatus::Cancelled,
+            _ => GoalDisplayStatus::NotStarted,
+        }
+    }
+}
+
 pub enum ModalState {
     CreateGoal {
         title: String,
@@ -36,7 +103,9 @@ pub enum ModalState {
         goal_id: String,
         title: String,
         description: String,
-        status: GoalStatus,
+        current_status: GoalDisplayStatus,
+        selected_status_index: usize,
+        allowed_statuses: Vec<GoalDisplayStatus>,
         current_field: FormField,
     },
 }
@@ -436,31 +505,30 @@ impl App {
         let goal_info = match rows.get(self.goal_tree.cursor) {
             Some(TreeRow::Goal {
                 goal_id,
-                title,
                 status,
                 is_completed,
                 ..
             }) => {
-                let status = if *is_completed {
-                    GoalStatus::None // Will be marked completed via completed_at
-                } else {
-                    status.cloned().unwrap_or(GoalStatus::None)
-                };
-                Some((goal_id.to_string(), title.to_string(), status))
+                let display_status = GoalDisplayStatus::from_goal_state(*status, *is_completed);
+                Some((goal_id.to_string(), display_status))
             }
             _ => None,
         };
 
-        if let Some((goal_id, _title, status)) = goal_info {
+        if let Some((goal_id, current_status)) = goal_info {
             // Fetch full goal details to get description
             match self.api_call(self.client.get_goal(&goal_id)) {
                 Ok(resp) => {
                     let goal = resp.data;
+                    let allowed_statuses = current_status.allowed_transitions();
+
                     self.modal_state = Some(ModalState::EditGoal {
                         goal_id: goal.id,
                         title: goal.title,
                         description: goal.description.unwrap_or_default(),
-                        status: goal.status.unwrap_or(status),
+                        current_status,
+                        selected_status_index: 0,
+                        allowed_statuses,
                         current_field: FormField::Title,
                     });
                 }
@@ -635,10 +703,17 @@ impl App {
                 goal_id,
                 title,
                 description,
-                status,
+                current_status,
+                selected_status_index,
+                allowed_statuses,
                 ..
             }) => {
-                self.modal_submit_edit(goal_id, title, description, status);
+                // Get selected status from allowed transitions
+                let new_status = allowed_statuses
+                    .get(selected_status_index)
+                    .cloned()
+                    .unwrap_or(current_status);
+                self.modal_submit_edit(goal_id, title, description, new_status);
             }
             None => {}
         }
@@ -688,7 +763,7 @@ impl App {
         goal_id: String,
         title: String,
         description: String,
-        status: GoalStatus,
+        new_display_status: GoalDisplayStatus,
     ) {
         // Validate
         if title.trim().is_empty() {
@@ -701,31 +776,22 @@ impl App {
             return;
         };
 
-        // Fetch current goal to check if we need to update completed_at
-        let current_goal = match self.api_call(self.client.get_goal(&goal_id)) {
-            Ok(resp) => resp.data,
-            Err(e) => {
-                self.error_message = Some(format!("Failed to load goal: {e}"));
-                return;
+        // Determine completed_at and status based on new display status
+        let (api_status, completed_at) = match new_display_status {
+            GoalDisplayStatus::Completed => {
+                // Mark as completed: set completed_at to current time
+                (GoalStatus::None, Some(Some(Utc::now().to_rfc3339())))
             }
-        };
-
-        // Determine completed_at based on status
-        let completed_at = match status {
-            GoalStatus::None | GoalStatus::InProgress | GoalStatus::Cancelled => {
-                if current_goal.is_completed {
-                    Some(None) // Uncomplete
-                } else {
-                    None // No change
-                }
+            _ => {
+                // Not completed: uncomplete if needed, set appropriate status
+                (new_display_status.to_goal_status(), Some(None))
             }
-            _ => None,
         };
 
         let req = UpdateGoalRequest {
             title: Some(title),
             description: Some(description),
-            status: Some(status),
+            status: Some(api_status),
             completed_at,
         };
 
@@ -741,23 +807,29 @@ impl App {
     }
 
     fn modal_next_status(&mut self) {
-        if let Some(ModalState::EditGoal { status, .. }) = &mut self.modal_state {
-            *status = match status {
-                GoalStatus::None => GoalStatus::InProgress,
-                GoalStatus::InProgress => GoalStatus::Cancelled,
-                GoalStatus::Cancelled => GoalStatus::None,
-                _ => GoalStatus::None,
-            };
+        if let Some(ModalState::EditGoal {
+            selected_status_index,
+            allowed_statuses,
+            ..
+        }) = &mut self.modal_state
+            && !allowed_statuses.is_empty()
+        {
+            *selected_status_index = (*selected_status_index + 1) % allowed_statuses.len();
         }
     }
 
     fn modal_prev_status(&mut self) {
-        if let Some(ModalState::EditGoal { status, .. }) = &mut self.modal_state {
-            *status = match status {
-                GoalStatus::None => GoalStatus::Cancelled,
-                GoalStatus::InProgress => GoalStatus::None,
-                GoalStatus::Cancelled => GoalStatus::InProgress,
-                _ => GoalStatus::None,
+        if let Some(ModalState::EditGoal {
+            selected_status_index,
+            allowed_statuses,
+            ..
+        }) = &mut self.modal_state
+            && !allowed_statuses.is_empty()
+        {
+            *selected_status_index = if *selected_status_index == 0 {
+                allowed_statuses.len() - 1
+            } else {
+                *selected_status_index - 1
             };
         }
     }

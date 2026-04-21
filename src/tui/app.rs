@@ -385,10 +385,8 @@ impl App {
                 _ => {}
             },
             KeyCode::Up | KeyCode::Char('k') => match self.active_pane {
-                ActivePane::Navigation => {
-                    if self.sidebar_index > 0 {
-                        self.sidebar_index -= 1;
-                    }
+                ActivePane::Navigation if self.sidebar_index > 0 => {
+                    self.sidebar_index -= 1;
                 }
                 ActivePane::Content if self.sidebar_index == 0 || self.sidebar_index == 1 => {
                     self.active_goal_tree_mut().cursor_up();
@@ -396,10 +394,8 @@ impl App {
                 _ => {}
             },
             KeyCode::Down | KeyCode::Char('j') => match self.active_pane {
-                ActivePane::Navigation => {
-                    if self.sidebar_index < self.sidebar_items.len() - 1 {
-                        self.sidebar_index += 1;
-                    }
+                ActivePane::Navigation if self.sidebar_index < self.sidebar_items.len() - 1 => {
+                    self.sidebar_index += 1;
                 }
                 ActivePane::Content if self.sidebar_index == 0 || self.sidebar_index == 1 => {
                     self.active_goal_tree_mut().cursor_down();
@@ -861,13 +857,13 @@ impl App {
             }
             Some(ModalState::DeleteGoal {
                 goal_id,
-                confirm_index,
+                confirm_index: 1,
                 ..
             }) => {
-                if confirm_index == 1 {
-                    // User confirmed deletion
-                    self.modal_submit_delete(goal_id);
-                }
+                // User confirmed deletion
+                self.modal_submit_delete(goal_id);
+            }
+            Some(ModalState::DeleteGoal { .. }) => {
                 // confirm_index == 0 means cancel, do nothing
             }
             None => {}

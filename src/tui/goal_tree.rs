@@ -1,6 +1,8 @@
+use std::collections::{HashMap, HashSet};
+
 use chrono::{DateTime, Utc};
 
-use crate::api::{Comment, Deliverable, GoalChildItem, GoalStatus, GoalTreeItem, Owner};
+use crate::api::{Comment, Deliverable, GoalChildItem, GoalStatus, GoalTreeItem, MemberId, Owner};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -214,6 +216,64 @@ impl GoalTree {
             scroll_offset: 0,
         }
     }
+
+    /// Create a filtered tree containing only goals owned by the specified user
+    /// and all ancestors needed to show the path from root to owned goals.
+    /// Auto-expands goals owned by the user.
+    pub fn from_tree_items_filtered(items: Vec<GoalTreeItem>, member_id: &MemberId) -> Self {
+        if items.is_empty() {
+            return Self::empty();
+        }
+
+        // Phase 1: Build lookup map
+        let goal_map: HashMap<String, &GoalTreeItem> =
+            items.iter().map(|item| (item.id.clone(), item)).collect();
+
+        // Phase 2: Find owned goals and collect all needed IDs (owned + ancestors)
+        let mut needed_ids: HashSet<String> = HashSet::new();
+
+        for item in &items {
+            if let Some(owner) = &item.owner
+                && &owner.organization_member_id == member_id
+            {
+                // Add this goal and all its ancestors
+                add_goal_and_ancestors(&item.id, &goal_map, &mut needed_ids);
+            }
+        }
+
+        // If no goals are owned by the user, return empty tree
+        if needed_ids.is_empty() {
+            return Self::empty();
+        }
+
+        // Phase 3: Filter and build tree
+        let roots = items
+            .into_iter()
+            .filter(|item| needed_ids.contains(&item.id))
+            .map(|item| {
+                let is_owned = item
+                    .owner
+                    .as_ref()
+                    .map(|o| &o.organization_member_id == member_id)
+                    .unwrap_or(false);
+
+                GoalRootNode {
+                    node: item,
+                    children: None,
+                    comments: None,
+                    deliverables: None,
+                    expanded: is_owned, // Auto-expand owned goals
+                    comment_display_limit: INITIAL_COMMENT_DISPLAY_LIMIT,
+                }
+            })
+            .collect();
+
+        GoalTree {
+            roots,
+            cursor: 0,
+            scroll_offset: 0,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -248,6 +308,47 @@ impl GoalTree {
         let mut children = Some(children);
         for root in &mut self.roots {
             if set_children_at(root, target, &mut idx, &mut children) {
+                return;
+            }
+        }
+    }
+
+    /// Insert fetched children with filtering applied for execution view.
+    /// Only includes children owned by member_id or that are ancestors of owned goals.
+    pub fn set_children_at_cursor_filtered(
+        &mut self,
+        children: Vec<GoalChildItem>,
+        member_id: &MemberId,
+    ) {
+        // Build lookup map for children
+        let child_map: HashMap<String, &GoalChildItem> = children
+            .iter()
+            .map(|item| (item.id.clone(), item))
+            .collect();
+
+        // Find needed IDs (owned + ancestors of owned)
+        let mut needed_ids: HashSet<String> = HashSet::new();
+
+        for child in &children {
+            if let Some(owner) = &child.owner
+                && &owner.organization_member_id == member_id
+            {
+                add_child_and_ancestors(&child.id, &child_map, &mut needed_ids);
+            }
+        }
+
+        // Filter children
+        let filtered_children: Vec<GoalChildItem> = children
+            .into_iter()
+            .filter(|item| needed_ids.contains(&item.id))
+            .collect();
+
+        // Use standard method to set filtered children
+        let target = self.cursor;
+        let mut idx = 0;
+        let mut filtered = Some((filtered_children, member_id.clone()));
+        for root in &mut self.roots {
+            if set_children_at_filtered(root, target, &mut idx, &mut filtered) {
                 return;
             }
         }
@@ -516,6 +617,57 @@ fn set_children_at<S: GoalItemAccessor>(
     false
 }
 
+fn set_children_at_filtered<S: GoalItemAccessor>(
+    node: &mut GoalNodeInner<S>,
+    target: usize,
+    idx: &mut usize,
+    children_with_member_id: &mut Option<(Vec<GoalChildItem>, MemberId)>,
+) -> bool {
+    if *idx == target {
+        if let Some((items, member_id)) = children_with_member_id.take() {
+            let child_nodes = items
+                .into_iter()
+                .map(|item| {
+                    let is_owned = item
+                        .owner
+                        .as_ref()
+                        .map(|o| o.organization_member_id == member_id)
+                        .unwrap_or(false);
+
+                    GoalChildNode {
+                        node: item,
+                        children: None,
+                        comments: None,
+                        deliverables: None,
+                        expanded: is_owned, // Auto-expand owned goals
+                        comment_display_limit: INITIAL_COMMENT_DISPLAY_LIMIT,
+                    }
+                })
+                .collect();
+            node.children = Some(Timestamped::now(child_nodes));
+        }
+        return true;
+    }
+    *idx += 1;
+
+    if node.expanded {
+        *idx += 1; // detail row
+        *idx += comment_row_count(&node.comments, node.comment_display_limit);
+        if let Some(ts) = &node.deliverables {
+            *idx += 1 + ts.data.len();
+        }
+        if let Some(ts) = &mut node.children {
+            for child in &mut ts.data {
+                if set_children_at_filtered(child, target, idx, children_with_member_id) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
 fn set_comments_at<S: GoalItemAccessor>(
     node: &mut GoalNodeInner<S>,
     target: usize,
@@ -616,4 +768,42 @@ fn increase_comment_limit_at<S: GoalItemAccessor>(
     }
 
     false
+}
+
+// ---------------------------------------------------------------------------
+// Filtering helpers
+// ---------------------------------------------------------------------------
+
+/// Recursively add a goal and all its ancestors to the needed_ids set
+fn add_goal_and_ancestors(
+    goal_id: &str,
+    goal_map: &HashMap<String, &GoalTreeItem>,
+    needed_ids: &mut HashSet<String>,
+) {
+    // Add this goal
+    needed_ids.insert(goal_id.to_string());
+
+    // Recursively add parent if it exists
+    if let Some(goal) = goal_map.get(goal_id)
+        && let Some(parent_id) = &goal.parent_id
+    {
+        add_goal_and_ancestors(parent_id, goal_map, needed_ids);
+    }
+}
+
+/// Recursively add a child goal and all its ancestors to the needed_ids set
+fn add_child_and_ancestors(
+    child_id: &str,
+    child_map: &HashMap<String, &GoalChildItem>,
+    needed_ids: &mut HashSet<String>,
+) {
+    // Add this child
+    needed_ids.insert(child_id.to_string());
+
+    // Recursively add parent if it exists
+    if let Some(child) = child_map.get(child_id)
+        && let Some(parent_id) = &child.parent_id
+    {
+        add_child_and_ancestors(parent_id, child_map, needed_ids);
+    }
 }

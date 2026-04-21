@@ -513,8 +513,7 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
         Span::raw(": Navigate  "),
     ];
 
-    if app.active_pane == ActivePane::Content
-        && (app.sidebar_index == 0 || app.sidebar_index == 1)
+    if app.active_pane == ActivePane::Content && (app.sidebar_index == 0 || app.sidebar_index == 1)
     {
         hints.push(Span::styled(
             "Enter/l",

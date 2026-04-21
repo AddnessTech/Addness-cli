@@ -1,6 +1,7 @@
 mod comment;
 mod deliverable;
 mod goal;
+mod goal_execution;
 mod member;
 mod org;
 

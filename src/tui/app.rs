@@ -92,6 +92,9 @@ impl GoalDisplayStatus {
     }
 }
 
+// NOTE: 将来goal以外についてのモーダルが出得るためsuffixにGoalと付けている
+// それまでclippy errorを抑制
+#[allow(clippy::enum_variant_names)]
 pub enum ModalState {
     CreateGoal {
         title: String,
@@ -330,15 +333,13 @@ impl App {
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.show_org_popup = false;
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                if self.org_popup_index > 0 {
-                    self.org_popup_index -= 1;
-                }
+            KeyCode::Up | KeyCode::Char('k') if self.org_popup_index > 0 => {
+                self.org_popup_index -= 1;
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if !self.orgs.is_empty() && self.org_popup_index < self.orgs.len() - 1 {
-                    self.org_popup_index += 1;
-                }
+            KeyCode::Down | KeyCode::Char('j')
+                if !self.orgs.is_empty() && self.org_popup_index < self.orgs.len() - 1 =>
+            {
+                self.org_popup_index += 1;
             }
             KeyCode::Enter => {
                 let new_index = self.org_popup_index;
@@ -414,33 +415,29 @@ impl App {
                 }
                 _ => {}
             },
-            KeyCode::Left | KeyCode::Char('h') => {
+            KeyCode::Left | KeyCode::Char('h')
                 if self.active_pane == ActivePane::Content
-                    && (self.sidebar_index == 0 || self.sidebar_index == 1)
-                {
-                    self.active_goal_tree_mut().collapse_or_parent();
-                }
+                    && (self.sidebar_index == 0 || self.sidebar_index == 1) =>
+            {
+                self.active_goal_tree_mut().collapse_or_parent();
             }
-            KeyCode::Char('c') => {
+            KeyCode::Char('c')
                 if self.active_pane == ActivePane::Content
-                    && (self.sidebar_index == 0 || self.sidebar_index == 1)
-                {
-                    self.start_create_goal_modal();
-                }
+                    && (self.sidebar_index == 0 || self.sidebar_index == 1) =>
+            {
+                self.start_create_goal_modal();
             }
-            KeyCode::Char('e') => {
+            KeyCode::Char('e')
                 if self.active_pane == ActivePane::Content
-                    && (self.sidebar_index == 0 || self.sidebar_index == 1)
-                {
-                    self.start_edit_goal_modal();
-                }
+                    && (self.sidebar_index == 0 || self.sidebar_index == 1) =>
+            {
+                self.start_edit_goal_modal();
             }
-            KeyCode::Char('d') => {
+            KeyCode::Char('d')
                 if self.active_pane == ActivePane::Content
-                    && (self.sidebar_index == 0 || self.sidebar_index == 1)
-                {
-                    self.start_delete_goal_modal();
-                }
+                    && (self.sidebar_index == 0 || self.sidebar_index == 1) =>
+            {
+                self.start_delete_goal_modal();
             }
             _ => {}
         }

@@ -67,6 +67,7 @@ pub struct ExecutionRecord {
 
 impl ExecutionRecord {
     /// Check if this execution is completed
+    #[allow(dead_code)]
     pub fn is_completed(&self) -> bool {
         self.completed_at.is_some()
     }

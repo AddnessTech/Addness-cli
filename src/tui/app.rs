@@ -6,9 +6,8 @@ use ratatui::{
 };
 use tokio::runtime::Handle;
 
-use crate::api::{
-    ApiClient, CreateGoalRequest, GoalStatus, MemberId, Organization, UpdateGoalRequest,
-};
+use crate::api::{ApiClient, CreateGoalRequest, GoalStatus, Organization, UpdateGoalRequest};
+use crate::dbg_log;
 
 use super::goal_tree::{GoalTree, TreeRow};
 use super::ui;
@@ -133,10 +132,7 @@ pub struct App {
 
     // Goal trees
     pub goal_tree: GoalTree,
-    pub execution_goal_tree: GoalTree,
-
-    // Current user
-    pub current_member_id: Option<MemberId>,
+    pub todays_goals_tree: GoalTree,
 
     /// Last known content viewport height (for scroll calculations)
     pub content_height: usize,
@@ -165,8 +161,7 @@ impl App {
             show_org_popup: false,
             org_popup_index: 0,
             goal_tree: GoalTree::empty(),
-            execution_goal_tree: GoalTree::empty(),
-            current_member_id: None,
+            todays_goals_tree: GoalTree::empty(),
             content_height: 0,
             error_message: None,
             modal_state: None,
@@ -189,7 +184,7 @@ impl App {
     pub fn active_goal_tree(&self) -> &GoalTree {
         match self.sidebar_index {
             0 => &self.goal_tree,
-            1 => &self.execution_goal_tree,
+            1 => &self.todays_goals_tree,
             _ => &self.goal_tree,
         }
     }
@@ -198,7 +193,7 @@ impl App {
     pub fn active_goal_tree_mut(&mut self) -> &mut GoalTree {
         match self.sidebar_index {
             0 => &mut self.goal_tree,
-            1 => &mut self.execution_goal_tree,
+            1 => &mut self.todays_goals_tree,
             _ => &mut self.goal_tree,
         }
     }
@@ -239,31 +234,8 @@ impl App {
             }
         }
 
-        self.load_current_user();
         self.load_goal_tree();
-        self.load_execution_tree();
-    }
-
-    fn load_current_user(&mut self) {
-        let Some(org_id) = self.current_org_id().map(|s| s.to_string()) else {
-            self.current_member_id = None;
-            return;
-        };
-
-        match self.api_call(self.client.get_members(&org_id)) {
-            Ok(resp) => {
-                self.current_member_id = resp
-                    .data
-                    .members
-                    .iter()
-                    .find(|m| m.is_current_user)
-                    .map(|m| m.id.clone());
-            }
-            Err(e) => {
-                self.error_message = Some(format!("Failed to load user info: {e}"));
-                self.current_member_id = None;
-            }
-        }
+        self.load_todays_goals();
     }
 
     fn load_goal_tree(&mut self) {
@@ -285,27 +257,45 @@ impl App {
         }
     }
 
-    fn load_execution_tree(&mut self) {
+    fn load_todays_goals(&mut self) {
         let Some(org_id) = self.current_org_id().map(|s| s.to_string()) else {
-            self.execution_goal_tree = GoalTree::empty();
+            self.todays_goals_tree = GoalTree::empty();
             return;
         };
 
-        let Some(member_id) = &self.current_member_id else {
-            self.execution_goal_tree = GoalTree::empty();
-            return;
-        };
-
+        dbg_log!("=== load_todays_goals ===");
         self.client.set_org_id(Some(org_id.clone()));
 
-        match self.api_call(self.client.get_goal_tree(&org_id, 1)) {
+        match self.api_call(self.client.get_todays_goals(&org_id, None, None)) {
             Ok(resp) => {
-                self.execution_goal_tree =
-                    GoalTree::from_tree_items_filtered(resp.data.items, member_id);
+                dbg_log!("Total nodes loaded: {}", resp.data.nodes.len());
+                dbg_log!("Excluded nodes: {}", resp.data.excluded_nodes.len());
+                dbg_log!("Auto-generated count: {}", resp.data.auto_generated_count);
+
+                for node in &resp.data.nodes {
+                    dbg_log!(
+                        "  Goal: {} | id: {} | depth: {} | is_direct: {} | owner: {}",
+                        node.title,
+                        node.id,
+                        node.depth,
+                        node.is_direct_assignment,
+                        node.owner
+                            .as_ref()
+                            .map(|o| o.name.as_str())
+                            .unwrap_or("None")
+                    );
+                }
+
+                self.todays_goals_tree = GoalTree::from_todays_goal_nodes(resp.data.nodes);
+
+                dbg_log!(
+                    "Today's goals tree has {} roots",
+                    self.todays_goals_tree.roots.len()
+                );
             }
             Err(e) => {
-                self.execution_goal_tree = GoalTree::empty();
-                self.error_message = Some(format!("Failed to load execution tree: {e}"));
+                self.todays_goals_tree = GoalTree::empty();
+                self.error_message = Some(format!("Failed to load today's goals: {e}"));
             }
         }
     }
@@ -355,10 +345,8 @@ impl App {
                 self.show_org_popup = false;
                 if new_index != self.current_org_index {
                     self.current_org_index = new_index;
-                    self.current_member_id = None; // Clear user ID when switching orgs
-                    self.load_current_user();
                     self.load_goal_tree();
-                    self.load_execution_tree();
+                    self.load_todays_goals();
                 }
             }
             _ => {}
@@ -459,6 +447,9 @@ impl App {
     }
 
     fn handle_goal_expand(&mut self) {
+        // Check if this is a complete tree (from todays-goals) - if so, only toggle expand
+        let is_completed_tree = !self.active_goal_tree().is_required_to_fetch;
+
         // Check if cursor is on CommentOmitted row - if so, increase display limit
         {
             let tree = self.active_goal_tree();
@@ -467,6 +458,12 @@ impl App {
                 self.active_goal_tree_mut().increase_comment_limit();
                 return;
             }
+        }
+
+        // If this is a complete tree, just toggle expand without fetching
+        if is_completed_tree {
+            self.active_goal_tree_mut().toggle_expand();
+            return;
         }
 
         // Extract info from the cursor row before mutating
@@ -548,10 +545,6 @@ impl App {
 
             match result {
                 Ok((comments_resp, deliverables_resp, children_resp)) => {
-                    // Get values before mutable borrow
-                    let is_execution_view = self.sidebar_index == 1;
-                    let member_id = self.current_member_id.clone();
-
                     let tree = self.active_goal_tree_mut();
                     if need_comments {
                         tree.set_comments_at_cursor(comments_resp.comments);
@@ -560,19 +553,7 @@ impl App {
                         tree.set_deliverables_at_cursor(deliverables_resp.data.deliverables);
                     }
                     if need_children {
-                        // Apply filtering in execution view
-                        if is_execution_view {
-                            if let Some(uid) = member_id {
-                                tree.set_children_at_cursor_filtered(
-                                    children_resp.data.children,
-                                    &uid,
-                                );
-                            } else {
-                                tree.set_children_at_cursor(children_resp.data.children);
-                            }
-                        } else {
-                            tree.set_children_at_cursor(children_resp.data.children);
-                        }
+                        tree.set_children_at_cursor(children_resp.data.children);
                     }
                 }
                 Err(e) => {
@@ -928,7 +909,7 @@ impl App {
             Ok(_) => {
                 self.success_message = Some("Goal created successfully".to_string());
                 self.load_goal_tree();
-                self.load_execution_tree();
+                self.load_todays_goals();
             }
             Err(e) => {
                 self.error_message = Some(format!("Failed to create goal: {e}"));
@@ -977,7 +958,7 @@ impl App {
             Ok(_) => {
                 self.success_message = Some("Goal updated successfully".to_string());
                 self.load_goal_tree();
-                self.load_execution_tree();
+                self.load_todays_goals();
             }
             Err(e) => {
                 self.error_message = Some(format!("Failed to update goal: {e}"));
@@ -990,7 +971,7 @@ impl App {
             Ok(_) => {
                 self.success_message = Some("Goal deleted successfully".to_string());
                 self.load_goal_tree();
-                self.load_execution_tree();
+                self.load_todays_goals();
             }
             Err(e) => {
                 self.error_message = Some(format!("Failed to delete goal: {e}"));

@@ -6,10 +6,12 @@ use serde::{Deserialize, Serialize};
 pub struct UserId(String);
 
 impl UserId {
+    #[allow(dead_code)]
     fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
 
+    #[allow(dead_code)]
     fn as_str(&self) -> &str {
         &self.0
     }
@@ -21,6 +23,7 @@ impl UserId {
 pub struct MemberId(String);
 
 impl MemberId {
+    #[allow(dead_code)]
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }

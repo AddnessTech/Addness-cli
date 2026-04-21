@@ -1,5 +1,7 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::api::{MemberId, UserId};
+
 /// Goal status values used by the backend API.
 /// Backend uses: "NONE", "IN_PROGRESS", "CANCELLED".
 /// Completion is tracked via `completedAt`, not status.
@@ -78,7 +80,8 @@ pub struct TreePage {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Owner {
-    pub id: String,
+    pub id: UserId,
+    pub organization_member_id: MemberId,
     pub name: String,
 }
 

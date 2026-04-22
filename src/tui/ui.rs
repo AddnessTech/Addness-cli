@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
 
-use super::app::{ActivePane, App};
+use super::app::{ActivePane, App, FormField, ModalState};
 use super::goal_tree::TreeRow;
 use crate::api::{DeliverableType, GoalStatus};
 
@@ -33,6 +33,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     if app.show_org_popup {
         draw_org_popup(frame, app);
+    }
+
+    // Draw modals last (on top of everything)
+    if let Some(ref modal) = app.modal_state {
+        match modal {
+            ModalState::CreateGoal { .. } => draw_create_goal_modal(frame, app),
+            ModalState::EditGoal { .. } => draw_edit_goal_modal(frame, app),
+            ModalState::DeleteGoal { .. } => draw_delete_goal_modal(frame, app),
+        }
     }
 }
 
@@ -381,12 +390,12 @@ fn render_tree_row(row: &TreeRow, is_cursor: bool, width: usize) -> Line<'static
 
 fn format_status(is_completed: bool, status: Option<&GoalStatus>) -> &'static str {
     if is_completed {
-        "Completed"
+        "✅ 完了"
     } else {
         match status {
-            Some(GoalStatus::InProgress) => "InProgress",
-            Some(GoalStatus::Cancelled) => "Cancelled",
-            _ => "NotStarted",
+            Some(GoalStatus::InProgress) => "⏩ 進行中",
+            Some(GoalStatus::Cancelled) => "⏸ 停止中",
+            _ => "🔵 未着手",
         }
     }
 }
@@ -448,6 +457,27 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
+    // Show success message if present
+    if let Some(ref msg) = app.success_message {
+        let status = Paragraph::new(Line::from(vec![
+            Span::styled(
+                " SUCCESS: ",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(msg.clone(), Style::default().fg(Color::Green)),
+        ]))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Green))
+                .title(" Success "),
+        );
+        frame.render_widget(status, area);
+        return;
+    }
+
     let current_section = app.sidebar_items[app.sidebar_index];
     let pane_label = match app.active_pane {
         ActivePane::OrgSelector => "Org",
@@ -494,6 +524,27 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ));
         hints.push(Span::raw(": Collapse  "));
+        hints.push(Span::styled(
+            "c",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        hints.push(Span::raw(": Create  "));
+        hints.push(Span::styled(
+            "e",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        hints.push(Span::raw(": Edit  "));
+        hints.push(Span::styled(
+            "d",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        hints.push(Span::raw(": Delete  "));
     }
 
     hints.push(Span::styled("|", Style::default().fg(Color::DarkGray)));
@@ -563,4 +614,308 @@ fn draw_org_popup(frame: &mut Frame, app: &App) {
             ),
     );
     frame.render_widget(popup, area);
+}
+
+// ---------------------------------------------------------------------------
+// Modal dialogs - Create/Edit Goal
+// ---------------------------------------------------------------------------
+
+fn draw_create_goal_modal(frame: &mut Frame, app: &App) {
+    let Some(ModalState::CreateGoal {
+        title,
+        description,
+        parent_goal_title,
+        current_field,
+        ..
+    }) = &app.modal_state
+    else {
+        return;
+    };
+
+    let area = centered_rect(60, 15, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Create Goal ")
+        .title_bottom(
+            Line::from(" Tab: Next Field | Enter: Create | Esc: Cancel ")
+                .style(Style::default().fg(Color::DarkGray)),
+        );
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Split into fields
+    let field_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Title
+            Constraint::Length(3), // Description
+            Constraint::Length(2), // Parent Goal (read-only)
+            Constraint::Min(0),    // Spacer
+        ])
+        .split(inner);
+
+    // Title field
+    let title_focused = *current_field == FormField::Title;
+    let title_border = if title_focused {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
+    let title_widget = Paragraph::new(title.as_str()).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(title_border))
+            .title(" Title * "),
+    );
+    frame.render_widget(title_widget, field_layout[0]);
+
+    // Description field
+    let desc_focused = *current_field == FormField::Description;
+    let desc_border = if desc_focused {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
+    let desc_widget = Paragraph::new(description.as_str()).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(desc_border))
+            .title(" Description "),
+    );
+    frame.render_widget(desc_widget, field_layout[1]);
+
+    // Parent Goal (read-only)
+    let parent_text = parent_goal_title
+        .as_ref()
+        .map(|s| s.as_str())
+        .unwrap_or("(Root Goal)");
+    let parent_widget = Paragraph::new(Line::from(vec![Span::styled(
+        parent_text,
+        Style::default().fg(Color::DarkGray),
+    )]))
+    .block(
+        Block::default()
+            .borders(Borders::NONE)
+            .title(" Parent Goal: "),
+    );
+    frame.render_widget(parent_widget, field_layout[2]);
+}
+
+fn draw_edit_goal_modal(frame: &mut Frame, app: &App) {
+    let Some(ModalState::EditGoal {
+        title,
+        description,
+        current_status,
+        selected_status_index,
+        allowed_statuses,
+        current_field,
+        ..
+    }) = &app.modal_state
+    else {
+        return;
+    };
+
+    // Calculate status field height
+    // "現在: ..." (1) + empty line (1) + transitions (n) + borders (2) = 4 + n
+    let status_field_height = if !allowed_statuses.is_empty() {
+        4 + allowed_statuses.len() as u16
+    } else {
+        4 // just "現在: ..." + borders
+    };
+
+    // Calculate total modal height
+    // outer borders (2) + title field (3) + description field (3) + status field (status_field_height)
+    let modal_height = 2 + 3 + 3 + status_field_height;
+
+    let area = centered_rect(60, modal_height, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Edit Goal ")
+        .title_bottom(
+            Line::from(
+                " Tab: Next Field | \u{2191}\u{2193}: Change Status | Enter: Save | Esc: Cancel ",
+            )
+            .style(Style::default().fg(Color::DarkGray)),
+        );
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let field_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),                   // Title
+            Constraint::Length(3),                   // Description
+            Constraint::Length(status_field_height), // Status
+            Constraint::Min(0),                      // Spacer
+        ])
+        .split(inner);
+
+    // Title field
+    let title_focused = *current_field == FormField::Title;
+    let title_border = if title_focused {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
+    let title_widget = Paragraph::new(title.as_str()).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(title_border))
+            .title(" Title * "),
+    );
+    frame.render_widget(title_widget, field_layout[0]);
+
+    // Description field
+    let desc_focused = *current_field == FormField::Description;
+    let desc_border = if desc_focused {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
+    let desc_widget = Paragraph::new(description.as_str()).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(desc_border))
+            .title(" Description "),
+    );
+    frame.render_widget(desc_widget, field_layout[1]);
+
+    // Status field - show current status and allowed transitions
+    let status_focused = *current_field == FormField::Status;
+    let status_border = if status_focused {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
+
+    // Build status display
+    let mut status_lines = vec![Line::from(vec![
+        Span::styled("現在: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            current_status.to_emoji_string(),
+            Style::default().fg(Color::White),
+        ),
+    ])];
+
+    if !allowed_statuses.is_empty() {
+        status_lines.push(Line::from(""));
+        for (i, status_option) in allowed_statuses.iter().enumerate() {
+            let is_selected = i == *selected_status_index;
+            let prefix = if is_selected { " > " } else { "   " };
+            let style = if is_selected {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            status_lines.push(Line::from(Span::styled(
+                format!("{}{}", prefix, status_option.to_emoji_string()),
+                style,
+            )));
+        }
+    }
+
+    let status_widget = Paragraph::new(status_lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(status_border))
+            .title(" Status (↑↓で選択) "),
+    );
+    frame.render_widget(status_widget, field_layout[2]);
+}
+
+fn draw_delete_goal_modal(frame: &mut Frame, app: &App) {
+    let Some(ModalState::DeleteGoal {
+        goal_title,
+        confirm_index,
+        ..
+    }) = &app.modal_state
+    else {
+        return;
+    };
+
+    let area = centered_rect(60, 10, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .title(" ⚠️  削除の確認 ")
+        .title_bottom(
+            Line::from(" ←→/hl: 選択 | Enter: 実行 | Esc: キャンセル ")
+                .style(Style::default().fg(Color::DarkGray)),
+        );
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2), // Goal title
+            Constraint::Length(2), // Warning message
+            Constraint::Length(1), // Spacer
+            Constraint::Length(1), // Buttons
+            Constraint::Min(0),    // Spacer
+        ])
+        .split(inner);
+
+    // Goal title
+    let title_text = Paragraph::new(Line::from(vec![
+        Span::styled("削除するゴール: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            goal_title.as_str(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    frame.render_widget(title_text, layout[0]);
+
+    // Warning message
+    let warning = Paragraph::new(Line::from(vec![
+        Span::styled("⚠️  ", Style::default().fg(Color::Red)),
+        Span::styled(
+            "この操作は取り消せません。本当に削除しますか？",
+            Style::default().fg(Color::Red),
+        ),
+    ]));
+    frame.render_widget(warning, layout[1]);
+
+    // Buttons
+    let cancel_style = if *confirm_index == 0 {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+
+    let delete_style = if *confirm_index == 1 {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Red)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Red)
+    };
+
+    let buttons = Line::from(vec![
+        Span::raw("  "),
+        Span::styled("[ キャンセル ]", cancel_style),
+        Span::raw("    "),
+        Span::styled("[ 削除 ]", delete_style),
+    ]);
+
+    frame.render_widget(Paragraph::new(buttons), layout[3]);
 }

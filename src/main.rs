@@ -138,7 +138,10 @@ async fn main() -> Result<()> {
     let update_handle = tokio::spawn(update_check::check_for_update());
 
     let result = match &cli.command {
-        None => tui::run(),
+        None => {
+            let client = build_client()?;
+            tui::run(client)
+        }
         Some(Commands::Login {
             api_url,
             frontend_url,

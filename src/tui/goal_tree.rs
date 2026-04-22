@@ -1,9 +1,13 @@
 use chrono::{DateTime, Utc};
 
-use crate::api::{
-    Comment, CommentAuthor, Deliverable, DeliverableType, GoalChildItem, GoalStatus, GoalTreeItem,
-    Owner,
-};
+use crate::api::{Comment, Deliverable, GoalChildItem, GoalStatus, GoalTreeItem, Owner};
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const INITIAL_COMMENT_DISPLAY_LIMIT: usize = 20;
+const COMMENT_DISPLAY_INCREMENT: usize = 20;
 
 // ---------------------------------------------------------------------------
 // Timestamped wrapper
@@ -11,6 +15,9 @@ use crate::api::{
 
 pub struct Timestamped<T> {
     pub data: T,
+
+    // 将来的にfetch時刻からのキャッシュTTLの実装に用いる
+    #[allow(dead_code)]
     pub fetched_at: DateTime<Utc>,
 }
 
@@ -33,6 +40,7 @@ pub trait GoalItemAccessor {
     fn description(&self) -> Option<&str>;
     fn status(&self) -> Option<&GoalStatus>;
     fn is_completed(&self) -> bool;
+    fn has_children(&self) -> bool;
     fn owner(&self) -> Option<&Owner>;
 }
 
@@ -51,6 +59,9 @@ impl GoalItemAccessor for GoalTreeItem {
     }
     fn is_completed(&self) -> bool {
         self.is_completed
+    }
+    fn has_children(&self) -> bool {
+        self.has_children
     }
     fn owner(&self) -> Option<&Owner> {
         self.owner.as_ref()
@@ -73,6 +84,9 @@ impl GoalItemAccessor for GoalChildItem {
     fn is_completed(&self) -> bool {
         self.is_completed
     }
+    fn has_children(&self) -> bool {
+        self.has_children
+    }
     fn owner(&self) -> Option<&Owner> {
         self.owner.as_ref()
     }
@@ -88,6 +102,7 @@ pub struct GoalNodeInner<S> {
     pub comments: Option<Timestamped<Vec<Comment>>>,
     pub deliverables: Option<Timestamped<Vec<Deliverable>>>,
     pub expanded: bool,
+    pub comment_display_limit: usize,
 }
 
 pub type GoalRootNode = GoalNodeInner<GoalTreeItem>;
@@ -98,7 +113,7 @@ pub type GoalChildNode = GoalNodeInner<GoalChildItem>;
 // ---------------------------------------------------------------------------
 
 pub struct GoalTree {
-    pub root: Timestamped<GoalRootNode>,
+    pub roots: Vec<GoalRootNode>,
     pub cursor: usize,
     pub scroll_offset: usize,
 }
@@ -109,11 +124,16 @@ pub struct GoalTree {
 
 pub enum TreeRow<'a> {
     Goal {
+        goal_id: &'a str,
         title: &'a str,
         status: Option<&'a GoalStatus>,
         owner_name: Option<&'a str>,
         is_completed: bool,
         expanded: bool,
+        has_children: bool,
+        children_loaded: bool,
+        comments_loaded: bool,
+        deliverables_loaded: bool,
         depth: usize,
     },
     Detail {
@@ -124,6 +144,10 @@ pub enum TreeRow<'a> {
         depth: usize,
     },
     CommentHeader {
+        count: usize,
+        depth: usize,
+    },
+    CommentOmitted {
         count: usize,
         depth: usize,
     },
@@ -147,6 +171,7 @@ impl<'a> TreeRow<'a> {
             TreeRow::Goal { depth, .. }
             | TreeRow::Detail { depth, .. }
             | TreeRow::CommentHeader { depth, .. }
+            | TreeRow::CommentOmitted { depth, .. }
             | TreeRow::CommentItem { depth, .. }
             | TreeRow::DeliverableHeader { depth, .. }
             | TreeRow::DeliverableItem { depth, .. } => *depth,
@@ -159,13 +184,48 @@ impl<'a> TreeRow<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// Tree construction
+// ---------------------------------------------------------------------------
+
+impl GoalTree {
+    pub fn empty() -> Self {
+        GoalTree {
+            roots: vec![],
+            cursor: 0,
+            scroll_offset: 0,
+        }
+    }
+
+    pub fn from_tree_items(items: Vec<GoalTreeItem>) -> Self {
+        let roots = items
+            .into_iter()
+            .map(|item| GoalRootNode {
+                node: item,
+                children: None,
+                comments: None,
+                deliverables: None,
+                expanded: false,
+                comment_display_limit: INITIAL_COMMENT_DISPLAY_LIMIT,
+            })
+            .collect();
+        GoalTree {
+            roots,
+            cursor: 0,
+            scroll_offset: 0,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tree operations
 // ---------------------------------------------------------------------------
 
 impl GoalTree {
     pub fn flatten(&self) -> Vec<TreeRow<'_>> {
         let mut rows = Vec::new();
-        flatten_node(&self.root.data, 0, &mut rows);
+        for root in &self.roots {
+            flatten_node(root, 0, &mut rows);
+        }
         rows
     }
 
@@ -173,7 +233,59 @@ impl GoalTree {
         let rows = self.flatten();
         if let Some(TreeRow::Goal { .. }) = rows.get(self.cursor) {
             let mut idx = 0;
-            toggle_at(&mut self.root.data, self.cursor, &mut idx);
+            for root in &mut self.roots {
+                if toggle_at(root, self.cursor, &mut idx) {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Insert fetched children into the Goal node at the current cursor position.
+    pub fn set_children_at_cursor(&mut self, children: Vec<GoalChildItem>) {
+        let target = self.cursor;
+        let mut idx = 0;
+        let mut children = Some(children);
+        for root in &mut self.roots {
+            if set_children_at(root, target, &mut idx, &mut children) {
+                return;
+            }
+        }
+    }
+
+    /// Insert fetched comments into the Goal node at the current cursor position.
+    pub fn set_comments_at_cursor(&mut self, comments: Vec<Comment>) {
+        let target = self.cursor;
+        let mut idx = 0;
+        let mut comments = Some(comments);
+        for root in &mut self.roots {
+            if set_comments_at(root, target, &mut idx, &mut comments) {
+                return;
+            }
+        }
+    }
+
+    /// Insert fetched deliverables into the Goal node at the current cursor position.
+    pub fn set_deliverables_at_cursor(&mut self, deliverables: Vec<Deliverable>) {
+        let target = self.cursor;
+        let mut idx = 0;
+        let mut deliverables = Some(deliverables);
+        for root in &mut self.roots {
+            if set_deliverables_at(root, target, &mut idx, &mut deliverables) {
+                return;
+            }
+        }
+    }
+
+    /// Increase the comment display limit for the goal containing the cursor.
+    /// Used when user expands on CommentOmitted row to show more comments.
+    pub fn increase_comment_limit(&mut self) {
+        let target = self.cursor;
+        let mut idx = 0;
+        for root in &mut self.roots {
+            if increase_comment_limit_at(root, target, &mut idx) {
+                return;
+            }
         }
     }
 
@@ -228,8 +340,23 @@ impl GoalTree {
 }
 
 // ---------------------------------------------------------------------------
-// Generic flatten / toggle helpers (no duplication between Root and Child)
+// Generic helpers (no duplication between Root and Child)
 // ---------------------------------------------------------------------------
+
+/// Calculate the number of rows occupied by comments when expanded.
+/// Only counts unresolved comments (resolved_at is None).
+/// Includes header, up to `limit` most recent items, and omitted row if total > limit.
+fn comment_row_count(comments: &Option<Timestamped<Vec<Comment>>>, limit: usize) -> usize {
+    match comments {
+        Some(ts) => {
+            let unresolved_count = ts.data.iter().filter(|c| c.resolved_at.is_none()).count();
+            let displayed = unresolved_count.min(limit);
+            let has_omitted = unresolved_count > limit;
+            1 + displayed + if has_omitted { 1 } else { 0 } // header + items + omitted row
+        }
+        None => 0,
+    }
+}
 
 fn flatten_node<'a, S: GoalItemAccessor>(
     node: &'a GoalNodeInner<S>,
@@ -237,11 +364,16 @@ fn flatten_node<'a, S: GoalItemAccessor>(
     rows: &mut Vec<TreeRow<'a>>,
 ) {
     rows.push(TreeRow::Goal {
+        goal_id: node.node.id(),
         title: node.node.title(),
         status: node.node.status(),
         owner_name: node.node.owner().map(|o| o.name.as_str()),
         is_completed: node.node.is_completed(),
         expanded: node.expanded,
+        has_children: node.node.has_children(),
+        children_loaded: node.children.is_some(),
+        comments_loaded: node.comments.is_some(),
+        deliverables_loaded: node.deliverables.is_some(),
         depth,
     });
 
@@ -251,7 +383,6 @@ fn flatten_node<'a, S: GoalItemAccessor>(
 
     let child_depth = depth + 1;
 
-    // Detail row (always available from node)
     rows.push(TreeRow::Detail {
         status: node.node.status(),
         owner_name: node.node.owner().map(|o| o.name.as_str()),
@@ -261,11 +392,31 @@ fn flatten_node<'a, S: GoalItemAccessor>(
     });
 
     if let Some(ref ts) = node.comments {
+        // Filter to only unresolved comments (resolved_at is None)
+        let mut unresolved_comments: Vec<&Comment> =
+            ts.data.iter().filter(|c| c.resolved_at.is_none()).collect();
+
+        let total_unresolved = unresolved_comments.len();
+
         rows.push(TreeRow::CommentHeader {
-            count: ts.data.len(),
+            count: total_unresolved,
             depth: child_depth,
         });
-        for comment in &ts.data {
+
+        // Sort by created_at descending (newest first)
+        unresolved_comments.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+        let display_count = total_unresolved.min(node.comment_display_limit);
+        let omitted_count = total_unresolved.saturating_sub(node.comment_display_limit);
+
+        if omitted_count > 0 {
+            rows.push(TreeRow::CommentOmitted {
+                count: omitted_count,
+                depth: child_depth + 1,
+            });
+        }
+
+        for comment in unresolved_comments.iter().take(display_count) {
             rows.push(TreeRow::CommentItem {
                 comment,
                 depth: child_depth + 1,
@@ -305,11 +456,8 @@ fn toggle_at<S: GoalItemAccessor>(
     *idx += 1;
 
     if node.expanded {
-        // Detail row (always present when expanded)
-        *idx += 1;
-        if let Some(ts) = &node.comments {
-            *idx += 1 + ts.data.len();
-        }
+        *idx += 1; // detail row
+        *idx += comment_row_count(&node.comments, node.comment_display_limit);
         if let Some(ts) = &node.deliverables {
             *idx += 1 + ts.data.len();
         }
@@ -325,208 +473,147 @@ fn toggle_at<S: GoalItemAccessor>(
     false
 }
 
-// ---------------------------------------------------------------------------
-// Mock data builder
-// ---------------------------------------------------------------------------
-
-impl GoalTree {
-    pub fn mock() -> Self {
-        let root = GoalRootNode {
-            node: GoalTreeItem {
-                id: "goal-001".into(),
-                parent_id: None,
-                title: "Company Strategy".into(),
-                status: Some(GoalStatus::InProgress),
-                order_no: 1.0,
-                is_completed: false,
-                has_children: true,
-                owner: Some(Owner {
-                    id: "user-001".into(),
-                    name: "Alice".into(),
-                }),
-            },
-            comments: Some(Timestamped::now(vec![
-                Comment {
-                    id: "comment-001".into(),
-                    content: "Great progress so far".into(),
-                    commentable_type: "Objective".into(),
-                    commentable_id: "goal-001".into(),
-                    parent_id: None,
-                    author: CommentAuthor {
-                        id: "user-001".into(),
-                        name: "Alice".into(),
-                        is_ai_agent: false,
-                    },
-                    reply_count: 0,
-                    resolved_at: None,
-                    created_at: "2025-04-01T10:30:00Z".into(),
-                    updated_at: "2025-04-01T10:30:00Z".into(),
-                },
-                Comment {
-                    id: "comment-002".into(),
-                    content: "Need to revisit Q3 targets".into(),
-                    commentable_type: "Objective".into(),
-                    commentable_id: "goal-001".into(),
-                    parent_id: None,
-                    author: CommentAuthor {
-                        id: "user-002".into(),
-                        name: "Bob".into(),
-                        is_ai_agent: false,
-                    },
-                    reply_count: 0,
-                    resolved_at: None,
-                    created_at: "2025-04-02T14:15:00Z".into(),
-                    updated_at: "2025-04-02T14:15:00Z".into(),
-                },
-            ])),
-            deliverables: Some(Timestamped::now(vec![Deliverable {
-                id: "del-001".into(),
-                display_name: "Strategy Document".into(),
-                node_type: DeliverableType::Document,
-                content: None,
-                link_url: None,
-                file_name: Some("strategy-2025.pdf".into()),
-                objective_id: "goal-001".into(),
-                parent_deliverable_id: None,
-                order_no: 1.0,
-                depth: 0,
-                is_root: true,
-                has_children: false,
-                children_count: 0,
-            }])),
-            children: Some(Timestamped::now(vec![
-                // Child: Q1 Goals – collapsed
-                GoalChildNode {
-                    node: GoalChildItem {
-                        id: "goal-002".into(),
-                        title: "Q1 Goals".into(),
-                        description: Some("First quarter objectives".into()),
-                        parent_id: Some("goal-001".into()),
-                        status: None,
-                        is_completed: true,
-                        has_children: true,
-                        order_no: 1.0,
-                        owner: Some(Owner {
-                            id: "user-001".into(),
-                            name: "Alice".into(),
-                        }),
-                    },
+fn set_children_at<S: GoalItemAccessor>(
+    node: &mut GoalNodeInner<S>,
+    target: usize,
+    idx: &mut usize,
+    children: &mut Option<Vec<GoalChildItem>>,
+) -> bool {
+    if *idx == target {
+        if let Some(items) = children.take() {
+            let child_nodes = items
+                .into_iter()
+                .map(|item| GoalChildNode {
+                    node: item,
                     children: None,
                     comments: None,
                     deliverables: None,
                     expanded: false,
-                },
-                // Child: Q2 Goals – expanded with children
-                GoalChildNode {
-                    node: GoalChildItem {
-                        id: "goal-003".into(),
-                        title: "Q2 Goals".into(),
-                        description: Some("Second quarter objectives".into()),
-                        parent_id: Some("goal-001".into()),
-                        status: Some(GoalStatus::InProgress),
-                        is_completed: false,
-                        has_children: true,
-                        order_no: 2.0,
-                        owner: Some(Owner {
-                            id: "user-002".into(),
-                            name: "Bob".into(),
-                        }),
-                    },
-                    children: Some(Timestamped::now(vec![
-                        GoalChildNode {
-                            node: GoalChildItem {
-                                id: "goal-004".into(),
-                                title: "Revenue Target".into(),
-                                description: Some("Achieve $1M ARR by end of Q2".into()),
-                                parent_id: Some("goal-003".into()),
-                                status: Some(GoalStatus::InProgress),
-                                is_completed: false,
-                                has_children: false,
-                                order_no: 1.0,
-                                owner: Some(Owner {
-                                    id: "user-003".into(),
-                                    name: "Charlie".into(),
-                                }),
-                            },
-                            children: Some(Timestamped::now(vec![
-                                GoalChildNode {
-                                    node: GoalChildItem {
-                                        id: "goal-006".into(),
-                                        parent_id: None,
-                                        title: "Personal Development".into(),
-                                        description: None,
-                                        status: Some(GoalStatus::InProgress),
-                                        order_no: 2.0,
-                                        is_completed: false,
-                                        has_children: true,
-                                        owner: Some(Owner {
-                                            id: "user-002".into(),
-                                            name: "Bob".into(),
-                                        }),
-                                    },
-                                    children: None,
-                                    comments: None,
-                                    deliverables: None,
-                                    expanded: false,
-                                },
-                                GoalChildNode {
-                                    node: GoalChildItem {
-                                        id: "goal-007".into(),
-                                        parent_id: None,
-                                        title: "Infrastructure Upgrade".into(),
-                                        description: Some("Migrate to new cloud provider".into()),
-                                        status: Some(GoalStatus::InProgress),
-                                        order_no: 3.0,
-                                        is_completed: false,
-                                        has_children: false,
-                                        owner: Some(Owner {
-                                            id: "user-003".into(),
-                                            name: "Charlie".into(),
-                                        }),
-                                    },
-                                    children: None,
-                                    comments: None,
-                                    deliverables: None,
-                                    expanded: false,
-                                },
-                            ])),
-                            comments: None,
-                            deliverables: None,
-                            expanded: false,
-                        },
-                        GoalChildNode {
-                            node: GoalChildItem {
-                                id: "goal-005".into(),
-                                title: "Customer Acquisition".into(),
-                                description: Some("Acquire 500 new customers".into()),
-                                parent_id: Some("goal-003".into()),
-                                status: Some(GoalStatus::InProgress),
-                                is_completed: false,
-                                has_children: false,
-                                order_no: 2.0,
-                                owner: Some(Owner {
-                                    id: "user-004".into(),
-                                    name: "Diana".into(),
-                                }),
-                            },
-                            children: None,
-                            comments: None,
-                            deliverables: None,
-                            expanded: false,
-                        },
-                    ])),
-                    comments: None,
-                    deliverables: None,
-                    expanded: true,
-                },
-            ])),
-            expanded: true,
-        };
+                    comment_display_limit: INITIAL_COMMENT_DISPLAY_LIMIT,
+                })
+                .collect();
+            node.children = Some(Timestamped::now(child_nodes));
+        }
+        return true;
+    }
+    *idx += 1;
 
-        GoalTree {
-            root: Timestamped::now(root),
-            cursor: 0,
-            scroll_offset: 0,
+    if node.expanded {
+        *idx += 1; // detail row
+        *idx += comment_row_count(&node.comments, node.comment_display_limit);
+        if let Some(ts) = &node.deliverables {
+            *idx += 1 + ts.data.len();
+        }
+        if let Some(ts) = &mut node.children {
+            for child in &mut ts.data {
+                if set_children_at(child, target, idx, children) {
+                    return true;
+                }
+            }
         }
     }
+
+    false
+}
+
+fn set_comments_at<S: GoalItemAccessor>(
+    node: &mut GoalNodeInner<S>,
+    target: usize,
+    idx: &mut usize,
+    comments: &mut Option<Vec<Comment>>,
+) -> bool {
+    if *idx == target {
+        if let Some(items) = comments.take() {
+            node.comments = Some(Timestamped::now(items));
+        }
+        return true;
+    }
+    *idx += 1;
+
+    if node.expanded {
+        *idx += 1; // detail row
+        *idx += comment_row_count(&node.comments, node.comment_display_limit);
+        if let Some(ts) = &node.deliverables {
+            *idx += 1 + ts.data.len();
+        }
+        if let Some(ts) = &mut node.children {
+            for child in &mut ts.data {
+                if set_comments_at(child, target, idx, comments) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn set_deliverables_at<S: GoalItemAccessor>(
+    node: &mut GoalNodeInner<S>,
+    target: usize,
+    idx: &mut usize,
+    deliverables: &mut Option<Vec<Deliverable>>,
+) -> bool {
+    if *idx == target {
+        if let Some(items) = deliverables.take() {
+            node.deliverables = Some(Timestamped::now(items));
+        }
+        return true;
+    }
+    *idx += 1;
+
+    if node.expanded {
+        *idx += 1; // detail row
+        *idx += comment_row_count(&node.comments, node.comment_display_limit);
+        if let Some(ts) = &node.deliverables {
+            *idx += 1 + ts.data.len();
+        }
+        if let Some(ts) = &mut node.children {
+            for child in &mut ts.data {
+                if set_deliverables_at(child, target, idx, deliverables) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn increase_comment_limit_at<S: GoalItemAccessor>(
+    node: &mut GoalNodeInner<S>,
+    target: usize,
+    idx: &mut usize,
+) -> bool {
+    *idx += 1;
+
+    if node.expanded {
+        *idx += 1; // detail row
+
+        // Calculate comment section indices
+        let comment_start = *idx;
+        let comment_rows = comment_row_count(&node.comments, node.comment_display_limit);
+        let comment_end = comment_start + comment_rows;
+
+        // If target is within comment section, increase this node's limit
+        if target >= comment_start && target < comment_end {
+            node.comment_display_limit += COMMENT_DISPLAY_INCREMENT;
+            return true;
+        }
+
+        *idx += comment_rows;
+
+        if let Some(ts) = &node.deliverables {
+            *idx += 1 + ts.data.len();
+        }
+        if let Some(ts) = &mut node.children {
+            for child in &mut ts.data {
+                if increase_comment_limit_at(child, target, idx) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }

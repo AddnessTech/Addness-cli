@@ -44,6 +44,10 @@ impl ApiClient {
         self
     }
 
+    pub fn set_org_id(&mut self, org_id: Option<String>) {
+        self.org_id = org_id;
+    }
+
     fn api_error(status: StatusCode, body: &str) -> anyhow::Error {
         let hint = Self::error_hint(status, body);
         match hint {

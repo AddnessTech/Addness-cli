@@ -1,12 +1,14 @@
 mod comment;
 mod deliverable;
 mod goal;
+mod goal_execution;
 mod member;
 mod org;
 
 pub use comment::*;
 pub use deliverable::*;
 pub use goal::*;
+pub use goal_execution::*;
 pub use member::*;
 pub use org::*;
 

@@ -7,6 +7,7 @@ use ratatui::{
 use tokio::runtime::Handle;
 
 use crate::api::{ApiClient, CreateGoalRequest, GoalStatus, Organization, UpdateGoalRequest};
+use crate::dbg_log;
 
 use super::goal_tree::{GoalTree, TreeRow};
 use super::ui;
@@ -91,6 +92,9 @@ impl GoalDisplayStatus {
     }
 }
 
+// NOTE: 将来goal以外についてのモーダルが出得るためsuffixにGoalと付けている
+// それまでclippy errorを抑制
+#[allow(clippy::enum_variant_names)]
 pub enum ModalState {
     CreateGoal {
         title: String,
@@ -129,8 +133,9 @@ pub struct App {
     pub show_org_popup: bool,
     pub org_popup_index: usize,
 
-    // Goal tree
+    // Goal trees
     pub goal_tree: GoalTree,
+    pub todays_goals_tree: GoalTree,
 
     /// Last known content viewport height (for scroll calculations)
     pub content_height: usize,
@@ -153,12 +158,13 @@ impl App {
             running: true,
             active_pane: ActivePane::Navigation,
             sidebar_index: 0,
-            sidebar_items: vec!["Goals"],
+            sidebar_items: vec!["Goals", "Execution"],
             orgs: vec![],
             current_org_index: 0,
             show_org_popup: false,
             org_popup_index: 0,
             goal_tree: GoalTree::empty(),
+            todays_goals_tree: GoalTree::empty(),
             content_height: 0,
             error_message: None,
             modal_state: None,
@@ -175,6 +181,24 @@ impl App {
 
     pub fn current_org_id(&self) -> Option<&str> {
         self.orgs.get(self.current_org_index).map(|o| o.id.as_str())
+    }
+
+    /// Get reference to the currently active goal tree based on sidebar selection
+    pub fn active_goal_tree(&self) -> &GoalTree {
+        match self.sidebar_index {
+            0 => &self.goal_tree,
+            1 => &self.todays_goals_tree,
+            _ => &self.goal_tree,
+        }
+    }
+
+    /// Get mutable reference to the currently active goal tree based on sidebar selection
+    pub fn active_goal_tree_mut(&mut self) -> &mut GoalTree {
+        match self.sidebar_index {
+            0 => &mut self.goal_tree,
+            1 => &mut self.todays_goals_tree,
+            _ => &mut self.goal_tree,
+        }
     }
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
@@ -214,6 +238,7 @@ impl App {
         }
 
         self.load_goal_tree();
+        self.load_todays_goals();
     }
 
     fn load_goal_tree(&mut self) {
@@ -231,6 +256,49 @@ impl App {
             Err(e) => {
                 self.goal_tree = GoalTree::empty();
                 self.error_message = Some(format!("Failed to load goals: {e}"));
+            }
+        }
+    }
+
+    fn load_todays_goals(&mut self) {
+        let Some(org_id) = self.current_org_id().map(|s| s.to_string()) else {
+            self.todays_goals_tree = GoalTree::empty();
+            return;
+        };
+
+        dbg_log!("=== load_todays_goals ===");
+        self.client.set_org_id(Some(org_id.clone()));
+
+        match self.api_call(self.client.get_todays_goals(&org_id, None, None)) {
+            Ok(resp) => {
+                dbg_log!("Total nodes loaded: {}", resp.data.nodes.len());
+                dbg_log!("Excluded nodes: {}", resp.data.excluded_nodes.len());
+                dbg_log!("Auto-generated count: {}", resp.data.auto_generated_count);
+
+                for node in &resp.data.nodes {
+                    dbg_log!(
+                        "  Goal: {} | id: {} | depth: {} | is_direct: {} | owner: {}",
+                        node.title,
+                        node.id,
+                        node.depth,
+                        node.is_direct_assignment,
+                        node.owner
+                            .as_ref()
+                            .map(|o| o.name.as_str())
+                            .unwrap_or("None")
+                    );
+                }
+
+                self.todays_goals_tree = GoalTree::from_todays_goal_nodes(resp.data.nodes);
+
+                dbg_log!(
+                    "Today's goals tree has {} roots",
+                    self.todays_goals_tree.roots.len()
+                );
+            }
+            Err(e) => {
+                self.todays_goals_tree = GoalTree::empty();
+                self.error_message = Some(format!("Failed to load today's goals: {e}"));
             }
         }
     }
@@ -265,15 +333,13 @@ impl App {
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.show_org_popup = false;
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                if self.org_popup_index > 0 {
-                    self.org_popup_index -= 1;
-                }
+            KeyCode::Up | KeyCode::Char('k') if self.org_popup_index > 0 => {
+                self.org_popup_index -= 1;
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if !self.orgs.is_empty() && self.org_popup_index < self.orgs.len() - 1 {
-                    self.org_popup_index += 1;
-                }
+            KeyCode::Down | KeyCode::Char('j')
+                if !self.orgs.is_empty() && self.org_popup_index < self.orgs.len() - 1 =>
+            {
+                self.org_popup_index += 1;
             }
             KeyCode::Enter => {
                 let new_index = self.org_popup_index;
@@ -281,6 +347,7 @@ impl App {
                 if new_index != self.current_org_index {
                     self.current_org_index = new_index;
                     self.load_goal_tree();
+                    self.load_todays_goals();
                 }
             }
             _ => {}
@@ -312,30 +379,26 @@ impl App {
                 ActivePane::Navigation => {
                     self.active_pane = ActivePane::Content;
                 }
-                ActivePane::Content if self.sidebar_index == 0 => {
+                ActivePane::Content if self.sidebar_index == 0 || self.sidebar_index == 1 => {
                     self.handle_goal_expand();
                 }
                 _ => {}
             },
             KeyCode::Up | KeyCode::Char('k') => match self.active_pane {
-                ActivePane::Navigation => {
-                    if self.sidebar_index > 0 {
-                        self.sidebar_index -= 1;
-                    }
+                ActivePane::Navigation if self.sidebar_index > 0 => {
+                    self.sidebar_index -= 1;
                 }
-                ActivePane::Content if self.sidebar_index == 0 => {
-                    self.goal_tree.cursor_up();
+                ActivePane::Content if self.sidebar_index == 0 || self.sidebar_index == 1 => {
+                    self.active_goal_tree_mut().cursor_up();
                 }
                 _ => {}
             },
             KeyCode::Down | KeyCode::Char('j') => match self.active_pane {
-                ActivePane::Navigation => {
-                    if self.sidebar_index < self.sidebar_items.len() - 1 {
-                        self.sidebar_index += 1;
-                    }
+                ActivePane::Navigation if self.sidebar_index < self.sidebar_items.len() - 1 => {
+                    self.sidebar_index += 1;
                 }
-                ActivePane::Content if self.sidebar_index == 0 => {
-                    self.goal_tree.cursor_down();
+                ActivePane::Content if self.sidebar_index == 0 || self.sidebar_index == 1 => {
+                    self.active_goal_tree_mut().cursor_down();
                 }
                 _ => {}
             },
@@ -343,52 +406,64 @@ impl App {
                 ActivePane::Navigation => {
                     self.active_pane = ActivePane::Content;
                 }
-                ActivePane::Content if self.sidebar_index == 0 => {
+                ActivePane::Content if self.sidebar_index == 0 || self.sidebar_index == 1 => {
                     self.handle_goal_expand();
                 }
                 _ => {}
             },
-            KeyCode::Left | KeyCode::Char('h') => {
-                if self.active_pane == ActivePane::Content && self.sidebar_index == 0 {
-                    self.goal_tree.collapse_or_parent();
-                }
+            KeyCode::Left | KeyCode::Char('h')
+                if self.active_pane == ActivePane::Content
+                    && (self.sidebar_index == 0 || self.sidebar_index == 1) =>
+            {
+                self.active_goal_tree_mut().collapse_or_parent();
             }
-            KeyCode::Char('c') => {
-                if self.active_pane == ActivePane::Content && self.sidebar_index == 0 {
-                    self.start_create_goal_modal();
-                }
+            KeyCode::Char('c')
+                if self.active_pane == ActivePane::Content
+                    && (self.sidebar_index == 0 || self.sidebar_index == 1) =>
+            {
+                self.start_create_goal_modal();
             }
-            KeyCode::Char('e') => {
-                if self.active_pane == ActivePane::Content && self.sidebar_index == 0 {
-                    self.start_edit_goal_modal();
-                }
+            KeyCode::Char('e')
+                if self.active_pane == ActivePane::Content
+                    && (self.sidebar_index == 0 || self.sidebar_index == 1) =>
+            {
+                self.start_edit_goal_modal();
             }
-            KeyCode::Char('d') => {
-                if self.active_pane == ActivePane::Content && self.sidebar_index == 0 {
-                    self.start_delete_goal_modal();
-                }
+            KeyCode::Char('d')
+                if self.active_pane == ActivePane::Content
+                    && (self.sidebar_index == 0 || self.sidebar_index == 1) =>
+            {
+                self.start_delete_goal_modal();
             }
             _ => {}
         }
     }
 
     fn handle_goal_expand(&mut self) {
+        // Check if this is a complete tree (from todays-goals) - if so, only toggle expand
+        let is_completed_tree = !self.active_goal_tree().is_required_to_fetch;
+
         // Check if cursor is on CommentOmitted row - if so, increase display limit
         {
-            let rows = self.goal_tree.flatten();
-            if matches!(
-                rows.get(self.goal_tree.cursor),
-                Some(TreeRow::CommentOmitted { .. })
-            ) {
-                self.goal_tree.increase_comment_limit();
+            let tree = self.active_goal_tree();
+            let rows = tree.flatten();
+            if matches!(rows.get(tree.cursor), Some(TreeRow::CommentOmitted { .. })) {
+                self.active_goal_tree_mut().increase_comment_limit();
                 return;
             }
         }
 
+        // If this is a complete tree, just toggle expand without fetching
+        if is_completed_tree {
+            self.active_goal_tree_mut().toggle_expand();
+            return;
+        }
+
         // Extract info from the cursor row before mutating
         let info = {
-            let rows = self.goal_tree.flatten();
-            match rows.get(self.goal_tree.cursor) {
+            let tree = self.active_goal_tree();
+            let rows = tree.flatten();
+            match rows.get(tree.cursor) {
                 Some(TreeRow::Goal {
                     goal_id,
                     has_children,
@@ -463,17 +538,15 @@ impl App {
 
             match result {
                 Ok((comments_resp, deliverables_resp, children_resp)) => {
+                    let tree = self.active_goal_tree_mut();
                     if need_comments {
-                        self.goal_tree
-                            .set_comments_at_cursor(comments_resp.comments);
+                        tree.set_comments_at_cursor(comments_resp.comments);
                     }
                     if need_deliverables {
-                        self.goal_tree
-                            .set_deliverables_at_cursor(deliverables_resp.data.deliverables);
+                        tree.set_deliverables_at_cursor(deliverables_resp.data.deliverables);
                     }
                     if need_children {
-                        self.goal_tree
-                            .set_children_at_cursor(children_resp.data.children);
+                        tree.set_children_at_cursor(children_resp.data.children);
                     }
                 }
                 Err(e) => {
@@ -483,7 +556,7 @@ impl App {
             }
         }
 
-        self.goal_tree.toggle_expand();
+        self.active_goal_tree_mut().toggle_expand();
     }
 
     // -----------------------------------------------------------------------
@@ -492,8 +565,9 @@ impl App {
 
     fn start_create_goal_modal(&mut self) {
         // Get parent goal info from cursor position
-        let rows = self.goal_tree.flatten();
-        let (parent_goal_id, parent_goal_title) = match rows.get(self.goal_tree.cursor) {
+        let tree = self.active_goal_tree();
+        let rows = tree.flatten();
+        let (parent_goal_id, parent_goal_title) = match rows.get(tree.cursor) {
             Some(TreeRow::Goal { goal_id, title, .. }) => {
                 (Some(goal_id.to_string()), Some(title.to_string()))
             }
@@ -511,8 +585,9 @@ impl App {
 
     fn start_edit_goal_modal(&mut self) {
         // Get goal info from cursor position
-        let rows = self.goal_tree.flatten();
-        let goal_info = match rows.get(self.goal_tree.cursor) {
+        let tree = self.active_goal_tree();
+        let rows = tree.flatten();
+        let goal_info = match rows.get(tree.cursor) {
             Some(TreeRow::Goal {
                 goal_id,
                 status,
@@ -553,8 +628,9 @@ impl App {
 
     fn start_delete_goal_modal(&mut self) {
         // Get goal info from cursor position
-        let rows = self.goal_tree.flatten();
-        let goal_info = match rows.get(self.goal_tree.cursor) {
+        let tree = self.active_goal_tree();
+        let rows = tree.flatten();
+        let goal_info = match rows.get(tree.cursor) {
             Some(TreeRow::Goal { goal_id, title, .. }) => {
                 Some((goal_id.to_string(), title.to_string()))
             }
@@ -608,15 +684,13 @@ impl App {
             }
             KeyCode::Left => {
                 // For delete confirmation modal
-                if let Some(ModalState::DeleteGoal { confirm_index, .. }) = &mut self.modal_state
-                {
+                if let Some(ModalState::DeleteGoal { confirm_index, .. }) = &mut self.modal_state {
                     *confirm_index = 0; // Cancel
                 }
             }
             KeyCode::Right => {
                 // For delete confirmation modal
-                if let Some(ModalState::DeleteGoal { confirm_index, .. }) = &mut self.modal_state
-                {
+                if let Some(ModalState::DeleteGoal { confirm_index, .. }) = &mut self.modal_state {
                     *confirm_index = 1; // Delete
                 }
             }
@@ -783,13 +857,13 @@ impl App {
             }
             Some(ModalState::DeleteGoal {
                 goal_id,
-                confirm_index,
+                confirm_index: 1,
                 ..
             }) => {
-                if confirm_index == 1 {
-                    // User confirmed deletion
-                    self.modal_submit_delete(goal_id);
-                }
+                // User confirmed deletion
+                self.modal_submit_delete(goal_id);
+            }
+            Some(ModalState::DeleteGoal { .. }) => {
                 // confirm_index == 0 means cancel, do nothing
             }
             None => {}
@@ -828,6 +902,7 @@ impl App {
             Ok(_) => {
                 self.success_message = Some("Goal created successfully".to_string());
                 self.load_goal_tree();
+                self.load_todays_goals();
             }
             Err(e) => {
                 self.error_message = Some(format!("Failed to create goal: {e}"));
@@ -876,6 +951,7 @@ impl App {
             Ok(_) => {
                 self.success_message = Some("Goal updated successfully".to_string());
                 self.load_goal_tree();
+                self.load_todays_goals();
             }
             Err(e) => {
                 self.error_message = Some(format!("Failed to update goal: {e}"));
@@ -888,6 +964,7 @@ impl App {
             Ok(_) => {
                 self.success_message = Some("Goal deleted successfully".to_string());
                 self.load_goal_tree();
+                self.load_todays_goals();
             }
             Err(e) => {
                 self.error_message = Some(format!("Failed to delete goal: {e}"));

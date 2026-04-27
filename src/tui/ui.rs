@@ -160,7 +160,8 @@ fn draw_content(frame: &mut Frame, area: Rect, app: &mut App) {
     };
 
     match app.sidebar_index {
-        0 => draw_goals(frame, area, app, border_color),
+        0 => draw_goals(frame, area, app, border_color, "Goals"),
+        1 => draw_goals(frame, area, app, border_color, "Execution"),
         _ => {}
     }
 }
@@ -169,11 +170,11 @@ fn draw_content(frame: &mut Frame, area: Rect, app: &mut App) {
 // Goal tree rendering
 // ---------------------------------------------------------------------------
 
-fn draw_goals(frame: &mut Frame, area: Rect, app: &mut App, border_color: Color) {
+fn draw_goals(frame: &mut Frame, area: Rect, app: &mut App, border_color: Color, title: &str) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color))
-        .title(" Goals ");
+        .title(format!(" {} ", title));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -183,10 +184,13 @@ fn draw_goals(frame: &mut Frame, area: Rect, app: &mut App, border_color: Color)
 
     let viewport_h = inner.height as usize;
     app.content_height = viewport_h;
-    app.goal_tree.adjust_scroll(viewport_h);
 
-    let rows = app.goal_tree.flatten();
-    let scroll = app.goal_tree.scroll_offset;
+    let tree = app.active_goal_tree_mut();
+    tree.adjust_scroll(viewport_h);
+
+    let rows = tree.flatten();
+    let scroll = tree.scroll_offset;
+    let cursor = tree.cursor;
 
     let visible = rows.iter().enumerate().skip(scroll).take(viewport_h);
 
@@ -196,7 +200,7 @@ fn draw_goals(frame: &mut Frame, area: Rect, app: &mut App, border_color: Color)
             break;
         }
         let line_area = Rect::new(inner.x, y, inner.width, 1);
-        let is_cursor = i == app.goal_tree.cursor;
+        let is_cursor = i == cursor;
 
         let line = render_tree_row(row, is_cursor, inner.width as usize);
         frame.render_widget(Paragraph::new(line), line_area);
@@ -509,7 +513,8 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
         Span::raw(": Navigate  "),
     ];
 
-    if app.active_pane == ActivePane::Content && app.sidebar_index == 0 {
+    if app.active_pane == ActivePane::Content && (app.sidebar_index == 0 || app.sidebar_index == 1)
+    {
         hints.push(Span::styled(
             "Enter/l",
             Style::default()

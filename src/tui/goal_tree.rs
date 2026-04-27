@@ -1,6 +1,11 @@
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 
-use crate::api::{Comment, Deliverable, GoalChildItem, GoalStatus, GoalTreeItem, Owner};
+use crate::{
+    api::{Comment, Deliverable, GoalChildItem, GoalStatus, GoalTreeItem, Owner, TodaysGoalNode},
+    dbg_log,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -13,6 +18,7 @@ const COMMENT_DISPLAY_INCREMENT: usize = 20;
 // Timestamped wrapper
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 pub struct Timestamped<T> {
     pub data: T,
 
@@ -96,6 +102,7 @@ impl GoalItemAccessor for GoalChildItem {
 // GoalNodeInner<S> – generic tree node
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 pub struct GoalNodeInner<S> {
     pub node: S,
     pub children: Option<Timestamped<Vec<GoalChildNode>>>,
@@ -112,10 +119,13 @@ pub type GoalChildNode = GoalNodeInner<GoalChildItem>;
 // GoalTree – the full tree + cursor state
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 pub struct GoalTree {
     pub roots: Vec<GoalRootNode>,
     pub cursor: usize,
     pub scroll_offset: usize,
+    /// If true, this tree is complete and should not fetch additional data on expand
+    pub is_required_to_fetch: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -193,6 +203,7 @@ impl GoalTree {
             roots: vec![],
             cursor: 0,
             scroll_offset: 0,
+            is_required_to_fetch: true,
         }
     }
 
@@ -212,7 +223,72 @@ impl GoalTree {
             roots,
             cursor: 0,
             scroll_offset: 0,
+            is_required_to_fetch: true,
         }
+    }
+
+    /// Create a tree from today's goal nodes (from todays-goals API).
+    /// The nodes are already filtered by the server and include execution records.
+    /// All nodes are pre-expanded since the complete tree structure is provided.
+    pub fn from_todays_goal_nodes(nodes: Vec<TodaysGoalNode>) -> Self {
+        dbg_log!(
+            "=== from_todays_goal_nodes: building complete tree from {} nodes ===",
+            nodes.len()
+        );
+
+        if nodes.is_empty() {
+            return Self::empty();
+        }
+
+        // Build lookup maps
+        let node_map: HashMap<String, TodaysGoalNode> = nodes
+            .into_iter()
+            .map(|node| (node.id.clone(), node))
+            .collect();
+
+        // Group nodes by parent_id
+        let mut children_map: HashMap<Option<String>, Vec<String>> = HashMap::new();
+        for (id, node) in &node_map {
+            children_map
+                .entry(node.parent_id.clone())
+                .or_default()
+                .push(id.clone());
+        }
+
+        // Sort children by order_no
+        for child_ids in children_map.values_mut() {
+            child_ids.sort_by(|a, b| {
+                let order_a = node_map.get(a).map(|n| n.order_no).unwrap_or(0.0);
+                let order_b = node_map.get(b).map(|n| n.order_no).unwrap_or(0.0);
+                order_a
+                    .partial_cmp(&order_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+
+        // Build root nodes (nodes with no parent)
+        let root_ids = children_map.get(&None).cloned().unwrap_or_default();
+
+        dbg_log!("Found {} root nodes", root_ids.len());
+
+        let roots: Vec<GoalRootNode> = root_ids
+            .iter()
+            .filter_map(|id| {
+                let node = node_map.get(id)?;
+                Some(build_goal_node_from_todays(node, &node_map, &children_map))
+            })
+            .collect();
+
+        let tree = GoalTree {
+            roots,
+            cursor: 0,
+            scroll_offset: 0,
+            is_required_to_fetch: false, // This tree is completed, no need to fetch more data
+        };
+
+        dbg_log!("Built complete tree with {} roots", tree.roots.len());
+
+        tree
     }
 }
 
@@ -616,4 +692,118 @@ fn increase_comment_limit_at<S: GoalItemAccessor>(
     }
 
     false
+}
+
+// ---------------------------------------------------------------------------
+// Today's goals tree building helpers
+// ---------------------------------------------------------------------------
+
+/// Build a GoalRootNode from a TodaysGoalNode, including all its children recursively
+fn build_goal_node_from_todays(
+    node: &TodaysGoalNode,
+    node_map: &HashMap<String, TodaysGoalNode>,
+    children_map: &HashMap<Option<String>, Vec<String>>,
+) -> GoalRootNode {
+    use crate::dbg_log;
+
+    // Convert TodaysGoalNode to GoalTreeItem
+    let tree_item = GoalTreeItem {
+        id: node.id.clone(),
+        parent_id: node.parent_id.clone(),
+        title: node.title.clone(),
+        status: node.parsed_status(),
+        order_no: node.order_no,
+        is_completed: node.is_completed(),
+        has_children: !node.is_leaf,
+        owner: node.owner.clone(),
+    };
+
+    // Build children recursively
+    let children = if let Some(child_ids) = children_map.get(&Some(node.id.clone())) {
+        let child_nodes: Vec<GoalChildNode> = child_ids
+            .iter()
+            .filter_map(|child_id| {
+                let child_node = node_map.get(child_id)?;
+                Some(build_child_node_from_todays(
+                    child_node,
+                    node_map,
+                    children_map,
+                ))
+            })
+            .collect();
+
+        if !child_nodes.is_empty() {
+            dbg_log!(
+                "  Node '{}' has {} children (pre-loaded)",
+                node.title,
+                child_nodes.len()
+            );
+            Some(Timestamped::now(child_nodes))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    GoalRootNode {
+        node: tree_item,
+        children,
+        comments: None,
+        deliverables: None,
+        expanded: true, // Always expanded since we have the complete tree
+        comment_display_limit: INITIAL_COMMENT_DISPLAY_LIMIT,
+    }
+}
+
+/// Build a GoalChildNode from a TodaysGoalNode, including all its children recursively
+fn build_child_node_from_todays(
+    node: &TodaysGoalNode,
+    node_map: &HashMap<String, TodaysGoalNode>,
+    children_map: &HashMap<Option<String>, Vec<String>>,
+) -> GoalChildNode {
+    // Convert TodaysGoalNode to GoalChildItem
+    let child_item = GoalChildItem {
+        id: node.id.clone(),
+        title: node.title.clone(),
+        description: None, // TodaysGoalNode doesn't include description
+        parent_id: node.parent_id.clone(),
+        status: node.parsed_status(),
+        is_completed: node.is_completed(),
+        has_children: !node.is_leaf,
+        order_no: node.order_no,
+        owner: node.owner.clone(),
+    };
+
+    // Build children recursively
+    let children = if let Some(child_ids) = children_map.get(&Some(node.id.clone())) {
+        let child_nodes: Vec<GoalChildNode> = child_ids
+            .iter()
+            .filter_map(|child_id| {
+                let child_node = node_map.get(child_id)?;
+                Some(build_child_node_from_todays(
+                    child_node,
+                    node_map,
+                    children_map,
+                ))
+            })
+            .collect();
+
+        if !child_nodes.is_empty() {
+            Some(Timestamped::now(child_nodes))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    GoalChildNode {
+        node: child_item,
+        children,
+        comments: None,
+        deliverables: None,
+        expanded: true, // Always expanded since we have the complete tree
+        comment_display_limit: INITIAL_COMMENT_DISPLAY_LIMIT,
+    }
 }

@@ -78,6 +78,10 @@ pub struct Owner {
 }
 
 // POST /api/v2/objectives
+//
+// CLI の `description` 引数は Backend の `definitionOfDone`（完了の基準）にマップされる。
+// Backend には別途 `description`（旧本文）と `body`（V2 Notion 風）カラムがあるが、
+// Frontend の「完了の基準」UI が読むのは `definitionOfDone` カラムのみ。
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateGoalRequest {
@@ -85,7 +89,7 @@ pub struct CreateGoalRequest {
     pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_objective_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "definitionOfDone", skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 }
 
@@ -100,7 +104,7 @@ pub struct UpdateGoalRequest {
     pub completed_at: Option<Option<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "definitionOfDone", skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 }
 
@@ -109,7 +113,8 @@ pub struct UpdateGoalRequest {
 pub struct Goal {
     pub id: String,
     pub title: String,
-    #[serde(default)]
+    /// Backend の `definitionOfDone`（完了の基準）にマップ。
+    #[serde(rename = "definitionOfDone", default)]
     pub description: Option<String>,
     #[serde(default)]
     pub body: Option<String>,
@@ -147,7 +152,8 @@ pub struct GoalChildrenData {
 pub struct GoalChildItem {
     pub id: String,
     pub title: String,
-    #[serde(default)]
+    /// Backend の `definitionOfDone`（完了の基準）にマップ。
+    #[serde(rename = "definitionOfDone", default)]
     pub description: Option<String>,
     #[serde(default)]
     pub parent_id: Option<String>,

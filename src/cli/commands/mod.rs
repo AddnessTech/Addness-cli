@@ -1,5 +1,6 @@
 pub mod comment;
 pub mod configure;
+pub mod deliverable;
 pub mod detect;
 pub mod goal;
 pub mod link;

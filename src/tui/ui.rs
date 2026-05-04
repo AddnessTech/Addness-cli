@@ -162,6 +162,7 @@ fn draw_content(frame: &mut Frame, area: Rect, app: &mut App) {
     match app.sidebar_index {
         0 => draw_goals(frame, area, app, border_color, "Goals"),
         1 => draw_goals(frame, area, app, border_color, "Execution"),
+        2 => draw_members(frame, area, app, border_color),
         _ => {}
     }
 }
@@ -923,4 +924,47 @@ fn draw_delete_goal_modal(frame: &mut Frame, app: &App) {
     ]);
 
     frame.render_widget(Paragraph::new(buttons), layout[3]);
+}
+
+fn draw_members(frame: &mut Frame, area: Rect, app: &mut App, border_color: Color) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .title(" Members ");
+
+    let inner_area = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Adjust scroll position
+    let viewport_height = inner_area.height as usize;
+    app.adjust_members_scroll(viewport_height);
+
+    // Build member list items
+    let is_active = app.active_pane == ActivePane::Content;
+    let visible_members: Vec<ListItem> = app.members
+        .iter()
+        .enumerate()
+        .skip(app.members_scroll_offset)
+        .take(viewport_height)
+        .map(|(idx, member)| {
+            let is_cursor = idx == app.members_cursor;
+            let is_current_user = member.is_current_user;
+
+            let style = if is_cursor && is_active {
+                Style::default().bg(Color::DarkGray).fg(Color::White)
+            } else if is_current_user {
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+
+            let prefix = if is_current_user { "👤 " } else { "  " };
+            let content = format!("{}{}", prefix, member.name);
+
+            ListItem::new(content).style(style)
+        })
+        .collect();
+
+    let list = List::new(visible_members);
+    frame.render_widget(list, inner_area);
 }

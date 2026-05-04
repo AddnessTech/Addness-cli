@@ -249,13 +249,69 @@ impl App {
 
         self.client.set_org_id(Some(org_id.clone()));
 
-        match self.api_call(self.client.get_goal_tree(&org_id, 1)) {
+        match self.api_call(self.client.get_goal_tree(&org_id, 2)) {
             Ok(resp) => {
                 self.goal_tree = GoalTree::from_tree_items(resp.data.items);
+
+                // Load comments and deliverables for auto-expanded root goals
+                self.load_root_goal_details();
             }
             Err(e) => {
                 self.goal_tree = GoalTree::empty();
                 self.error_message = Some(format!("Failed to load goals: {e}"));
+            }
+        }
+    }
+
+    fn load_root_goal_details(&mut self) {
+        // Collect root goal IDs from the flattened tree
+        let root_goal_ids: Vec<(usize, String)> = {
+            let rows = self.goal_tree.flatten();
+            rows.iter()
+                .enumerate()
+                .filter_map(|(idx, row)| {
+                    if let TreeRow::Goal { goal_id, depth, .. } = row {
+                        if *depth == 0 {
+                            // This is a root goal
+                            Some((idx, goal_id.to_string()))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+
+        // Load comments and deliverables for each root goal
+        for (cursor_idx, goal_id) in root_goal_ids {
+            let goal_id_ref = &goal_id;
+            let client = &self.client;
+
+            let result = self.api_call(async {
+                tokio::try_join!(
+                    client.list_comments(goal_id_ref),
+                    client.get_goal_deliverables(goal_id_ref)
+                )
+            });
+
+            match result {
+                Ok((comments_resp, deliverables_resp)) => {
+                    // Temporarily set cursor to the root goal
+                    let original_cursor = self.goal_tree.cursor;
+                    self.goal_tree.cursor = cursor_idx;
+
+                    // Set comments and deliverables
+                    self.goal_tree.set_comments_at_cursor(comments_resp.comments);
+                    self.goal_tree.set_deliverables_at_cursor(deliverables_resp.data.deliverables);
+
+                    // Restore original cursor
+                    self.goal_tree.cursor = original_cursor;
+                }
+                Err(_) => {
+                    // Ignore errors for individual goals
+                }
             }
         }
     }

@@ -4,9 +4,12 @@ use ratatui::{
     DefaultTerminal,
     crossterm::event::{self, Event, KeyCode, KeyEventKind},
 };
+use std::collections::HashMap;
 use tokio::runtime::Handle;
 
-use crate::api::{ApiClient, CreateGoalRequest, GoalStatus, Member, Organization, UpdateGoalRequest};
+use crate::api::{
+    ApiClient, CreateGoalRequest, GoalStatus, Member, MemberId, Organization, UpdateGoalRequest,
+};
 use crate::dbg_log;
 
 use super::goal_tree::{GoalTree, TreeRow};
@@ -138,7 +141,8 @@ pub struct App {
     pub todays_goals_tree: GoalTree,
 
     // Members state
-    pub members: Vec<Member>,
+    pub members: HashMap<MemberId, Member>,
+    pub members_list: Vec<Member>, // For display in Members tab
     pub members_cursor: usize,
     pub members_scroll_offset: usize,
 
@@ -170,7 +174,8 @@ impl App {
             org_popup_index: 0,
             goal_tree: GoalTree::empty(),
             todays_goals_tree: GoalTree::empty(),
-            members: vec![],
+            members: HashMap::new(),
+            members_list: vec![],
             members_cursor: 0,
             members_scroll_offset: 0,
             content_height: 0,
@@ -314,18 +319,29 @@ impl App {
 
     fn load_members(&mut self) {
         let Some(org_id) = self.current_org_id().map(|s| s.to_string()) else {
-            self.members = vec![];
+            self.members = HashMap::new();
+            self.members_list = vec![];
             return;
         };
 
         match self.api_call(self.client.get_members(&org_id)) {
             Ok(resp) => {
-                self.members = resp.data.members;
+                let member_list = resp.data.members;
+
+                // Build HashMap for fast lookup
+                self.members = member_list
+                    .iter()
+                    .map(|m| (m.id.clone(), m.clone()))
+                    .collect();
+
+                // Keep list for display
+                self.members_list = member_list;
                 self.members_cursor = 0;
                 self.members_scroll_offset = 0;
             }
             Err(e) => {
-                self.members = vec![];
+                self.members = HashMap::new();
+                self.members_list = vec![];
                 self.error_message = Some(format!("Failed to load members: {e}"));
             }
         }
@@ -338,7 +354,7 @@ impl App {
     }
 
     fn members_cursor_down(&mut self) {
-        if self.members_cursor + 1 < self.members.len() {
+        if self.members_cursor + 1 < self.members_list.len() {
             self.members_cursor += 1;
         }
     }

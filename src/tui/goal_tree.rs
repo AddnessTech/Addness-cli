@@ -208,8 +208,25 @@ impl GoalTree {
     }
 
     pub fn from_tree_items(items: Vec<GoalTreeItem>) -> Self {
+        use std::collections::HashSet;
+
+        // Build a set of all item IDs in this response
+        let id_set: HashSet<String> = items
+            .iter()
+            .map(|item| item.id.clone())
+            .collect();
+
+        // Root determination (same logic as frontend):
+        // - parent_id is None → true root goal
+        // - parent_id is Some(id) AND id is NOT in id_set → orphan (parent not in response)
         let roots = items
             .into_iter()
+            .filter(|item| {
+                match &item.parent_id {
+                    None => true,
+                    Some(parent_id) => !id_set.contains(parent_id),
+                }
+            })
             .map(|item| GoalRootNode {
                 node: item,
                 children: None,
@@ -219,6 +236,7 @@ impl GoalTree {
                 comment_display_limit: INITIAL_COMMENT_DISPLAY_LIMIT,
             })
             .collect();
+
         GoalTree {
             roots,
             cursor: 0,

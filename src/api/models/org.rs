@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-// GET /api/v1/team/organizations/my_organizations
-// Response: { "data": [ { "id": "...", "name": "...", ... } ] }
+// GET /api/v2/organizations/me
+// Response: { "data": { "organizations": [ { "id": "...", "name": "...", ... } ] }, "message": "success" }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Organization {
@@ -13,6 +13,12 @@ pub struct Organization {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct OrganizationsData {
+    pub organizations: Vec<Organization>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OrganizationsResponse {
-    pub data: Vec<Organization>,
+    pub data: OrganizationsData,
 }

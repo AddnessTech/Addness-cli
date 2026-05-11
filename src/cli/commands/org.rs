@@ -31,17 +31,23 @@ pub async fn handle_org(cmd: &OrgCommands, client: &ApiClient) -> Result<()> {
         OrgCommands::List { json } => {
             let resp: OrganizationsResponse = client.list_organizations().await?;
             if *json {
-                println!("{}", serde_json::to_string_pretty(&resp.data)?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&resp.data.organizations)?
+                );
             } else {
                 let settings = Settings::load()?;
-                print_organizations_table(&resp.data, settings.current_organization_id());
+                print_organizations_table(
+                    &resp.data.organizations,
+                    settings.current_organization_id(),
+                );
             }
             Ok(())
         }
         OrgCommands::Switch { id } => {
             // 所属確認: APIで組織一覧を取得し、指定IDが含まれるか検証
             let resp: OrganizationsResponse = client.list_organizations().await?;
-            let found = resp.data.iter().find(|org| org.id == *id);
+            let found = resp.data.organizations.iter().find(|org| org.id == *id);
             match found {
                 Some(org) => {
                     let mut settings = Settings::load()?;

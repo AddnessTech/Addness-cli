@@ -8,7 +8,9 @@ use clap::{CommandFactory, Parser, Subcommand};
 
 use crate::config::{Credentials, DEFAULT_API_URL, Settings};
 use api::ApiClient;
-use cli::commands::{comment, configure, detect, goal, link, login, org, skills, summary};
+use cli::commands::{
+    comment, configure, deliverable, detect, goal, link, login, org, skills, summary,
+};
 
 #[derive(Parser)]
 #[command(
@@ -61,6 +63,11 @@ enum Commands {
     Link {
         #[command(subcommand)]
         command: link::LinkCommands,
+    },
+    /// Manage deliverables (text/markdown content or file uploads) on goals
+    Deliverable {
+        #[command(subcommand)]
+        command: deliverable::DeliverableCommands,
     },
     /// Show progress summary of all goals
     Summary {
@@ -159,6 +166,10 @@ async fn main() -> Result<()> {
         Commands::Link { command } => {
             let client = build_client()?;
             link::handle_link(command, &client).await
+        }
+        Commands::Deliverable { command } => {
+            let client = build_client()?;
+            deliverable::handle_deliverable(command, &client).await
         }
         Commands::Summary { org, depth, json } => {
             let client = build_client()?;

@@ -37,6 +37,119 @@ pub enum DeliverableCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Update a deliverable's content (document type)
+    Update {
+        /// Goal ID
+        #[arg(long)]
+        goal: String,
+        /// Deliverable ID
+        id: String,
+        /// New content (markdown)
+        #[arg(long)]
+        content: Option<String>,
+        /// New content from a file
+        #[arg(long)]
+        content_file: Option<PathBuf>,
+        /// Mention member IDs (UUID), repeatable
+        #[arg(long)]
+        mention: Vec<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rename a deliverable
+    Rename {
+        /// Goal ID
+        #[arg(long)]
+        goal: String,
+        /// Deliverable ID
+        id: String,
+        /// New display name
+        #[arg(long)]
+        name: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Move a deliverable under a different parent (or to root with --root)
+    Move {
+        /// Goal ID
+        #[arg(long)]
+        goal: String,
+        /// Deliverable ID to move
+        id: String,
+        /// New parent deliverable ID (folder)
+        #[arg(long, conflicts_with = "root")]
+        parent: Option<String>,
+        /// Move to root of the goal's deliverable tree
+        #[arg(long, conflicts_with = "parent")]
+        root: bool,
+        /// Display order (default 0.0)
+        #[arg(long, default_value = "0.0")]
+        order: f64,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a deliverable
+    Rm {
+        /// Goal ID
+        #[arg(long)]
+        goal: String,
+        /// Deliverable ID
+        id: String,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
+    },
+    /// Batch-move multiple deliverables
+    BatchMove {
+        /// Goal ID
+        #[arg(long)]
+        goal: String,
+        /// Comma-separated deliverable IDs to move
+        #[arg(long)]
+        ids: String,
+        /// New parent deliverable ID
+        #[arg(long, conflicts_with = "root")]
+        parent: Option<String>,
+        /// Move to root (clear parent)
+        #[arg(long, conflicts_with = "parent")]
+        root: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Batch-delete multiple deliverables
+    BatchRm {
+        /// Goal ID
+        #[arg(long)]
+        goal: String,
+        /// Comma-separated deliverable IDs to delete
+        #[arg(long)]
+        ids: String,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+fn split_ids(csv: &str) -> Vec<String> {
+    csv.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn read_content(inline: &Option<String>, file: &Option<PathBuf>) -> Result<String> {
+    match (inline, file) {
+        (Some(s), None) => Ok(s.clone()),
+        (None, Some(p)) => {
+            std::fs::read_to_string(p).with_context(|| format!("Failed to read {}", p.display()))
+        }
+        (Some(_), Some(_)) => bail!("Specify only one of --content or --content-file"),
+        (None, None) => bail!("Specify --content or --content-file"),
+    }
 }
 
 pub async fn handle_deliverable(cmd: &DeliverableCommands, client: &ApiClient) -> Result<()> {
@@ -49,29 +162,147 @@ pub async fn handle_deliverable(cmd: &DeliverableCommands, client: &ApiClient) -
             name,
             json,
         } => add_deliverable(client, goal, content, content_file, file, name, *json).await,
-        DeliverableCommands::List { goal, json } => {
-            let resp = client.get_goal_deliverables(goal).await?;
+        DeliverableCommands::List { goal, json } => list_deliverables(client, goal, *json).await,
+        DeliverableCommands::Update {
+            goal,
+            id,
+            content,
+            content_file,
+            mention,
+            json,
+        } => {
+            let body = read_content(content, content_file)?;
+            let resp = client
+                .update_deliverable(goal, id, &body, mention.clone())
+                .await?;
             if *json {
-                println!("{}", serde_json::to_string_pretty(&resp.data)?);
+                println!("{}", serde_json::to_string_pretty(&resp)?);
             } else {
-                if resp.data.deliverables.is_empty() {
-                    println!("No deliverables on goal {goal}");
-                    return Ok(());
-                }
-                println!("Deliverables on goal {goal} (total: {}):", resp.data.total);
-                for d in &resp.data.deliverables {
-                    let kind = match d.node_type {
-                        DeliverableType::Folder => "folder",
-                        DeliverableType::Document => "document",
-                        DeliverableType::File => "file",
-                        DeliverableType::Link => "link",
-                    };
-                    println!("  [{kind}] {} ({})", d.display_name, d.id);
-                }
+                println!("Deliverable {id} updated");
             }
             Ok(())
         }
+        DeliverableCommands::Rename {
+            goal,
+            id,
+            name,
+            json,
+        } => {
+            let resp = client.rename_deliverable(goal, id, name).await?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&resp)?);
+            } else {
+                println!("Renamed deliverable {id} to {name}");
+            }
+            Ok(())
+        }
+        DeliverableCommands::Move {
+            goal,
+            id,
+            parent,
+            root,
+            order,
+            json,
+        } => {
+            if parent.is_none() && !*root {
+                bail!("Specify --parent <ID> or --root.");
+            }
+            let target = if *root { None } else { parent.clone() };
+            let resp = client
+                .move_deliverable(goal, id, target.clone(), *order)
+                .await?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&resp)?);
+            } else {
+                let dest = target.as_deref().unwrap_or("(root)");
+                println!("Moved deliverable {id} to {dest}");
+            }
+            Ok(())
+        }
+        DeliverableCommands::Rm { goal, id, force } => {
+            if !*force {
+                eprint!("Delete deliverable {id}? [y/N] ");
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                if !input.trim().eq_ignore_ascii_case("y") {
+                    println!("Cancelled.");
+                    return Ok(());
+                }
+            }
+            client.delete_deliverable(goal, id).await?;
+            println!("Deliverable {id} deleted");
+            Ok(())
+        }
+        DeliverableCommands::BatchMove {
+            goal,
+            ids,
+            parent,
+            root,
+            json,
+        } => {
+            let id_list = split_ids(ids);
+            if id_list.is_empty() {
+                bail!("--ids must contain at least one ID");
+            }
+            if parent.is_none() && !*root {
+                bail!("Specify --parent <ID> or --root.");
+            }
+            let target = if *root { None } else { parent.clone() };
+            let resp = client
+                .batch_move_deliverables(goal, id_list.clone(), target.clone())
+                .await?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&resp)?);
+            } else {
+                let dest = target.as_deref().unwrap_or("(root)");
+                println!("Moved {} deliverables to {dest}", id_list.len());
+            }
+            Ok(())
+        }
+        DeliverableCommands::BatchRm { goal, ids, force } => {
+            let id_list = split_ids(ids);
+            if id_list.is_empty() {
+                bail!("--ids must contain at least one ID");
+            }
+            if !*force {
+                eprint!("Delete {} deliverables? [y/N] ", id_list.len());
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                if !input.trim().eq_ignore_ascii_case("y") {
+                    println!("Cancelled.");
+                    return Ok(());
+                }
+            }
+            client
+                .batch_delete_deliverables(goal, id_list.clone())
+                .await?;
+            println!("Deleted {} deliverables", id_list.len());
+            Ok(())
+        }
     }
+}
+
+async fn list_deliverables(client: &ApiClient, goal: &str, json: bool) -> Result<()> {
+    let resp = client.get_goal_deliverables(goal).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&resp.data)?);
+        return Ok(());
+    }
+    if resp.data.deliverables.is_empty() {
+        println!("No deliverables on goal {goal}");
+        return Ok(());
+    }
+    println!("Deliverables on goal {goal} (total: {}):", resp.data.total);
+    for d in &resp.data.deliverables {
+        let kind = match d.node_type {
+            DeliverableType::Folder => "folder",
+            DeliverableType::Document => "document",
+            DeliverableType::File => "file",
+            DeliverableType::Link => "link",
+        };
+        println!("  [{kind}] {} ({})", d.display_name, d.id);
+    }
+    Ok(())
 }
 
 async fn add_deliverable(

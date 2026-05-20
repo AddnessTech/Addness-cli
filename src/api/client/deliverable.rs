@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 
 use crate::api::{
-    ApiClient, ApiResponse, AttachmentUploadRequest, CreateDeliverableRequest, Deliverable,
-    DeliverableCreateData, DeliverableListData, DeliverableType,
+    ApiClient, ApiResponse, AttachmentUploadRequest, BatchDeleteDeliverableRequest,
+    BatchMoveDeliverableRequest, CreateDeliverableRequest, Deliverable, DeliverableCreateData,
+    DeliverableListData, DeliverableType, MoveDeliverableRequest, RenameDeliverableRequest,
+    UpdateDeliverableRequest,
 };
 use anyhow::{Context, Result};
 
@@ -105,6 +107,79 @@ impl ApiClient {
     ) -> Result<ApiResponse<DeliverableListData>> {
         let path = format!("/api/v1/team/objectives/{goal_id}/deliverables");
         self.get(&path).await
+    }
+
+    pub async fn update_deliverable(
+        &self,
+        goal_id: &str,
+        deliverable_id: &str,
+        content: &str,
+        mentions: Vec<String>,
+    ) -> Result<serde_json::Value> {
+        let path = format!("/api/v1/team/objectives/{goal_id}/deliverables/{deliverable_id}");
+        let body = UpdateDeliverableRequest {
+            content: content.to_string(),
+            mentions,
+        };
+        self.patch(&path, &body).await
+    }
+
+    pub async fn rename_deliverable(
+        &self,
+        goal_id: &str,
+        deliverable_id: &str,
+        display_name: &str,
+    ) -> Result<serde_json::Value> {
+        let path =
+            format!("/api/v1/team/objectives/{goal_id}/deliverables/{deliverable_id}/rename");
+        let body = RenameDeliverableRequest {
+            display_name: display_name.to_string(),
+        };
+        self.patch(&path, &body).await
+    }
+
+    pub async fn move_deliverable(
+        &self,
+        goal_id: &str,
+        deliverable_id: &str,
+        target_parent_deliverable_id: Option<String>,
+        order_no: f64,
+    ) -> Result<serde_json::Value> {
+        let path = format!("/api/v1/team/objectives/{goal_id}/deliverables/{deliverable_id}/move");
+        let body = MoveDeliverableRequest {
+            target_parent_deliverable_id,
+            order_no,
+        };
+        self.patch(&path, &body).await
+    }
+
+    pub async fn delete_deliverable(&self, goal_id: &str, deliverable_id: &str) -> Result<()> {
+        let path = format!("/api/v1/team/objectives/{goal_id}/deliverables/{deliverable_id}");
+        self.delete_no_body(&path).await
+    }
+
+    pub async fn batch_move_deliverables(
+        &self,
+        goal_id: &str,
+        node_ids: Vec<String>,
+        target_parent_deliverable_id: Option<String>,
+    ) -> Result<serde_json::Value> {
+        let path = format!("/api/v1/team/objectives/{goal_id}/deliverables/batch_move");
+        let body = BatchMoveDeliverableRequest {
+            node_ids,
+            target_parent_deliverable_id,
+        };
+        self.post(&path, &body).await
+    }
+
+    pub async fn batch_delete_deliverables(
+        &self,
+        goal_id: &str,
+        node_ids: Vec<String>,
+    ) -> Result<()> {
+        let path = format!("/api/v1/team/objectives/{goal_id}/deliverables/batch_delete");
+        let body = BatchDeleteDeliverableRequest { node_ids };
+        self.post_no_content(&path, &body).await
     }
 
     /// 各ゴールの成果物を並行取得してマップで返す

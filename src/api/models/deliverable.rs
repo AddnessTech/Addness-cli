@@ -71,6 +71,47 @@ pub enum DeliverableType {
     Link,
 }
 
+// PATCH /:deliverableId
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateDeliverableRequest {
+    pub content: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<String>,
+}
+
+// PATCH /:deliverableId/rename
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameDeliverableRequest {
+    pub display_name: String,
+}
+
+// PATCH /:deliverableId/move
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MoveDeliverableRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_parent_deliverable_id: Option<String>,
+    pub order_no: f64,
+}
+
+// POST /batch_move
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchMoveDeliverableRequest {
+    pub node_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_parent_deliverable_id: Option<String>,
+}
+
+// POST /batch_delete
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchDeleteDeliverableRequest {
+    pub node_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Deliverable {

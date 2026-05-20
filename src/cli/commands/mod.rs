@@ -1,10 +1,15 @@
+pub mod assignment;
 pub mod comment;
 pub mod configure;
 pub mod deliverable;
 pub mod detect;
 pub mod goal;
+pub mod invitation;
+pub mod kpi;
 pub mod link;
 pub mod login;
+pub mod member;
 pub mod org;
 pub mod skills;
 pub mod summary;
+pub mod tui;

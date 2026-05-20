@@ -45,3 +45,18 @@ pub struct CreateCommentRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
 }
+
+// PUT /v1/team/comments/:id
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateCommentRequest {
+    pub content: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<String>,
+}
+
+// POST /v1/team/comments/:id/reactions
+#[derive(Debug, Serialize)]
+pub struct ReactionRequest {
+    pub emoji: String,
+}

@@ -112,14 +112,9 @@ pub async fn handle_kpi(cmd: &KpiCommands, client: &ApiClient) -> Result<()> {
             Ok(())
         }
         KpiCommands::Rm { id, force } => {
-            if !*force {
-                eprint!("Delete KPI {id}? [y/N] ");
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input)?;
-                if !input.trim().eq_ignore_ascii_case("y") {
-                    println!("Cancelled.");
-                    return Ok(());
-                }
+            if !*force && !crate::cli::commands::confirm(&format!("Delete KPI {id}?"))? {
+                println!("Cancelled.");
+                return Ok(());
             }
             client.delete_kpi(id).await?;
             println!("KPI {id} deleted");

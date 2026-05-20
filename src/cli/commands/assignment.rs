@@ -111,14 +111,13 @@ pub async fn handle_assignment(cmd: &AssignmentCommands, client: &ApiClient) -> 
             Ok(())
         }
         AssignmentCommands::Rm { goal, id, force } => {
-            if !*force {
-                eprint!("Remove assignment {id} from goal {goal}? [y/N] ");
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input)?;
-                if !input.trim().eq_ignore_ascii_case("y") {
-                    println!("Cancelled.");
-                    return Ok(());
-                }
+            if !*force
+                && !crate::cli::commands::confirm(&format!(
+                    "Remove assignment {id} from goal {goal}?"
+                ))?
+            {
+                println!("Cancelled.");
+                return Ok(());
             }
             client.delete_assignment(goal, id).await?;
             println!("Assignment {id} removed");

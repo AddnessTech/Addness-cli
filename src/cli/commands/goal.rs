@@ -116,9 +116,6 @@ pub enum GoalCommands {
     Update {
         /// Goal ID
         id: String,
-        /// Organization ID (uses default if not specified)
-        #[arg(long)]
-        org: Option<String>,
         /// Status: NOT_STARTED, IN_PROGRESS, COMPLETED, CANCELLED
         #[arg(long)]
         status: Option<String>,
@@ -678,12 +675,11 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
         }
         GoalCommands::Delete { id, force, json } => {
             if !force {
-                // Fetch goal title for confirmation
                 let resp: ApiResponse<Goal> = client.get_goal(id).await?;
-                eprint!("Delete goal \"{}\" ({id})? [y/N] ", resp.data.title);
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input)?;
-                if !input.trim().eq_ignore_ascii_case("y") {
+                if !crate::cli::commands::confirm(&format!(
+                    "Delete goal \"{}\" ({id})?",
+                    resp.data.title
+                ))? {
                     println!("Cancelled.");
                     return Ok(());
                 }
@@ -706,15 +702,12 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
         }
         GoalCommands::Update {
             id,
-            org,
             status,
             title,
             description,
             description_file,
             json,
         } => {
-            let org_id = resolve_org_id(org.as_deref())?;
-
             let (completed_at, goal_status) = if let Some(s) = status {
                 parse_status(s)?
             } else {
@@ -742,7 +735,7 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
                 bail!("Nothing to update. Specify --status, --title, or --description.");
             }
 
-            let resp: ApiResponse<Goal> = client.update_goal(&org_id, id, &req).await?;
+            let resp: ApiResponse<Goal> = client.update_goal(id, &req).await?;
 
             if *json {
                 println!("{}", serde_json::to_string_pretty(&resp.data)?);
@@ -831,14 +824,11 @@ async fn handle_share(cmd: &ShareCommands, client: &ApiClient) -> Result<()> {
             Ok(())
         }
         ShareCommands::Revoke { id, force } => {
-            if !*force {
-                eprint!("Revoke share link for goal {id}? [y/N] ");
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input)?;
-                if !input.trim().eq_ignore_ascii_case("y") {
-                    println!("Cancelled.");
-                    return Ok(());
-                }
+            if !*force
+                && !crate::cli::commands::confirm(&format!("Revoke share link for goal {id}?"))?
+            {
+                println!("Cancelled.");
+                return Ok(());
             }
             client.revoke_share_link(id).await?;
             println!("Share link revoked for goal {id}");
@@ -876,14 +866,13 @@ async fn handle_alias(cmd: &AliasCommands, client: &ApiClient) -> Result<()> {
             alias_id,
             force,
         } => {
-            if !*force {
-                eprint!("Delete alias {alias_id} from parent {parent_id}? [y/N] ");
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input)?;
-                if !input.trim().eq_ignore_ascii_case("y") {
-                    println!("Cancelled.");
-                    return Ok(());
-                }
+            if !*force
+                && !crate::cli::commands::confirm(&format!(
+                    "Delete alias {alias_id} from parent {parent_id}?"
+                ))?
+            {
+                println!("Cancelled.");
+                return Ok(());
             }
             client.delete_alias(parent_id, alias_id).await?;
             println!("Alias {alias_id} deleted");

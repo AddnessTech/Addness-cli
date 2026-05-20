@@ -220,14 +220,9 @@ pub async fn handle_deliverable(cmd: &DeliverableCommands, client: &ApiClient) -
             Ok(())
         }
         DeliverableCommands::Rm { goal, id, force } => {
-            if !*force {
-                eprint!("Delete deliverable {id}? [y/N] ");
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input)?;
-                if !input.trim().eq_ignore_ascii_case("y") {
-                    println!("Cancelled.");
-                    return Ok(());
-                }
+            if !*force && !crate::cli::commands::confirm(&format!("Delete deliverable {id}?"))? {
+                println!("Cancelled.");
+                return Ok(());
             }
             client.delete_deliverable(goal, id).await?;
             println!("Deliverable {id} deleted");
@@ -264,14 +259,14 @@ pub async fn handle_deliverable(cmd: &DeliverableCommands, client: &ApiClient) -
             if id_list.is_empty() {
                 bail!("--ids must contain at least one ID");
             }
-            if !*force {
-                eprint!("Delete {} deliverables? [y/N] ", id_list.len());
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input)?;
-                if !input.trim().eq_ignore_ascii_case("y") {
-                    println!("Cancelled.");
-                    return Ok(());
-                }
+            if !*force
+                && !crate::cli::commands::confirm(&format!(
+                    "Delete {} deliverables?",
+                    id_list.len()
+                ))?
+            {
+                println!("Cancelled.");
+                return Ok(());
             }
             client
                 .batch_delete_deliverables(goal, id_list.clone())

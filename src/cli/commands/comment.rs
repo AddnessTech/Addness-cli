@@ -145,14 +145,9 @@ pub async fn handle_comments(cmd: &CommentCommands, client: &ApiClient) -> Resul
             Ok(())
         }
         CommentCommands::Delete { id, force } => {
-            if !*force {
-                eprint!("Delete comment {id}? [y/N] ");
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input)?;
-                if !input.trim().eq_ignore_ascii_case("y") {
-                    println!("Cancelled.");
-                    return Ok(());
-                }
+            if !*force && !crate::cli::commands::confirm(&format!("Delete comment {id}?"))? {
+                println!("Cancelled.");
+                return Ok(());
             }
             client.delete_comment(id).await?;
             println!("Comment {id} deleted");
@@ -187,14 +182,13 @@ pub async fn handle_comments(cmd: &CommentCommands, client: &ApiClient) -> Resul
                 attachment_id,
                 force,
             } => {
-                if !*force {
-                    eprint!("Delete attachment {attachment_id} from comment {comment_id}? [y/N] ");
-                    let mut input = String::new();
-                    std::io::stdin().read_line(&mut input)?;
-                    if !input.trim().eq_ignore_ascii_case("y") {
-                        println!("Cancelled.");
-                        return Ok(());
-                    }
+                if !*force
+                    && !crate::cli::commands::confirm(&format!(
+                        "Delete attachment {attachment_id} from comment {comment_id}?"
+                    ))?
+                {
+                    println!("Cancelled.");
+                    return Ok(());
                 }
                 client
                     .delete_comment_attachment(comment_id, attachment_id)

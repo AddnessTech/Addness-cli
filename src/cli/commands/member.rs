@@ -104,14 +104,9 @@ pub async fn handle_member(cmd: &MemberCommands, client: &ApiClient) -> Result<(
             Ok(())
         }
         MemberCommands::Rm { id, force } => {
-            if !*force {
-                eprint!("Remove member {id}? [y/N] ");
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input)?;
-                if !input.trim().eq_ignore_ascii_case("y") {
-                    println!("Cancelled.");
-                    return Ok(());
-                }
+            if !*force && !crate::cli::commands::confirm(&format!("Remove member {id}?"))? {
+                println!("Cancelled.");
+                return Ok(());
             }
             client.delete_member(id).await?;
             println!("Member {id} removed");

@@ -2,7 +2,9 @@ use std::io::{self, Stdout};
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -72,8 +74,20 @@ async fn run_app(
     list_state.select(Some(0));
     let mut detail = DetailState::default();
     let mut status_msg = format!("org {org_id} — {} goals — ?:help q:quit", items.len());
+    // ID of the goal whose comments are currently cached. When selection moves,
+    // we drop the cache so stale comments don't linger on the new goal.
+    let mut comments_loaded_for: Option<String> = None;
 
     loop {
+        // If the selection has moved off the goal whose comments we cached, drop them.
+        if let Some(idx) = list_state.selected()
+            && let Some(item) = items.get(idx)
+            && comments_loaded_for.as_deref() != Some(item.id.as_str())
+        {
+            detail.comments = None;
+            detail.show_comments = false;
+        }
+
         terminal.draw(|f| ui(f, &items, &mut list_state, &detail, &status_msg))?;
 
         if !event::poll(Duration::from_millis(200))? {
@@ -88,9 +102,7 @@ async fn run_app(
 
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => break,
-            KeyCode::Char('c')
-                if key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 break;
             }
             KeyCode::Down | KeyCode::Char('j') => move_selection(&mut list_state, &items, 1),
@@ -107,33 +119,26 @@ async fn run_app(
                         match client.list_comments(&item.id).await {
                             Ok(resp) => {
                                 detail.comments = Some(resp.comments);
+                                comments_loaded_for = Some(item.id.clone());
                                 status_msg = "comments loaded — c:close".into();
                             }
                             Err(e) => {
                                 detail.comments = Some(vec![]);
+                                comments_loaded_for = Some(item.id.clone());
                                 status_msg = format!("failed to load comments: {e}");
                             }
                         }
                     }
                 } else {
+                    comments_loaded_for = None;
+                    detail.comments = None;
                     status_msg = "comment panel closed".into();
                 }
             }
             KeyCode::Char('?') | KeyCode::Char('h') => {
-                status_msg =
-                    "j/k:move  g/G:top/bottom  c:comments  q:quit  Esc:quit".to_string();
+                status_msg = "j/k:move  g/G:top/bottom  c:comments  q:quit  Esc:quit".to_string();
             }
             _ => {}
-        }
-
-        // Reset comments when selection changes.
-        if let Some(idx) = list_state.selected()
-            && let Some(_item) = items.get(idx)
-        {
-            // Currently we only clear when comment panel was closed.
-            if !detail.show_comments {
-                detail.comments = None;
-            }
         }
     }
 
@@ -188,9 +193,9 @@ fn draw_list(
                 "✓"
             } else {
                 match &g.status {
-                    Some(GoalStatus::InProgress) => "▶"
-                    , Some(GoalStatus::Cancelled) => "✗"
-                    , _ => "·"
+                    Some(GoalStatus::InProgress) => "▶",
+                    Some(GoalStatus::Cancelled) => "✗",
+                    _ => "·",
                 }
             };
             let line = Line::from(vec![
@@ -203,7 +208,11 @@ fn draw_list(
         .collect();
 
     let list = List::new(list_items)
-        .block(Block::default().borders(Borders::ALL).title("Goals (j/k, ?:help)"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Goals (j/k, ?:help)"),
+        )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     f.render_stateful_widget(list, area, list_state);
 }
@@ -246,9 +255,8 @@ fn draw_detail(
     detail: &DetailState,
 ) {
     let Some(idx) = list_state.selected() else {
-        let p = Paragraph::new("No selection").block(
-            Block::default().borders(Borders::ALL).title("Detail"),
-        );
+        let p = Paragraph::new("No selection")
+            .block(Block::default().borders(Borders::ALL).title("Detail"));
         f.render_widget(p, area);
         return;
     };

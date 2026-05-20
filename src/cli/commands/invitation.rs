@@ -132,14 +132,9 @@ pub async fn handle_invitation(cmd: &InvitationCommands, client: &ApiClient) -> 
         }
         InvitationCommands::Revoke { id, org, force } => {
             let org_id = resolve_org_id(org.as_deref())?;
-            if !*force {
-                eprint!("Revoke invitation {id}? [y/N] ");
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input)?;
-                if !input.trim().eq_ignore_ascii_case("y") {
-                    println!("Cancelled.");
-                    return Ok(());
-                }
+            if !*force && !crate::cli::commands::confirm(&format!("Revoke invitation {id}?"))? {
+                println!("Cancelled.");
+                return Ok(());
             }
             client.revoke_invitation(&org_id, id).await?;
             println!("Invitation {id} revoked");
@@ -180,14 +175,11 @@ pub async fn handle_invitation(cmd: &InvitationCommands, client: &ApiClient) -> 
             }
             InviteLinkCommands::Deactivate { id, org, force } => {
                 let org_id = resolve_org_id(org.as_deref())?;
-                if !*force {
-                    eprint!("Deactivate invite link {id}? [y/N] ");
-                    let mut input = String::new();
-                    std::io::stdin().read_line(&mut input)?;
-                    if !input.trim().eq_ignore_ascii_case("y") {
-                        println!("Cancelled.");
-                        return Ok(());
-                    }
+                if !*force
+                    && !crate::cli::commands::confirm(&format!("Deactivate invite link {id}?"))?
+                {
+                    println!("Cancelled.");
+                    return Ok(());
                 }
                 client.deactivate_invite_link(&org_id, id).await?;
                 println!("Invite link {id} deactivated");

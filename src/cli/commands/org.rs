@@ -152,7 +152,9 @@ pub async fn handle_org(cmd: &OrgCommands, client: &ApiClient) -> Result<()> {
                 _ => bail!("Invalid --type '{type}'. Use PERSONAL or BUSINESS."),
             }
             if upper_type == "BUSINESS" && team_scale.is_none() {
-                bail!("--team-scale is required for BUSINESS (one of SOLO, 2_5, 6_20, 21_50, 50_PLUS)");
+                bail!(
+                    "--team-scale is required for BUSINESS (one of SOLO, 2_5, 6_20, 21_50, 50_PLUS)"
+                );
             }
             let resp = client
                 .create_organization(name, &upper_type, team_scale.clone())
@@ -179,14 +181,9 @@ pub async fn handle_org(cmd: &OrgCommands, client: &ApiClient) -> Result<()> {
             Ok(())
         }
         OrgCommands::Rm { id, force } => {
-            if !*force {
-                eprint!("Delete organization {id}? [y/N] ");
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input)?;
-                if !input.trim().eq_ignore_ascii_case("y") {
-                    println!("Cancelled.");
-                    return Ok(());
-                }
+            if !*force && !crate::cli::commands::confirm(&format!("Delete organization {id}?"))? {
+                println!("Cancelled.");
+                return Ok(());
             }
             client.delete_organization(id).await?;
             println!("Organization {id} deleted");

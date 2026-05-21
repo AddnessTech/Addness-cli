@@ -6,9 +6,59 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
 
+use std::collections::HashMap;
+
 use super::app::{ActivePane, App, FormField, ModalState};
 use super::goal_tree::TreeRow;
-use crate::api::{DeliverableType, GoalStatus};
+use crate::api::{DeliverableType, GoalStatus, Member, MemberId};
+
+/// Replace @uuid mentions in text with @member_name
+fn replace_member_mentions(text: &str, members: &HashMap<MemberId, Member>) -> String {
+    let mut result = String::new();
+    let mut chars = text.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '@' {
+            // Collect characters after @
+            let mut potential_uuid = String::new();
+            while let Some(&next_ch) = chars.peek() {
+                if next_ch.is_alphanumeric() || next_ch == '-' {
+                    potential_uuid.push(chars.next().unwrap());
+                } else {
+                    break;
+                }
+            }
+
+            // Check if it looks like a UUID (36 chars with hyphens at positions 8, 13, 18, 23)
+            let is_uuid_like = potential_uuid.len() == 36
+                && potential_uuid.chars().nth(8) == Some('-')
+                && potential_uuid.chars().nth(13) == Some('-')
+                && potential_uuid.chars().nth(18) == Some('-')
+                && potential_uuid.chars().nth(23) == Some('-');
+
+            if is_uuid_like {
+                // Try to find member
+                let member_id = MemberId::new(&potential_uuid);
+                if let Some(member) = members.get(&member_id) {
+                    result.push('@');
+                    result.push_str(&member.name);
+                } else {
+                    result.push('@');
+                    result.push_str(&potential_uuid);
+                    result.push_str("(不明なメンバ)");
+                }
+            } else {
+                // Not a UUID, keep original
+                result.push('@');
+                result.push_str(&potential_uuid);
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+
+    result
+}
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let main_layout = Layout::default()
@@ -162,6 +212,7 @@ fn draw_content(frame: &mut Frame, area: Rect, app: &mut App) {
     match app.sidebar_index {
         0 => draw_goals(frame, area, app, border_color, "Goals"),
         1 => draw_goals(frame, area, app, border_color, "Execution"),
+        2 => draw_members(frame, area, app, border_color),
         _ => {}
     }
 }
@@ -185,8 +236,8 @@ fn draw_goals(frame: &mut Frame, area: Rect, app: &mut App, border_color: Color,
     let viewport_h = inner.height as usize;
     app.content_height = viewport_h;
 
-    let tree = app.active_goal_tree_mut();
-    tree.adjust_scroll(viewport_h);
+    app.active_goal_tree_mut().adjust_scroll(viewport_h);
+    let tree = app.active_goal_tree();
 
     let rows = tree.flatten();
     let scroll = tree.scroll_offset;
@@ -202,12 +253,17 @@ fn draw_goals(frame: &mut Frame, area: Rect, app: &mut App, border_color: Color,
         let line_area = Rect::new(inner.x, y, inner.width, 1);
         let is_cursor = i == cursor;
 
-        let line = render_tree_row(row, is_cursor, inner.width as usize);
+        let line = render_tree_row(row, is_cursor, inner.width as usize, &app.members);
         frame.render_widget(Paragraph::new(line), line_area);
     }
 }
 
-fn render_tree_row(row: &TreeRow, is_cursor: bool, width: usize) -> Line<'static> {
+fn render_tree_row(
+    row: &TreeRow,
+    is_cursor: bool,
+    width: usize,
+    members: &HashMap<MemberId, Member>,
+) -> Line<'static> {
     let bg = if is_cursor {
         Color::DarkGray
     } else {
@@ -332,8 +388,12 @@ fn render_tree_row(row: &TreeRow, is_cursor: bool, width: usize) -> Line<'static
         TreeRow::CommentItem { comment, depth } => {
             let indent = "  ".repeat(*depth);
             let author = &comment.author.name;
+
+            // Replace @uuid mentions with @member_name
+            let content_with_mentions = replace_member_mentions(&comment.content, members);
+
             let content = truncate_str(
-                &comment.content,
+                &content_with_mentions,
                 width.saturating_sub(indent.len() + author.len() + 4),
             );
             let text_len = indent.len() + author.len() + 2 + content.len();
@@ -923,4 +983,50 @@ fn draw_delete_goal_modal(frame: &mut Frame, app: &App) {
     ]);
 
     frame.render_widget(Paragraph::new(buttons), layout[3]);
+}
+
+fn draw_members(frame: &mut Frame, area: Rect, app: &mut App, border_color: Color) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .title(" Members ");
+
+    let inner_area = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Adjust scroll position
+    let viewport_height = inner_area.height as usize;
+    app.adjust_members_scroll(viewport_height);
+
+    // Build member list items
+    let is_active = app.active_pane == ActivePane::Content;
+    let visible_members: Vec<ListItem> = app
+        .members_list
+        .iter()
+        .enumerate()
+        .skip(app.members_scroll_offset)
+        .take(viewport_height)
+        .map(|(idx, member)| {
+            let is_cursor = idx == app.members_cursor;
+            let is_current_user = member.is_current_user;
+
+            let style = if is_cursor && is_active {
+                Style::default().bg(Color::DarkGray).fg(Color::White)
+            } else if is_current_user {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+
+            let prefix = if is_current_user { "👤 " } else { "  " };
+            let content = format!("{}{}", prefix, member.name);
+
+            ListItem::new(content).style(style)
+        })
+        .collect();
+
+    let list = List::new(visible_members);
+    frame.render_widget(list, inner_area);
 }

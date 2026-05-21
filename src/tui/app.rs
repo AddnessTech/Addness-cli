@@ -4,9 +4,12 @@ use ratatui::{
     DefaultTerminal,
     crossterm::event::{self, Event, KeyCode, KeyEventKind},
 };
+use std::collections::HashMap;
 use tokio::runtime::Handle;
 
-use crate::api::{ApiClient, CreateGoalRequest, GoalStatus, Organization, UpdateGoalRequest};
+use crate::api::{
+    ApiClient, CreateGoalRequest, GoalStatus, Member, MemberId, Organization, UpdateGoalRequest,
+};
 use crate::dbg_log;
 
 use super::goal_tree::{GoalTree, TreeRow};
@@ -137,6 +140,12 @@ pub struct App {
     pub goal_tree: GoalTree,
     pub todays_goals_tree: GoalTree,
 
+    // Members state
+    pub members: HashMap<MemberId, Member>,
+    pub members_list: Vec<Member>, // For display in Members tab
+    pub members_cursor: usize,
+    pub members_scroll_offset: usize,
+
     /// Last known content viewport height (for scroll calculations)
     pub content_height: usize,
 
@@ -158,13 +167,17 @@ impl App {
             running: true,
             active_pane: ActivePane::Navigation,
             sidebar_index: 0,
-            sidebar_items: vec!["Goals", "Execution"],
+            sidebar_items: vec!["Goals", "Execution", "Members"],
             orgs: vec![],
             current_org_index: 0,
             show_org_popup: false,
             org_popup_index: 0,
             goal_tree: GoalTree::empty(),
             todays_goals_tree: GoalTree::empty(),
+            members: HashMap::new(),
+            members_list: vec![],
+            members_cursor: 0,
+            members_scroll_offset: 0,
             content_height: 0,
             error_message: None,
             modal_state: None,
@@ -239,6 +252,7 @@ impl App {
 
         self.load_goal_tree();
         self.load_todays_goals();
+        self.load_members();
     }
 
     fn load_goal_tree(&mut self) {
@@ -352,6 +366,59 @@ impl App {
         }
     }
 
+    fn load_members(&mut self) {
+        let Some(org_id) = self.current_org_id().map(|s| s.to_string()) else {
+            self.members = HashMap::new();
+            self.members_list = vec![];
+            return;
+        };
+
+        match self.api_call(self.client.get_members(&org_id)) {
+            Ok(resp) => {
+                let member_list = resp.data.members;
+
+                // Build HashMap for fast lookup
+                self.members = member_list
+                    .iter()
+                    .map(|m| (m.id.clone(), m.clone()))
+                    .collect();
+
+                // Keep list for display
+                self.members_list = member_list;
+                self.members_cursor = 0;
+                self.members_scroll_offset = 0;
+            }
+            Err(e) => {
+                self.members = HashMap::new();
+                self.members_list = vec![];
+                self.error_message = Some(format!("Failed to load members: {e}"));
+            }
+        }
+    }
+
+    fn members_cursor_up(&mut self) {
+        if self.members_cursor > 0 {
+            self.members_cursor -= 1;
+        }
+    }
+
+    fn members_cursor_down(&mut self) {
+        if self.members_cursor + 1 < self.members_list.len() {
+            self.members_cursor += 1;
+        }
+    }
+
+    pub(super) fn adjust_members_scroll(&mut self, viewport_height: usize) {
+        if viewport_height == 0 {
+            return;
+        }
+        if self.members_cursor < self.members_scroll_offset {
+            self.members_scroll_offset = self.members_cursor;
+        } else if self.members_cursor >= self.members_scroll_offset + viewport_height {
+            self.members_scroll_offset = self.members_cursor - viewport_height + 1;
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Event handling
     // -----------------------------------------------------------------------
@@ -397,6 +464,7 @@ impl App {
                     self.current_org_index = new_index;
                     self.load_goal_tree();
                     self.load_todays_goals();
+                    self.load_members();
                 }
             }
             _ => {}
@@ -440,6 +508,9 @@ impl App {
                 ActivePane::Content if self.sidebar_index == 0 || self.sidebar_index == 1 => {
                     self.active_goal_tree_mut().cursor_up();
                 }
+                ActivePane::Content if self.sidebar_index == 2 => {
+                    self.members_cursor_up();
+                }
                 _ => {}
             },
             KeyCode::Down | KeyCode::Char('j') => match self.active_pane {
@@ -448,6 +519,9 @@ impl App {
                 }
                 ActivePane::Content if self.sidebar_index == 0 || self.sidebar_index == 1 => {
                     self.active_goal_tree_mut().cursor_down();
+                }
+                ActivePane::Content if self.sidebar_index == 2 => {
+                    self.members_cursor_down();
                 }
                 _ => {}
             },

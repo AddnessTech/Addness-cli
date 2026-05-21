@@ -265,15 +265,13 @@ impl App {
 
     fn load_root_goal_details(&mut self) {
         // Collect root goal IDs from the flattened tree
-        let root_goal_ids: Vec<(usize, String)> = {
+        let root_goal_ids: Vec<String> = {
             let rows = self.goal_tree.flatten();
             rows.iter()
-                .enumerate()
-                .filter_map(|(idx, row)| {
+                .filter_map(|row| {
                     if let TreeRow::Goal { goal_id, depth, .. } = row {
                         if *depth == 0 {
-                            // This is a root goal
-                            Some((idx, goal_id.to_string()))
+                            Some(goal_id.to_string())
                         } else {
                             None
                         }
@@ -284,8 +282,8 @@ impl App {
                 .collect()
         };
 
-        // Load comments and deliverables for each root goal
-        for (cursor_idx, goal_id) in root_goal_ids {
+        // Load comments and deliverables for each root goal by id (not by flat index)
+        for goal_id in root_goal_ids {
             let goal_id_ref = &goal_id;
             let client = &self.client;
 
@@ -298,18 +296,10 @@ impl App {
 
             match result {
                 Ok((comments_resp, deliverables_resp)) => {
-                    // Temporarily set cursor to the root goal
-                    let original_cursor = self.goal_tree.cursor;
-                    self.goal_tree.cursor = cursor_idx;
-
-                    // Set comments and deliverables
                     self.goal_tree
-                        .set_comments_at_cursor(comments_resp.comments);
+                        .set_comments_for_goal_id(&goal_id, comments_resp.comments);
                     self.goal_tree
-                        .set_deliverables_at_cursor(deliverables_resp.data.deliverables);
-
-                    // Restore original cursor
-                    self.goal_tree.cursor = original_cursor;
+                        .set_deliverables_for_goal_id(&goal_id, deliverables_resp.data.deliverables);
                 }
                 Err(e) => {
                     self.error_message = Some(e.to_string());

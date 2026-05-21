@@ -409,6 +409,16 @@ impl GoalTree {
         }
     }
 
+    /// Insert fetched comments into the Goal node with the given goal_id.
+    pub fn set_comments_for_goal_id(&mut self, goal_id: &str, comments: Vec<Comment>) {
+        let mut comments = Some(comments);
+        for root in &mut self.roots {
+            if set_comments_by_id(root, goal_id, &mut comments) {
+                return;
+            }
+        }
+    }
+
     /// Insert fetched deliverables into the Goal node at the current cursor position.
     pub fn set_deliverables_at_cursor(&mut self, deliverables: Vec<Deliverable>) {
         let target = self.cursor;
@@ -416,6 +426,16 @@ impl GoalTree {
         let mut deliverables = Some(deliverables);
         for root in &mut self.roots {
             if set_deliverables_at(root, target, &mut idx, &mut deliverables) {
+                return;
+            }
+        }
+    }
+
+    /// Insert fetched deliverables into the Goal node with the given goal_id.
+    pub fn set_deliverables_for_goal_id(&mut self, goal_id: &str, deliverables: Vec<Deliverable>) {
+        let mut deliverables = Some(deliverables);
+        for root in &mut self.roots {
+            if set_deliverables_by_id(root, goal_id, &mut deliverables) {
                 return;
             }
         }
@@ -759,6 +779,50 @@ fn increase_comment_limit_at<S: GoalItemAccessor>(
         }
     }
 
+    false
+}
+
+/// Set comments on a node matched by goal_id, without relying on flat indices.
+fn set_comments_by_id<S: GoalItemAccessor>(
+    node: &mut GoalNodeInner<S>,
+    goal_id: &str,
+    comments: &mut Option<Vec<Comment>>,
+) -> bool {
+    if node.node.id() == goal_id {
+        if let Some(items) = comments.take() {
+            node.comments = Some(Timestamped::now(items));
+        }
+        return true;
+    }
+    if let Some(ts) = &mut node.children {
+        for child in &mut ts.data {
+            if set_comments_by_id(child, goal_id, comments) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Set deliverables on a node matched by goal_id, without relying on flat indices.
+fn set_deliverables_by_id<S: GoalItemAccessor>(
+    node: &mut GoalNodeInner<S>,
+    goal_id: &str,
+    deliverables: &mut Option<Vec<Deliverable>>,
+) -> bool {
+    if node.node.id() == goal_id {
+        if let Some(items) = deliverables.take() {
+            node.deliverables = Some(Timestamped::now(items));
+        }
+        return true;
+    }
+    if let Some(ts) = &mut node.children {
+        for child in &mut ts.data {
+            if set_deliverables_by_id(child, goal_id, deliverables) {
+                return true;
+            }
+        }
+    }
     false
 }
 

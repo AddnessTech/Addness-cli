@@ -311,8 +311,8 @@ impl App {
                     // Restore original cursor
                     self.goal_tree.cursor = original_cursor;
                 }
-                Err(_) => {
-                    // Ignore errors for individual goals
+                Err(e) => {
+                    self.error_message = Some(e.to_string());
                 }
             }
         }

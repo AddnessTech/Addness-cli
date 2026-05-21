@@ -1,7 +1,8 @@
 use crate::api::{
-    ApiClient, ApiResponse, ChangeParentRequest, CreateAliasRequest, CreateGoalRequest,
+    Alias, ApiClient, ApiResponse, ChangeParentRequest, CreateAliasRequest, CreateGoalRequest,
     DuplicateRequest, Goal, GoalChildrenData, GoalSearchResponse, GoalTreeData,
-    ObjectiveIdsRequest, ReorderAliasesRequest, ShareLinkResponse, UpdateGoalRequest,
+    ObjectiveIdsRequest, ReorderAliasesRequest, ReorderAliasesResponse, ShareLinkResponse,
+    UpdateGoalRequest,
 };
 use anyhow::Result;
 
@@ -140,7 +141,7 @@ impl ApiClient {
         parent_goal_id: &str,
         target_objective_id: &str,
         order_no: i32,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<ApiResponse<Alias>> {
         let path = format!("/api/v1/team/objectives/{parent_goal_id}/aliases");
         let body = CreateAliasRequest {
             target_objective_id: target_objective_id.to_string(),
@@ -156,8 +157,7 @@ impl ApiClient {
     ) -> Result<()> {
         let path = format!("/api/v1/team/objectives/{parent_goal_id}/aliases/reorder");
         let body = ReorderAliasesRequest { alias_ids };
-        // resolveでJSON expectしないため、Value で受ける
-        let _: serde_json::Value = self.patch(&path, &body).await?;
+        let _: ApiResponse<ReorderAliasesResponse> = self.patch(&path, &body).await?;
         Ok(())
     }
 

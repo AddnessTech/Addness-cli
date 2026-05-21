@@ -1,6 +1,6 @@
 use crate::api::{
-    ApiClient, CreateOrganizationRequest, OrganizationsResponse, UpdateContextRequest,
-    UpdateOrganizationRequest,
+    ApiClient, ApiResponse, CreateOrganizationRequest, Organization, OrganizationsResponse,
+    UpdateContextRequest, UpdateOrganizationRequest,
 };
 use anyhow::Result;
 
@@ -14,7 +14,7 @@ impl ApiClient {
         name: &str,
         organization_type: &str,
         team_scale: Option<String>,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<ApiResponse<Organization>> {
         let body = CreateOrganizationRequest {
             name: name.to_string(),
             organization_type: organization_type.to_string(),
@@ -23,7 +23,11 @@ impl ApiClient {
         self.post("/api/v1/team/organizations", &body).await
     }
 
-    pub async fn update_organization(&self, org_id: &str, name: &str) -> Result<serde_json::Value> {
+    pub async fn update_organization(
+        &self,
+        org_id: &str,
+        name: &str,
+    ) -> Result<ApiResponse<Organization>> {
         let path = format!("/api/v2/organizations/{org_id}");
         let body = UpdateOrganizationRequest {
             name: name.to_string(),
@@ -40,7 +44,7 @@ impl ApiClient {
         &self,
         org_id: &str,
         context_text: &str,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<ApiResponse<Organization>> {
         let path = format!("/api/v2/organizations/{org_id}/context");
         let body = UpdateContextRequest {
             context_text: context_text.to_string(),

@@ -10,7 +10,7 @@ use crate::config::{Credentials, DEFAULT_API_URL, Settings};
 use api::ApiClient;
 use cli::commands::{
     assignment, comment, configure, deliverable, detect, goal, invitation, kpi, link, login,
-    member, org, skills, summary, tui,
+    member, org, skills, summary,
 };
 
 #[derive(Parser)]
@@ -107,12 +107,6 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
-    },
-    /// Launch interactive TUI (ratatui) to browse goals and comments
-    Tui {
-        /// Organization ID (uses default if not specified)
-        #[arg(long)]
-        org: Option<String>,
     },
     /// Output AI skills prompt for this CLI
     Skills,
@@ -219,10 +213,6 @@ async fn main() -> Result<()> {
             summary::handle_summary(org.as_deref(), *depth, *json, &client).await
         }
         Commands::DetectGoal { json } => detect::handle_detect_goal(*json),
-        Commands::Tui { org } => {
-            let client = build_client()?;
-            tui::handle_tui(org.as_deref(), &client).await
-        }
         Commands::Skills => skills::handle_skills(),
         Commands::Completions { shell } => {
             clap_complete::generate(

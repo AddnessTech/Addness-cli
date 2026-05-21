@@ -12,7 +12,6 @@ pub mod member;
 pub mod org;
 pub mod skills;
 pub mod summary;
-pub mod tui;
 
 use anyhow::Result;
 use std::io::{self, Write};

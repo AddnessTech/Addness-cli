@@ -81,7 +81,7 @@ pub async fn handle_kpi(cmd: &KpiCommands, client: &ApiClient) -> Result<()> {
             if *json {
                 println!("{}", serde_json::to_string_pretty(&resp)?);
             } else {
-                let kpi_id = extract_id(&resp);
+                let kpi_id = resp.data.id.as_deref().unwrap_or("(unknown)");
                 println!("KPI created: {title} ({kpi_id}) target={target}{unit}");
             }
             Ok(())
@@ -121,13 +121,4 @@ pub async fn handle_kpi(cmd: &KpiCommands, client: &ApiClient) -> Result<()> {
             Ok(())
         }
     }
-}
-
-fn extract_id(resp: &serde_json::Value) -> String {
-    let inner = resp.get("data").unwrap_or(resp);
-    inner
-        .get("id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("(unknown)")
-        .to_string()
 }

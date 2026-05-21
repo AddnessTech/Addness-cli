@@ -1,4 +1,28 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Assignment {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub objective_id: Option<String>,
+    #[serde(default)]
+    pub organization_member_id: Option<String>,
+    #[serde(default)]
+    pub role: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferOwnershipResponse {
+    #[serde(default)]
+    pub objective_id: Option<String>,
+    #[serde(default)]
+    pub previous_owner_member_id: Option<String>,
+    #[serde(default)]
+    pub new_owner_member_id: Option<String>,
+}
 
 // POST /api/v2/objectives/:id/assignments
 #[derive(Debug, Serialize)]

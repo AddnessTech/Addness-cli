@@ -1,7 +1,8 @@
 use anyhow::Result;
 
 use crate::api::{
-    AcceptInvitationRequest, ApiClient, CreateInvitationsRequest, CreateInviteLinkRequest,
+    AcceptInvitationRequest, AcceptInvitationResponse, ApiClient, ApiResponse,
+    CreateInvitationsRequest, CreateInviteLinkRequest, Invitation, InvitationsData, InviteLink,
 };
 
 impl ApiClient {
@@ -9,7 +10,7 @@ impl ApiClient {
         &self,
         org_id: &str,
         emails: Vec<String>,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<ApiResponse<InvitationsData>> {
         let path = format!("/api/v2/organizations/{org_id}/invitations");
         let body = CreateInvitationsRequest { emails };
         self.post(&path, &body).await
@@ -19,10 +20,9 @@ impl ApiClient {
         &self,
         org_id: &str,
         invitation_id: &str,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<ApiResponse<Invitation>> {
         let path = format!("/api/v2/organizations/{org_id}/invitations/{invitation_id}/resend");
-        let body = serde_json::json!({});
-        self.post(&path, &body).await
+        self.post_empty(&path).await
     }
 
     pub async fn revoke_invitation(&self, org_id: &str, invitation_id: &str) -> Result<()> {
@@ -34,7 +34,7 @@ impl ApiClient {
         &self,
         invited_member_id: &str,
         token: &str,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<ApiResponse<AcceptInvitationResponse>> {
         let body = AcceptInvitationRequest {
             invited_member_id: invited_member_id.to_string(),
             token: token.to_string(),
@@ -49,7 +49,7 @@ impl ApiClient {
         max_uses: Option<i32>,
         expires_at: Option<String>,
         is_external: bool,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<ApiResponse<InviteLink>> {
         let path = format!("/api/v2/organizations/{org_id}/invite-links");
         let body = CreateInviteLinkRequest {
             code: code.to_string(),

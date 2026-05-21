@@ -162,12 +162,7 @@ pub async fn handle_org(cmd: &OrgCommands, client: &ApiClient) -> Result<()> {
             if *json {
                 println!("{}", serde_json::to_string_pretty(&resp)?);
             } else {
-                let inner = resp.get("data").unwrap_or(&resp);
-                let id = inner
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("(unknown)");
-                println!("Organization created: {name} ({id})");
+                println!("Organization created: {name} ({})", resp.data.id);
             }
             Ok(())
         }

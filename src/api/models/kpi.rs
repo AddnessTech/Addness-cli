@@ -1,4 +1,21 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Kpi {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub objective_id: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub unit: Option<String>,
+    #[serde(default)]
+    pub target_value: Option<i32>,
+    #[serde(default)]
+    pub actual_value: Option<i32>,
+}
 
 // POST /api/v2/objectives/:id/kpis
 #[derive(Debug, Serialize)]

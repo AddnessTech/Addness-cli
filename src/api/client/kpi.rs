@@ -1,4 +1,4 @@
-use crate::api::{ApiClient, CreateKpiRequest, UpdateKpiRequest};
+use crate::api::{ApiClient, ApiResponse, CreateKpiRequest, Kpi, UpdateKpiRequest};
 use anyhow::Result;
 
 impl ApiClient {
@@ -6,7 +6,7 @@ impl ApiClient {
         &self,
         goal_id: &str,
         req: &CreateKpiRequest,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<ApiResponse<Kpi>> {
         let path = format!("/api/v2/objectives/{goal_id}/kpis");
         self.post(&path, req).await
     }
@@ -15,7 +15,7 @@ impl ApiClient {
         &self,
         kpi_id: &str,
         req: &UpdateKpiRequest,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<ApiResponse<Kpi>> {
         let path = format!("/api/v2/objective-kpis/{kpi_id}");
         self.patch(&path, req).await
     }

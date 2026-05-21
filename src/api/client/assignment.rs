@@ -1,5 +1,6 @@
 use crate::api::{
-    ApiClient, CreateAssignmentRequest, TransferOwnershipRequest, UpdateAssignmentRequest,
+    ApiClient, ApiResponse, Assignment, CreateAssignmentRequest, TransferOwnershipRequest,
+    TransferOwnershipResponse, UpdateAssignmentRequest,
 };
 use anyhow::Result;
 
@@ -9,7 +10,7 @@ impl ApiClient {
         goal_id: &str,
         member_id: &str,
         role: Option<String>,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<ApiResponse<Assignment>> {
         let path = format!("/api/v2/objectives/{goal_id}/assignments");
         let body = CreateAssignmentRequest {
             organization_member_id: member_id.to_string(),
@@ -23,7 +24,7 @@ impl ApiClient {
         goal_id: &str,
         assignment_id: &str,
         role: Option<String>,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<ApiResponse<Assignment>> {
         let path = format!("/api/v2/objectives/{goal_id}/assignments/{assignment_id}");
         let body = UpdateAssignmentRequest { role };
         self.patch(&path, &body).await
@@ -39,7 +40,7 @@ impl ApiClient {
         goal_id: &str,
         new_owner_member_id: &str,
         actor_as_editor: bool,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<ApiResponse<TransferOwnershipResponse>> {
         let path = format!("/api/v2/objectives/{goal_id}/transfer-ownership");
         let body = TransferOwnershipRequest {
             new_owner_member_id: new_owner_member_id.to_string(),

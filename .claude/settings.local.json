@@ -56,7 +56,9 @@
       "Bash(cargo audit:*)",
       "Bash(cargo add:*)",
       "Bash(git reset:*)",
-      "Bash(git branch:*)"
+      "Bash(git branch:*)",
+      "Bash(git rebase *)",
+      "Bash(git ls-tree *)"
     ]
   },
   "enabledMcpjsonServers": [

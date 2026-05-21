@@ -197,11 +197,31 @@ pub struct CreateAliasRequest {
     pub order_no: i32,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Alias {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub parent_objective_id: Option<String>,
+    #[serde(default)]
+    pub target_objective_id: Option<String>,
+    #[serde(default)]
+    pub order_no: Option<i32>,
+}
+
 // PATCH /api/v1/team/objectives/:id/aliases/reorder
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReorderAliasesRequest {
     pub alias_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReorderAliasesResponse {
+    #[serde(default)]
+    pub aliases: Vec<Alias>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

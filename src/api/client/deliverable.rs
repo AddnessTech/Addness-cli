@@ -115,7 +115,7 @@ impl ApiClient {
         deliverable_id: &str,
         content: &str,
         mentions: Vec<String>,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<ApiResponse<Deliverable>> {
         let path = format!("/api/v1/team/objectives/{goal_id}/deliverables/{deliverable_id}");
         let body = UpdateDeliverableRequest {
             content: content.to_string(),
@@ -129,7 +129,7 @@ impl ApiClient {
         goal_id: &str,
         deliverable_id: &str,
         display_name: &str,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<ApiResponse<Deliverable>> {
         let path =
             format!("/api/v1/team/objectives/{goal_id}/deliverables/{deliverable_id}/rename");
         let body = RenameDeliverableRequest {
@@ -144,7 +144,7 @@ impl ApiClient {
         deliverable_id: &str,
         target_parent_deliverable_id: Option<String>,
         order_no: f64,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<ApiResponse<Deliverable>> {
         let path = format!("/api/v1/team/objectives/{goal_id}/deliverables/{deliverable_id}/move");
         let body = MoveDeliverableRequest {
             target_parent_deliverable_id,
@@ -163,7 +163,7 @@ impl ApiClient {
         goal_id: &str,
         node_ids: Vec<String>,
         target_parent_deliverable_id: Option<String>,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<ApiResponse<DeliverableListData>> {
         let path = format!("/api/v1/team/objectives/{goal_id}/deliverables/batch_move");
         let body = BatchMoveDeliverableRequest {
             node_ids,

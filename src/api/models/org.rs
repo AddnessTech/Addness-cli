@@ -9,6 +9,8 @@ pub struct Organization {
     pub name: String,
     #[serde(default)]
     pub plan_type: Option<String>,
+    #[serde(default)]
+    pub context_text: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

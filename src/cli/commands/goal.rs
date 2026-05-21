@@ -849,12 +849,7 @@ async fn handle_alias(cmd: &AliasCommands, client: &ApiClient) -> Result<()> {
             if *json {
                 println!("{}", serde_json::to_string_pretty(&alias)?);
             } else {
-                // Backend wraps the alias in {"data": {...}} (ApiResponse).
-                let inner = alias.get("data").unwrap_or(&alias);
-                let alias_id = inner
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("(unknown)");
+                let alias_id = alias.data.id.as_deref().unwrap_or("(unknown)");
                 println!(
                     "Alias created: {alias_id} (parent={parent_id}, target={target}, order={order})"
                 );

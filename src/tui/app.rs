@@ -298,8 +298,10 @@ impl App {
                 Ok((comments_resp, deliverables_resp)) => {
                     self.goal_tree
                         .set_comments_for_goal_id(&goal_id, comments_resp.comments);
-                    self.goal_tree
-                        .set_deliverables_for_goal_id(&goal_id, deliverables_resp.data.deliverables);
+                    self.goal_tree.set_deliverables_for_goal_id(
+                        &goal_id,
+                        deliverables_resp.data.deliverables,
+                    );
                 }
                 Err(e) => {
                     self.error_message = Some(e.to_string());
@@ -320,7 +322,6 @@ impl App {
         match self.api_call(self.client.get_todays_goals(&org_id, None, None)) {
             Ok(resp) => {
                 dbg_log!("Total nodes loaded: {}", resp.data.nodes.len());
-                dbg_log!("Excluded nodes: {}", resp.data.excluded_nodes.len());
                 dbg_log!("Auto-generated count: {}", resp.data.auto_generated_count);
 
                 for node in &resp.data.nodes {

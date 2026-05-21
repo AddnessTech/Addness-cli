@@ -7,7 +7,6 @@ use super::{GoalStatus, Owner};
 #[serde(rename_all = "camelCase")]
 pub struct TodaysGoalsData {
     pub nodes: Vec<TodaysGoalNode>,
-    pub excluded_nodes: Vec<TodaysGoalNode>,
     pub auto_generated_count: i32,
     pub collapsed_goal_ids: Vec<String>,
 }

@@ -208,13 +208,10 @@ impl GoalTree {
     }
 
     pub fn from_tree_items(items: Vec<GoalTreeItem>) -> Self {
-        use std::collections::{HashSet, HashMap};
+        use std::collections::{HashMap, HashSet};
 
         // Build a set of all item IDs in this response
-        let id_set: HashSet<String> = items
-            .iter()
-            .map(|item| item.id.clone())
-            .collect();
+        let id_set: HashSet<String> = items.iter().map(|item| item.id.clone()).collect();
 
         // Group items by parent_id for building the tree
         let mut children_by_parent: HashMap<String, Vec<GoalTreeItem>> = HashMap::new();
@@ -234,7 +231,7 @@ impl GoalTree {
                         // Child item - add to parent's children
                         children_by_parent
                             .entry(parent_id.clone())
-                            .or_insert_with(Vec::new)
+                            .or_default()
                             .push(item);
                     }
                 }
@@ -248,45 +245,43 @@ impl GoalTree {
                 let item_id = item.id.clone();
 
                 // Get children for this root goal (2nd level)
-                let children = children_by_parent
-                    .remove(&item_id)
-                    .map(|child_items| {
-                        let child_nodes: Vec<GoalChildNode> = child_items
-                            .into_iter()
-                            .map(|child_item| {
-                                // Convert GoalTreeItem to GoalChildItem
-                                let child_goal_item = GoalChildItem {
-                                    id: child_item.id,
-                                    title: child_item.title,
-                                    description: None,  // GoalTreeItem doesn't have description
-                                    parent_id: child_item.parent_id,
-                                    status: child_item.status,
-                                    is_completed: child_item.is_completed,
-                                    has_children: child_item.has_children,
-                                    order_no: child_item.order_no,
-                                    owner: child_item.owner,
-                                };
+                let children = children_by_parent.remove(&item_id).map(|child_items| {
+                    let child_nodes: Vec<GoalChildNode> = child_items
+                        .into_iter()
+                        .map(|child_item| {
+                            // Convert GoalTreeItem to GoalChildItem
+                            let child_goal_item = GoalChildItem {
+                                id: child_item.id,
+                                title: child_item.title,
+                                description: None, // GoalTreeItem doesn't have description
+                                parent_id: child_item.parent_id,
+                                status: child_item.status,
+                                is_completed: child_item.is_completed,
+                                has_children: child_item.has_children,
+                                order_no: child_item.order_no,
+                                owner: child_item.owner,
+                            };
 
-                                GoalChildNode {
-                                    node: child_goal_item,
-                                    children: None,
-                                    comments: None,
-                                    deliverables: None,
-                                    expanded: false,
-                                    comment_display_limit: INITIAL_COMMENT_DISPLAY_LIMIT,
-                                }
-                            })
-                            .collect();
+                            GoalChildNode {
+                                node: child_goal_item,
+                                children: None,
+                                comments: None,
+                                deliverables: None,
+                                expanded: false,
+                                comment_display_limit: INITIAL_COMMENT_DISPLAY_LIMIT,
+                            }
+                        })
+                        .collect();
 
-                        Timestamped::now(child_nodes)
-                    });
+                    Timestamped::now(child_nodes)
+                });
 
                 GoalRootNode {
                     node: item,
                     children,
                     comments: None,
                     deliverables: None,
-                    expanded: true,  // Auto-expand root goals to show 2nd level
+                    expanded: true, // Auto-expand root goals to show 2nd level
                     comment_display_limit: INITIAL_COMMENT_DISPLAY_LIMIT,
                 }
             })

@@ -303,8 +303,10 @@ impl App {
                     self.goal_tree.cursor = cursor_idx;
 
                     // Set comments and deliverables
-                    self.goal_tree.set_comments_at_cursor(comments_resp.comments);
-                    self.goal_tree.set_deliverables_at_cursor(deliverables_resp.data.deliverables);
+                    self.goal_tree
+                        .set_comments_at_cursor(comments_resp.comments);
+                    self.goal_tree
+                        .set_deliverables_at_cursor(deliverables_resp.data.deliverables);
 
                     // Restore original cursor
                     self.goal_tree.cursor = original_cursor;

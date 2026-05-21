@@ -236,11 +236,8 @@ fn draw_goals(frame: &mut Frame, area: Rect, app: &mut App, border_color: Color,
     let viewport_h = inner.height as usize;
     app.content_height = viewport_h;
 
-    // Clone members to avoid borrow conflicts
-    let members = app.members.clone();
-
-    let tree = app.active_goal_tree_mut();
-    tree.adjust_scroll(viewport_h);
+    app.active_goal_tree_mut().adjust_scroll(viewport_h);
+    let tree = app.active_goal_tree();
 
     let rows = tree.flatten();
     let scroll = tree.scroll_offset;
@@ -256,12 +253,17 @@ fn draw_goals(frame: &mut Frame, area: Rect, app: &mut App, border_color: Color,
         let line_area = Rect::new(inner.x, y, inner.width, 1);
         let is_cursor = i == cursor;
 
-        let line = render_tree_row(row, is_cursor, inner.width as usize, &members);
+        let line = render_tree_row(row, is_cursor, inner.width as usize, &app.members);
         frame.render_widget(Paragraph::new(line), line_area);
     }
 }
 
-fn render_tree_row(row: &TreeRow, is_cursor: bool, width: usize, members: &HashMap<MemberId, Member>) -> Line<'static> {
+fn render_tree_row(
+    row: &TreeRow,
+    is_cursor: bool,
+    width: usize,
+    members: &HashMap<MemberId, Member>,
+) -> Line<'static> {
     let bg = if is_cursor {
         Color::DarkGray
     } else {
@@ -998,7 +1000,8 @@ fn draw_members(frame: &mut Frame, area: Rect, app: &mut App, border_color: Colo
 
     // Build member list items
     let is_active = app.active_pane == ActivePane::Content;
-    let visible_members: Vec<ListItem> = app.members_list
+    let visible_members: Vec<ListItem> = app
+        .members_list
         .iter()
         .enumerate()
         .skip(app.members_scroll_offset)
@@ -1010,7 +1013,9 @@ fn draw_members(frame: &mut Frame, area: Rect, app: &mut App, border_color: Colo
             let style = if is_cursor && is_active {
                 Style::default().bg(Color::DarkGray).fg(Color::White)
             } else if is_current_user {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };

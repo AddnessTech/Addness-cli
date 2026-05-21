@@ -208,17 +208,85 @@ impl GoalTree {
     }
 
     pub fn from_tree_items(items: Vec<GoalTreeItem>) -> Self {
-        let roots = items
+        use std::collections::{HashMap, HashSet};
+
+        // Build a set of all item IDs in this response
+        let id_set: HashSet<String> = items.iter().map(|item| item.id.clone()).collect();
+
+        // Group items by parent_id for building the tree
+        let mut children_by_parent: HashMap<String, Vec<GoalTreeItem>> = HashMap::new();
+        let mut root_items: Vec<GoalTreeItem> = Vec::new();
+
+        for item in items {
+            match &item.parent_id {
+                None => {
+                    // True root goal
+                    root_items.push(item);
+                }
+                Some(parent_id) => {
+                    if !id_set.contains(parent_id) {
+                        // Orphan (parent not in response) - treat as root
+                        root_items.push(item);
+                    } else {
+                        // Child item - add to parent's children
+                        children_by_parent
+                            .entry(parent_id.clone())
+                            .or_default()
+                            .push(item);
+                    }
+                }
+            }
+        }
+
+        // Build root nodes with their immediate children (2nd level)
+        let roots = root_items
             .into_iter()
-            .map(|item| GoalRootNode {
-                node: item,
-                children: None,
-                comments: None,
-                deliverables: None,
-                expanded: false,
-                comment_display_limit: INITIAL_COMMENT_DISPLAY_LIMIT,
+            .map(|item| {
+                let item_id = item.id.clone();
+
+                // Get children for this root goal (2nd level)
+                let children = children_by_parent.remove(&item_id).map(|child_items| {
+                    let child_nodes: Vec<GoalChildNode> = child_items
+                        .into_iter()
+                        .map(|child_item| {
+                            // Convert GoalTreeItem to GoalChildItem
+                            let child_goal_item = GoalChildItem {
+                                id: child_item.id,
+                                title: child_item.title,
+                                description: None, // GoalTreeItem doesn't have description
+                                parent_id: child_item.parent_id,
+                                status: child_item.status,
+                                is_completed: child_item.is_completed,
+                                has_children: child_item.has_children,
+                                order_no: child_item.order_no,
+                                owner: child_item.owner,
+                            };
+
+                            GoalChildNode {
+                                node: child_goal_item,
+                                children: None,
+                                comments: None,
+                                deliverables: None,
+                                expanded: false,
+                                comment_display_limit: INITIAL_COMMENT_DISPLAY_LIMIT,
+                            }
+                        })
+                        .collect();
+
+                    Timestamped::now(child_nodes)
+                });
+
+                GoalRootNode {
+                    node: item,
+                    children,
+                    comments: None,
+                    deliverables: None,
+                    expanded: true, // Auto-expand root goals to show 2nd level
+                    comment_display_limit: INITIAL_COMMENT_DISPLAY_LIMIT,
+                }
             })
             .collect();
+
         GoalTree {
             roots,
             cursor: 0,
@@ -341,6 +409,16 @@ impl GoalTree {
         }
     }
 
+    /// Insert fetched comments into the Goal node with the given goal_id.
+    pub fn set_comments_for_goal_id(&mut self, goal_id: &str, comments: Vec<Comment>) {
+        let mut comments = Some(comments);
+        for root in &mut self.roots {
+            if set_comments_by_id(root, goal_id, &mut comments) {
+                return;
+            }
+        }
+    }
+
     /// Insert fetched deliverables into the Goal node at the current cursor position.
     pub fn set_deliverables_at_cursor(&mut self, deliverables: Vec<Deliverable>) {
         let target = self.cursor;
@@ -348,6 +426,16 @@ impl GoalTree {
         let mut deliverables = Some(deliverables);
         for root in &mut self.roots {
             if set_deliverables_at(root, target, &mut idx, &mut deliverables) {
+                return;
+            }
+        }
+    }
+
+    /// Insert fetched deliverables into the Goal node with the given goal_id.
+    pub fn set_deliverables_for_goal_id(&mut self, goal_id: &str, deliverables: Vec<Deliverable>) {
+        let mut deliverables = Some(deliverables);
+        for root in &mut self.roots {
+            if set_deliverables_by_id(root, goal_id, &mut deliverables) {
                 return;
             }
         }
@@ -691,6 +779,50 @@ fn increase_comment_limit_at<S: GoalItemAccessor>(
         }
     }
 
+    false
+}
+
+/// Set comments on a node matched by goal_id, without relying on flat indices.
+fn set_comments_by_id<S: GoalItemAccessor>(
+    node: &mut GoalNodeInner<S>,
+    goal_id: &str,
+    comments: &mut Option<Vec<Comment>>,
+) -> bool {
+    if node.node.id() == goal_id {
+        if let Some(items) = comments.take() {
+            node.comments = Some(Timestamped::now(items));
+        }
+        return true;
+    }
+    if let Some(ts) = &mut node.children {
+        for child in &mut ts.data {
+            if set_comments_by_id(child, goal_id, comments) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Set deliverables on a node matched by goal_id, without relying on flat indices.
+fn set_deliverables_by_id<S: GoalItemAccessor>(
+    node: &mut GoalNodeInner<S>,
+    goal_id: &str,
+    deliverables: &mut Option<Vec<Deliverable>>,
+) -> bool {
+    if node.node.id() == goal_id {
+        if let Some(items) = deliverables.take() {
+            node.deliverables = Some(Timestamped::now(items));
+        }
+        return true;
+    }
+    if let Some(ts) = &mut node.children {
+        for child in &mut ts.data {
+            if set_deliverables_by_id(child, goal_id, deliverables) {
+                return true;
+            }
+        }
+    }
     false
 }
 

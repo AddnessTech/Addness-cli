@@ -226,7 +226,7 @@ impl App {
         // Fetch organizations
         match self.api_call(self.client.list_organizations()) {
             Ok(resp) => {
-                self.orgs = resp.data;
+                self.orgs = resp.data.organizations;
                 if !self.orgs.is_empty() {
                     self.current_org_index = 0;
                 }

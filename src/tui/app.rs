@@ -249,13 +249,63 @@ impl App {
 
         self.client.set_org_id(Some(org_id.clone()));
 
-        match self.api_call(self.client.get_goal_tree(&org_id, 1)) {
+        match self.api_call(self.client.get_goal_tree(&org_id, 2)) {
             Ok(resp) => {
                 self.goal_tree = GoalTree::from_tree_items(resp.data.items);
+
+                // Load comments and deliverables for auto-expanded root goals
+                self.load_root_goal_details();
             }
             Err(e) => {
                 self.goal_tree = GoalTree::empty();
                 self.error_message = Some(format!("Failed to load goals: {e}"));
+            }
+        }
+    }
+
+    fn load_root_goal_details(&mut self) {
+        // Collect root goal IDs from the flattened tree
+        let root_goal_ids: Vec<String> = {
+            let rows = self.goal_tree.flatten();
+            rows.iter()
+                .filter_map(|row| {
+                    if let TreeRow::Goal { goal_id, depth, .. } = row {
+                        if *depth == 0 {
+                            Some(goal_id.to_string())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+
+        // Load comments and deliverables for each root goal by id (not by flat index)
+        for goal_id in root_goal_ids {
+            let goal_id_ref = &goal_id;
+            let client = &self.client;
+
+            let result = self.api_call(async {
+                tokio::try_join!(
+                    client.list_comments(goal_id_ref),
+                    client.get_goal_deliverables(goal_id_ref)
+                )
+            });
+
+            match result {
+                Ok((comments_resp, deliverables_resp)) => {
+                    self.goal_tree
+                        .set_comments_for_goal_id(&goal_id, comments_resp.comments);
+                    self.goal_tree.set_deliverables_for_goal_id(
+                        &goal_id,
+                        deliverables_resp.data.deliverables,
+                    );
+                }
+                Err(e) => {
+                    self.error_message = Some(e.to_string());
+                }
             }
         }
     }
@@ -272,7 +322,6 @@ impl App {
         match self.api_call(self.client.get_todays_goals(&org_id, None, None)) {
             Ok(resp) => {
                 dbg_log!("Total nodes loaded: {}", resp.data.nodes.len());
-                dbg_log!("Excluded nodes: {}", resp.data.excluded_nodes.len());
                 dbg_log!("Auto-generated count: {}", resp.data.auto_generated_count);
 
                 for node in &resp.data.nodes {

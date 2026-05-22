@@ -168,6 +168,73 @@ pub struct GoalChildItem {
     pub owner: Option<Owner>,
 }
 
+// POST /api/v2/objectives/{archive,unarchive,restore}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectiveIdsRequest {
+    pub objective_ids: Vec<String>,
+}
+
+// POST /api/v2/objectives/:id/duplicate
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateRequest {
+    pub parent_id: String,
+}
+
+// POST /api/v2/objectives/:id/parent
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeParentRequest {
+    pub new_parent_id: Option<String>,
+}
+
+// POST /api/v1/team/objectives/:id/aliases
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateAliasRequest {
+    pub target_objective_id: String,
+    pub order_no: i32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Alias {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub parent_objective_id: Option<String>,
+    #[serde(default)]
+    pub target_objective_id: Option<String>,
+    #[serde(default)]
+    pub order_no: Option<i32>,
+}
+
+// PATCH /api/v1/team/objectives/:id/aliases/reorder
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReorderAliasesRequest {
+    pub alias_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReorderAliasesResponse {
+    #[serde(default)]
+    pub aliases: Vec<Alias>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareLinkResponse {
+    #[serde(default)]
+    pub share_url: Option<String>,
+    #[serde(default)]
+    pub public_id: Option<String>,
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
 // GET /api/v1/team/:org-id/objectives/search
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

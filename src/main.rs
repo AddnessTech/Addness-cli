@@ -9,7 +9,8 @@ use clap::{CommandFactory, Parser, Subcommand};
 use crate::config::{Credentials, DEFAULT_API_URL, Settings};
 use api::ApiClient;
 use cli::commands::{
-    comment, configure, deliverable, detect, goal, link, login, org, skills, summary,
+    assignment, comment, configure, deliverable, detect, goal, invitation, kpi, link, login,
+    member, org, skills, summary,
 };
 
 #[derive(Parser)]
@@ -68,6 +69,26 @@ enum Commands {
     Deliverable {
         #[command(subcommand)]
         command: deliverable::DeliverableCommands,
+    },
+    /// Manage goal assignments (member roles: OWNER/EDITOR/MEMBER)
+    Assignment {
+        #[command(subcommand)]
+        command: assignment::AssignmentCommands,
+    },
+    /// Manage KPIs on goals
+    Kpi {
+        #[command(subcommand)]
+        command: kpi::KpiCommands,
+    },
+    /// Manage organization members
+    Member {
+        #[command(subcommand)]
+        command: member::MemberCommands,
+    },
+    /// Manage invitations and invite links
+    Invitation {
+        #[command(subcommand)]
+        command: invitation::InvitationCommands,
     },
     /// Show progress summary of all goals
     Summary {
@@ -170,6 +191,22 @@ async fn main() -> Result<()> {
         Commands::Deliverable { command } => {
             let client = build_client()?;
             deliverable::handle_deliverable(command, &client).await
+        }
+        Commands::Assignment { command } => {
+            let client = build_client()?;
+            assignment::handle_assignment(command, &client).await
+        }
+        Commands::Kpi { command } => {
+            let client = build_client()?;
+            kpi::handle_kpi(command, &client).await
+        }
+        Commands::Member { command } => {
+            let client = build_client()?;
+            member::handle_member(command, &client).await
+        }
+        Commands::Invitation { command } => {
+            let client = build_client()?;
+            invitation::handle_invitation(command, &client).await
         }
         Commands::Summary { org, depth, json } => {
             let client = build_client()?;

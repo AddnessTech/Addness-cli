@@ -1,6 +1,9 @@
+mod assignment;
 mod comment;
 mod deliverable;
 mod goal;
+mod invitation;
+mod kpi;
 mod member;
 mod org;
 
@@ -313,5 +316,221 @@ impl ApiClient {
             .json::<T>()
             .await
             .with_context(|| format!("Failed to parse response from {url}"))
+    }
+
+    /// POST with JSON body, expects 204 No Content response (no body parsing).
+    pub(super) async fn post_no_content<B: Serialize>(&self, path: &str, body: &B) -> Result<()> {
+        let url = format!("{}{}", self.base_url, path);
+        let mut req = self.client.post(&url).json(body);
+
+        if let Some(org_id) = &self.org_id {
+            req = req.header(
+                HeaderName::from_static("x-organization-id"),
+                HeaderValue::from_str(org_id).context("Invalid organization ID")?,
+            );
+        }
+
+        let response = req
+            .send()
+            .await
+            .with_context(|| format!("Failed to send request to {url}"))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(Self::api_error(status, &body));
+        }
+        Ok(())
+    }
+
+    /// POST with no request body, expects JSON response.
+    pub(super) async fn post_empty<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+        let url = format!("{}{}", self.base_url, path);
+        let mut req = self.client.post(&url);
+
+        if let Some(org_id) = &self.org_id {
+            req = req.header(
+                HeaderName::from_static("x-organization-id"),
+                HeaderValue::from_str(org_id).context("Invalid organization ID")?,
+            );
+        }
+
+        let response = req
+            .send()
+            .await
+            .with_context(|| format!("Failed to send request to {url}"))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(Self::api_error(status, &body));
+        }
+
+        response
+            .json::<T>()
+            .await
+            .with_context(|| format!("Failed to parse response from {url}"))
+    }
+
+    /// PATCH with no request body, expects JSON response (used for resolve/unresolve).
+    pub(super) async fn patch_empty<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+        let url = format!("{}{}", self.base_url, path);
+        let mut req = self.client.patch(&url);
+
+        if let Some(org_id) = &self.org_id {
+            req = req.header(
+                HeaderName::from_static("x-organization-id"),
+                HeaderValue::from_str(org_id).context("Invalid organization ID")?,
+            );
+        }
+
+        let response = req
+            .send()
+            .await
+            .with_context(|| format!("Failed to send request to {url}"))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(Self::api_error(status, &body));
+        }
+
+        response
+            .json::<T>()
+            .await
+            .with_context(|| format!("Failed to parse response from {url}"))
+    }
+
+    /// PUT with JSON body and JSON response.
+    pub(super) async fn put<T: DeserializeOwned, B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        let url = format!("{}{}", self.base_url, path);
+        let mut req = self.client.put(&url).json(body);
+
+        if let Some(org_id) = &self.org_id {
+            req = req.header(
+                HeaderName::from_static("x-organization-id"),
+                HeaderValue::from_str(org_id).context("Invalid organization ID")?,
+            );
+        }
+
+        let response = req
+            .send()
+            .await
+            .with_context(|| format!("Failed to send request to {url}"))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(Self::api_error(status, &body));
+        }
+
+        response
+            .json::<T>()
+            .await
+            .with_context(|| format!("Failed to parse response from {url}"))
+    }
+
+    /// PUT with JSON body, expects 204 No Content response.
+    pub(super) async fn put_no_content<B: Serialize>(&self, path: &str, body: &B) -> Result<()> {
+        let url = format!("{}{}", self.base_url, path);
+        let mut req = self.client.put(&url).json(body);
+
+        if let Some(org_id) = &self.org_id {
+            req = req.header(
+                HeaderName::from_static("x-organization-id"),
+                HeaderValue::from_str(org_id).context("Invalid organization ID")?,
+            );
+        }
+
+        let response = req
+            .send()
+            .await
+            .with_context(|| format!("Failed to send request to {url}"))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(Self::api_error(status, &body));
+        }
+        Ok(())
+    }
+
+    /// PUT with no request body, expects 204 No Content response.
+    pub(super) async fn put_empty_no_content(&self, path: &str) -> Result<()> {
+        let url = format!("{}{}", self.base_url, path);
+        let mut req = self.client.put(&url);
+
+        if let Some(org_id) = &self.org_id {
+            req = req.header(
+                HeaderName::from_static("x-organization-id"),
+                HeaderValue::from_str(org_id).context("Invalid organization ID")?,
+            );
+        }
+
+        let response = req
+            .send()
+            .await
+            .with_context(|| format!("Failed to send request to {url}"))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(Self::api_error(status, &body));
+        }
+        Ok(())
+    }
+
+    /// PATCH with JSON body, expects 204 No Content response.
+    pub(super) async fn patch_no_content<B: Serialize>(&self, path: &str, body: &B) -> Result<()> {
+        let url = format!("{}{}", self.base_url, path);
+        let mut req = self.client.patch(&url).json(body);
+
+        if let Some(org_id) = &self.org_id {
+            req = req.header(
+                HeaderName::from_static("x-organization-id"),
+                HeaderValue::from_str(org_id).context("Invalid organization ID")?,
+            );
+        }
+
+        let response = req
+            .send()
+            .await
+            .with_context(|| format!("Failed to send request to {url}"))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(Self::api_error(status, &body));
+        }
+        Ok(())
+    }
+
+    /// DELETE with no request body, expects 204 No Content response.
+    pub(super) async fn delete_no_body(&self, path: &str) -> Result<()> {
+        let url = format!("{}{}", self.base_url, path);
+        let mut req = self.client.delete(&url);
+
+        if let Some(org_id) = &self.org_id {
+            req = req.header(
+                HeaderName::from_static("x-organization-id"),
+                HeaderValue::from_str(org_id).context("Invalid organization ID")?,
+            );
+        }
+
+        let response = req
+            .send()
+            .await
+            .with_context(|| format!("Failed to send request to {url}"))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(Self::api_error(status, &body));
+        }
+        Ok(())
     }
 }

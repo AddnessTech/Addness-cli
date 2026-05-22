@@ -10,6 +10,15 @@ use crate::cli::output::{
     print_children_table, print_goals_table, print_search_results, resolve_status,
 };
 
+fn read_text_arg(inline: Option<&String>, file: Option<&String>) -> Result<Option<String>> {
+    match (inline, file) {
+        (Some(s), None) => Ok(Some(s.clone())),
+        (None, Some(p)) => Ok(Some(std::fs::read_to_string(p)?)),
+        (Some(_), Some(_)) => bail!("Specify only one of --description or --description-file"),
+        (None, None) => Ok(None),
+    }
+}
+
 #[derive(Subcommand)]
 pub enum GoalCommands {
     /// List goals in the organization tree
@@ -103,19 +112,22 @@ pub enum GoalCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Update a goal's status or title
+    /// Update a goal's status, title, or description
     Update {
         /// Goal ID
         id: String,
-        /// Organization ID (uses default if not specified)
-        #[arg(long)]
-        org: Option<String>,
         /// Status: NOT_STARTED, IN_PROGRESS, COMPLETED, CANCELLED
         #[arg(long)]
         status: Option<String>,
         /// Title
         #[arg(long)]
         title: Option<String>,
+        /// Description (definition of done) - replaces the current value
+        #[arg(long)]
+        description: Option<String>,
+        /// Description from a file path (alternative to --description)
+        #[arg(long)]
+        description_file: Option<String>,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -130,6 +142,121 @@ pub enum GoalCommands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+    },
+    /// Archive a goal (move out of active tree, keep data)
+    Archive {
+        /// Goal ID
+        id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Unarchive (restore from archive) a goal
+    Unarchive {
+        /// Goal ID
+        id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Restore a soft-deleted goal
+    Restore {
+        /// Goal ID
+        id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Duplicate a goal under a specified parent
+    Duplicate {
+        /// Source goal ID
+        id: String,
+        /// Parent goal ID where the duplicate will be placed
+        #[arg(long)]
+        parent: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Move a goal under a different parent (or to root with --root)
+    Move {
+        /// Goal ID to move
+        id: String,
+        /// New parent goal ID
+        #[arg(long, conflicts_with = "root")]
+        parent: Option<String>,
+        /// Move to root (clears parent)
+        #[arg(long, conflicts_with = "parent")]
+        root: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Manage public share links for a goal
+    Share {
+        #[command(subcommand)]
+        command: ShareCommands,
+    },
+    /// Manage goal aliases (link an existing goal under another parent)
+    Alias {
+        #[command(subcommand)]
+        command: AliasCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ShareCommands {
+    /// Create (or fetch existing) public share link
+    Create {
+        /// Goal ID
+        id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Revoke the public share link
+    Revoke {
+        /// Goal ID
+        id: String,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AliasCommands {
+    /// Add an alias under a parent goal (links an existing goal)
+    Add {
+        /// Parent goal ID (where the alias appears)
+        parent_id: String,
+        /// Target goal ID to reference
+        #[arg(long)]
+        target: String,
+        /// Display order (1 or greater; backend rejects 0)
+        #[arg(long, default_value = "1")]
+        order: i32,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove an alias
+    Rm {
+        /// Parent goal ID
+        parent_id: String,
+        /// Alias ID
+        alias_id: String,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
+    },
+    /// Reorder aliases under a parent goal
+    Reorder {
+        /// Parent goal ID
+        parent_id: String,
+        /// Comma-separated alias IDs in the desired order
+        #[arg(long)]
+        order: String,
     },
 }
 
@@ -548,12 +675,11 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
         }
         GoalCommands::Delete { id, force, json } => {
             if !force {
-                // Fetch goal title for confirmation
                 let resp: ApiResponse<Goal> = client.get_goal(id).await?;
-                eprint!("Delete goal \"{}\" ({id})? [y/N] ", resp.data.title);
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input)?;
-                if !input.trim().eq_ignore_ascii_case("y") {
+                if !crate::cli::commands::confirm(&format!(
+                    "Delete goal \"{}\" ({id})?",
+                    resp.data.title
+                ))? {
                     println!("Cancelled.");
                     return Ok(());
                 }
@@ -576,35 +702,40 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
         }
         GoalCommands::Update {
             id,
-            org,
             status,
             title,
+            description,
+            description_file,
             json,
         } => {
-            let org_id = resolve_org_id(org.as_deref())?;
-
             let (completed_at, goal_status) = if let Some(s) = status {
                 parse_status(s)?
             } else {
                 (None, None)
             };
 
+            let desc = read_text_arg(description.as_ref(), description_file.as_ref())?;
+
             let mut req = UpdateGoalRequest {
                 status: goal_status,
                 completed_at,
                 title: None,
-                description: None,
+                description: desc,
             };
 
             if let Some(t) = title {
                 req.title = Some(t.clone());
             }
 
-            if req.status.is_none() && req.completed_at.is_none() && req.title.is_none() {
-                bail!("Nothing to update. Specify --status or --title.");
+            if req.status.is_none()
+                && req.completed_at.is_none()
+                && req.title.is_none()
+                && req.description.is_none()
+            {
+                bail!("Nothing to update. Specify --status, --title, or --description.");
             }
 
-            let resp: ApiResponse<Goal> = client.update_goal(&org_id, id, &req).await?;
+            let resp: ApiResponse<Goal> = client.update_goal(id, &req).await?;
 
             if *json {
                 println!("{}", serde_json::to_string_pretty(&resp.data)?);
@@ -612,6 +743,147 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
                 let (label, _) = resolve_status(resp.data.is_completed, resp.data.status.as_ref());
                 println!("Updated goal: {} [{label}]", resp.data.title);
             }
+            Ok(())
+        }
+        GoalCommands::Archive { id, json } => {
+            client.archive_goals(vec![id.clone()]).await?;
+            print_status_result(*json, "archived", id)
+        }
+        GoalCommands::Unarchive { id, json } => {
+            client.unarchive_goals(vec![id.clone()]).await?;
+            print_status_result(*json, "unarchived", id)
+        }
+        GoalCommands::Restore { id, json } => {
+            client.restore_goals(vec![id.clone()]).await?;
+            print_status_result(*json, "restored", id)
+        }
+        GoalCommands::Duplicate { id, parent, json } => {
+            let resp = client.duplicate_goal(id, parent).await?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&resp.data)?);
+            } else {
+                println!(
+                    "Duplicated goal: {} ({}) under parent {parent}",
+                    resp.data.title, resp.data.id
+                );
+            }
+            Ok(())
+        }
+        GoalCommands::Move {
+            id,
+            parent,
+            root,
+            json,
+        } => {
+            if parent.is_none() && !*root {
+                bail!("Specify --parent <ID> or --root.");
+            }
+            let new_parent = if *root { None } else { parent.clone() };
+            let resp = client.change_goal_parent(id, new_parent.clone()).await?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&resp.data)?);
+            } else {
+                let dest = new_parent.as_deref().unwrap_or("(root)");
+                println!("Moved goal {} to {dest}", resp.data.id);
+            }
+            Ok(())
+        }
+        GoalCommands::Share { command } => handle_share(command, client).await,
+        GoalCommands::Alias { command } => handle_alias(command, client).await,
+    }
+}
+
+fn print_status_result(json: bool, action: &str, id: &str) -> Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "action": action,
+                "id": id,
+            }))?
+        );
+    } else {
+        println!("Goal {id} {action}");
+    }
+    Ok(())
+}
+
+async fn handle_share(cmd: &ShareCommands, client: &ApiClient) -> Result<()> {
+    match cmd {
+        ShareCommands::Create { id, json } => {
+            let resp = client.create_share_link(id).await?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&resp)?);
+            } else if let Some(url) = &resp.share_url {
+                println!("Share URL: {url}");
+            } else if let Some(pid) = &resp.public_id {
+                println!("Public ID: {pid}");
+            } else {
+                println!("Share link created for goal {id}");
+            }
+            Ok(())
+        }
+        ShareCommands::Revoke { id, force } => {
+            if !*force
+                && !crate::cli::commands::confirm(&format!("Revoke share link for goal {id}?"))?
+            {
+                println!("Cancelled.");
+                return Ok(());
+            }
+            client.revoke_share_link(id).await?;
+            println!("Share link revoked for goal {id}");
+            Ok(())
+        }
+    }
+}
+
+async fn handle_alias(cmd: &AliasCommands, client: &ApiClient) -> Result<()> {
+    match cmd {
+        AliasCommands::Add {
+            parent_id,
+            target,
+            order,
+            json,
+        } => {
+            let alias = client.create_alias(parent_id, target, *order).await?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&alias)?);
+            } else {
+                let alias_id = alias.data.id.as_deref().unwrap_or("(unknown)");
+                println!(
+                    "Alias created: {alias_id} (parent={parent_id}, target={target}, order={order})"
+                );
+            }
+            Ok(())
+        }
+        AliasCommands::Rm {
+            parent_id,
+            alias_id,
+            force,
+        } => {
+            if !*force
+                && !crate::cli::commands::confirm(&format!(
+                    "Delete alias {alias_id} from parent {parent_id}?"
+                ))?
+            {
+                println!("Cancelled.");
+                return Ok(());
+            }
+            client.delete_alias(parent_id, alias_id).await?;
+            println!("Alias {alias_id} deleted");
+            Ok(())
+        }
+        AliasCommands::Reorder { parent_id, order } => {
+            let ids: Vec<String> = order
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if ids.is_empty() {
+                bail!("--order must contain at least one alias ID");
+            }
+            client.reorder_aliases(parent_id, ids).await?;
+            println!("Aliases reordered under parent {parent_id}");
             Ok(())
         }
     }

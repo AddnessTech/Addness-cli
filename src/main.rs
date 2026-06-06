@@ -1,6 +1,8 @@
 mod api;
 mod cli;
 mod config;
+mod debug_log;
+mod tui;
 mod update_check;
 
 use anyhow::{Result, bail};
@@ -21,7 +23,7 @@ use cli::commands::{
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -165,56 +167,60 @@ async fn main() -> Result<()> {
     let update_handle = tokio::spawn(update_check::check_for_update());
 
     let result = match &cli.command {
-        Commands::Login {
+        None => {
+            let client = build_client()?;
+            tui::run(client)
+        }
+        Some(Commands::Login {
             api_url,
             frontend_url,
-        } => login::handle_login(api_url, frontend_url.as_deref()).await,
-        Commands::Configure => configure::handle_configure(),
-        Commands::Status { json } => configure::handle_status(*json),
-        Commands::Logout => configure::handle_logout(),
-        Commands::Org { command } => {
+        }) => login::handle_login(api_url, frontend_url.as_deref()).await,
+        Some(Commands::Configure) => configure::handle_configure(),
+        Some(Commands::Status { json }) => configure::handle_status(*json),
+        Some(Commands::Logout) => configure::handle_logout(),
+        Some(Commands::Org { command }) => {
             let client = build_client_for_org_commands()?;
             org::handle_org(command, &client).await
         }
-        Commands::Goal { command } => {
+        Some(Commands::Goal { command }) => {
             let client = build_client()?;
             goal::handle_goals(command, &client).await
         }
-        Commands::Comment { command } => {
+        Some(Commands::Comment { command }) => {
             let client = build_client()?;
             comment::handle_comments(command, &client).await
         }
-        Commands::Link { command } => {
+        Some(Commands::Link { command }) => {
             let client = build_client()?;
             link::handle_link(command, &client).await
         }
-        Commands::Deliverable { command } => {
+        Some(Commands::Deliverable { command }) => {
             let client = build_client()?;
             deliverable::handle_deliverable(command, &client).await
         }
-        Commands::Assignment { command } => {
+        Some(Commands::Assignment { command }) => {
             let client = build_client()?;
             assignment::handle_assignment(command, &client).await
         }
-        Commands::Kpi { command } => {
+        Some(Commands::Kpi { command }) => {
             let client = build_client()?;
             kpi::handle_kpi(command, &client).await
         }
-        Commands::Member { command } => {
+        Some(Commands::Member { command }) => {
             let client = build_client()?;
             member::handle_member(command, &client).await
         }
-        Commands::Invitation { command } => {
+        Some(Commands::Invitation { command }) => {
             let client = build_client()?;
             invitation::handle_invitation(command, &client).await
         }
-        Commands::Summary { org, depth, json } => {
+        Some(Commands::Summary { org, depth, json }) => {
             let client = build_client()?;
             summary::handle_summary(org.as_deref(), *depth, *json, &client).await
         }
-        Commands::DetectGoal { json } => detect::handle_detect_goal(*json),
-        Commands::Skills => skills::handle_skills(),
-        Commands::Completions { shell } => {
+        Some(Commands::DetectGoal { json }) => detect::handle_detect_goal(*json),
+        Some(Commands::Skills) => skills::handle_skills(),
+        Some(Commands::Completions { shell }) => {
             clap_complete::generate(
                 *shell,
                 &mut Cli::command(),

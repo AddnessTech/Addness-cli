@@ -1,8 +1,15 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::api::{MemberId, UserId};
+
 /// Goal status values used by the backend API.
 /// Backend uses: "NONE", "IN_PROGRESS", "CANCELLED".
 /// Completion is tracked via `completedAt`, not status.
+///
+/// Only these transitions are allowed.
+/// None => InProgress or Cancelled,
+/// InProgress => None or Cancelled,
+/// Cancelled => None or InProgress,
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GoalStatus {
     #[serde(rename = "NONE")]
@@ -70,10 +77,11 @@ pub struct TreePage {
     pub offset: i64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Owner {
-    pub id: String,
+    pub id: UserId,
+    pub organization_member_id: MemberId,
     pub name: String,
 }
 

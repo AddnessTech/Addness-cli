@@ -1,6 +1,39 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, Deserialize)]
+/// User ID - globally unique across the service
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct UserId(String);
+
+impl UserId {
+    #[allow(dead_code)]
+    fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    #[allow(dead_code)]
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Member ID - unique within an organization
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MemberId(String);
+
+impl MemberId {
+    #[allow(dead_code)]
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Member {
     pub id: String,

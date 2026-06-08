@@ -380,7 +380,7 @@ impl App {
                 // Build HashMap for fast lookup
                 self.members = member_list
                     .iter()
-                    .map(|m| (m.id.clone(), m.clone()))
+                    .map(|m| (MemberId::new(m.id.clone()), m.clone()))
                     .collect();
 
                 // Keep list for display
@@ -1046,7 +1046,7 @@ impl App {
             return;
         }
 
-        let Some(org_id) = self.current_org_id().map(|s| s.to_string()) else {
+        let Some(_org_id) = self.current_org_id().map(|s| s.to_string()) else {
             self.error_message = Some("No organization selected".to_string());
             return;
         };
@@ -1070,7 +1070,7 @@ impl App {
             completed_at,
         };
 
-        match self.api_call(self.client.update_goal(&org_id, &goal_id, &req)) {
+        match self.api_call(self.client.update_goal(&goal_id, &req)) {
             Ok(_) => {
                 self.success_message = Some("Goal updated successfully".to_string());
                 self.load_goal_tree();

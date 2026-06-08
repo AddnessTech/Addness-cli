@@ -1,14 +1,20 @@
+mod assignment;
 mod comment;
 mod deliverable;
 mod goal;
 mod goal_execution;
+mod invitation;
+mod kpi;
 mod member;
 mod org;
 
+pub use assignment::*;
 pub use comment::*;
 pub use deliverable::*;
 pub use goal::*;
 pub use goal_execution::*;
+pub use invitation::*;
+pub use kpi::*;
 pub use member::*;
 pub use org::*;
 

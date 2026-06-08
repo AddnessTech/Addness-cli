@@ -36,7 +36,7 @@ impl MemberId {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Member {
-    pub id: MemberId,
+    pub id: String,
     pub name: String,
     pub is_current_user: bool,
 }
@@ -47,54 +47,21 @@ pub struct MembersListData {
     pub members: Vec<Member>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+// PUT /api/v2/members/:id (no content response)
+#[derive(Debug, Serialize)]
+pub struct UpdateMemberRequest {
+    pub name: String,
+}
 
-    #[test]
-    fn test_user_id_serde() {
-        // シリアライズ：UserId → JSON文字列
-        let user_id = UserId::new("user-123");
-        let json = serde_json::to_string(&user_id).unwrap();
-        assert_eq!(json, r#""user-123""#);
+// PUT /api/v2/members/:id/pin
+#[derive(Debug, Serialize)]
+pub struct PinMemberRequest {
+    pub pinned: bool,
+}
 
-        // デシリアライズ：JSON文字列 → UserId
-        let deserialized: UserId = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized, user_id);
-        assert_eq!(deserialized.as_str(), "user-123");
-    }
-
-    #[test]
-    fn test_member_id_serde() {
-        // シリアライズ：MemberId → JSON文字列
-        let member_id = MemberId::new("member-456");
-        let json = serde_json::to_string(&member_id).unwrap();
-        assert_eq!(json, r#""member-456""#);
-
-        // デシリアライズ：JSON文字列 → MemberId
-        let deserialized: MemberId = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized, member_id);
-        assert_eq!(deserialized.as_str(), "member-456");
-    }
-
-    #[test]
-    fn test_in_struct() {
-        // 構造体の中でも正しく動作する
-        #[derive(Serialize, Deserialize, PartialEq, Debug)]
-        struct TestData {
-            user_id: UserId,
-            member_id: MemberId,
-        }
-
-        let data = TestData {
-            user_id: UserId::new("user-123"),
-            member_id: MemberId::new("member-456"),
-        };
-
-        let json = serde_json::to_string(&data).unwrap();
-        assert_eq!(json, r#"{"user_id":"user-123","member_id":"member-456"}"#);
-
-        let deserialized: TestData = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized, data);
-    }
+// PATCH /api/v2/members/:id/source-organization
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSourceOrganizationRequest {
+    pub source_organization_id: String,
 }

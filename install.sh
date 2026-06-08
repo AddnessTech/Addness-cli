@@ -222,7 +222,13 @@ ensure_path() {
 
 verify_installation() {
   printf "\n"
-  if command -v addness >/dev/null 2>&1; then
+  INSTALLED_VERSION=""
+  if [ -x "${INSTALL_DIR}/addness" ]; then
+    INSTALLED_VERSION="$("${INSTALL_DIR}/addness" --version 2>/dev/null || true)"
+  fi
+  if [ -n "${INSTALLED_VERSION}" ]; then
+    ok "${GREEN}Addness CLI installed successfully! ${INSTALLED_VERSION}${RESET}"
+  elif command -v addness >/dev/null 2>&1; then
     ok "${GREEN}Addness CLI installed successfully!${RESET}"
   else
     ok "Installed to ${BOLD}${INSTALL_DIR}/addness${RESET}"

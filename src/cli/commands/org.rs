@@ -24,6 +24,54 @@ pub enum OrgCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Create a new organization
+    Create {
+        /// Organization name
+        #[arg(long)]
+        name: String,
+        /// Organization type: PERSONAL or BUSINESS (default PERSONAL)
+        #[arg(long, default_value = "PERSONAL")]
+        r#type: String,
+        /// Team scale (required for BUSINESS): SOLO, 2_5, 6_20, 21_50, 50_PLUS
+        #[arg(long)]
+        team_scale: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Update an organization's name
+    Update {
+        /// Organization ID
+        id: String,
+        /// New name
+        #[arg(long)]
+        name: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete an organization
+    Rm {
+        /// Organization ID
+        id: String,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
+    },
+    /// Update the organization's context text (free-form AI context)
+    SetContext {
+        /// Organization ID
+        id: String,
+        /// Inline context text
+        #[arg(long, conflicts_with = "text_file")]
+        text: Option<String>,
+        /// Read context text from a file
+        #[arg(long, conflicts_with = "text")]
+        text_file: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub async fn handle_org(cmd: &OrgCommands, client: &ApiClient) -> Result<()> {
@@ -89,6 +137,73 @@ pub async fn handle_org(cmd: &OrgCommands, client: &ApiClient) -> Result<()> {
                     }
                 }
                 None => bail!("No current organization set. Run: addness org switch <id>"),
+            }
+            Ok(())
+        }
+        OrgCommands::Create {
+            name,
+            r#type,
+            team_scale,
+            json,
+        } => {
+            let upper_type = r#type.to_uppercase();
+            match upper_type.as_str() {
+                "PERSONAL" | "BUSINESS" => {}
+                _ => bail!("Invalid --type '{type}'. Use PERSONAL or BUSINESS."),
+            }
+            if upper_type == "BUSINESS" && team_scale.is_none() {
+                bail!(
+                    "--team-scale is required for BUSINESS (one of SOLO, 2_5, 6_20, 21_50, 50_PLUS)"
+                );
+            }
+            let resp = client
+                .create_organization(name, &upper_type, team_scale.clone())
+                .await?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&resp)?);
+            } else {
+                println!("Organization created: {name} ({})", resp.data.id);
+            }
+            Ok(())
+        }
+        OrgCommands::Update { id, name, json } => {
+            let resp = client.update_organization(id, name).await?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&resp)?);
+            } else {
+                println!("Organization {id} renamed to {name}");
+            }
+            Ok(())
+        }
+        OrgCommands::Rm { id, force } => {
+            if !*force && !crate::cli::commands::confirm(&format!("Delete organization {id}?"))? {
+                println!("Cancelled.");
+                return Ok(());
+            }
+            client.delete_organization(id).await?;
+            println!("Organization {id} deleted");
+            Ok(())
+        }
+        OrgCommands::SetContext {
+            id,
+            text,
+            text_file,
+            json,
+        } => {
+            let body = match (text, text_file) {
+                (Some(s), None) => s.clone(),
+                (None, Some(p)) => std::fs::read_to_string(p)?,
+                (Some(_), Some(_)) => bail!("Specify only one of --text or --text-file"),
+                (None, None) => bail!("Specify --text or --text-file"),
+            };
+            let resp = client.update_organization_context(id, &body).await?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&resp)?);
+            } else {
+                println!(
+                    "Organization {id} context updated ({} chars)",
+                    body.chars().count()
+                );
             }
             Ok(())
         }

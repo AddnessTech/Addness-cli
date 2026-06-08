@@ -4,11 +4,6 @@ use crate::api::{ApiClient, ApiResponse, MemberId, TodaysGoalsData};
 
 impl ApiClient {
     /// Get today's goals for the current user or a specific member.
-    ///
-    /// # Arguments
-    /// * `org_id` - Organization ID
-    /// * `date` - Optional date in YYYY-MM-DD format (defaults to server date if None)
-    /// * `member_id` - Optional member ID to view another member's goals
     pub async fn get_todays_goals(
         &self,
         org_id: &str,

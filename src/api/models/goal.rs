@@ -1,15 +1,8 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::api::{MemberId, UserId};
-
 /// Goal status values used by the backend API.
 /// Backend uses: "NONE", "IN_PROGRESS", "CANCELLED".
 /// Completion is tracked via `completedAt`, not status.
-///
-/// Only these transitions are allowed.
-/// None => InProgress or Cancelled,
-/// InProgress => None or Cancelled,
-/// Cancelled => None or InProgress,
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GoalStatus {
     #[serde(rename = "NONE")]
@@ -80,12 +73,15 @@ pub struct TreePage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Owner {
-    pub id: UserId,
-    pub organization_member_id: MemberId,
+    pub id: String,
     pub name: String,
 }
 
 // POST /api/v2/objectives
+//
+// CLI の `description` 引数は Backend の `definitionOfDone`（完了の基準）にマップされる。
+// Backend には別途 `description`（旧本文）と `body`（V2 Notion 風）カラムがあるが、
+// Frontend の「完了の基準」UI が読むのは `definitionOfDone` カラムのみ。
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateGoalRequest {
@@ -93,7 +89,7 @@ pub struct CreateGoalRequest {
     pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_objective_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "definitionOfDone", skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 }
 
@@ -108,7 +104,7 @@ pub struct UpdateGoalRequest {
     pub completed_at: Option<Option<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "definitionOfDone", skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 }
 
@@ -117,7 +113,8 @@ pub struct UpdateGoalRequest {
 pub struct Goal {
     pub id: String,
     pub title: String,
-    #[serde(default)]
+    /// Backend の `definitionOfDone`（完了の基準）にマップ。
+    #[serde(rename = "definitionOfDone", default)]
     pub description: Option<String>,
     #[serde(default)]
     pub body: Option<String>,
@@ -155,7 +152,8 @@ pub struct GoalChildrenData {
 pub struct GoalChildItem {
     pub id: String,
     pub title: String,
-    #[serde(default)]
+    /// Backend の `definitionOfDone`（完了の基準）にマップ。
+    #[serde(rename = "definitionOfDone", default)]
     pub description: Option<String>,
     #[serde(default)]
     pub parent_id: Option<String>,
@@ -168,6 +166,73 @@ pub struct GoalChildItem {
     pub order_no: f64,
     #[serde(default)]
     pub owner: Option<Owner>,
+}
+
+// POST /api/v2/objectives/{archive,unarchive,restore}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectiveIdsRequest {
+    pub objective_ids: Vec<String>,
+}
+
+// POST /api/v2/objectives/:id/duplicate
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateRequest {
+    pub parent_id: String,
+}
+
+// POST /api/v2/objectives/:id/parent
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeParentRequest {
+    pub new_parent_id: Option<String>,
+}
+
+// POST /api/v1/team/objectives/:id/aliases
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateAliasRequest {
+    pub target_objective_id: String,
+    pub order_no: i32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Alias {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub parent_objective_id: Option<String>,
+    #[serde(default)]
+    pub target_objective_id: Option<String>,
+    #[serde(default)]
+    pub order_no: Option<i32>,
+}
+
+// PATCH /api/v1/team/objectives/:id/aliases/reorder
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReorderAliasesRequest {
+    pub alias_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReorderAliasesResponse {
+    #[serde(default)]
+    pub aliases: Vec<Alias>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareLinkResponse {
+    #[serde(default)]
+    pub share_url: Option<String>,
+    #[serde(default)]
+    pub public_id: Option<String>,
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
 // GET /api/v1/team/:org-id/objectives/search

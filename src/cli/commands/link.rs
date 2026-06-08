@@ -110,7 +110,7 @@ pub async fn handle_link(cmd: &LinkCommands, client: &ApiClient) -> Result<()> {
                     title: None,
                     description: None,
                 };
-                let _: ApiResponse<Goal> = client.update_goal("", goal, &req).await?;
+                let _: ApiResponse<Goal> = client.update_goal(goal, &req).await?;
             }
 
             if *json {

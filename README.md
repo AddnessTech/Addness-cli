@@ -1,6 +1,6 @@
 # Addness CLI
 
-Addness CLI is a terminal interface for working with Addness from local development environments, scripts, and AI coding agents.
+Addness CLI is an open source terminal client for working with Addness from local development environments, scripts, and AI coding agents.
 
 Use it to inspect goals, update progress, write comments, switch organizations, and connect pull requests back to Addness without leaving the command line.
 
@@ -105,6 +105,8 @@ Use GitHub Issues for reproducible bugs, feature requests, and documentation pro
 
 ## License
 
-Addness CLI is released under the [MIT License](LICENSE).
+Addness CLI is released under the [Apache License 2.0](LICENSE).
+
+Addness and the Addness logo are trademarks of Addness. Use of the Addness service and API is governed by the Addness Terms of Service.
 
 Copyright (c) 2026 Addness.

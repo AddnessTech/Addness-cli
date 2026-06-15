@@ -5,6 +5,12 @@
 Addness SaaSの全操作をターミナルから実行するRust製CLI/TUIアプリケーション。
 人間のインタラクティブ操作とClaude Code等のAIツールからの自動操作の両方に対応する。
 
+## Open source
+
+- License: MIT. See [LICENSE](LICENSE).
+- Contributions must go through GitHub Pull Requests. See [CONTRIBUTING.md](CONTRIBUTING.md).
+- Security reports should not be filed as public issues. See [SECURITY.md](SECURITY.md).
+
 ## コアビジョン
 
 **「Addnessに書いた目標を、AIが自動で実行できるようにする」**

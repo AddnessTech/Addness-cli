@@ -5,7 +5,8 @@ files in the repository.
 
 ## Before making the repository public
 
-- Confirm the intended license is MIT.
+- Confirm the intended license is Apache-2.0.
+- Confirm Addness trademark and Terms of Service language is present.
 - Remove local-only files and unrelated assets from the repository.
 - Run a secret scan against the full Git history.
 - Rotate any credential that has ever been committed.

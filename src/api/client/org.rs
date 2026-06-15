@@ -4,6 +4,17 @@ use crate::api::{
 };
 use anyhow::Result;
 
+pub struct CreateOrganizationParams {
+    pub name: String,
+    pub organization_type: String,
+    pub team_scale: Option<String>,
+    pub plan_type: Option<String>,
+    pub industry: Option<String>,
+    pub phone_number: Option<String>,
+    pub browser_timezone: Option<String>,
+    pub logo_url: Option<String>,
+}
+
 impl ApiClient {
     pub async fn list_organizations(&self) -> Result<OrganizationsResponse> {
         self.get_without_org("/api/v2/organizations/me").await
@@ -11,16 +22,20 @@ impl ApiClient {
 
     pub async fn create_organization(
         &self,
-        name: &str,
-        organization_type: &str,
-        team_scale: Option<String>,
+        params: CreateOrganizationParams,
     ) -> Result<ApiResponse<Organization>> {
         let body = CreateOrganizationRequest {
-            name: name.to_string(),
-            organization_type: organization_type.to_string(),
-            team_scale,
+            name: params.name,
+            organization_type: params.organization_type,
+            team_scale: params.team_scale,
+            plan_type: params.plan_type,
+            industry: params.industry,
+            phone_number: params.phone_number,
+            browser_timezone: params.browser_timezone,
+            logo_url: params.logo_url,
         };
-        self.post("/api/v1/team/organizations", &body).await
+        self.post_without_org("/api/v1/team/organizations", &body)
+            .await
     }
 
     pub async fn update_organization(

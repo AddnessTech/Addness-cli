@@ -2,6 +2,10 @@
 name = "addness-cli"
 version = "0.3.0"
 edition = "2024"
+description = "Command-line interface for Addness"
+license = "MIT"
+repository = "https://github.com/AddnessTech/Addness-cli"
+readme = "README.md"
 
 [[bin]]
 name = "addness"

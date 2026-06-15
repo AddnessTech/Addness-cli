@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security reports
+    url: https://github.com/AddnessTech/Addness-cli/security/advisories
+    about: Report vulnerabilities privately. Do not file public security issues.

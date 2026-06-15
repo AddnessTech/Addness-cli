@@ -10,8 +10,7 @@ use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
-use oauth2::PkceCodeChallenge;
-use rand::rngs::OsRng;
+use sha2::{Digest, Sha256};
 use spki::EncodePublicKey;
 
 use crate::config::{Credentials, Settings};
@@ -55,13 +54,26 @@ struct RegisterData {
     installation_id: String,
 }
 
-fn generate_keypair() -> (SigningKey, String) {
-    let signing_key = SigningKey::generate(&mut OsRng);
+fn generate_keypair() -> Result<(SigningKey, String)> {
+    let mut seed = [0u8; 32];
+    getrandom::getrandom(&mut seed).context("Failed to generate signing key seed")?;
+    let signing_key = SigningKey::from_bytes(&seed);
     let verifying_key = signing_key.verifying_key();
     let pem = verifying_key
         .to_public_key_pem(spki::der::pem::LineEnding::LF)
-        .expect("failed to encode public key as PEM");
-    (signing_key, pem)
+        .context("Failed to encode public key as PEM")?;
+    Ok((signing_key, pem))
+}
+
+fn generate_pkce_pair() -> Result<(String, String)> {
+    let mut verifier_bytes = [0u8; 32];
+    getrandom::getrandom(&mut verifier_bytes).context("Failed to generate PKCE verifier")?;
+
+    let verifier = URL_SAFE_NO_PAD.encode(verifier_bytes);
+    let challenge_digest = Sha256::digest(verifier.as_bytes());
+    let challenge = URL_SAFE_NO_PAD.encode(challenge_digest);
+
+    Ok((challenge, verifier))
 }
 
 fn sign_message(signing_key: &SigningKey, message: &str) -> String {
@@ -89,7 +101,7 @@ pub async fn handle_login(api_url: &str, frontend_url: Option<&str>) -> Result<(
     println!();
 
     // 1. Ed25519キーペア生成
-    let (signing_key, public_key_pem) = generate_keypair();
+    let (signing_key, public_key_pem) = generate_keypair()?;
     let installation_id = uuid::Uuid::new_v4().simple().to_string();
 
     // 2. localhostサーバー起動（空きポートを自動取得）
@@ -98,10 +110,8 @@ pub async fn handle_login(api_url: &str, frontend_url: Option<&str>) -> Result<(
         .context("Failed to bind localhost port")?;
     let port = listener.local_addr()?.port();
 
-    // 3. PKCE用のcode_verifierとcode_challenge生成（oauth2 crateを使用）
-    let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
-    let code_challenge = pkce_challenge.as_str().to_string();
-    let code_verifier = pkce_verifier.secret().to_string();
+    // 3. PKCE用のcode_verifierとcode_challenge生成
+    let (code_challenge, code_verifier) = generate_pkce_pair()?;
 
     // 4. State生成
     let state = uuid::Uuid::new_v4().simple().to_string();

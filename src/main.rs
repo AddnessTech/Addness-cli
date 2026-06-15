@@ -128,16 +128,20 @@ fn build_client() -> Result<ApiClient> {
             let token = match org_id {
                 Some(id) => c.token_for_org(id).ok_or_else(|| {
                     anyhow::anyhow!(
-                        "No API key stored for organization '{id}'. Run `addness login` to authenticate."
+                        "No API key stored for organization '{id}'. Run `addness login` to authenticate this org, or `addness configure` if you have a key for it."
                     )
                 })?,
                 None => c.any_token().ok_or_else(|| {
-                    anyhow::anyhow!("Not configured. Run: addness login")
+                    anyhow::anyhow!(
+                        "Not configured. Run: addness login (or 'addness configure' if you already have an API key)."
+                    )
                 })?,
             };
             Ok(ApiClient::new(token, c.api_url())?.with_org_id(org_id.map(|id| id.to_string())))
         }
-        None => bail!("Not configured. Run: addness login"),
+        None => bail!(
+            "Not configured. Run: addness login (or 'addness configure' if you already have an API key)."
+        ),
     }
 }
 
@@ -153,10 +157,16 @@ fn build_client_for_org_commands() -> Result<ApiClient> {
                 Some(id) => c.token_for_org(id).or_else(|| c.any_token()),
                 None => c.any_token(),
             }
-            .ok_or_else(|| anyhow::anyhow!("Not configured. Run: addness login"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Not configured. Run: addness login (or 'addness configure' if you already have an API key)."
+                )
+            })?;
             Ok(ApiClient::new(token, c.api_url())?.with_org_id(org_id.map(|id| id.to_string())))
         }
-        None => bail!("Not configured. Run: addness login"),
+        None => bail!(
+            "Not configured. Run: addness login (or 'addness configure' if you already have an API key)."
+        ),
     }
 }
 

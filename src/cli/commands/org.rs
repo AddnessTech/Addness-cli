@@ -108,7 +108,7 @@ pub async fn handle_org(cmd: &OrgCommands, client: &ApiClient) -> Result<()> {
                     {
                         println!();
                         println!(
-                            "Warning: No API key stored for this organization. Run `addness login` to authenticate."
+                            "Warning: No API key stored for this organization. Run `addness login` to authenticate this org, or `addness configure` if you have a key for it."
                         );
                     }
                 }

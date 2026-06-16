@@ -4,11 +4,12 @@ use ratatui::{
     DefaultTerminal,
     crossterm::event::{self, Event, KeyCode, KeyEventKind},
 };
-use std::collections::HashMap;
+use std::{collections::HashMap, path::PathBuf};
 use tokio::runtime::Handle;
 
 use crate::api::{
-    ApiClient, CreateGoalRequest, GoalStatus, Member, MemberId, Organization, UpdateGoalRequest,
+    ApiClient, CreateGoalRequest, DeliverableType, GoalStatus, Member, MemberId, Organization,
+    UpdateGoalRequest,
 };
 use crate::dbg_log;
 
@@ -27,6 +28,75 @@ pub enum FormField {
     Title,
     Description,
     Status,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeliverableKind {
+    File,
+    Document,
+    Link,
+    Folder,
+}
+
+impl DeliverableKind {
+    fn next(&self) -> Self {
+        match self {
+            DeliverableKind::File => DeliverableKind::Document,
+            DeliverableKind::Document => DeliverableKind::Link,
+            DeliverableKind::Link => DeliverableKind::Folder,
+            DeliverableKind::Folder => DeliverableKind::File,
+        }
+    }
+
+    fn prev(&self) -> Self {
+        match self {
+            DeliverableKind::File => DeliverableKind::Folder,
+            DeliverableKind::Document => DeliverableKind::File,
+            DeliverableKind::Link => DeliverableKind::Document,
+            DeliverableKind::Folder => DeliverableKind::Link,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            DeliverableKind::File => "file",
+            DeliverableKind::Document => "document",
+            DeliverableKind::Link => "link",
+            DeliverableKind::Folder => "folder",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeliverableFormField {
+    Kind,
+    Name,
+    Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionMenuItem {
+    AddDeliverable,
+    EditGoal,
+    DeleteGoal,
+    UpdateDeliverable,
+    RenameDeliverable,
+    MoveDeliverable,
+    DeleteDeliverable,
+}
+
+impl ActionMenuItem {
+    pub fn label(&self) -> &'static str {
+        match self {
+            ActionMenuItem::AddDeliverable => "add deliverable",
+            ActionMenuItem::EditGoal => "edit goal",
+            ActionMenuItem::DeleteGoal => "delete goal",
+            ActionMenuItem::UpdateDeliverable => "update document",
+            ActionMenuItem::RenameDeliverable => "rename deliverable",
+            ActionMenuItem::MoveDeliverable => "move deliverable",
+            ActionMenuItem::DeleteDeliverable => "delete deliverable",
+        }
+    }
 }
 
 /// Display status combining GoalStatus and completed_at
@@ -99,6 +169,11 @@ impl GoalDisplayStatus {
 // それまでclippy errorを抑制
 #[allow(clippy::enum_variant_names)]
 pub enum ModalState {
+    ActionMenu {
+        title: String,
+        items: Vec<ActionMenuItem>,
+        selected_index: usize,
+    },
     CreateGoal {
         title: String,
         description: String,
@@ -119,6 +194,39 @@ pub enum ModalState {
         goal_id: String,
         goal_title: String,
         confirm_index: usize, // 0 = Cancel (default), 1 = Delete
+    },
+    AddDeliverable {
+        goal_id: String,
+        goal_title: String,
+        kind: DeliverableKind,
+        name: String,
+        value: String,
+        current_field: DeliverableFormField,
+    },
+    UpdateDeliverable {
+        goal_id: String,
+        deliverable_id: String,
+        deliverable_name: String,
+        content_file: String,
+    },
+    RenameDeliverable {
+        goal_id: String,
+        deliverable_id: String,
+        current_name: String,
+        name: String,
+    },
+    MoveDeliverable {
+        goal_id: String,
+        deliverable_id: String,
+        deliverable_name: String,
+        targets: Vec<(Option<String>, String)>,
+        selected_index: usize,
+    },
+    DeleteDeliverable {
+        goal_id: String,
+        deliverable_id: String,
+        deliverable_name: String,
+        confirm_index: usize,
     },
 }
 
@@ -419,6 +527,131 @@ impl App {
         }
     }
 
+    fn selected_goal_context(&self) -> Option<(String, String)> {
+        let tree = self.active_goal_tree();
+        let rows = tree.flatten();
+
+        if let Some(TreeRow::DeliverableItem { deliverable, .. }) = rows.get(tree.cursor) {
+            return Some((
+                deliverable.objective_id.clone(),
+                format!("goal {}", deliverable.objective_id),
+            ));
+        }
+
+        for row in rows.iter().take(tree.cursor + 1).rev() {
+            if let TreeRow::Goal { goal_id, title, .. } = row {
+                return Some((goal_id.to_string(), title.to_string()));
+            }
+        }
+        None
+    }
+
+    fn selected_deliverable_context(
+        &self,
+    ) -> Option<(String, String, String, String, DeliverableType)> {
+        let tree = self.active_goal_tree();
+        let rows = tree.flatten();
+        match rows.get(tree.cursor) {
+            Some(TreeRow::DeliverableItem { deliverable, .. }) => Some((
+                deliverable.objective_id.clone(),
+                deliverable.id.clone(),
+                deliverable.display_name.clone(),
+                deliverable
+                    .parent_deliverable_id
+                    .clone()
+                    .unwrap_or_default(),
+                deliverable.node_type.clone(),
+            )),
+            _ => None,
+        }
+    }
+
+    fn selected_goal_row_context(&self) -> Option<(String, String)> {
+        let tree = self.active_goal_tree();
+        let rows = tree.flatten();
+        match rows.get(tree.cursor) {
+            Some(TreeRow::Goal { goal_id, title, .. }) => {
+                Some((goal_id.to_string(), title.to_string()))
+            }
+            _ => None,
+        }
+    }
+
+    fn deliverable_folder_targets_for_goal(
+        &self,
+        goal_id: &str,
+        current_deliverable_id: &str,
+    ) -> Vec<(Option<String>, String)> {
+        let tree = self.active_goal_tree();
+        let rows = tree.flatten();
+        let mut targets = vec![(None, "(root)".to_string())];
+
+        for row in rows {
+            if let TreeRow::DeliverableItem { deliverable, .. } = row
+                && deliverable.objective_id == goal_id
+                && deliverable.id != current_deliverable_id
+                && deliverable.node_type == DeliverableType::Folder
+            {
+                targets.push((
+                    Some(deliverable.id.clone()),
+                    format!("{} ({})", deliverable.display_name, deliverable.id),
+                ));
+            }
+        }
+
+        targets
+    }
+
+    fn start_action_menu(&mut self) {
+        if let Some((_, deliverable_id, deliverable_name, _, node_type)) =
+            self.selected_deliverable_context()
+        {
+            let mut items = Vec::new();
+            if node_type == DeliverableType::Document {
+                items.push(ActionMenuItem::UpdateDeliverable);
+            }
+            items.push(ActionMenuItem::RenameDeliverable);
+            items.push(ActionMenuItem::MoveDeliverable);
+            items.push(ActionMenuItem::DeleteDeliverable);
+            self.modal_state = Some(ModalState::ActionMenu {
+                title: format!("{deliverable_name} ({deliverable_id})"),
+                items,
+                selected_index: 0,
+            });
+            return;
+        }
+
+        if let Some((_, goal_title)) = self.selected_goal_row_context() {
+            self.modal_state = Some(ModalState::ActionMenu {
+                title: goal_title,
+                items: vec![
+                    ActionMenuItem::AddDeliverable,
+                    ActionMenuItem::EditGoal,
+                    ActionMenuItem::DeleteGoal,
+                ],
+                selected_index: 0,
+            });
+            return;
+        }
+
+        self.error_message = Some("Select a goal or deliverable to open actions".to_string());
+    }
+
+    fn reload_deliverables_for_goal(&mut self, goal_id: &str) {
+        match self.api_call(self.client.get_goal_deliverables(goal_id)) {
+            Ok(resp) => {
+                let deliverables = resp.data.deliverables;
+                self.goal_tree
+                    .set_deliverables_for_goal_id(goal_id, deliverables.clone());
+                self.todays_goals_tree
+                    .set_deliverables_for_goal_id(goal_id, deliverables);
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Failed to reload deliverables: {e}"));
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Event handling
     // -----------------------------------------------------------------------
@@ -501,6 +734,12 @@ impl App {
                 }
                 _ => {}
             },
+            KeyCode::Char('o') | KeyCode::Char(' ')
+                if self.active_pane == ActivePane::Content
+                    && (self.sidebar_index == 0 || self.sidebar_index == 1) =>
+            {
+                self.start_action_menu();
+            }
             KeyCode::Up | KeyCode::Char('k') => match self.active_pane {
                 ActivePane::Navigation if self.sidebar_index > 0 => {
                     self.sidebar_index -= 1;
@@ -557,6 +796,36 @@ impl App {
                     && (self.sidebar_index == 0 || self.sidebar_index == 1) =>
             {
                 self.start_delete_goal_modal();
+            }
+            KeyCode::Char('a')
+                if self.active_pane == ActivePane::Content
+                    && (self.sidebar_index == 0 || self.sidebar_index == 1) =>
+            {
+                self.start_add_deliverable_modal();
+            }
+            KeyCode::Char('u')
+                if self.active_pane == ActivePane::Content
+                    && (self.sidebar_index == 0 || self.sidebar_index == 1) =>
+            {
+                self.start_update_deliverable_modal();
+            }
+            KeyCode::Char('r')
+                if self.active_pane == ActivePane::Content
+                    && (self.sidebar_index == 0 || self.sidebar_index == 1) =>
+            {
+                self.start_rename_deliverable_modal();
+            }
+            KeyCode::Char('m')
+                if self.active_pane == ActivePane::Content
+                    && (self.sidebar_index == 0 || self.sidebar_index == 1) =>
+            {
+                self.start_move_deliverable_modal();
+            }
+            KeyCode::Char('x')
+                if self.active_pane == ActivePane::Content
+                    && (self.sidebar_index == 0 || self.sidebar_index == 1) =>
+            {
+                self.start_delete_deliverable_modal();
             }
             _ => {}
         }
@@ -771,6 +1040,92 @@ impl App {
         }
     }
 
+    fn start_add_deliverable_modal(&mut self) {
+        let Some((goal_id, goal_title)) = self.selected_goal_context() else {
+            self.error_message = Some("Please select a goal to add a deliverable".to_string());
+            return;
+        };
+
+        self.modal_state = Some(ModalState::AddDeliverable {
+            goal_id,
+            goal_title,
+            kind: DeliverableKind::File,
+            name: String::new(),
+            value: String::new(),
+            current_field: DeliverableFormField::Kind,
+        });
+    }
+
+    fn start_update_deliverable_modal(&mut self) {
+        let Some((goal_id, deliverable_id, deliverable_name, _, node_type)) =
+            self.selected_deliverable_context()
+        else {
+            self.error_message = Some("Please select a document deliverable to update".to_string());
+            return;
+        };
+        if node_type != DeliverableType::Document {
+            self.error_message = Some("Only document deliverables can be updated".to_string());
+            return;
+        }
+
+        self.modal_state = Some(ModalState::UpdateDeliverable {
+            goal_id,
+            deliverable_id,
+            deliverable_name,
+            content_file: String::new(),
+        });
+    }
+
+    fn start_rename_deliverable_modal(&mut self) {
+        let Some((goal_id, deliverable_id, deliverable_name, _, _)) =
+            self.selected_deliverable_context()
+        else {
+            self.error_message = Some("Please select a deliverable to rename".to_string());
+            return;
+        };
+
+        self.modal_state = Some(ModalState::RenameDeliverable {
+            goal_id,
+            deliverable_id,
+            current_name: deliverable_name.clone(),
+            name: deliverable_name,
+        });
+    }
+
+    fn start_move_deliverable_modal(&mut self) {
+        let Some((goal_id, deliverable_id, deliverable_name, _, _)) =
+            self.selected_deliverable_context()
+        else {
+            self.error_message = Some("Please select a deliverable to move".to_string());
+            return;
+        };
+        let targets = self.deliverable_folder_targets_for_goal(&goal_id, &deliverable_id);
+
+        self.modal_state = Some(ModalState::MoveDeliverable {
+            goal_id,
+            deliverable_id,
+            deliverable_name,
+            targets,
+            selected_index: 0,
+        });
+    }
+
+    fn start_delete_deliverable_modal(&mut self) {
+        let Some((goal_id, deliverable_id, deliverable_name, _, _)) =
+            self.selected_deliverable_context()
+        else {
+            self.error_message = Some("Please select a deliverable to delete".to_string());
+            return;
+        };
+
+        self.modal_state = Some(ModalState::DeleteDeliverable {
+            goal_id,
+            deliverable_id,
+            deliverable_name,
+            confirm_index: 0,
+        });
+    }
+
     fn handle_modal_input(&mut self, code: KeyCode) {
         match code {
             KeyCode::Esc => {
@@ -786,43 +1141,90 @@ impl App {
                 self.modal_submit();
             }
             KeyCode::Up => {
-                // For status field in edit modal
-                if let Some(ModalState::EditGoal {
+                if matches!(self.modal_state, Some(ModalState::ActionMenu { .. })) {
+                    self.modal_menu_prev();
+                } else if matches!(self.modal_state, Some(ModalState::MoveDeliverable { .. })) {
+                    self.modal_move_target_prev();
+                } else if let Some(ModalState::EditGoal {
                     current_field: FormField::Status,
                     ..
                 }) = &self.modal_state
                 {
                     self.modal_prev_status();
+                } else if let Some(ModalState::AddDeliverable {
+                    current_field: DeliverableFormField::Kind,
+                    ..
+                }) = &self.modal_state
+                {
+                    self.modal_prev_deliverable_kind();
                 }
             }
             KeyCode::Down => {
-                // For status field in edit modal
-                if let Some(ModalState::EditGoal {
+                if matches!(self.modal_state, Some(ModalState::ActionMenu { .. })) {
+                    self.modal_menu_next();
+                } else if matches!(self.modal_state, Some(ModalState::MoveDeliverable { .. })) {
+                    self.modal_move_target_next();
+                } else if let Some(ModalState::EditGoal {
                     current_field: FormField::Status,
                     ..
                 }) = &self.modal_state
                 {
                     self.modal_next_status();
+                } else if let Some(ModalState::AddDeliverable {
+                    current_field: DeliverableFormField::Kind,
+                    ..
+                }) = &self.modal_state
+                {
+                    self.modal_next_deliverable_kind();
                 }
             }
             KeyCode::Left => {
                 // For delete confirmation modal
                 if let Some(ModalState::DeleteGoal { confirm_index, .. }) = &mut self.modal_state {
                     *confirm_index = 0; // Cancel
+                } else if let Some(ModalState::DeleteDeliverable { confirm_index, .. }) =
+                    &mut self.modal_state
+                {
+                    *confirm_index = 0;
                 }
             }
             KeyCode::Right => {
                 // For delete confirmation modal
                 if let Some(ModalState::DeleteGoal { confirm_index, .. }) = &mut self.modal_state {
                     *confirm_index = 1; // Delete
+                } else if let Some(ModalState::DeleteDeliverable { confirm_index, .. }) =
+                    &mut self.modal_state
+                {
+                    *confirm_index = 1;
                 }
             }
             KeyCode::Char(c) => {
-                // For delete confirmation modal, handle h/l as left/right
-                if let Some(ModalState::DeleteGoal { confirm_index, .. }) = &mut self.modal_state {
+                if matches!(self.modal_state, Some(ModalState::ActionMenu { .. })) {
+                    match c {
+                        'j' => self.modal_menu_next(),
+                        'k' => self.modal_menu_prev(),
+                        _ => {}
+                    }
+                } else if matches!(self.modal_state, Some(ModalState::MoveDeliverable { .. })) {
+                    match c {
+                        'j' => self.modal_move_target_next(),
+                        'k' => self.modal_move_target_prev(),
+                        _ => {}
+                    }
+                } else if let Some(ModalState::DeleteGoal { confirm_index, .. }) =
+                    &mut self.modal_state
+                {
                     match c {
                         'h' => *confirm_index = 0, // Cancel
                         'l' => *confirm_index = 1, // Delete
+                        _ => {}
+                    }
+                } else if let Some(ModalState::DeleteDeliverable { confirm_index, .. }) =
+                    &mut self.modal_state
+                {
+                    match c {
+                        'h' => *confirm_index = 0,
+                        'l' => *confirm_index = 1,
                         _ => {}
                     }
                 } else {
@@ -856,6 +1258,17 @@ impl App {
                 ModalState::DeleteGoal { .. } => {
                     // No fields to navigate in delete modal
                 }
+                ModalState::AddDeliverable { current_field, .. } => {
+                    *current_field = match current_field {
+                        DeliverableFormField::Kind => DeliverableFormField::Name,
+                        DeliverableFormField::Name => DeliverableFormField::Value,
+                        DeliverableFormField::Value => DeliverableFormField::Kind,
+                    };
+                }
+                ModalState::ActionMenu { .. } | ModalState::MoveDeliverable { .. } => {}
+                ModalState::UpdateDeliverable { .. }
+                | ModalState::RenameDeliverable { .. }
+                | ModalState::DeleteDeliverable { .. } => {}
             }
         }
     }
@@ -880,6 +1293,17 @@ impl App {
                 ModalState::DeleteGoal { .. } => {
                     // No fields to navigate in delete modal
                 }
+                ModalState::AddDeliverable { current_field, .. } => {
+                    *current_field = match current_field {
+                        DeliverableFormField::Kind => DeliverableFormField::Value,
+                        DeliverableFormField::Name => DeliverableFormField::Kind,
+                        DeliverableFormField::Value => DeliverableFormField::Name,
+                    };
+                }
+                ModalState::ActionMenu { .. } | ModalState::MoveDeliverable { .. } => {}
+                ModalState::UpdateDeliverable { .. }
+                | ModalState::RenameDeliverable { .. }
+                | ModalState::DeleteDeliverable { .. } => {}
             }
         }
     }
@@ -910,6 +1334,24 @@ impl App {
                 ModalState::DeleteGoal { .. } => {
                     // No text input in delete modal
                 }
+                ModalState::AddDeliverable {
+                    name,
+                    value,
+                    current_field,
+                    ..
+                } => match current_field {
+                    DeliverableFormField::Name => name.push(c),
+                    DeliverableFormField::Value => value.push(c),
+                    _ => {}
+                },
+                ModalState::UpdateDeliverable { content_file, .. } => {
+                    content_file.push(c);
+                }
+                ModalState::RenameDeliverable { name, .. } => {
+                    name.push(c);
+                }
+                ModalState::ActionMenu { .. } | ModalState::MoveDeliverable { .. } => {}
+                ModalState::DeleteDeliverable { .. } => {}
             }
         }
     }
@@ -948,12 +1390,43 @@ impl App {
                 ModalState::DeleteGoal { .. } => {
                     // No text input in delete modal
                 }
+                ModalState::AddDeliverable {
+                    name,
+                    value,
+                    current_field,
+                    ..
+                } => match current_field {
+                    DeliverableFormField::Name => {
+                        name.pop();
+                    }
+                    DeliverableFormField::Value => {
+                        value.pop();
+                    }
+                    _ => {}
+                },
+                ModalState::UpdateDeliverable { content_file, .. } => {
+                    content_file.pop();
+                }
+                ModalState::RenameDeliverable { name, .. } => {
+                    name.pop();
+                }
+                ModalState::ActionMenu { .. } | ModalState::MoveDeliverable { .. } => {}
+                ModalState::DeleteDeliverable { .. } => {}
             }
         }
     }
 
     fn modal_submit(&mut self) {
         match self.modal_state.take() {
+            Some(ModalState::ActionMenu {
+                items,
+                selected_index,
+                ..
+            }) => {
+                if let Some(item) = items.get(selected_index).cloned() {
+                    self.run_action_menu_item(item);
+                }
+            }
             Some(ModalState::CreateGoal {
                 title,
                 description,
@@ -989,6 +1462,52 @@ impl App {
             Some(ModalState::DeleteGoal { .. }) => {
                 // confirm_index == 0 means cancel, do nothing
             }
+            Some(ModalState::AddDeliverable {
+                goal_id,
+                kind,
+                name,
+                value,
+                ..
+            }) => {
+                self.modal_submit_add_deliverable(goal_id, kind, name, value);
+            }
+            Some(ModalState::UpdateDeliverable {
+                goal_id,
+                deliverable_id,
+                content_file,
+                ..
+            }) => {
+                self.modal_submit_update_deliverable(goal_id, deliverable_id, content_file);
+            }
+            Some(ModalState::RenameDeliverable {
+                goal_id,
+                deliverable_id,
+                name,
+                ..
+            }) => {
+                self.modal_submit_rename_deliverable(goal_id, deliverable_id, name);
+            }
+            Some(ModalState::MoveDeliverable {
+                goal_id,
+                deliverable_id,
+                targets,
+                selected_index,
+                ..
+            }) => {
+                let parent = targets
+                    .get(selected_index)
+                    .and_then(|(parent_id, _)| parent_id.clone());
+                self.modal_submit_move_deliverable(goal_id, deliverable_id, parent);
+            }
+            Some(ModalState::DeleteDeliverable {
+                goal_id,
+                deliverable_id,
+                confirm_index: 1,
+                ..
+            }) => {
+                self.modal_submit_delete_deliverable(goal_id, deliverable_id);
+            }
+            Some(ModalState::DeleteDeliverable { .. }) => {}
             None => {}
         }
     }
@@ -1095,6 +1614,210 @@ impl App {
         }
     }
 
+    fn run_action_menu_item(&mut self, item: ActionMenuItem) {
+        match item {
+            ActionMenuItem::AddDeliverable => self.start_add_deliverable_modal(),
+            ActionMenuItem::EditGoal => self.start_edit_goal_modal(),
+            ActionMenuItem::DeleteGoal => self.start_delete_goal_modal(),
+            ActionMenuItem::UpdateDeliverable => self.start_update_deliverable_modal(),
+            ActionMenuItem::RenameDeliverable => self.start_rename_deliverable_modal(),
+            ActionMenuItem::MoveDeliverable => self.start_move_deliverable_modal(),
+            ActionMenuItem::DeleteDeliverable => self.start_delete_deliverable_modal(),
+        }
+    }
+
+    fn modal_submit_add_deliverable(
+        &mut self,
+        goal_id: String,
+        kind: DeliverableKind,
+        name: String,
+        value: String,
+    ) {
+        let display_name = name.trim();
+        let value = value.trim();
+
+        let result = match kind {
+            DeliverableKind::File => {
+                if value.is_empty() {
+                    self.error_message = Some("File path is required".to_string());
+                    return;
+                }
+                let path = PathBuf::from(value);
+                let display = if display_name.is_empty() {
+                    None
+                } else {
+                    Some(display_name)
+                };
+                self.api_call(
+                    self.client
+                        .create_file_deliverable_from_path(&goal_id, &path, display),
+                )
+                .map(|resp| resp.data.id)
+            }
+            DeliverableKind::Document => {
+                if value.is_empty() {
+                    self.error_message = Some("Content file path is required".to_string());
+                    return;
+                }
+                let path = PathBuf::from(value);
+                let content = match std::fs::read_to_string(&path) {
+                    Ok(content) => content,
+                    Err(e) => {
+                        self.error_message = Some(format!(
+                            "Failed to read content file {}: {e}",
+                            path.display()
+                        ));
+                        return;
+                    }
+                };
+                let display = if display_name.is_empty() {
+                    match path.file_name().and_then(|s| s.to_str()) {
+                        Some(file_name) => file_name.to_string(),
+                        None => {
+                            self.error_message = Some("Name is required".to_string());
+                            return;
+                        }
+                    }
+                } else {
+                    display_name.to_string()
+                };
+                self.api_call(
+                    self.client
+                        .create_document_deliverable(&goal_id, &display, &content),
+                )
+                .map(|resp| resp.data.id)
+            }
+            DeliverableKind::Link => {
+                if display_name.is_empty() || value.is_empty() {
+                    self.error_message = Some("Name and URL are required".to_string());
+                    return;
+                }
+                self.api_call(
+                    self.client
+                        .create_link_deliverable(&goal_id, value, display_name),
+                )
+                .map(|resp| resp.data.id)
+            }
+            DeliverableKind::Folder => {
+                if display_name.is_empty() {
+                    self.error_message = Some("Name is required".to_string());
+                    return;
+                }
+                self.api_call(
+                    self.client
+                        .create_folder_deliverable(&goal_id, display_name),
+                )
+                .map(|resp| resp.data.id)
+            }
+        };
+
+        match result {
+            Ok(id) => {
+                self.success_message = Some(format!("Deliverable added: {id}"));
+                self.reload_deliverables_for_goal(&goal_id);
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Failed to add deliverable: {e}"));
+            }
+        }
+    }
+
+    fn modal_submit_update_deliverable(
+        &mut self,
+        goal_id: String,
+        deliverable_id: String,
+        content_file: String,
+    ) {
+        let path = PathBuf::from(content_file.trim());
+        if path.as_os_str().is_empty() {
+            self.error_message = Some("Content file path is required".to_string());
+            return;
+        }
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(e) => {
+                self.error_message = Some(format!(
+                    "Failed to read content file {}: {e}",
+                    path.display()
+                ));
+                return;
+            }
+        };
+
+        match self.api_call(self.client.update_deliverable(
+            &goal_id,
+            &deliverable_id,
+            &content,
+            vec![],
+        )) {
+            Ok(_) => {
+                self.success_message = Some("Deliverable updated".to_string());
+                self.reload_deliverables_for_goal(&goal_id);
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Failed to update deliverable: {e}"));
+            }
+        }
+    }
+
+    fn modal_submit_rename_deliverable(
+        &mut self,
+        goal_id: String,
+        deliverable_id: String,
+        name: String,
+    ) {
+        let name = name.trim();
+        if name.is_empty() {
+            self.error_message = Some("Name is required".to_string());
+            return;
+        }
+
+        match self.api_call(
+            self.client
+                .rename_deliverable(&goal_id, &deliverable_id, name),
+        ) {
+            Ok(_) => {
+                self.success_message = Some("Deliverable renamed".to_string());
+                self.reload_deliverables_for_goal(&goal_id);
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Failed to rename deliverable: {e}"));
+            }
+        }
+    }
+
+    fn modal_submit_move_deliverable(
+        &mut self,
+        goal_id: String,
+        deliverable_id: String,
+        parent: Option<String>,
+    ) {
+        match self.api_call(
+            self.client
+                .move_deliverable(&goal_id, &deliverable_id, parent, 0.0),
+        ) {
+            Ok(_) => {
+                self.success_message = Some("Deliverable moved".to_string());
+                self.reload_deliverables_for_goal(&goal_id);
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Failed to move deliverable: {e}"));
+            }
+        }
+    }
+
+    fn modal_submit_delete_deliverable(&mut self, goal_id: String, deliverable_id: String) {
+        match self.api_call(self.client.delete_deliverable(&goal_id, &deliverable_id)) {
+            Ok(_) => {
+                self.success_message = Some("Deliverable deleted".to_string());
+                self.reload_deliverables_for_goal(&goal_id);
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Failed to delete deliverable: {e}"));
+            }
+        }
+    }
+
     fn modal_next_status(&mut self) {
         if let Some(ModalState::EditGoal {
             selected_status_index,
@@ -1119,6 +1842,74 @@ impl App {
                 allowed_statuses.len() - 1
             } else {
                 *selected_status_index - 1
+            };
+        }
+    }
+
+    fn modal_next_deliverable_kind(&mut self) {
+        if let Some(ModalState::AddDeliverable { kind, .. }) = &mut self.modal_state {
+            *kind = kind.next();
+        }
+    }
+
+    fn modal_prev_deliverable_kind(&mut self) {
+        if let Some(ModalState::AddDeliverable { kind, .. }) = &mut self.modal_state {
+            *kind = kind.prev();
+        }
+    }
+
+    fn modal_menu_next(&mut self) {
+        if let Some(ModalState::ActionMenu {
+            selected_index,
+            items,
+            ..
+        }) = &mut self.modal_state
+            && !items.is_empty()
+        {
+            *selected_index = (*selected_index + 1) % items.len();
+        }
+    }
+
+    fn modal_menu_prev(&mut self) {
+        if let Some(ModalState::ActionMenu {
+            selected_index,
+            items,
+            ..
+        }) = &mut self.modal_state
+            && !items.is_empty()
+        {
+            *selected_index = if *selected_index == 0 {
+                items.len() - 1
+            } else {
+                *selected_index - 1
+            };
+        }
+    }
+
+    fn modal_move_target_next(&mut self) {
+        if let Some(ModalState::MoveDeliverable {
+            selected_index,
+            targets,
+            ..
+        }) = &mut self.modal_state
+            && !targets.is_empty()
+        {
+            *selected_index = (*selected_index + 1) % targets.len();
+        }
+    }
+
+    fn modal_move_target_prev(&mut self) {
+        if let Some(ModalState::MoveDeliverable {
+            selected_index,
+            targets,
+            ..
+        }) = &mut self.modal_state
+            && !targets.is_empty()
+        {
+            *selected_index = if *selected_index == 0 {
+                targets.len() - 1
+            } else {
+                *selected_index - 1
             };
         }
     }

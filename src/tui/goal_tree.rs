@@ -128,6 +128,51 @@ pub struct GoalTree {
     pub is_required_to_fetch: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreeGuide {
+    depth: usize,
+    ancestor_has_next: Vec<bool>,
+    is_last: bool,
+}
+
+impl TreeGuide {
+    fn root(is_last: bool) -> Self {
+        Self {
+            depth: 0,
+            ancestor_has_next: Vec::new(),
+            is_last,
+        }
+    }
+
+    fn child(&self, is_last: bool) -> Self {
+        let mut ancestor_has_next = self.ancestor_has_next.clone();
+        ancestor_has_next.push(!self.is_last);
+
+        Self {
+            depth: self.depth + 1,
+            ancestor_has_next,
+            is_last,
+        }
+    }
+
+    pub fn depth(&self) -> usize {
+        self.depth
+    }
+
+    pub fn prefix(&self) -> String {
+        let mut prefix = String::new();
+        for has_next in &self.ancestor_has_next {
+            prefix.push_str(if *has_next { "│   " } else { "    " });
+        }
+        prefix.push_str(if self.is_last {
+            "└── "
+        } else {
+            "├── "
+        });
+        prefix
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TreeRow – one flattened row for rendering
 // ---------------------------------------------------------------------------
@@ -145,6 +190,7 @@ pub enum TreeRow<'a> {
         comments_loaded: bool,
         deliverables_loaded: bool,
         depth: usize,
+        guide: TreeGuide,
     },
     Detail {
         status: Option<&'a GoalStatus>,
@@ -152,26 +198,32 @@ pub enum TreeRow<'a> {
         is_completed: bool,
         description: Option<&'a str>,
         depth: usize,
+        guide: TreeGuide,
     },
     CommentHeader {
         count: usize,
         depth: usize,
+        guide: TreeGuide,
     },
     CommentOmitted {
         count: usize,
         depth: usize,
+        guide: TreeGuide,
     },
     CommentItem {
         comment: &'a Comment,
         depth: usize,
+        guide: TreeGuide,
     },
     DeliverableHeader {
         count: usize,
         depth: usize,
+        guide: TreeGuide,
     },
     DeliverableItem {
         deliverable: &'a Deliverable,
         depth: usize,
+        guide: TreeGuide,
     },
 }
 
@@ -367,8 +419,10 @@ impl GoalTree {
 impl GoalTree {
     pub fn flatten(&self) -> Vec<TreeRow<'_>> {
         let mut rows = Vec::new();
-        for root in &self.roots {
-            flatten_node(root, 0, &mut rows);
+        let root_count = self.roots.len();
+        for (idx, root) in self.roots.iter().enumerate() {
+            let guide = TreeGuide::root(idx + 1 == root_count);
+            flatten_node(root, guide, &mut rows);
         }
         rows
     }
@@ -524,7 +578,7 @@ fn comment_row_count(comments: &Option<Timestamped<Vec<Comment>>>, limit: usize)
 
 fn flatten_node<'a, S: GoalItemAccessor>(
     node: &'a GoalNodeInner<S>,
-    depth: usize,
+    guide: TreeGuide,
     rows: &mut Vec<TreeRow<'a>>,
 ) {
     rows.push(TreeRow::Goal {
@@ -538,21 +592,26 @@ fn flatten_node<'a, S: GoalItemAccessor>(
         children_loaded: node.children.is_some(),
         comments_loaded: node.comments.is_some(),
         deliverables_loaded: node.deliverables.is_some(),
-        depth,
+        depth: guide.depth(),
+        guide: guide.clone(),
     });
 
     if !node.expanded {
         return;
     }
 
-    let child_depth = depth + 1;
+    let has_comments = node.comments.is_some();
+    let has_deliverables = node.deliverables.is_some();
+    let has_children = node.children.as_ref().is_some_and(|ts| !ts.data.is_empty());
 
+    let detail_guide = guide.child(!has_comments && !has_deliverables && !has_children);
     rows.push(TreeRow::Detail {
         status: node.node.status(),
         owner_name: node.node.owner().map(|o| o.name.as_str()),
         is_completed: node.node.is_completed(),
         description: node.node.description(),
-        depth: child_depth,
+        depth: detail_guide.depth(),
+        guide: detail_guide,
     });
 
     if let Some(ref ts) = node.comments {
@@ -561,49 +620,61 @@ fn flatten_node<'a, S: GoalItemAccessor>(
             ts.data.iter().filter(|c| c.resolved_at.is_none()).collect();
 
         let total_unresolved = unresolved_comments.len();
+        let display_count = total_unresolved.min(node.comment_display_limit);
+        let omitted_count = total_unresolved.saturating_sub(node.comment_display_limit);
+        let comment_guide = guide.child(!has_deliverables && !has_children);
 
         rows.push(TreeRow::CommentHeader {
             count: total_unresolved,
-            depth: child_depth,
+            depth: comment_guide.depth(),
+            guide: comment_guide.clone(),
         });
 
         // Sort by created_at descending (newest first)
         unresolved_comments.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
-        let display_count = total_unresolved.min(node.comment_display_limit);
-        let omitted_count = total_unresolved.saturating_sub(node.comment_display_limit);
-
         if omitted_count > 0 {
+            let omitted_guide = comment_guide.child(display_count == 0);
             rows.push(TreeRow::CommentOmitted {
                 count: omitted_count,
-                depth: child_depth + 1,
+                depth: omitted_guide.depth(),
+                guide: omitted_guide,
             });
         }
 
-        for comment in unresolved_comments.iter().take(display_count) {
+        for (idx, comment) in unresolved_comments.iter().take(display_count).enumerate() {
+            let item_guide = comment_guide.child(idx + 1 == display_count);
             rows.push(TreeRow::CommentItem {
                 comment,
-                depth: child_depth + 1,
+                depth: item_guide.depth(),
+                guide: item_guide,
             });
         }
     }
 
     if let Some(ref ts) = node.deliverables {
+        let deliverable_count = ts.data.len();
+        let deliverable_guide = guide.child(!has_children);
         rows.push(TreeRow::DeliverableHeader {
-            count: ts.data.len(),
-            depth: child_depth,
+            count: deliverable_count,
+            depth: deliverable_guide.depth(),
+            guide: deliverable_guide.clone(),
         });
-        for deliverable in &ts.data {
+        for (idx, deliverable) in ts.data.iter().enumerate() {
+            let item_guide = deliverable_guide.child(idx + 1 == deliverable_count);
             rows.push(TreeRow::DeliverableItem {
                 deliverable,
-                depth: child_depth + 1,
+                depth: item_guide.depth(),
+                guide: item_guide,
             });
         }
     }
 
     if let Some(ref ts) = node.children {
-        for child in &ts.data {
-            flatten_node(child, depth + 1, rows);
+        let child_count = ts.data.len();
+        for (idx, child) in ts.data.iter().enumerate() {
+            let child_guide = guide.child(idx + 1 == child_count);
+            flatten_node(child, child_guide, rows);
         }
     }
 }

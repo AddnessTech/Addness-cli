@@ -33,9 +33,19 @@ pub struct CreateOrganizationRequest {
     /// PERSONAL or BUSINESS. Backend requires this field.
     #[serde(rename = "type")]
     pub organization_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logo_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_type: Option<String>,
     /// Required when organization_type is BUSINESS. One of SOLO, 2_5, 6_20, 21_50, 50_PLUS.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub team_scale: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub industry: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phone_number: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub browser_timezone: Option<String>,
 }
 
 // PUT/PATCH /api/v2/organizations/:id

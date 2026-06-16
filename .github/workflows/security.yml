@@ -1,0 +1,58 @@
+name: Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  secret-patterns:
+    name: secret patterns
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan for obvious committed secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          found=0
+          patterns=(
+            'AKIA[0-9A-Z]{16}'
+            'gh[pousr]_[A-Za-z0-9_]{36,}'
+            'xox[baprs]-[A-Za-z0-9-]{20,}'
+            'sk-[A-Za-z0-9_-]{20,}'
+            'eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}'
+            '-----BEGIN (RSA|DSA|EC|OPENSSH|PRIVATE) KEY-----'
+          )
+
+          for pattern in "${patterns[@]}"; do
+            if git grep -nI -E -e "$pattern" -- . ':!Cargo.lock' ':!README.md' ':!docs/OPEN_SOURCE_CHECKLIST.md'; then
+              found=1
+            fi
+          done
+
+          if [ "$found" -ne 0 ]; then
+            echo "::error::Potential secret pattern found. Remove it or add a targeted exception with maintainer review."
+            exit 1
+          fi

@@ -1,2 +1,14 @@
 /target
 CLAUDE.md
+
+# Local machine and editor state
+.DS_Store
+*.log
+
+# Local secrets and credentials
+.env
+.env.*
+!.env.example
+.claude/settings.local.json
+.addness/
+tmp-addness/

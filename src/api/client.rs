@@ -8,6 +8,9 @@ mod kpi;
 mod member;
 mod org;
 
+pub use comment::ListCommentsParams;
+pub use org::CreateOrganizationParams;
+
 use anyhow::{Context, Result};
 use reqwest::Client;
 use reqwest::StatusCode;
@@ -249,6 +252,34 @@ impl ApiClient {
         }
 
         let response = req
+            .send()
+            .await
+            .with_context(|| format!("Failed to send request to {url}"))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(Self::api_error(status, &body));
+        }
+
+        response
+            .json::<T>()
+            .await
+            .with_context(|| format!("Failed to parse response from {url}"))
+    }
+
+    /// x-organization-id ヘッダーなしでPOSTリクエストを発行する。
+    /// 組織作成など、まだ対象組織が存在しない操作で使用。
+    pub(super) async fn post_without_org<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        let url = format!("{}{}", self.base_url, path);
+        let response = self
+            .client
+            .post(&url)
+            .json(body)
             .send()
             .await
             .with_context(|| format!("Failed to send request to {url}"))?;

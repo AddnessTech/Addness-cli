@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use clap::Subcommand;
 
-use crate::api::{ApiClient, OrganizationsResponse};
+use crate::api::{ApiClient, CreateOrganizationParams, OrganizationsResponse};
 use crate::cli::output::print_organizations_table;
 use crate::config::{Credentials, Settings};
 
@@ -35,6 +35,24 @@ pub enum OrgCommands {
         /// Team scale (required for BUSINESS): SOLO, 2_5, 6_20, 21_50, 50_PLUS
         #[arg(long)]
         team_scale: Option<String>,
+        /// Plan type: FREE, PACKAGE, or SUBSCRIPTION
+        #[arg(long)]
+        plan_type: Option<String>,
+        /// Industry text
+        #[arg(long)]
+        industry: Option<String>,
+        /// Phone number
+        #[arg(long)]
+        phone_number: Option<String>,
+        /// Browser timezone for initial organization settings (default Asia/Tokyo on API)
+        #[arg(long = "timezone")]
+        browser_timezone: Option<String>,
+        /// Logo URL
+        #[arg(long)]
+        logo_url: Option<String>,
+        /// Switch current organization to the created organization
+        #[arg(long)]
+        switch: bool,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -144,6 +162,12 @@ pub async fn handle_org(cmd: &OrgCommands, client: &ApiClient) -> Result<()> {
             name,
             r#type,
             team_scale,
+            plan_type,
+            industry,
+            phone_number,
+            browser_timezone,
+            logo_url,
+            switch,
             json,
         } => {
             let upper_type = r#type.to_uppercase();
@@ -151,18 +175,62 @@ pub async fn handle_org(cmd: &OrgCommands, client: &ApiClient) -> Result<()> {
                 "PERSONAL" | "BUSINESS" => {}
                 _ => bail!("Invalid --type '{type}'. Use PERSONAL or BUSINESS."),
             }
-            if upper_type == "BUSINESS" && team_scale.is_none() {
+            let normalized_team_scale = team_scale
+                .as_ref()
+                .map(|scale| scale.trim().to_uppercase())
+                .filter(|scale| !scale.is_empty());
+            if upper_type == "BUSINESS" && normalized_team_scale.is_none() {
                 bail!(
                     "--team-scale is required for BUSINESS (one of SOLO, 2_5, 6_20, 21_50, 50_PLUS)"
                 );
             }
+            if let Some(scale) = &normalized_team_scale {
+                match scale.as_str() {
+                    "SOLO" | "2_5" | "6_20" | "21_50" | "50_PLUS" => {}
+                    _ => bail!(
+                        "Invalid --team-scale '{scale}'. Use SOLO, 2_5, 6_20, 21_50, or 50_PLUS."
+                    ),
+                }
+            }
+            let normalized_plan_type = plan_type
+                .as_ref()
+                .map(|plan| plan.trim().to_uppercase())
+                .filter(|plan| !plan.is_empty());
+            if let Some(plan) = &normalized_plan_type {
+                match plan.as_str() {
+                    "FREE" | "PACKAGE" | "SUBSCRIPTION" => {}
+                    _ => bail!("Invalid --plan-type '{plan}'. Use FREE, PACKAGE, or SUBSCRIPTION."),
+                }
+            }
             let resp = client
-                .create_organization(name, &upper_type, team_scale.clone())
+                .create_organization(CreateOrganizationParams {
+                    name: name.clone(),
+                    organization_type: upper_type,
+                    team_scale: normalized_team_scale,
+                    plan_type: normalized_plan_type,
+                    industry: non_empty(industry),
+                    phone_number: non_empty(phone_number),
+                    browser_timezone: non_empty(browser_timezone),
+                    logo_url: non_empty(logo_url),
+                })
                 .await?;
+
+            if *switch {
+                let created_org_id = resp.data.id.clone();
+                copy_current_token_for_created_org(&created_org_id)?;
+                let mut settings = Settings::load()?;
+                settings.set_current_organization_id(created_org_id.clone())?;
+            }
+
             if *json {
                 println!("{}", serde_json::to_string_pretty(&resp)?);
             } else {
                 println!("Organization created: {name} ({})", resp.data.id);
+                if *switch {
+                    println!("Switched to organization: {}", resp.data.id);
+                } else {
+                    println!("Switch with: addness org switch {}", resp.data.id);
+                }
             }
             Ok(())
         }
@@ -208,6 +276,35 @@ pub async fn handle_org(cmd: &OrgCommands, client: &ApiClient) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn non_empty(value: &Option<String>) -> Option<String> {
+    value
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn copy_current_token_for_created_org(created_org_id: &str) -> Result<()> {
+    let Some(mut creds) = Credentials::load()? else {
+        return Ok(());
+    };
+    if creds.has_token_for_org(created_org_id) {
+        return Ok(());
+    }
+
+    let settings = Settings::load()?;
+    let token = settings
+        .current_organization_id()
+        .and_then(|id| creds.token_for_org(id))
+        .or_else(|| creds.any_token())
+        .map(|token| token.to_string());
+
+    if let Some(token) = token {
+        creds.set_token(created_org_id.to_string(), token);
+        creds.save()?;
+    }
+    Ok(())
 }
 
 pub fn resolve_org_id(flag: Option<&str>) -> Result<String> {

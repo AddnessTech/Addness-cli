@@ -1,5 +1,9 @@
 # Addness CLI
 
+<p align="center">
+  <img src="assets/addness-cli-demo.gif" alt="Addness CLI demo" width="900">
+</p>
+
 Addness CLI is a terminal interface for working with Addness from local development environments, scripts, and AI coding agents.
 
 Use it to inspect goals, update progress, write comments, switch organizations, and connect pull requests back to Addness without leaving the command line.

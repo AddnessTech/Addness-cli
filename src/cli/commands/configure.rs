@@ -128,7 +128,7 @@ pub fn handle_status(json: bool) -> Result<()> {
                     println!("  Organization: {}", id);
                     if creds.token_for_org(id).is_none() {
                         println!(
-                            "  Warning: No API key for this organization. Run 'addness login' to authenticate."
+                            "  Warning: No API key for this organization. Run 'addness login' to authenticate this org, or 'addness configure' if you have a key for it."
                         );
                     }
                 }
@@ -145,7 +145,9 @@ pub fn handle_status(json: bool) -> Result<()> {
                 let output = serde_json::json!({ "authenticated": false });
                 println!("{}", serde_json::to_string_pretty(&output)?);
             } else {
-                println!("Not configured. Run: addness configure");
+                println!(
+                    "Not configured. Run: addness login (or 'addness configure' if you already have an API key)."
+                );
             }
         }
     }

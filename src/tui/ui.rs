@@ -9,7 +9,7 @@ use ratatui::{
 use std::collections::HashMap;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::app::{ActivePane, App, FormField, ModalState};
+use super::app::{ActivePane, App, DeliverableFormField, FormField, ModalState};
 use super::goal_tree::TreeRow;
 use crate::api::{DeliverableType, GoalStatus, Member, MemberId};
 
@@ -89,9 +89,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Draw modals last (on top of everything)
     if let Some(ref modal) = app.modal_state {
         match modal {
+            ModalState::ActionMenu { .. } => draw_action_menu(frame, app),
             ModalState::CreateGoal { .. } => draw_create_goal_modal(frame, app),
             ModalState::EditGoal { .. } => draw_edit_goal_modal(frame, app),
             ModalState::DeleteGoal { .. } => draw_delete_goal_modal(frame, app),
+            ModalState::AddDeliverable { .. } => draw_add_deliverable_modal(frame, app),
+            ModalState::UpdateDeliverable { .. } => draw_update_deliverable_modal(frame, app),
+            ModalState::RenameDeliverable { .. } => draw_rename_deliverable_modal(frame, app),
+            ModalState::MoveDeliverable { .. } => draw_move_deliverable_modal(frame, app),
+            ModalState::DeleteDeliverable { .. } => draw_delete_deliverable_modal(frame, app),
         }
     }
 }
@@ -648,6 +654,20 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ));
         hints.push(Span::raw(": Delete  "));
+        hints.push(Span::styled(
+            "o/Space",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        hints.push(Span::raw(": Actions  "));
+        hints.push(Span::styled(
+            "a/u/r/m/x",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        hints.push(Span::raw(": Direct  "));
     }
 
     hints.push(Span::styled("|", Style::default().fg(Color::DarkGray)));
@@ -1021,6 +1041,403 @@ fn draw_delete_goal_modal(frame: &mut Frame, app: &App) {
     ]);
 
     frame.render_widget(Paragraph::new(buttons), layout[3]);
+}
+
+fn draw_action_menu(frame: &mut Frame, app: &App) {
+    let Some(ModalState::ActionMenu {
+        title,
+        items,
+        selected_index,
+    }) = &app.modal_state
+    else {
+        return;
+    };
+
+    let height = (items.len() as u16 + 4).max(7);
+    let area = centered_rect(48, height, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Actions ")
+        .title_bottom(
+            Line::from(" j/k: Select | Enter: Open | Esc: Cancel ")
+                .style(Style::default().fg(Color::DarkGray)),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(0)])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            truncate_str(title, layout[0].width as usize),
+            Style::default().fg(Color::DarkGray),
+        ))),
+        layout[0],
+    );
+
+    let rows: Vec<ListItem> = items
+        .iter()
+        .enumerate()
+        .map(|(idx, item)| {
+            let selected = idx == *selected_index;
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let prefix = if selected { " > " } else { "   " };
+            ListItem::new(Line::from(Span::styled(
+                format!("{prefix}{}", item.label()),
+                style,
+            )))
+        })
+        .collect();
+    frame.render_widget(List::new(rows), layout[1]);
+}
+
+fn draw_add_deliverable_modal(frame: &mut Frame, app: &App) {
+    let Some(ModalState::AddDeliverable {
+        goal_title,
+        kind,
+        name,
+        value,
+        current_field,
+        ..
+    }) = &app.modal_state
+    else {
+        return;
+    };
+
+    let area = centered_rect(64, 17, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Add Deliverable ")
+        .title_bottom(
+            Line::from(" Tab: Next Field | ↑↓: Kind | Enter: Add | Esc: Cancel ")
+                .style(Style::default().fg(Color::DarkGray)),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Goal: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(goal_title.as_str(), Style::default().fg(Color::White)),
+        ])),
+        layout[0],
+    );
+
+    draw_readonly_field(
+        frame,
+        layout[1],
+        " Kind ",
+        kind.label(),
+        *current_field == DeliverableFormField::Kind,
+    );
+    draw_text_field(
+        frame,
+        layout[2],
+        " Name ",
+        name,
+        *current_field == DeliverableFormField::Name,
+    );
+    let value_title = match kind {
+        super::app::DeliverableKind::File => " File Path * ",
+        super::app::DeliverableKind::Document => " Content File Path * ",
+        super::app::DeliverableKind::Link => " URL * ",
+        super::app::DeliverableKind::Folder => " Value (unused) ",
+    };
+    draw_text_field(
+        frame,
+        layout[3],
+        value_title,
+        value,
+        *current_field == DeliverableFormField::Value,
+    );
+}
+
+fn draw_update_deliverable_modal(frame: &mut Frame, app: &App) {
+    let Some(ModalState::UpdateDeliverable {
+        deliverable_name,
+        content_file,
+        ..
+    }) = &app.modal_state
+    else {
+        return;
+    };
+
+    let area = centered_rect(60, 10, frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Update Document Deliverable ")
+        .title_bottom(
+            Line::from(" Enter: Update | Esc: Cancel ").style(Style::default().fg(Color::DarkGray)),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Deliverable: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(deliverable_name.as_str(), Style::default().fg(Color::White)),
+        ])),
+        layout[0],
+    );
+    draw_text_field(
+        frame,
+        layout[1],
+        " Content File Path * ",
+        content_file,
+        true,
+    );
+}
+
+fn draw_rename_deliverable_modal(frame: &mut Frame, app: &App) {
+    let Some(ModalState::RenameDeliverable {
+        current_name, name, ..
+    }) = &app.modal_state
+    else {
+        return;
+    };
+
+    let area = centered_rect(60, 10, frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Rename Deliverable ")
+        .title_bottom(
+            Line::from(" Enter: Rename | Esc: Cancel ").style(Style::default().fg(Color::DarkGray)),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Current: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(current_name.as_str(), Style::default().fg(Color::White)),
+        ])),
+        layout[0],
+    );
+    draw_text_field(frame, layout[1], " New Name * ", name, true);
+}
+
+fn draw_move_deliverable_modal(frame: &mut Frame, app: &App) {
+    let Some(ModalState::MoveDeliverable {
+        deliverable_name,
+        targets,
+        selected_index,
+        ..
+    }) = &app.modal_state
+    else {
+        return;
+    };
+
+    let height = (targets.len() as u16 + 5).clamp(8, 18);
+    let area = centered_rect(62, height, frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Move Deliverable ")
+        .title_bottom(
+            Line::from(" j/k: Select Folder | Enter: Move | Esc: Cancel ")
+                .style(Style::default().fg(Color::DarkGray)),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(0)])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Deliverable: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(deliverable_name.as_str(), Style::default().fg(Color::White)),
+        ])),
+        layout[0],
+    );
+
+    let rows: Vec<ListItem> = targets
+        .iter()
+        .enumerate()
+        .map(|(idx, (_, label))| {
+            let selected = idx == *selected_index;
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let prefix = if selected { " > " } else { "   " };
+            ListItem::new(Line::from(Span::styled(format!("{prefix}{label}"), style)))
+        })
+        .collect();
+    frame.render_widget(List::new(rows), layout[1]);
+}
+
+fn draw_delete_deliverable_modal(frame: &mut Frame, app: &App) {
+    let Some(ModalState::DeleteDeliverable {
+        deliverable_name,
+        confirm_index,
+        ..
+    }) = &app.modal_state
+    else {
+        return;
+    };
+
+    let area = centered_rect(60, 10, frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .title(" Delete Deliverable ")
+        .title_bottom(
+            Line::from(" ←→/hl: Select | Enter: Apply | Esc: Cancel ")
+                .style(Style::default().fg(Color::DarkGray)),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Delete: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                deliverable_name.as_str(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])),
+        layout[0],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "This cannot be undone.",
+            Style::default().fg(Color::Red),
+        ))),
+        layout[1],
+    );
+    draw_confirm_buttons(frame, layout[3], *confirm_index, "Cancel", "Delete");
+}
+
+fn draw_text_field(frame: &mut Frame, area: Rect, title: &str, text: &str, focused: bool) {
+    let border = if focused {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
+    let widget = Paragraph::new(text.to_string()).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border))
+            .title(title.to_string()),
+    );
+    frame.render_widget(widget, area);
+}
+
+fn draw_readonly_field(frame: &mut Frame, area: Rect, title: &str, text: &str, focused: bool) {
+    let border = if focused {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
+    let widget = Paragraph::new(Line::from(Span::styled(
+        text.to_string(),
+        Style::default().fg(Color::White),
+    )))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border))
+            .title(title.to_string()),
+    );
+    frame.render_widget(widget, area);
+}
+
+fn draw_confirm_buttons(
+    frame: &mut Frame,
+    area: Rect,
+    selected: usize,
+    cancel_label: &str,
+    confirm_label: &str,
+) {
+    let cancel_style = if selected == 0 {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let confirm_style = if selected == 1 {
+        Style::default()
+            .fg(Color::White)
+            .bg(Color::Red)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Red)
+    };
+
+    let buttons = Paragraph::new(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(format!(" [ {cancel_label} ] "), cancel_style),
+        Span::raw("    "),
+        Span::styled(format!(" [ {confirm_label} ] "), confirm_style),
+    ]));
+    frame.render_widget(buttons, area);
 }
 
 fn draw_members(frame: &mut Frame, area: Rect, app: &mut App, border_color: Color) {

@@ -28,6 +28,15 @@ pub struct Comment {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CommentDetail {
+    #[serde(flatten)]
+    pub comment: Comment,
+    #[serde(default)]
+    pub replies: Vec<Comment>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CommentAuthor {
     pub id: String,
     pub name: String,
@@ -44,6 +53,8 @@ pub struct CreateCommentRequest {
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<String>,
 }
 
 // PUT /v1/team/comments/:id

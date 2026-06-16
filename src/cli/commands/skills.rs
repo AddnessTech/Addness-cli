@@ -95,10 +95,31 @@ addness goal update <GOAL_ID> --status NOT_STARTED --title "タイトル変更" 
 # ゴールへのコメント一覧
 addness comment list --goal <GOAL_ID>
 addness comment list --goal <GOAL_ID> --json
+addness comment list --goal <GOAL_ID> --resolved false --include-replies
+
+# コメント詳細
+addness comment get <COMMENT_ID>
+addness comment get <COMMENT_ID> --json
 
 # コメントを投稿
 addness comment create --goal <GOAL_ID> --body "進捗報告です"
 addness comment create --goal <GOAL_ID> --body "完了しました" --json
+addness comment create --goal <GOAL_ID> --body-file ./comment.md
+printf "確認お願いします" | addness comment create --goal <GOAL_ID> --body -
+addness comment create --goal <GOAL_ID> --parent <COMMENT_ID> --body "返信です"
+
+# コメント編集・削除・解決
+addness comment update <COMMENT_ID> --body "更新後の本文"
+addness comment delete <COMMENT_ID> --force
+addness comment resolve <COMMENT_ID>
+```
+
+## 組織
+
+```bash
+# 組織作成
+addness org create --name "新しい組織" --type PERSONAL
+addness org create --name "新しい会社" --type BUSINESS --team-scale 2_5 --switch
 ```
 
 ## PRリンク・進捗記録

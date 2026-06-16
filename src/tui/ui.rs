@@ -7,6 +7,7 @@ use ratatui::{
 };
 
 use std::collections::HashMap;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{ActivePane, App, FormField, ModalState};
 use super::goal_tree::TreeRow;
@@ -277,11 +278,11 @@ fn render_tree_row(
             owner_name,
             is_completed,
             expanded,
-            depth,
+            guide,
             ..
         } => {
-            let indent = "  ".repeat(*depth);
-            let icon = if *expanded { "- " } else { "+ " };
+            let prefix = guide.prefix();
+            let icon = if *expanded { "▾ " } else { "▸ " };
 
             let status_str = format_status(*is_completed, *status);
             let owner_str = owner_name.unwrap_or("");
@@ -297,10 +298,8 @@ fn render_tree_row(
             };
 
             let mut spans = vec![
-                Span::styled(
-                    format!("{indent}{icon}"),
-                    Style::default().fg(Color::Cyan).bg(bg),
-                ),
+                Span::styled(prefix, Style::default().fg(Color::DarkGray).bg(bg)),
+                Span::styled(icon, Style::default().fg(Color::Cyan).bg(bg)),
                 Span::styled(title.to_string(), title_style),
             ];
 
@@ -315,13 +314,8 @@ fn render_tree_row(
 
             // Pad to full width for cursor highlight
             if is_cursor {
-                let content_len: usize = spans.iter().map(|s| s.content.len()).sum();
-                if content_len < width {
-                    spans.push(Span::styled(
-                        " ".repeat(width - content_len),
-                        Style::default().bg(bg),
-                    ));
-                }
+                let content_width = spans_display_width(&spans);
+                pad_line(&mut spans, content_width, width, bg);
             }
 
             Line::from(spans)
@@ -331,62 +325,66 @@ fn render_tree_row(
             owner_name,
             description,
             is_completed,
-            depth,
+            guide,
+            ..
         } => {
-            let indent = "  ".repeat(*depth);
+            let prefix = guide.prefix();
             let status_str = format_status(*is_completed, *status);
             let owner_str = owner_name.unwrap_or("-");
             let desc = description.unwrap_or("");
 
             let text = if desc.is_empty() {
-                format!("{indent}  {status_str} | {owner_str}")
+                format!("{status_str} | {owner_str}")
             } else {
-                format!("{indent}  {status_str} | {owner_str} | {desc}")
+                format!("{status_str} | {owner_str} | {desc}")
             };
 
-            let mut spans = vec![Span::styled(
-                text.clone(),
-                Style::default().fg(Color::DarkGray).bg(bg),
-            )];
+            let mut spans = vec![
+                Span::styled(prefix, Style::default().fg(Color::DarkGray).bg(bg)),
+                Span::styled(text, Style::default().fg(Color::DarkGray).bg(bg)),
+            ];
             if is_cursor {
-                pad_line(&mut spans, text.len(), width, bg);
+                let content_width = spans_display_width(&spans);
+                pad_line(&mut spans, content_width, width, bg);
             }
             Line::from(spans)
         }
-        TreeRow::CommentHeader { count, depth } => {
-            let indent = "  ".repeat(*depth);
+        TreeRow::CommentHeader { count, guide, .. } => {
+            let prefix = guide.prefix();
             let text = format!(
-                "{indent}  \u{1F4DD} {count} comment{}",
+                "\u{1F4DD} {count} comment{}",
                 if *count != 1 { "s" } else { "" }
             );
 
-            let mut spans = vec![Span::styled(
-                text.clone(),
-                Style::default().fg(Color::Yellow).bg(bg),
-            )];
+            let mut spans = vec![
+                Span::styled(prefix, Style::default().fg(Color::DarkGray).bg(bg)),
+                Span::styled(text, Style::default().fg(Color::Yellow).bg(bg)),
+            ];
             if is_cursor {
-                pad_line(&mut spans, text.len(), width, bg);
+                let content_width = spans_display_width(&spans);
+                pad_line(&mut spans, content_width, width, bg);
             }
             Line::from(spans)
         }
-        TreeRow::CommentOmitted { count, depth } => {
-            let indent = "  ".repeat(*depth);
+        TreeRow::CommentOmitted { count, guide, .. } => {
+            let prefix = guide.prefix();
             let text = format!(
-                "{indent}  ... {count} older comment{} hidden",
+                "... {count} older comment{} hidden",
                 if *count != 1 { "s" } else { "" }
             );
 
-            let mut spans = vec![Span::styled(
-                text.clone(),
-                Style::default().fg(Color::DarkGray).bg(bg),
-            )];
+            let mut spans = vec![
+                Span::styled(prefix, Style::default().fg(Color::DarkGray).bg(bg)),
+                Span::styled(text, Style::default().fg(Color::DarkGray).bg(bg)),
+            ];
             if is_cursor {
-                pad_line(&mut spans, text.len(), width, bg);
+                let content_width = spans_display_width(&spans);
+                pad_line(&mut spans, content_width, width, bg);
             }
             Line::from(spans)
         }
-        TreeRow::CommentItem { comment, depth } => {
-            let indent = "  ".repeat(*depth);
+        TreeRow::CommentItem { comment, guide, .. } => {
+            let prefix = guide.prefix();
             let author = &comment.author.name;
 
             // Replace @uuid mentions with @member_name
@@ -394,12 +392,13 @@ fn render_tree_row(
 
             let content = truncate_str(
                 &content_with_mentions,
-                width.saturating_sub(indent.len() + author.len() + 4),
+                width.saturating_sub(
+                    display_width(&prefix) + display_width(author) + display_width(": "),
+                ),
             );
-            let text_len = indent.len() + author.len() + 2 + content.len();
 
             let mut spans = vec![
-                Span::styled(format!("{indent}  "), Style::default().bg(bg)),
+                Span::styled(prefix, Style::default().fg(Color::DarkGray).bg(bg)),
                 Span::styled(
                     format!("{author}:"),
                     Style::default().fg(Color::Cyan).bg(bg),
@@ -410,42 +409,47 @@ fn render_tree_row(
                 ),
             ];
             if is_cursor {
-                pad_line(&mut spans, text_len + 1, width, bg);
+                let content_width = spans_display_width(&spans);
+                pad_line(&mut spans, content_width, width, bg);
             }
             Line::from(spans)
         }
-        TreeRow::DeliverableHeader { count, depth } => {
-            let indent = "  ".repeat(*depth);
+        TreeRow::DeliverableHeader { count, guide, .. } => {
+            let prefix = guide.prefix();
             let text = format!(
-                "{indent}  \u{1F4CE} {count} deliverable{}",
+                "\u{1F4CE} {count} deliverable{}",
                 if *count != 1 { "s" } else { "" }
             );
 
-            let mut spans = vec![Span::styled(
-                text.clone(),
-                Style::default().fg(Color::Magenta).bg(bg),
-            )];
+            let mut spans = vec![
+                Span::styled(prefix, Style::default().fg(Color::DarkGray).bg(bg)),
+                Span::styled(text, Style::default().fg(Color::Magenta).bg(bg)),
+            ];
             if is_cursor {
-                pad_line(&mut spans, text.len(), width, bg);
+                let content_width = spans_display_width(&spans);
+                pad_line(&mut spans, content_width, width, bg);
             }
             Line::from(spans)
         }
-        TreeRow::DeliverableItem { deliverable, depth } => {
-            let indent = "  ".repeat(*depth);
+        TreeRow::DeliverableItem {
+            deliverable, guide, ..
+        } => {
+            let prefix = guide.prefix();
             let icon = match deliverable.node_type {
                 DeliverableType::Document => "\u{1F4C4}",
                 DeliverableType::Folder => "\u{1F4C1}",
                 DeliverableType::File => "\u{1F4CE}",
                 DeliverableType::Link => "\u{1F517}",
             };
-            let text = format!("{indent}  {icon} {}", deliverable.display_name);
+            let text = format!("{icon} {}", deliverable.display_name);
 
-            let mut spans = vec![Span::styled(
-                text.clone(),
-                Style::default().fg(Color::White).bg(bg),
-            )];
+            let mut spans = vec![
+                Span::styled(prefix, Style::default().fg(Color::DarkGray).bg(bg)),
+                Span::styled(text, Style::default().fg(Color::White).bg(bg)),
+            ];
             if is_cursor {
-                pad_line(&mut spans, text.len(), width, bg);
+                let content_width = spans_display_width(&spans);
+                pad_line(&mut spans, content_width, width, bg);
             }
             Line::from(spans)
         }
@@ -474,17 +478,40 @@ fn format_goal_meta(status: &str, owner: &str) -> String {
 }
 
 fn truncate_str(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if display_width(s) <= max {
         s.to_string()
+    } else if max == 0 {
+        String::new()
     } else if max > 3 {
-        let end = s
-            .char_indices()
-            .nth(max - 3)
-            .map(|(i, _)| i)
-            .unwrap_or(s.len());
-        format!("{}...", &s[..end])
+        let mut out = String::new();
+        let mut width = 0;
+        let limit = max - 3;
+
+        for ch in s.chars() {
+            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if width + ch_width > limit {
+                break;
+            }
+            width += ch_width;
+            out.push(ch);
+        }
+
+        out.push_str("...");
+        out
     } else {
-        s.chars().take(max).collect()
+        let mut out = String::new();
+        let mut width = 0;
+
+        for ch in s.chars() {
+            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if width + ch_width > max {
+                break;
+            }
+            width += ch_width;
+            out.push(ch);
+        }
+
+        out
     }
 }
 
@@ -495,6 +522,17 @@ fn pad_line(spans: &mut Vec<Span<'static>>, content_len: usize, width: usize, bg
             Style::default().bg(bg),
         ));
     }
+}
+
+fn display_width(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
+}
+
+fn spans_display_width(spans: &[Span<'static>]) -> usize {
+    spans
+        .iter()
+        .map(|span| display_width(span.content.as_ref()))
+        .sum()
 }
 
 // ---------------------------------------------------------------------------

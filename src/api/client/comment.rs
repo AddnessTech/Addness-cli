@@ -1,24 +1,89 @@
 use std::collections::HashMap;
 
 use crate::api::{
-    ApiClient, ApiResponse, Comment, CommentsResponse, CreateCommentRequest, ReactionRequest,
-    UpdateCommentRequest,
+    ApiClient, ApiResponse, Comment, CommentDetail, CommentsResponse, CreateCommentRequest,
+    ReactionRequest, UpdateCommentRequest,
 };
 use anyhow::Result;
 
+#[derive(Default)]
+pub struct ListCommentsParams<'a> {
+    pub goal_id: &'a str,
+    pub parent_id: Option<&'a str>,
+    pub resolved: Option<bool>,
+    pub limit: Option<u16>,
+    pub offset: Option<u64>,
+    pub sort: Option<&'a str>,
+    pub include_replies: bool,
+}
+
 impl ApiClient {
     pub async fn list_comments(&self, goal_id: &str) -> Result<CommentsResponse> {
-        let path = format!("/api/v2/objectives/{goal_id}/comments");
+        self.list_comments_with_params(ListCommentsParams {
+            goal_id,
+            ..Default::default()
+        })
+        .await
+    }
+
+    pub async fn list_comments_with_params(
+        &self,
+        params: ListCommentsParams<'_>,
+    ) -> Result<CommentsResponse> {
+        let mut query = form_urlencoded::Serializer::new(String::new());
+        if let Some(parent_id) = params.parent_id {
+            query.append_pair("parentId", parent_id);
+        }
+        if let Some(resolved) = params.resolved {
+            query.append_pair("resolved", if resolved { "true" } else { "false" });
+        }
+        if let Some(limit) = params.limit {
+            query.append_pair("limit", &limit.to_string());
+        }
+        if let Some(offset) = params.offset {
+            query.append_pair("offset", &offset.to_string());
+        }
+        if let Some(sort) = params.sort {
+            query.append_pair("sort", sort);
+        }
+        if params.include_replies {
+            query.append_pair("include_replies", "true");
+        }
+        let query = query.finish();
+        let suffix = if query.is_empty() {
+            String::new()
+        } else {
+            format!("?{query}")
+        };
+        let path = format!("/api/v2/objectives/{}/comments{suffix}", params.goal_id);
         let resp: ApiResponse<CommentsResponse> = self.get(&path).await?;
         Ok(resp.data)
     }
 
+    pub async fn get_comment(&self, comment_id: &str) -> Result<CommentDetail> {
+        let path = format!("/api/v1/team/comments/{comment_id}");
+        let resp: ApiResponse<CommentDetail> = self.get(&path).await?;
+        Ok(resp.data)
+    }
+
     pub async fn create_comment(&self, goal_id: &str, body: &str) -> Result<Comment> {
+        self.create_comment_with_options(goal_id, body, None, Vec::new())
+            .await
+    }
+
+    pub async fn create_comment_with_options(
+        &self,
+        goal_id: &str,
+        body: &str,
+        parent_id: Option<String>,
+        mentions: Vec<String>,
+    ) -> Result<Comment> {
         let req = CreateCommentRequest {
             commentable_type: "objective".to_string(),
             commentable_id: goal_id.to_string(),
             content: body.to_string(),
-            parent_id: None,
+            parent_id,
+            mentions,
         };
         let resp: ApiResponse<Comment> = self.post("/api/v1/team/comments", &req).await?;
         Ok(resp.data)

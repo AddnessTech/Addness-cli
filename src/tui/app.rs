@@ -531,13 +531,8 @@ impl App {
         let tree = self.active_goal_tree();
         let rows = tree.flatten();
 
-        if let Some(TreeRow::DeliverableItem { deliverable, .. }) = rows.get(tree.cursor) {
-            return Some((
-                deliverable.objective_id.clone(),
-                format!("goal {}", deliverable.objective_id),
-            ));
-        }
-
+        // 成果物行を選択していても、その成果物が属するゴール行まで遡って
+        // 実際のタイトルを使う（IDではなくタイトルで提示する方針）。
         for row in rows.iter().take(tree.cursor + 1).rev() {
             if let TreeRow::Goal { goal_id, title, .. } = row {
                 return Some((goal_id.to_string(), title.to_string()));

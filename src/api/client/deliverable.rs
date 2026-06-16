@@ -153,7 +153,7 @@ impl ApiClient {
         let bytes = std::fs::read(path)
             .with_context(|| format!("Failed to read file {}", path.display()))?;
 
-        if let Err(e) = self
+        if let Err(upload_err) = self
             .upload_attachment(
                 &upload.url,
                 &upload.values,
@@ -163,8 +163,16 @@ impl ApiClient {
             )
             .await
         {
-            let _ = self.delete_deliverable(goal_id, &resp.data.id).await;
-            anyhow::bail!("{e}");
+            // アップロード失敗時はサーバ側に空のdeliverableが残るため削除する。
+            // 削除にも失敗した場合は孤立IDをユーザーに案内する。
+            if let Err(cleanup_err) = self.delete_deliverable(goal_id, &resp.data.id).await {
+                anyhow::bail!(
+                    "{upload_err}\n\nNote: failed to remove the placeholder deliverable \
+                     (id={}): {cleanup_err}. You may want to delete it from the web UI.",
+                    resp.data.id
+                );
+            }
+            return Err(upload_err.context("Failed to upload file deliverable"));
         }
 
         Ok(resp)

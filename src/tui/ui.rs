@@ -105,6 +105,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             ModalState::ReactComment { .. } => draw_react_comment_modal(frame, app),
         }
     }
+
+    // Help overlay sits above everything else.
+    if app.show_help {
+        draw_help_overlay(frame);
+    }
 }
 
 fn draw_title_bar(frame: &mut Frame, area: Rect) {
@@ -667,6 +672,13 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(": Navigate  "),
+        Span::styled(
+            "?",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(": Help  "),
     ];
 
     if app.active_pane == ActivePane::Content && (app.sidebar_index == 0 || app.sidebar_index == 1)
@@ -745,6 +757,82 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
             .title(" Help "),
     );
     frame.render_widget(status, area);
+}
+
+// ---------------------------------------------------------------------------
+// Help overlay
+// ---------------------------------------------------------------------------
+
+fn draw_help_overlay(frame: &mut Frame) {
+    // (key, description) の行。section() は見出し。
+    let section = |title: &str| {
+        Line::from(Span::styled(
+            title.to_string(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    let kv = |key: &str, desc: &str| {
+        Line::from(vec![
+            Span::styled(
+                format!("  {key:<16}"),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(desc.to_string(), Style::default().fg(Color::White)),
+        ])
+    };
+    let blank = || Line::from("");
+
+    let lines: Vec<Line> = vec![
+        section("全体 / ペイン"),
+        kv("Tab / S-Tab", "ペイン移動"),
+        kv("?", "ヘルプ表示 / 閉じる"),
+        kv("q / Esc", "終了"),
+        blank(),
+        section("サイドバー (Navigation)"),
+        kv("↑↓ / j k", "項目移動"),
+        kv("Enter / → / l", "コンテンツへ移動"),
+        blank(),
+        section("ゴールツリー (Goals / Execution)"),
+        kv("↑↓ / j k", "カーソル移動"),
+        kv("Enter / → / l", "展開 / 子へ"),
+        kv("h / ←", "折りたたみ / 親へ"),
+        kv("c", "ゴール作成"),
+        kv("e", "ゴール編集"),
+        kv("d", "ゴール削除"),
+        kv("C", "コメント表示切替 (非表示/未解決/全件)"),
+        kv("o / Space", "アクションメニュー"),
+        kv("a u r m x", "成果物: 追加/更新/リネーム/移動/削除"),
+        blank(),
+        section("アクションメニュー (o) の内容"),
+        kv("ゴール上", "コメント追加 / 成果物追加 / 編集 / 削除"),
+        kv(
+            "コメント上",
+            "返信 / 解決・未解決 / 編集 / 削除 / リアクション",
+        ),
+        blank(),
+        section("モーダル共通"),
+        kv("Enter", "確定"),
+        kv("Esc", "キャンセル"),
+        kv("Tab", "次フィールド"),
+        kv("←→ / h l", "選択 (確認 / 移動先 / 絵文字)"),
+    ];
+
+    let height = (lines.len() as u16 + 2).min(frame.area().height);
+    let area = centered_rect(64, height, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Keybindings ")
+        .title_bottom(
+            Line::from(" ? / Esc / q: Close ").style(Style::default().fg(Color::DarkGray)),
+        );
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 // ---------------------------------------------------------------------------

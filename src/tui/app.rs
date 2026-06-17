@@ -78,6 +78,8 @@ pub enum DeliverableFormField {
 pub enum ActionMenuItem {
     AddDeliverable,
     AddComment,
+    CompleteGoal,
+    ReopenGoal,
     EditGoal,
     DeleteGoal,
     UpdateDeliverable,
@@ -97,6 +99,8 @@ impl ActionMenuItem {
         match self {
             ActionMenuItem::AddDeliverable => "add deliverable",
             ActionMenuItem::AddComment => "add comment",
+            ActionMenuItem::CompleteGoal => "complete goal ✅",
+            ActionMenuItem::ReopenGoal => "reopen goal",
             ActionMenuItem::EditGoal => "edit goal",
             ActionMenuItem::DeleteGoal => "delete goal",
             ActionMenuItem::UpdateDeliverable => "update document",
@@ -648,13 +652,17 @@ impl App {
         }
     }
 
-    fn selected_goal_row_context(&self) -> Option<(String, String)> {
+    /// カーソル上のゴール行の (goal_id, title, is_completed)。
+    fn selected_goal_row_context(&self) -> Option<(String, String, bool)> {
         let tree = self.active_goal_tree();
         let rows = tree.flatten();
         match rows.get(tree.cursor) {
-            Some(TreeRow::Goal { goal_id, title, .. }) => {
-                Some((goal_id.to_string(), title.to_string()))
-            }
+            Some(TreeRow::Goal {
+                goal_id,
+                title,
+                is_completed,
+                ..
+            }) => Some((goal_id.to_string(), title.to_string(), *is_completed)),
             _ => None,
         }
     }
@@ -739,10 +747,16 @@ impl App {
             return;
         }
 
-        if let Some((_, goal_title)) = self.selected_goal_row_context() {
+        if let Some((_, goal_title, is_completed)) = self.selected_goal_row_context() {
+            let complete_item = if is_completed {
+                ActionMenuItem::ReopenGoal
+            } else {
+                ActionMenuItem::CompleteGoal
+            };
             self.modal_state = Some(ModalState::ActionMenu {
                 title: goal_title,
                 items: vec![
+                    complete_item,
                     ActionMenuItem::AddComment,
                     ActionMenuItem::AddDeliverable,
                     ActionMenuItem::EditGoal,
@@ -2030,10 +2044,59 @@ impl App {
         }
     }
 
+    /// カーソル上のゴールの完了状態を切り替える。
+    /// 完了は completed_at に現在時刻、再開は completed_at をクリアする
+    /// （title/description は送らず最小更新）。
+    fn do_set_goal_completed(&mut self, completed: bool) {
+        let Some((goal_id, _title, _)) = self.selected_goal_row_context() else {
+            self.error_message = Some("Please select a goal to complete".to_string());
+            return;
+        };
+
+        let req = if completed {
+            UpdateGoalRequest {
+                status: Some(GoalStatus::None),
+                completed_at: Some(Some(Utc::now().to_rfc3339())),
+                title: None,
+                description: None,
+            }
+        } else {
+            UpdateGoalRequest {
+                status: Some(GoalStatus::InProgress),
+                completed_at: Some(None),
+                title: None,
+                description: None,
+            }
+        };
+
+        match self.api_call(self.client.update_goal(&goal_id, &req)) {
+            Ok(_) => {
+                self.success_message = Some(
+                    if completed {
+                        "Goal completed ✅"
+                    } else {
+                        "Goal reopened"
+                    }
+                    .to_string(),
+                );
+                self.load_goal_tree();
+                // Execution は表示済みのときだけ再取得（遅延ロードを維持）。
+                if self.todays_loaded {
+                    self.load_todays_goals();
+                }
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Failed to update goal: {e}"));
+            }
+        }
+    }
+
     fn run_action_menu_item(&mut self, item: ActionMenuItem) {
         match item {
             ActionMenuItem::AddDeliverable => self.start_add_deliverable_modal(),
             ActionMenuItem::AddComment => self.start_add_comment_modal(),
+            ActionMenuItem::CompleteGoal => self.do_set_goal_completed(true),
+            ActionMenuItem::ReopenGoal => self.do_set_goal_completed(false),
             ActionMenuItem::EditGoal => self.start_edit_goal_modal(),
             ActionMenuItem::DeleteGoal => self.start_delete_goal_modal(),
             ActionMenuItem::UpdateDeliverable => self.start_update_deliverable_modal(),

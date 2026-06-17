@@ -9,8 +9,8 @@ use ratatui::{
 use std::collections::HashMap;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::app::{ActivePane, App, FormField, ModalState};
-use super::goal_tree::TreeRow;
+use super::app::{ActivePane, App, DeliverableFormField, FormField, ModalState};
+use super::goal_tree::{CommentView, TreeRow};
 use crate::api::{DeliverableType, GoalStatus, Member, MemberId};
 
 /// Replace @uuid mentions in text with @member_name
@@ -89,10 +89,26 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Draw modals last (on top of everything)
     if let Some(ref modal) = app.modal_state {
         match modal {
+            ModalState::ActionMenu { .. } => draw_action_menu(frame, app),
             ModalState::CreateGoal { .. } => draw_create_goal_modal(frame, app),
             ModalState::EditGoal { .. } => draw_edit_goal_modal(frame, app),
             ModalState::DeleteGoal { .. } => draw_delete_goal_modal(frame, app),
+            ModalState::AddDeliverable { .. } => draw_add_deliverable_modal(frame, app),
+            ModalState::UpdateDeliverable { .. } => draw_update_deliverable_modal(frame, app),
+            ModalState::RenameDeliverable { .. } => draw_rename_deliverable_modal(frame, app),
+            ModalState::MoveDeliverable { .. } => draw_move_deliverable_modal(frame, app),
+            ModalState::DeleteDeliverable { .. } => draw_delete_deliverable_modal(frame, app),
+            ModalState::AddComment { .. } => draw_add_comment_modal(frame, app),
+            ModalState::ReplyComment { .. } => draw_reply_comment_modal(frame, app),
+            ModalState::EditComment { .. } => draw_edit_comment_modal(frame, app),
+            ModalState::DeleteComment { .. } => draw_delete_comment_modal(frame, app),
+            ModalState::ReactComment { .. } => draw_react_comment_modal(frame, app),
         }
+    }
+
+    // Help overlay sits above everything else.
+    if app.show_help {
+        draw_help_overlay(frame);
     }
 }
 
@@ -243,6 +259,7 @@ fn draw_goals(frame: &mut Frame, area: Rect, app: &mut App, border_color: Color,
     let rows = tree.flatten();
     let scroll = tree.scroll_offset;
     let cursor = tree.cursor;
+    let comment_view = tree.comment_view;
 
     let visible = rows.iter().enumerate().skip(scroll).take(viewport_h);
 
@@ -254,7 +271,13 @@ fn draw_goals(frame: &mut Frame, area: Rect, app: &mut App, border_color: Color,
         let line_area = Rect::new(inner.x, y, inner.width, 1);
         let is_cursor = i == cursor;
 
-        let line = render_tree_row(row, is_cursor, inner.width as usize, &app.members);
+        let line = render_tree_row(
+            row,
+            is_cursor,
+            inner.width as usize,
+            &app.members,
+            comment_view,
+        );
         frame.render_widget(Paragraph::new(line), line_area);
     }
 }
@@ -264,6 +287,7 @@ fn render_tree_row(
     is_cursor: bool,
     width: usize,
     members: &HashMap<MemberId, Member>,
+    comment_view: CommentView,
 ) -> Line<'static> {
     let bg = if is_cursor {
         Color::DarkGray
@@ -278,6 +302,7 @@ fn render_tree_row(
             owner_name,
             is_completed,
             expanded,
+            unresolved_comments,
             guide,
             ..
         } => {
@@ -302,6 +327,19 @@ fn render_tree_row(
                 Span::styled(icon, Style::default().fg(Color::Cyan).bg(bg)),
                 Span::styled(title.to_string(), title_style),
             ];
+
+            // コメント未解決件数のバッジ。インラインにコメントが見えない場面
+            // （Hidden モード or 折りたたみ中）でのみ出して存在を可視化する。
+            let comments_inline_visible = *expanded && !matches!(comment_view, CommentView::Hidden);
+            if let Some(n) = unresolved_comments
+                && *n > 0
+                && !comments_inline_visible
+            {
+                spans.push(Span::styled(
+                    format!("  \u{1F4AC}{n}"),
+                    Style::default().fg(Color::Yellow).bg(bg),
+                ));
+            }
 
             // Append status + owner inline if there's room
             let meta = format_goal_meta(status_str, owner_str);
@@ -386,6 +424,16 @@ fn render_tree_row(
         TreeRow::CommentItem { comment, guide, .. } => {
             let prefix = guide.prefix();
             let author = &comment.author.name;
+            let resolved = comment.resolved_at.is_some();
+
+            // 返信件数インジケータと解決済みマーカー。
+            let mut suffix = String::new();
+            if comment.reply_count > 0 {
+                suffix.push_str(&format!("  \u{21B3}{}", comment.reply_count));
+            }
+            if resolved {
+                suffix.push_str("  \u{2713}");
+            }
 
             // Replace @uuid mentions with @member_name
             let content_with_mentions = replace_member_mentions(&comment.content, members);
@@ -393,10 +441,19 @@ fn render_tree_row(
             let content = truncate_str(
                 &content_with_mentions,
                 width.saturating_sub(
-                    display_width(&prefix) + display_width(author) + display_width(": "),
+                    display_width(&prefix)
+                        + display_width(author)
+                        + display_width(": ")
+                        + display_width(&suffix),
                 ),
             );
 
+            // 解決済みは淡色（All モードで主に出る）。
+            let content_color = if resolved {
+                Color::DarkGray
+            } else {
+                Color::White
+            };
             let mut spans = vec![
                 Span::styled(prefix, Style::default().fg(Color::DarkGray).bg(bg)),
                 Span::styled(
@@ -405,9 +462,15 @@ fn render_tree_row(
                 ),
                 Span::styled(
                     format!(" {content}"),
-                    Style::default().fg(Color::White).bg(bg),
+                    Style::default().fg(content_color).bg(bg),
                 ),
             ];
+            if !suffix.is_empty() {
+                spans.push(Span::styled(
+                    suffix,
+                    Style::default().fg(Color::DarkGray).bg(bg),
+                ));
+            }
             if is_cursor {
                 let content_width = spans_display_width(&spans);
                 pad_line(&mut spans, content_width, width, bg);
@@ -609,6 +672,13 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(": Navigate  "),
+        Span::styled(
+            "?",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(": Help  "),
     ];
 
     if app.active_pane == ActivePane::Content && (app.sidebar_index == 0 || app.sidebar_index == 1)
@@ -648,6 +718,30 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ));
         hints.push(Span::raw(": Delete  "));
+        hints.push(Span::styled(
+            "o/Space",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        hints.push(Span::raw(": Actions  "));
+        hints.push(Span::styled(
+            "a/u/r/m/x",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        hints.push(Span::raw(": Direct  "));
+        hints.push(Span::styled(
+            "C",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        hints.push(Span::raw(format!(
+            ": Comments({})  ",
+            app.active_goal_tree().comment_view.label()
+        )));
     }
 
     hints.push(Span::styled("|", Style::default().fg(Color::DarkGray)));
@@ -663,6 +757,82 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
             .title(" Help "),
     );
     frame.render_widget(status, area);
+}
+
+// ---------------------------------------------------------------------------
+// Help overlay
+// ---------------------------------------------------------------------------
+
+fn draw_help_overlay(frame: &mut Frame) {
+    // (key, description) の行。section() は見出し。
+    let section = |title: &str| {
+        Line::from(Span::styled(
+            title.to_string(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    let kv = |key: &str, desc: &str| {
+        Line::from(vec![
+            Span::styled(
+                format!("  {key:<16}"),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(desc.to_string(), Style::default().fg(Color::White)),
+        ])
+    };
+    let blank = || Line::from("");
+
+    let lines: Vec<Line> = vec![
+        section("全体 / ペイン"),
+        kv("Tab / S-Tab", "ペイン移動"),
+        kv("?", "ヘルプ表示 / 閉じる"),
+        kv("q / Esc", "終了"),
+        blank(),
+        section("サイドバー (Navigation)"),
+        kv("↑↓ / j k", "項目移動"),
+        kv("Enter / → / l", "コンテンツへ移動"),
+        blank(),
+        section("ゴールツリー (Goals / Execution)"),
+        kv("↑↓ / j k", "カーソル移動"),
+        kv("Enter / → / l", "展開 / 子へ"),
+        kv("h / ←", "折りたたみ / 親へ"),
+        kv("c", "ゴール作成"),
+        kv("e", "ゴール編集"),
+        kv("d", "ゴール削除"),
+        kv("C", "コメント表示切替 (非表示/未解決/全件)"),
+        kv("o / Space", "アクションメニュー"),
+        kv("a u r m x", "成果物: 追加/更新/リネーム/移動/削除"),
+        blank(),
+        section("アクションメニュー (o) の内容"),
+        kv("ゴール上", "コメント追加 / 成果物追加 / 編集 / 削除"),
+        kv(
+            "コメント上",
+            "返信 / 解決・未解決 / 編集 / 削除 / リアクション",
+        ),
+        blank(),
+        section("モーダル共通"),
+        kv("Enter", "確定"),
+        kv("Esc", "キャンセル"),
+        kv("Tab", "次フィールド"),
+        kv("←→ / h l", "選択 (確認 / 移動先 / 絵文字)"),
+    ];
+
+    let height = (lines.len() as u16 + 2).min(frame.area().height);
+    let area = centered_rect(64, height, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Keybindings ")
+        .title_bottom(
+            Line::from(" ? / Esc / q: Close ").style(Style::default().fg(Color::DarkGray)),
+        );
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 // ---------------------------------------------------------------------------
@@ -1021,6 +1191,616 @@ fn draw_delete_goal_modal(frame: &mut Frame, app: &App) {
     ]);
 
     frame.render_widget(Paragraph::new(buttons), layout[3]);
+}
+
+fn draw_action_menu(frame: &mut Frame, app: &App) {
+    let Some(ModalState::ActionMenu {
+        title,
+        items,
+        selected_index,
+    }) = &app.modal_state
+    else {
+        return;
+    };
+
+    let height = (items.len() as u16 + 4).max(7);
+    let area = centered_rect(48, height, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Actions ")
+        .title_bottom(
+            Line::from(" j/k: Select | Enter: Open | Esc: Cancel ")
+                .style(Style::default().fg(Color::DarkGray)),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(0)])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            truncate_str(title, layout[0].width as usize),
+            Style::default().fg(Color::DarkGray),
+        ))),
+        layout[0],
+    );
+
+    let rows: Vec<ListItem> = items
+        .iter()
+        .enumerate()
+        .map(|(idx, item)| {
+            let selected = idx == *selected_index;
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let prefix = if selected { " > " } else { "   " };
+            ListItem::new(Line::from(Span::styled(
+                format!("{prefix}{}", item.label()),
+                style,
+            )))
+        })
+        .collect();
+    frame.render_widget(List::new(rows), layout[1]);
+}
+
+fn draw_add_deliverable_modal(frame: &mut Frame, app: &App) {
+    let Some(ModalState::AddDeliverable {
+        goal_title,
+        kind,
+        name,
+        value,
+        current_field,
+        ..
+    }) = &app.modal_state
+    else {
+        return;
+    };
+
+    let area = centered_rect(64, 17, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Add Deliverable ")
+        .title_bottom(
+            Line::from(" Tab: Next Field | ↑↓: Kind | Enter: Add | Esc: Cancel ")
+                .style(Style::default().fg(Color::DarkGray)),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Goal: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(goal_title.as_str(), Style::default().fg(Color::White)),
+        ])),
+        layout[0],
+    );
+
+    draw_readonly_field(
+        frame,
+        layout[1],
+        " Kind ",
+        kind.label(),
+        *current_field == DeliverableFormField::Kind,
+    );
+    draw_text_field(
+        frame,
+        layout[2],
+        " Name ",
+        name,
+        *current_field == DeliverableFormField::Name,
+    );
+    let value_title = match kind {
+        super::app::DeliverableKind::File => " File Path * ",
+        super::app::DeliverableKind::Document => " Content File Path * ",
+        super::app::DeliverableKind::Link => " URL * ",
+        super::app::DeliverableKind::Folder => " Value (unused) ",
+    };
+    draw_text_field(
+        frame,
+        layout[3],
+        value_title,
+        value,
+        *current_field == DeliverableFormField::Value,
+    );
+}
+
+fn draw_update_deliverable_modal(frame: &mut Frame, app: &App) {
+    let Some(ModalState::UpdateDeliverable {
+        deliverable_name,
+        content_file,
+        ..
+    }) = &app.modal_state
+    else {
+        return;
+    };
+
+    let area = centered_rect(60, 10, frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Update Document Deliverable ")
+        .title_bottom(
+            Line::from(" Enter: Update | Esc: Cancel ").style(Style::default().fg(Color::DarkGray)),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Deliverable: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(deliverable_name.as_str(), Style::default().fg(Color::White)),
+        ])),
+        layout[0],
+    );
+    draw_text_field(
+        frame,
+        layout[1],
+        " Content File Path * ",
+        content_file,
+        true,
+    );
+}
+
+fn draw_rename_deliverable_modal(frame: &mut Frame, app: &App) {
+    let Some(ModalState::RenameDeliverable {
+        current_name, name, ..
+    }) = &app.modal_state
+    else {
+        return;
+    };
+
+    let area = centered_rect(60, 10, frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Rename Deliverable ")
+        .title_bottom(
+            Line::from(" Enter: Rename | Esc: Cancel ").style(Style::default().fg(Color::DarkGray)),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Current: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(current_name.as_str(), Style::default().fg(Color::White)),
+        ])),
+        layout[0],
+    );
+    draw_text_field(frame, layout[1], " New Name * ", name, true);
+}
+
+fn draw_move_deliverable_modal(frame: &mut Frame, app: &App) {
+    let Some(ModalState::MoveDeliverable {
+        deliverable_name,
+        targets,
+        selected_index,
+        ..
+    }) = &app.modal_state
+    else {
+        return;
+    };
+
+    let height = (targets.len() as u16 + 5).clamp(8, 18);
+    let area = centered_rect(62, height, frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Move Deliverable ")
+        .title_bottom(
+            Line::from(" j/k: Select Folder | Enter: Move | Esc: Cancel ")
+                .style(Style::default().fg(Color::DarkGray)),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(0)])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Deliverable: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(deliverable_name.as_str(), Style::default().fg(Color::White)),
+        ])),
+        layout[0],
+    );
+
+    let rows: Vec<ListItem> = targets
+        .iter()
+        .enumerate()
+        .map(|(idx, (_, label))| {
+            let selected = idx == *selected_index;
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let prefix = if selected { " > " } else { "   " };
+            ListItem::new(Line::from(Span::styled(format!("{prefix}{label}"), style)))
+        })
+        .collect();
+    frame.render_widget(List::new(rows), layout[1]);
+}
+
+fn draw_delete_deliverable_modal(frame: &mut Frame, app: &App) {
+    let Some(ModalState::DeleteDeliverable {
+        deliverable_name,
+        confirm_index,
+        ..
+    }) = &app.modal_state
+    else {
+        return;
+    };
+
+    let area = centered_rect(60, 10, frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .title(" Delete Deliverable ")
+        .title_bottom(
+            Line::from(" ←→/hl: Select | Enter: Apply | Esc: Cancel ")
+                .style(Style::default().fg(Color::DarkGray)),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Delete: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                deliverable_name.as_str(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])),
+        layout[0],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "This cannot be undone.",
+            Style::default().fg(Color::Red),
+        ))),
+        layout[1],
+    );
+    draw_confirm_buttons(frame, layout[3], *confirm_index, "Cancel", "Delete");
+}
+
+fn draw_add_comment_modal(frame: &mut Frame, app: &App) {
+    let Some(ModalState::AddComment {
+        goal_title, body, ..
+    }) = &app.modal_state
+    else {
+        return;
+    };
+
+    let area = centered_rect(64, 10, frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Add Comment ")
+        .title_bottom(
+            Line::from(" Enter: Post | Esc: Cancel ").style(Style::default().fg(Color::DarkGray)),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Goal: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(goal_title.as_str(), Style::default().fg(Color::White)),
+        ])),
+        layout[0],
+    );
+    draw_text_field(frame, layout[1], " Comment * ", body, true);
+}
+
+fn draw_reply_comment_modal(frame: &mut Frame, app: &App) {
+    let Some(ModalState::ReplyComment {
+        parent_excerpt,
+        body,
+        ..
+    }) = &app.modal_state
+    else {
+        return;
+    };
+
+    let area = centered_rect(64, 10, frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Reply to Comment ")
+        .title_bottom(
+            Line::from(" Enter: Reply | Esc: Cancel ").style(Style::default().fg(Color::DarkGray)),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Re: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(parent_excerpt.as_str(), Style::default().fg(Color::White)),
+        ])),
+        layout[0],
+    );
+    draw_text_field(frame, layout[1], " Reply * ", body, true);
+}
+
+fn draw_edit_comment_modal(frame: &mut Frame, app: &App) {
+    let Some(ModalState::EditComment { body, .. }) = &app.modal_state else {
+        return;
+    };
+
+    let area = centered_rect(64, 10, frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Edit Comment ")
+        .title_bottom(
+            Line::from(" Enter: Save | Esc: Cancel ").style(Style::default().fg(Color::DarkGray)),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .split(inner);
+    draw_text_field(frame, layout[0], " Comment * ", body, true);
+}
+
+fn draw_delete_comment_modal(frame: &mut Frame, app: &App) {
+    let Some(ModalState::DeleteComment {
+        excerpt,
+        confirm_index,
+        ..
+    }) = &app.modal_state
+    else {
+        return;
+    };
+
+    let area = centered_rect(60, 10, frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .title(" Delete Comment ")
+        .title_bottom(
+            Line::from(" ←→/hl: Select | Enter: Apply | Esc: Cancel ")
+                .style(Style::default().fg(Color::DarkGray)),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Delete: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                excerpt.as_str(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])),
+        layout[0],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "This cannot be undone.",
+            Style::default().fg(Color::Red),
+        ))),
+        layout[1],
+    );
+    draw_confirm_buttons(frame, layout[3], *confirm_index, "Cancel", "Delete");
+}
+
+fn draw_react_comment_modal(frame: &mut Frame, app: &App) {
+    let Some(ModalState::ReactComment {
+        emojis,
+        selected_index,
+        ..
+    }) = &app.modal_state
+    else {
+        return;
+    };
+
+    let area = centered_rect(50, 8, frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" React ")
+        .title_bottom(
+            Line::from(" ←→/hl: Select | Enter: React | Esc: Cancel ")
+                .style(Style::default().fg(Color::DarkGray)),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "Pick a reaction:",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        layout[0],
+    );
+
+    let mut spans = vec![Span::raw("  ")];
+    for (idx, emoji) in emojis.iter().enumerate() {
+        let style = if idx == *selected_index {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        spans.push(Span::styled(format!(" {emoji} "), style));
+        spans.push(Span::raw(" "));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), layout[1]);
+}
+
+fn draw_text_field(frame: &mut Frame, area: Rect, title: &str, text: &str, focused: bool) {
+    let border = if focused {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
+    let widget = Paragraph::new(text.to_string()).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border))
+            .title(title.to_string()),
+    );
+    frame.render_widget(widget, area);
+}
+
+fn draw_readonly_field(frame: &mut Frame, area: Rect, title: &str, text: &str, focused: bool) {
+    let border = if focused {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
+    let widget = Paragraph::new(Line::from(Span::styled(
+        text.to_string(),
+        Style::default().fg(Color::White),
+    )))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border))
+            .title(title.to_string()),
+    );
+    frame.render_widget(widget, area);
+}
+
+fn draw_confirm_buttons(
+    frame: &mut Frame,
+    area: Rect,
+    selected: usize,
+    cancel_label: &str,
+    confirm_label: &str,
+) {
+    let cancel_style = if selected == 0 {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let confirm_style = if selected == 1 {
+        Style::default()
+            .fg(Color::White)
+            .bg(Color::Red)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Red)
+    };
+
+    let buttons = Paragraph::new(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(format!(" [ {cancel_label} ] "), cancel_style),
+        Span::raw("    "),
+        Span::styled(format!(" [ {confirm_label} ] "), confirm_style),
+    ]));
+    frame.render_widget(buttons, area);
 }
 
 fn draw_members(frame: &mut Frame, area: Rect, app: &mut App, border_color: Color) {

@@ -8,7 +8,7 @@ pub struct CommentsResponse {
     pub total_count: i64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Comment {
     pub id: String,
@@ -35,7 +35,7 @@ pub struct CommentDetail {
     pub replies: Vec<Comment>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommentAuthor {
     pub id: String,

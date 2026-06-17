@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, path::Path};
 
 use crate::api::{
     ApiClient, ApiResponse, AttachmentUploadRequest, BatchDeleteDeliverableRequest,
@@ -9,6 +9,22 @@ use crate::api::{
 use anyhow::{Context, Result};
 
 impl ApiClient {
+    pub async fn create_folder_deliverable(
+        &self,
+        goal_id: &str,
+        display_name: &str,
+    ) -> Result<ApiResponse<DeliverableCreateData>> {
+        let body = CreateDeliverableRequest {
+            node_type: DeliverableType::Folder,
+            display_name: display_name.to_string(),
+            content: None,
+            link_url: None,
+            file: None,
+        };
+        let path = format!("/api/v1/team/objectives/{goal_id}/deliverables");
+        self.post(&path, &body).await
+    }
+
     pub async fn create_link_deliverable(
         &self,
         goal_id: &str,
@@ -99,6 +115,67 @@ impl ApiClient {
             anyhow::bail!("S3 upload failed ({status}): {body}");
         }
         Ok(())
+    }
+
+    pub async fn create_file_deliverable_from_path(
+        &self,
+        goal_id: &str,
+        path: &Path,
+        display_name: Option<&str>,
+    ) -> Result<ApiResponse<DeliverableCreateData>> {
+        let metadata = std::fs::metadata(path)
+            .with_context(|| format!("Failed to stat file {}", path.display()))?;
+        if !metadata.is_file() {
+            anyhow::bail!("{} is not a regular file", path.display());
+        }
+
+        let file_name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(String::from)
+            .ok_or_else(|| anyhow::anyhow!("Cannot derive file name from {}", path.display()))?;
+        let display = display_name.unwrap_or(&file_name);
+        let content_type = guess_content_type(path)?;
+
+        let resp = self
+            .create_file_deliverable(
+                goal_id,
+                display,
+                &file_name,
+                &content_type,
+                metadata.len() as i64,
+            )
+            .await?;
+
+        let upload = resp.data.upload_request.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("Server did not return an upload URL for the file deliverable")
+        })?;
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("Failed to read file {}", path.display()))?;
+
+        if let Err(upload_err) = self
+            .upload_attachment(
+                &upload.url,
+                &upload.values,
+                bytes,
+                &file_name,
+                &content_type,
+            )
+            .await
+        {
+            // アップロード失敗時はサーバ側に空のdeliverableが残るため削除する。
+            // 削除にも失敗した場合は孤立IDをユーザーに案内する。
+            if let Err(cleanup_err) = self.delete_deliverable(goal_id, &resp.data.id).await {
+                anyhow::bail!(
+                    "{upload_err}\n\nNote: failed to remove the placeholder deliverable \
+                     (id={}): {cleanup_err}. You may want to delete it from the web UI.",
+                    resp.data.id
+                );
+            }
+            return Err(upload_err.context("Failed to upload file deliverable"));
+        }
+
+        Ok(resp)
     }
 
     pub async fn get_goal_deliverables(
@@ -210,4 +287,36 @@ impl ApiClient {
 
         map
     }
+}
+
+fn guess_content_type(path: &Path) -> Result<String> {
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase());
+
+    let ct = match ext.as_deref() {
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("png") => "image/png",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("mp4") => "video/mp4",
+        Some("mov") => "video/quicktime",
+        Some("webm") => "video/webm",
+        Some("pdf") => "application/pdf",
+        Some("csv") => "text/csv",
+        Some("txt") => "text/plain",
+        Some("md" | "markdown") => "text/markdown",
+        Some("doc") => "application/msword",
+        Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        Some("xls") => "application/vnd.ms-excel",
+        Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        Some("ppt") => "application/vnd.ms-powerpoint",
+        Some("pptx") => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        _ => anyhow::bail!(
+            "Unsupported file extension: {}. Supported: jpg/jpeg/png/gif/webp/mp4/mov/webm/pdf/csv/txt/md/doc/docx/xls/xlsx/ppt/pptx",
+            path.display()
+        ),
+    };
+    Ok(ct.to_string())
 }

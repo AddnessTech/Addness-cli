@@ -3091,3 +3091,124 @@ mod picker_render_tests {
         std::fs::remove_dir_all(&d).ok();
     }
 }
+
+#[cfg(test)]
+mod picker_interaction_tests {
+    //! 実際のキーイベント処理経路 (`handle_modal_input`) に合成 KeyEvent を流し、
+    //! Tab補完・Ctrl+Fでのファイラー起動・選択の書き戻し・フィールド送りを検証する。
+    use super::*;
+    use std::path::PathBuf;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("addness_itx_{}_{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn app_add_deliverable(
+        value: &str,
+        field: DeliverableFormField,
+        kind: DeliverableKind,
+    ) -> (tokio::runtime::Runtime, App) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = ApiClient::new("t", "http://localhost").unwrap();
+        let mut app = App::new(client, rt.handle().clone());
+        app.modal_state = Some(ModalState::AddDeliverable {
+            goal_id: "g".into(),
+            goal_title: "t".into(),
+            kind,
+            name: "n".into(),
+            value: value.into(),
+            current_field: field,
+        });
+        (rt, app)
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn value_of(app: &App) -> String {
+        match &app.modal_state {
+            Some(ModalState::AddDeliverable { value, .. }) => value.clone(),
+            _ => panic!("expected AddDeliverable modal"),
+        }
+    }
+
+    #[test]
+    fn tab_completes_path_value() {
+        let d = tmp("complete");
+        std::fs::write(d.join("alpha.txt"), "x").unwrap();
+        let (_rt, mut app) = app_add_deliverable(
+            &format!("{}/al", d.display()),
+            DeliverableFormField::Value,
+            DeliverableKind::Document,
+        );
+        app.handle_modal_input(key(KeyCode::Tab));
+        assert!(
+            value_of(&app).ends_with("/alpha.txt"),
+            "got {}",
+            value_of(&app)
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn ctrl_f_opens_picker_and_enter_writes_back() {
+        let d = tmp("pick");
+        std::fs::write(d.join("alpha.txt"), "x").unwrap();
+        let (_rt, mut app) = app_add_deliverable(
+            &format!("{}/", d.display()),
+            DeliverableFormField::Value,
+            DeliverableKind::Document,
+        );
+        // Ctrl+F でファイラーが開く
+        app.handle_modal_input(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        assert!(
+            matches!(app.modal_state, Some(ModalState::FilePicker { .. })),
+            "Ctrl+F should open the file picker"
+        );
+        // Enter で選択中のファイルを書き戻して元モーダルへ戻る
+        app.handle_modal_input(key(KeyCode::Enter));
+        assert!(
+            value_of(&app).ends_with("/alpha.txt"),
+            "got {}",
+            value_of(&app)
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn tab_advances_field_when_no_completion_progress() {
+        let d = tmp("advance");
+        std::fs::write(d.join("only.txt"), "x").unwrap();
+        // 既に一意な完全パス → 補完で前進しない → Tab はフィールド送り(Value→Kind)
+        let (_rt, mut app) = app_add_deliverable(
+            &format!("{}/only.txt", d.display()),
+            DeliverableFormField::Value,
+            DeliverableKind::Document,
+        );
+        app.handle_modal_input(key(KeyCode::Tab));
+        match &app.modal_state {
+            Some(ModalState::AddDeliverable { current_field, .. }) => {
+                assert_eq!(*current_field, DeliverableFormField::Kind);
+            }
+            _ => panic!("expected AddDeliverable modal"),
+        }
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn plain_f_types_into_value() {
+        // Ctrl修飾なしの 'f' は通常文字として value に入る（ファイラーは開かない）
+        let (_rt, mut app) =
+            app_add_deliverable("", DeliverableFormField::Value, DeliverableKind::Document);
+        app.handle_modal_input(key(KeyCode::Char('f')));
+        assert_eq!(value_of(&app), "f");
+        assert!(matches!(
+            app.modal_state,
+            Some(ModalState::AddDeliverable { .. })
+        ));
+    }
+}

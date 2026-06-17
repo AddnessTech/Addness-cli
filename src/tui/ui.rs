@@ -826,7 +826,7 @@ fn draw_help_overlay(frame: &mut Frame) {
 
     let height = (lines.len() as u16 + 2).min(frame.area().height);
     let area = centered_rect(64, height, frame.area());
-    frame.render_widget(Clear, area);
+    clear_modal_area(frame, area);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -849,13 +849,26 @@ fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
     Rect::new(x, y, popup_width, height.min(area.height))
 }
 
+/// モーダル/ポップアップ領域を消去する。
+/// 背面に全角文字（絵文字・日本語・罫線）があると、モーダルの左右境界で
+/// 全角セルの片側が残って透けて見えるため、左右を1列ずつ広げてクリアする。
+fn clear_modal_area(frame: &mut Frame, area: Rect) {
+    let full = frame.area();
+    let left = area.x.saturating_sub(1);
+    let right = (area.x + area.width)
+        .saturating_add(1)
+        .min(full.x + full.width);
+    let expanded = Rect::new(left, area.y, right.saturating_sub(left), area.height);
+    frame.render_widget(Clear, expanded);
+}
+
 fn draw_org_popup(frame: &mut Frame, app: &App) {
     let item_count = app.orgs.len() as u16;
     // border(2) + header(1) + items
     let popup_height = item_count + 3;
     let area = centered_rect(40, popup_height, frame.area());
 
-    frame.render_widget(Clear, area);
+    clear_modal_area(frame, area);
 
     let items: Vec<ListItem> = app
         .orgs
@@ -909,7 +922,7 @@ fn draw_create_goal_modal(frame: &mut Frame, app: &App) {
     };
 
     let area = centered_rect(60, 15, frame.area());
-    frame.render_widget(Clear, area);
+    clear_modal_area(frame, area);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1008,7 +1021,7 @@ fn draw_edit_goal_modal(frame: &mut Frame, app: &App) {
     let modal_height = 2 + 3 + 3 + status_field_height;
 
     let area = centered_rect(60, modal_height, frame.area());
-    frame.render_widget(Clear, area);
+    clear_modal_area(frame, area);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1120,7 +1133,7 @@ fn draw_delete_goal_modal(frame: &mut Frame, app: &App) {
     };
 
     let area = centered_rect(60, 10, frame.area());
-    frame.render_widget(Clear, area);
+    clear_modal_area(frame, area);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1208,7 +1221,7 @@ fn draw_action_menu(frame: &mut Frame, app: &App) {
 
     let height = (items.len() as u16 + 4).max(7);
     let area = centered_rect(48, height, frame.area());
-    frame.render_widget(Clear, area);
+    clear_modal_area(frame, area);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1270,7 +1283,7 @@ fn draw_add_deliverable_modal(frame: &mut Frame, app: &App) {
     };
 
     let area = centered_rect(64, 17, frame.area());
-    frame.render_widget(Clear, area);
+    clear_modal_area(frame, area);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1342,7 +1355,7 @@ fn draw_update_deliverable_modal(frame: &mut Frame, app: &App) {
     };
 
     let area = centered_rect(60, 10, frame.area());
-    frame.render_widget(Clear, area);
+    clear_modal_area(frame, area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
@@ -1386,7 +1399,7 @@ fn draw_rename_deliverable_modal(frame: &mut Frame, app: &App) {
     };
 
     let area = centered_rect(60, 10, frame.area());
-    frame.render_widget(Clear, area);
+    clear_modal_area(frame, area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
@@ -1428,7 +1441,7 @@ fn draw_move_deliverable_modal(frame: &mut Frame, app: &App) {
 
     let height = (targets.len() as u16 + 5).clamp(8, 18);
     let area = centered_rect(62, height, frame.area());
-    frame.render_widget(Clear, area);
+    clear_modal_area(frame, area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
@@ -1482,7 +1495,7 @@ fn draw_delete_deliverable_modal(frame: &mut Frame, app: &App) {
     };
 
     let area = centered_rect(60, 10, frame.area());
-    frame.render_widget(Clear, area);
+    clear_modal_area(frame, area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Red))
@@ -1535,7 +1548,7 @@ fn draw_add_comment_modal(frame: &mut Frame, app: &App) {
     };
 
     let area = centered_rect(64, 10, frame.area());
-    frame.render_widget(Clear, area);
+    clear_modal_area(frame, area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
@@ -1575,7 +1588,7 @@ fn draw_reply_comment_modal(frame: &mut Frame, app: &App) {
     };
 
     let area = centered_rect(64, 10, frame.area());
-    frame.render_widget(Clear, area);
+    clear_modal_area(frame, area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
@@ -1610,7 +1623,7 @@ fn draw_edit_comment_modal(frame: &mut Frame, app: &App) {
     };
 
     let area = centered_rect(64, 10, frame.area());
-    frame.render_widget(Clear, area);
+    clear_modal_area(frame, area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
@@ -1639,7 +1652,7 @@ fn draw_delete_comment_modal(frame: &mut Frame, app: &App) {
     };
 
     let area = centered_rect(60, 10, frame.area());
-    frame.render_widget(Clear, area);
+    clear_modal_area(frame, area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Red))
@@ -1694,7 +1707,7 @@ fn draw_react_comment_modal(frame: &mut Frame, app: &App) {
     };
 
     let area = centered_rect(50, 8, frame.area());
-    frame.render_widget(Clear, area);
+    clear_modal_area(frame, area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))

@@ -302,6 +302,8 @@ pub struct App {
     // Goal trees
     pub goal_tree: GoalTree,
     pub todays_goals_tree: GoalTree,
+    /// Execution(todays) ツリーは初回表示時に遅延ロードする。起動を軽くするため。
+    todays_loaded: bool,
 
     // Members state
     pub members: HashMap<MemberId, Member>,
@@ -337,6 +339,7 @@ impl App {
             org_popup_index: 0,
             goal_tree: GoalTree::empty(),
             todays_goals_tree: GoalTree::empty(),
+            todays_loaded: false,
             members: HashMap::new(),
             members_list: vec![],
             members_cursor: 0,
@@ -381,10 +384,20 @@ impl App {
         self.load_initial_data();
 
         while self.running {
+            // 表示しようとしているタブのデータを必要になった時点で取得する。
+            self.ensure_active_tab_loaded();
             terminal.draw(|frame| ui::draw(frame, self))?;
             self.handle_events()?;
         }
         Ok(())
+    }
+
+    /// アクティブなタブが未ロードなら取得する（遅延ロード）。
+    /// Execution(todays) は初回表示までロードしないことで起動を軽くする。
+    fn ensure_active_tab_loaded(&mut self) {
+        if self.sidebar_index == 1 && !self.todays_loaded {
+            self.load_todays_goals();
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -413,8 +426,8 @@ impl App {
             }
         }
 
+        // Goals タブのみ起動時にロードし、Execution(todays) は初回表示まで遅延する。
         self.load_goal_tree();
-        self.load_todays_goals();
         self.load_members();
     }
 
@@ -459,35 +472,35 @@ impl App {
                 .collect()
         };
 
-        // Load comments and deliverables for each root goal by id (not by flat index)
-        for goal_id in root_goal_ids {
-            let goal_id_ref = &goal_id;
-            let client = &self.client;
+        if root_goal_ids.is_empty() {
+            return;
+        }
 
-            let result = self.api_call(async {
-                tokio::try_join!(
-                    client.list_comments(goal_id_ref),
-                    client.get_goal_deliverables(goal_id_ref)
-                )
-            });
+        // 全ルートゴールのコメント・成果物を並列取得する（逐次 N 往復 → 概ね 1 往復）。
+        let client = &self.client;
+        let result = self.api_call(async {
+            let id_refs: Vec<&str> = root_goal_ids.iter().map(String::as_str).collect();
+            let maps = tokio::join!(
+                client.get_comments_map(&id_refs),
+                client.get_deliverables_map(&id_refs),
+            );
+            Ok::<_, anyhow::Error>(maps)
+        });
 
-            match result {
-                Ok((comments_resp, deliverables_resp)) => {
-                    self.goal_tree
-                        .set_comments_for_goal_id(&goal_id, comments_resp.comments);
-                    self.goal_tree.set_deliverables_for_goal_id(
-                        &goal_id,
-                        deliverables_resp.data.deliverables,
-                    );
-                }
-                Err(e) => {
-                    self.error_message = Some(e.to_string());
-                }
+        if let Ok((comments_map, deliverables_map)) = result {
+            for (id, comments) in comments_map {
+                self.goal_tree.set_comments_for_goal_id(&id, comments);
+            }
+            for (id, deliverables) in deliverables_map {
+                self.goal_tree
+                    .set_deliverables_for_goal_id(&id, deliverables);
             }
         }
     }
 
     fn load_todays_goals(&mut self) {
+        // 一度試みたら（成否に関わらず）再取得しないようフラグを立てる。
+        self.todays_loaded = true;
         let Some(org_id) = self.current_org_id().map(|s| s.to_string()) else {
             self.todays_goals_tree = GoalTree::empty();
             return;
@@ -969,8 +982,10 @@ impl App {
                 if new_index != self.current_org_index {
                     self.current_org_index = new_index;
                     self.load_goal_tree();
-                    self.load_todays_goals();
                     self.load_members();
+                    // Execution は次に表示された時に再ロードする。
+                    self.todays_loaded = false;
+                    self.todays_goals_tree = GoalTree::empty();
                 }
             }
             _ => {}

@@ -2827,3 +2827,86 @@ impl App {
         }
     }
 }
+
+#[cfg(test)]
+mod path_tests {
+    use super::{complete_path, expand_tilde, longest_common_prefix, read_dir_entries};
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("addness_pathtest_{}_{}", tag, std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn lcp_basic() {
+        assert_eq!(
+            longest_common_prefix(["foobar", "foobaz", "fooqux"].into_iter()),
+            "foo"
+        );
+        assert_eq!(longest_common_prefix(["abc"].into_iter()), "abc");
+        assert_eq!(longest_common_prefix(["a", "b"].into_iter()), "");
+        assert_eq!(longest_common_prefix(std::iter::empty::<&str>()), "");
+    }
+
+    #[test]
+    fn expand_tilde_passthrough() {
+        assert_eq!(expand_tilde("/abs/path"), "/abs/path");
+        assert_eq!(expand_tilde("rel/path"), "rel/path");
+        assert_eq!(expand_tilde("~notapath"), "~notapath");
+    }
+
+    #[test]
+    fn complete_unique_to_full_name() {
+        let d = temp_dir("unique");
+        fs::write(d.join("alpha.txt"), "x").unwrap();
+        fs::write(d.join("beta.txt"), "x").unwrap();
+        let out = complete_path(&format!("{}/al", d.display())).unwrap();
+        assert!(out.ends_with("/alpha.txt"), "got {out}");
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn complete_common_prefix_of_multiple() {
+        let d = temp_dir("multi");
+        fs::write(d.join("report_a.md"), "x").unwrap();
+        fs::write(d.join("report_b.md"), "x").unwrap();
+        let out = complete_path(&format!("{}/rep", d.display())).unwrap();
+        assert!(out.ends_with("/report_"), "got {out}");
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn complete_single_dir_appends_slash() {
+        let d = temp_dir("dir");
+        fs::create_dir(d.join("subdir")).unwrap();
+        let out = complete_path(&format!("{}/sub", d.display())).unwrap();
+        assert!(out.ends_with("/subdir/"), "got {out}");
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn complete_no_match_is_none() {
+        let d = temp_dir("nomatch");
+        fs::write(d.join("alpha.txt"), "x").unwrap();
+        assert!(complete_path(&format!("{}/zzz", d.display())).is_none());
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn entries_dirs_first_hidden_excluded() {
+        let d = temp_dir("entries");
+        fs::create_dir(d.join("zdir")).unwrap();
+        fs::write(d.join("afile.txt"), "x").unwrap();
+        fs::write(d.join(".hidden"), "x").unwrap();
+        let entries = read_dir_entries(&d);
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["zdir", "afile.txt"]);
+        assert!(entries[0].is_dir);
+        fs::remove_dir_all(&d).ok();
+    }
+}

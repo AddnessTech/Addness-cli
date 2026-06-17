@@ -299,6 +299,9 @@ pub struct App {
     pub show_org_popup: bool,
     pub org_popup_index: usize,
 
+    /// キーバインド一覧のヘルプオーバーレイ表示中か（`?` で開く）
+    pub show_help: bool,
+
     // Goal trees
     pub goal_tree: GoalTree,
     pub todays_goals_tree: GoalTree,
@@ -337,6 +340,7 @@ impl App {
             current_org_index: 0,
             show_org_popup: false,
             org_popup_index: 0,
+            show_help: false,
             goal_tree: GoalTree::empty(),
             todays_goals_tree: GoalTree::empty(),
             todays_loaded: false,
@@ -967,7 +971,15 @@ impl App {
             self.error_message = None;
             self.success_message = None;
 
-            if self.modal_state.is_some() {
+            if self.show_help {
+                // ヘルプ表示中は閉じる操作のみ受け付ける。
+                if matches!(
+                    key.code,
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')
+                ) {
+                    self.show_help = false;
+                }
+            } else if self.modal_state.is_some() {
                 self.handle_modal_input(key.code);
             } else if self.show_org_popup {
                 self.handle_org_popup(key.code);
@@ -1009,6 +1021,7 @@ impl App {
 
     fn handle_normal(&mut self, code: KeyCode) {
         match code {
+            KeyCode::Char('?') => self.show_help = true,
             KeyCode::Char('q') | KeyCode::Esc => self.running = false,
             KeyCode::Tab => {
                 self.active_pane = match self.active_pane {

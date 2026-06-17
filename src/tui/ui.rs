@@ -103,6 +103,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             ModalState::EditComment { .. } => draw_edit_comment_modal(frame, app),
             ModalState::DeleteComment { .. } => draw_delete_comment_modal(frame, app),
             ModalState::ReactComment { .. } => draw_react_comment_modal(frame, app),
+            ModalState::FilePicker { .. } => draw_file_picker_modal(frame, app),
         }
     }
 
@@ -822,6 +823,10 @@ fn draw_help_overlay(frame: &mut Frame) {
         kv("Esc", "キャンセル"),
         kv("Tab", "次フィールド"),
         kv("←→ / h l", "選択 (確認 / 移動先 / 絵文字)"),
+        blank(),
+        section("ファイルパス入力"),
+        kv("Tab", "パス補完（共通接頭辞まで・~展開）"),
+        kv("Ctrl+F", "ファイラーを開いて選択"),
     ];
 
     let height = (lines.len() as u16 + 2).min(frame.area().height);
@@ -1290,8 +1295,10 @@ fn draw_add_deliverable_modal(frame: &mut Frame, app: &App) {
         .border_style(Style::default().fg(Color::Cyan))
         .title(" Add Deliverable ")
         .title_bottom(
-            Line::from(" Tab: Next Field | ↑↓: Kind | Enter: Add | Esc: Cancel ")
-                .style(Style::default().fg(Color::DarkGray)),
+            Line::from(
+                " Tab: Next/Complete | ↑↓: Kind | Ctrl+F: Browse | Enter: Add | Esc: Cancel ",
+            )
+            .style(Style::default().fg(Color::DarkGray)),
         );
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -1361,7 +1368,8 @@ fn draw_update_deliverable_modal(frame: &mut Frame, app: &App) {
         .border_style(Style::default().fg(Color::Cyan))
         .title(" Update Document Deliverable ")
         .title_bottom(
-            Line::from(" Enter: Update | Esc: Cancel ").style(Style::default().fg(Color::DarkGray)),
+            Line::from(" Tab: Complete | Ctrl+F: Browse | Enter: Update | Esc: Cancel ")
+                .style(Style::default().fg(Color::DarkGray)),
         );
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -1750,6 +1758,90 @@ fn draw_react_comment_modal(frame: &mut Frame, app: &App) {
         spans.push(Span::raw(" "));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), layout[1]);
+}
+
+fn draw_file_picker_modal(frame: &mut Frame, app: &App) {
+    let Some(ModalState::FilePicker {
+        dir,
+        entries,
+        selected_index,
+        scroll_offset,
+        ..
+    }) = &app.modal_state
+    else {
+        return;
+    };
+
+    let visible = super::app::PICKER_VISIBLE_ROWS as u16;
+    // border(2) + dir行(1) + 区切り(1) + リスト
+    let height = (visible + 4).min(frame.area().height);
+    let area = centered_rect(70, height, frame.area());
+    clear_modal_area(frame, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Select File ")
+        .title_bottom(
+            Line::from(" j/k: Move | Enter/l: Open | h: Up | Esc: Cancel ")
+                .style(Style::default().fg(Color::DarkGray)),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(inner);
+
+    // 現在ディレクトリ（右寄せで切り詰め）。
+    let dir_str = dir.to_string_lossy();
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            truncate_str(&dir_str, layout[0].width as usize),
+            Style::default().fg(Color::DarkGray),
+        ))),
+        layout[0],
+    );
+
+    if entries.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "  (empty)",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            layout[1],
+        );
+        return;
+    }
+
+    let start = *scroll_offset.min(&entries.len().saturating_sub(1));
+    let rows: Vec<ListItem> = entries
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(layout[1].height as usize)
+        .map(|(idx, entry)| {
+            let selected = idx == *selected_index;
+            let icon = if entry.is_dir { "📁 " } else { "📄 " };
+            let suffix = if entry.is_dir { "/" } else { "" };
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else if entry.is_dir {
+                Style::default().fg(Color::White)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            let prefix = if selected { ">" } else { " " };
+            ListItem::new(Line::from(Span::styled(
+                format!("{prefix} {icon}{}{suffix}", entry.name),
+                style,
+            )))
+        })
+        .collect();
+    frame.render_widget(List::new(rows), layout[1]);
 }
 
 fn draw_text_field(frame: &mut Frame, area: Rect, title: &str, text: &str, focused: bool) {

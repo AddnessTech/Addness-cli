@@ -3010,3 +3010,84 @@ mod path_tests {
         fs::remove_dir_all(&d).ok();
     }
 }
+
+#[cfg(test)]
+mod picker_render_tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn render_text(app: &mut App, w: u16, h: u16) -> String {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| super::super::ui::draw(f, app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let mut s = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                s.push_str(buf[(x, y)].symbol());
+            }
+            s.push('\n');
+        }
+        s
+    }
+
+    fn app_with_picker(entries: Vec<FileEntry>, selected: usize) -> (tokio::runtime::Runtime, App) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = ApiClient::new("t", "http://localhost").unwrap();
+        let mut app = App::new(client, rt.handle().clone());
+        app.modal_state = Some(ModalState::FilePicker {
+            dir: std::path::PathBuf::from("/tmp"),
+            entries,
+            selected_index: selected,
+            ret: FilePickerReturn::UpdateDeliverable {
+                goal_id: "g".into(),
+                deliverable_id: "d".into(),
+                deliverable_name: "n".into(),
+                content_file: String::new(),
+            },
+        });
+        (rt, app)
+    }
+
+    #[test]
+    fn picker_selected_visible_on_short_terminal() {
+        let entries: Vec<FileEntry> = (0..30)
+            .map(|i| FileEntry {
+                name: format!("file_{i:02}"),
+                is_dir: false,
+            })
+            .collect();
+        // 選択を末尾付近に。低い端末(高さ10)でも選択行が画面内に描画されること。
+        // （scroll_offset を固定値で計算していた頃のリグレッション防止）
+        let (_rt, mut app) = app_with_picker(entries, 27);
+        let text = render_text(&mut app, 80, 10);
+        assert!(
+            text.contains("file_27"),
+            "selected entry must be visible on a short terminal:\n{text}"
+        );
+    }
+
+    #[test]
+    fn picker_top_visible_when_selected_at_start() {
+        let entries: Vec<FileEntry> = (0..30)
+            .map(|i| FileEntry {
+                name: format!("file_{i:02}"),
+                is_dir: false,
+            })
+            .collect();
+        let (_rt, mut app) = app_with_picker(entries, 0);
+        let text = render_text(&mut app, 80, 24);
+        assert!(text.contains("file_00"), "got:\n{text}");
+    }
+
+    #[test]
+    fn complete_path_noop_when_already_complete() {
+        // 一意な完全パスは complete_path で変化しない → Tab はフィールド送りにフォールバックする
+        let d = std::env::temp_dir().join(format!("addness_verify_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("only.txt"), "x").unwrap();
+        let full = format!("{}/only.txt", d.display());
+        assert_eq!(complete_path(&full).as_deref(), Some(full.as_str()));
+        std::fs::remove_dir_all(&d).ok();
+    }
+}

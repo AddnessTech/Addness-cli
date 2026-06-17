@@ -77,24 +77,38 @@ pub enum DeliverableFormField {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionMenuItem {
     AddDeliverable,
+    AddComment,
     EditGoal,
     DeleteGoal,
     UpdateDeliverable,
     RenameDeliverable,
     MoveDeliverable,
     DeleteDeliverable,
+    ReplyComment,
+    ResolveComment,
+    UnresolveComment,
+    EditComment,
+    DeleteComment,
+    ReactComment,
 }
 
 impl ActionMenuItem {
     pub fn label(&self) -> &'static str {
         match self {
             ActionMenuItem::AddDeliverable => "add deliverable",
+            ActionMenuItem::AddComment => "add comment",
             ActionMenuItem::EditGoal => "edit goal",
             ActionMenuItem::DeleteGoal => "delete goal",
             ActionMenuItem::UpdateDeliverable => "update document",
             ActionMenuItem::RenameDeliverable => "rename deliverable",
             ActionMenuItem::MoveDeliverable => "move deliverable",
             ActionMenuItem::DeleteDeliverable => "delete deliverable",
+            ActionMenuItem::ReplyComment => "reply to comment",
+            ActionMenuItem::ResolveComment => "resolve comment",
+            ActionMenuItem::UnresolveComment => "unresolve comment",
+            ActionMenuItem::EditComment => "edit comment",
+            ActionMenuItem::DeleteComment => "delete comment",
+            ActionMenuItem::ReactComment => "react (👍)",
         }
     }
 }
@@ -165,6 +179,19 @@ impl GoalDisplayStatus {
     }
 }
 
+/// コメント本文を一覧表示・タイトル用に短く切り詰める（改行は空白化）。
+fn truncate_comment(content: &str) -> String {
+    let oneline = content.replace(['\n', '\r'], " ");
+    let trimmed = oneline.trim();
+    let max = 40;
+    if trimmed.chars().count() > max {
+        let head: String = trimmed.chars().take(max).collect();
+        format!("{head}…")
+    } else {
+        trimmed.to_string()
+    }
+}
+
 // NOTE: 将来goal以外についてのモーダルが出得るためsuffixにGoalと付けている
 // それまでclippy errorを抑制
 #[allow(clippy::enum_variant_names)]
@@ -227,6 +254,34 @@ pub enum ModalState {
         deliverable_id: String,
         deliverable_name: String,
         confirm_index: usize,
+    },
+    AddComment {
+        goal_id: String,
+        goal_title: String,
+        body: String,
+    },
+    ReplyComment {
+        goal_id: String,
+        parent_comment_id: String,
+        parent_excerpt: String,
+        body: String,
+    },
+    EditComment {
+        goal_id: String,
+        comment_id: String,
+        body: String,
+    },
+    DeleteComment {
+        goal_id: String,
+        comment_id: String,
+        excerpt: String,
+        confirm_index: usize,
+    },
+    ReactComment {
+        goal_id: String,
+        comment_id: String,
+        emojis: Vec<&'static str>,
+        selected_index: usize,
     },
 }
 
@@ -572,6 +627,23 @@ impl App {
         }
     }
 
+    /// カーソル上のコメント行の情報。返り値は
+    /// (goal_id, comment_id, 本文, 解決済みか)。
+    /// goal_id はコメントの commentable_id（= ゴールID）から得る。
+    fn selected_comment_context(&self) -> Option<(String, String, String, bool)> {
+        let tree = self.active_goal_tree();
+        let rows = tree.flatten();
+        match rows.get(tree.cursor) {
+            Some(TreeRow::CommentItem { comment, .. }) => Some((
+                comment.commentable_id.clone(),
+                comment.id.clone(),
+                comment.content.clone(),
+                comment.resolved_at.is_some(),
+            )),
+            _ => None,
+        }
+    }
+
     fn deliverable_folder_targets_for_goal(
         &self,
         goal_id: &str,
@@ -598,6 +670,25 @@ impl App {
     }
 
     fn start_action_menu(&mut self) {
+        // コメント行が最も具体的なので先に判定する。
+        if let Some((_, _, content, resolved)) = self.selected_comment_context() {
+            let mut items = vec![ActionMenuItem::ReplyComment];
+            if resolved {
+                items.push(ActionMenuItem::UnresolveComment);
+            } else {
+                items.push(ActionMenuItem::ResolveComment);
+            }
+            items.push(ActionMenuItem::ReactComment);
+            items.push(ActionMenuItem::EditComment);
+            items.push(ActionMenuItem::DeleteComment);
+            self.modal_state = Some(ModalState::ActionMenu {
+                title: format!("comment: {}", truncate_comment(&content)),
+                items,
+                selected_index: 0,
+            });
+            return;
+        }
+
         if let Some((_, deliverable_id, deliverable_name, _, node_type)) =
             self.selected_deliverable_context()
         {
@@ -620,6 +711,7 @@ impl App {
             self.modal_state = Some(ModalState::ActionMenu {
                 title: goal_title,
                 items: vec![
+                    ActionMenuItem::AddComment,
                     ActionMenuItem::AddDeliverable,
                     ActionMenuItem::EditGoal,
                     ActionMenuItem::DeleteGoal,
@@ -629,7 +721,8 @@ impl App {
             return;
         }
 
-        self.error_message = Some("Select a goal or deliverable to open actions".to_string());
+        self.error_message =
+            Some("Select a goal, deliverable or comment to open actions".to_string());
     }
 
     fn reload_deliverables_for_goal(&mut self, goal_id: &str) {
@@ -643,6 +736,191 @@ impl App {
             }
             Err(e) => {
                 self.error_message = Some(format!("Failed to reload deliverables: {e}"));
+            }
+        }
+    }
+
+    fn reload_comments_for_goal(&mut self, goal_id: &str) {
+        match self.api_call(self.client.list_comments(goal_id)) {
+            Ok(resp) => {
+                let comments = resp.comments;
+                self.goal_tree
+                    .set_comments_for_goal_id(goal_id, comments.clone());
+                self.todays_goals_tree
+                    .set_comments_for_goal_id(goal_id, comments);
+                // 削除・解決で行数が減るとカーソルが範囲外/別ノードを指すため再クランプ。
+                self.goal_tree.clamp_cursor();
+                self.todays_goals_tree.clamp_cursor();
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Failed to reload comments: {e}"));
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Comment actions
+    // -----------------------------------------------------------------------
+
+    fn start_add_comment_modal(&mut self) {
+        let Some((goal_id, goal_title)) = self.selected_goal_context() else {
+            self.error_message = Some("Please select a goal to add a comment".to_string());
+            return;
+        };
+        self.modal_state = Some(ModalState::AddComment {
+            goal_id,
+            goal_title,
+            body: String::new(),
+        });
+    }
+
+    fn start_reply_comment_modal(&mut self) {
+        let Some((goal_id, comment_id, content, _)) = self.selected_comment_context() else {
+            self.error_message = Some("Please select a comment to reply to".to_string());
+            return;
+        };
+        self.modal_state = Some(ModalState::ReplyComment {
+            goal_id,
+            parent_comment_id: comment_id,
+            parent_excerpt: truncate_comment(&content),
+            body: String::new(),
+        });
+    }
+
+    fn start_edit_comment_modal(&mut self) {
+        let Some((goal_id, comment_id, content, _)) = self.selected_comment_context() else {
+            self.error_message = Some("Please select a comment to edit".to_string());
+            return;
+        };
+        self.modal_state = Some(ModalState::EditComment {
+            goal_id,
+            comment_id,
+            body: content,
+        });
+    }
+
+    fn start_delete_comment_modal(&mut self) {
+        let Some((goal_id, comment_id, content, _)) = self.selected_comment_context() else {
+            self.error_message = Some("Please select a comment to delete".to_string());
+            return;
+        };
+        self.modal_state = Some(ModalState::DeleteComment {
+            goal_id,
+            comment_id,
+            excerpt: truncate_comment(&content),
+            confirm_index: 0,
+        });
+    }
+
+    fn start_react_comment_modal(&mut self) {
+        let Some((goal_id, comment_id, _, _)) = self.selected_comment_context() else {
+            self.error_message = Some("Please select a comment to react to".to_string());
+            return;
+        };
+        self.modal_state = Some(ModalState::ReactComment {
+            goal_id,
+            comment_id,
+            emojis: vec!["👍", "❤️", "🎉", "👀", "🙏", "🚀"],
+            selected_index: 0,
+        });
+    }
+
+    fn do_set_comment_resolved(&mut self, resolved: bool) {
+        let Some((goal_id, comment_id, _, _)) = self.selected_comment_context() else {
+            self.error_message = Some("Please select a comment".to_string());
+            return;
+        };
+        let result = if resolved {
+            self.api_call(self.client.resolve_comment(&comment_id))
+                .map(|_| ())
+        } else {
+            self.api_call(self.client.unresolve_comment(&comment_id))
+                .map(|_| ())
+        };
+        match result {
+            Ok(()) => {
+                self.success_message = Some(
+                    if resolved {
+                        "Comment resolved"
+                    } else {
+                        "Comment unresolved"
+                    }
+                    .to_string(),
+                );
+                self.reload_comments_for_goal(&goal_id);
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Failed to update comment: {e}"));
+            }
+        }
+    }
+
+    fn modal_submit_add_comment(
+        &mut self,
+        goal_id: String,
+        parent_comment_id: Option<String>,
+        body: String,
+    ) {
+        let body = body.trim();
+        if body.is_empty() {
+            self.error_message = Some("Comment body is required".to_string());
+            return;
+        }
+        // AIではなく人間の操作だが、CLI経由と区別できるよう本文はそのまま送る。
+        let result = self.api_call(self.client.create_comment_with_options(
+            &goal_id,
+            body,
+            parent_comment_id,
+            Vec::new(),
+        ));
+        match result {
+            Ok(_) => {
+                self.success_message = Some("Comment posted".to_string());
+                self.reload_comments_for_goal(&goal_id);
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Failed to post comment: {e}"));
+            }
+        }
+    }
+
+    fn modal_submit_edit_comment(&mut self, goal_id: String, comment_id: String, body: String) {
+        let body = body.trim();
+        if body.is_empty() {
+            self.error_message = Some("Comment body is required".to_string());
+            return;
+        }
+        match self.api_call(self.client.update_comment(&comment_id, body, Vec::new())) {
+            Ok(_) => {
+                self.success_message = Some("Comment updated".to_string());
+                self.reload_comments_for_goal(&goal_id);
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Failed to update comment: {e}"));
+            }
+        }
+    }
+
+    fn modal_submit_delete_comment(&mut self, goal_id: String, comment_id: String) {
+        match self.api_call(self.client.delete_comment(&comment_id)) {
+            Ok(()) => {
+                self.success_message = Some("Comment deleted".to_string());
+                self.reload_comments_for_goal(&goal_id);
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Failed to delete comment: {e}"));
+            }
+        }
+    }
+
+    fn modal_submit_react_comment(&mut self, goal_id: String, comment_id: String, emoji: &str) {
+        match self.api_call(self.client.add_reaction(&comment_id, emoji)) {
+            Ok(()) => {
+                self.success_message = Some(format!("Reacted {emoji}"));
+                self.reload_comments_for_goal(&goal_id);
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Failed to react: {e}"));
             }
         }
     }
@@ -779,6 +1057,14 @@ impl App {
                     && (self.sidebar_index == 0 || self.sidebar_index == 1) =>
             {
                 self.start_create_goal_modal();
+            }
+            KeyCode::Char('C')
+                if self.active_pane == ActivePane::Content
+                    && (self.sidebar_index == 0 || self.sidebar_index == 1) =>
+            {
+                self.active_goal_tree_mut().cycle_comment_view();
+                let mode = self.active_goal_tree().comment_view.label();
+                self.success_message = Some(format!("Comments: {mode}"));
             }
             KeyCode::Char('e')
                 if self.active_pane == ActivePane::Content
@@ -1140,6 +1426,8 @@ impl App {
                     self.modal_menu_prev();
                 } else if matches!(self.modal_state, Some(ModalState::MoveDeliverable { .. })) {
                     self.modal_move_target_prev();
+                } else if matches!(self.modal_state, Some(ModalState::ReactComment { .. })) {
+                    self.modal_react_prev();
                 } else if let Some(ModalState::EditGoal {
                     current_field: FormField::Status,
                     ..
@@ -1159,6 +1447,8 @@ impl App {
                     self.modal_menu_next();
                 } else if matches!(self.modal_state, Some(ModalState::MoveDeliverable { .. })) {
                     self.modal_move_target_next();
+                } else if matches!(self.modal_state, Some(ModalState::ReactComment { .. })) {
+                    self.modal_react_next();
                 } else if let Some(ModalState::EditGoal {
                     current_field: FormField::Status,
                     ..
@@ -1181,6 +1471,12 @@ impl App {
                     &mut self.modal_state
                 {
                     *confirm_index = 0;
+                } else if let Some(ModalState::DeleteComment { confirm_index, .. }) =
+                    &mut self.modal_state
+                {
+                    *confirm_index = 0;
+                } else if matches!(self.modal_state, Some(ModalState::ReactComment { .. })) {
+                    self.modal_react_prev();
                 }
             }
             KeyCode::Right => {
@@ -1191,6 +1487,12 @@ impl App {
                     &mut self.modal_state
                 {
                     *confirm_index = 1;
+                } else if let Some(ModalState::DeleteComment { confirm_index, .. }) =
+                    &mut self.modal_state
+                {
+                    *confirm_index = 1;
+                } else if matches!(self.modal_state, Some(ModalState::ReactComment { .. })) {
+                    self.modal_react_next();
                 }
             }
             KeyCode::Char(c) => {
@@ -1220,6 +1522,20 @@ impl App {
                     match c {
                         'h' => *confirm_index = 0,
                         'l' => *confirm_index = 1,
+                        _ => {}
+                    }
+                } else if let Some(ModalState::DeleteComment { confirm_index, .. }) =
+                    &mut self.modal_state
+                {
+                    match c {
+                        'h' => *confirm_index = 0,
+                        'l' => *confirm_index = 1,
+                        _ => {}
+                    }
+                } else if matches!(self.modal_state, Some(ModalState::ReactComment { .. })) {
+                    match c {
+                        'j' | 'l' => self.modal_react_next(),
+                        'k' | 'h' => self.modal_react_prev(),
                         _ => {}
                     }
                 } else {
@@ -1264,6 +1580,11 @@ impl App {
                 ModalState::UpdateDeliverable { .. }
                 | ModalState::RenameDeliverable { .. }
                 | ModalState::DeleteDeliverable { .. } => {}
+                ModalState::AddComment { .. }
+                | ModalState::ReplyComment { .. }
+                | ModalState::EditComment { .. }
+                | ModalState::DeleteComment { .. }
+                | ModalState::ReactComment { .. } => {}
             }
         }
     }
@@ -1299,6 +1620,11 @@ impl App {
                 ModalState::UpdateDeliverable { .. }
                 | ModalState::RenameDeliverable { .. }
                 | ModalState::DeleteDeliverable { .. } => {}
+                ModalState::AddComment { .. }
+                | ModalState::ReplyComment { .. }
+                | ModalState::EditComment { .. }
+                | ModalState::DeleteComment { .. }
+                | ModalState::ReactComment { .. } => {}
             }
         }
     }
@@ -1345,8 +1671,15 @@ impl App {
                 ModalState::RenameDeliverable { name, .. } => {
                     name.push(c);
                 }
+                ModalState::AddComment { body, .. }
+                | ModalState::ReplyComment { body, .. }
+                | ModalState::EditComment { body, .. } => {
+                    body.push(c);
+                }
                 ModalState::ActionMenu { .. } | ModalState::MoveDeliverable { .. } => {}
-                ModalState::DeleteDeliverable { .. } => {}
+                ModalState::DeleteDeliverable { .. }
+                | ModalState::DeleteComment { .. }
+                | ModalState::ReactComment { .. } => {}
             }
         }
     }
@@ -1405,8 +1738,15 @@ impl App {
                 ModalState::RenameDeliverable { name, .. } => {
                     name.pop();
                 }
+                ModalState::AddComment { body, .. }
+                | ModalState::ReplyComment { body, .. }
+                | ModalState::EditComment { body, .. } => {
+                    body.pop();
+                }
                 ModalState::ActionMenu { .. } | ModalState::MoveDeliverable { .. } => {}
-                ModalState::DeleteDeliverable { .. } => {}
+                ModalState::DeleteDeliverable { .. }
+                | ModalState::DeleteComment { .. }
+                | ModalState::ReactComment { .. } => {}
             }
         }
     }
@@ -1503,6 +1843,44 @@ impl App {
                 self.modal_submit_delete_deliverable(goal_id, deliverable_id);
             }
             Some(ModalState::DeleteDeliverable { .. }) => {}
+            Some(ModalState::AddComment { goal_id, body, .. }) => {
+                self.modal_submit_add_comment(goal_id, None, body);
+            }
+            Some(ModalState::ReplyComment {
+                goal_id,
+                parent_comment_id,
+                body,
+                ..
+            }) => {
+                self.modal_submit_add_comment(goal_id, Some(parent_comment_id), body);
+            }
+            Some(ModalState::EditComment {
+                goal_id,
+                comment_id,
+                body,
+                ..
+            }) => {
+                self.modal_submit_edit_comment(goal_id, comment_id, body);
+            }
+            Some(ModalState::DeleteComment {
+                goal_id,
+                comment_id,
+                confirm_index: 1,
+                ..
+            }) => {
+                self.modal_submit_delete_comment(goal_id, comment_id);
+            }
+            Some(ModalState::DeleteComment { .. }) => {}
+            Some(ModalState::ReactComment {
+                goal_id,
+                comment_id,
+                emojis,
+                selected_index,
+            }) => {
+                if let Some(emoji) = emojis.get(selected_index) {
+                    self.modal_submit_react_comment(goal_id, comment_id, emoji);
+                }
+            }
             None => {}
         }
     }
@@ -1612,12 +1990,19 @@ impl App {
     fn run_action_menu_item(&mut self, item: ActionMenuItem) {
         match item {
             ActionMenuItem::AddDeliverable => self.start_add_deliverable_modal(),
+            ActionMenuItem::AddComment => self.start_add_comment_modal(),
             ActionMenuItem::EditGoal => self.start_edit_goal_modal(),
             ActionMenuItem::DeleteGoal => self.start_delete_goal_modal(),
             ActionMenuItem::UpdateDeliverable => self.start_update_deliverable_modal(),
             ActionMenuItem::RenameDeliverable => self.start_rename_deliverable_modal(),
             ActionMenuItem::MoveDeliverable => self.start_move_deliverable_modal(),
             ActionMenuItem::DeleteDeliverable => self.start_delete_deliverable_modal(),
+            ActionMenuItem::ReplyComment => self.start_reply_comment_modal(),
+            ActionMenuItem::ResolveComment => self.do_set_comment_resolved(true),
+            ActionMenuItem::UnresolveComment => self.do_set_comment_resolved(false),
+            ActionMenuItem::EditComment => self.start_edit_comment_modal(),
+            ActionMenuItem::DeleteComment => self.start_delete_comment_modal(),
+            ActionMenuItem::ReactComment => self.start_react_comment_modal(),
         }
     }
 
@@ -1903,6 +2288,34 @@ impl App {
         {
             *selected_index = if *selected_index == 0 {
                 targets.len() - 1
+            } else {
+                *selected_index - 1
+            };
+        }
+    }
+
+    fn modal_react_next(&mut self) {
+        if let Some(ModalState::ReactComment {
+            selected_index,
+            emojis,
+            ..
+        }) = &mut self.modal_state
+            && !emojis.is_empty()
+        {
+            *selected_index = (*selected_index + 1) % emojis.len();
+        }
+    }
+
+    fn modal_react_prev(&mut self) {
+        if let Some(ModalState::ReactComment {
+            selected_index,
+            emojis,
+            ..
+        }) = &mut self.modal_state
+            && !emojis.is_empty()
+        {
+            *selected_index = if *selected_index == 0 {
+                emojis.len() - 1
             } else {
                 *selected_index - 1
             };

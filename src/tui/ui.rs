@@ -1868,7 +1868,6 @@ fn draw_file_picker_modal(frame: &mut Frame, app: &App) {
         dir,
         entries,
         selected_index,
-        scroll_offset,
         ..
     }) = &app.modal_state
     else {
@@ -1918,12 +1917,19 @@ fn draw_file_picker_modal(frame: &mut Frame, app: &App) {
         return;
     }
 
-    let start = *scroll_offset.min(&entries.len().saturating_sub(1));
+    // 実際に描画できる行数から可視窓を決め、選択行が常に収まるようにする。
+    // （端末高に依存しない固定値でスクロールすると、低い端末で選択が画面外に出るため）
+    let visible_rows = (layout[1].height as usize).max(1);
+    let start = if *selected_index < visible_rows {
+        0
+    } else {
+        *selected_index + 1 - visible_rows
+    };
     let rows: Vec<ListItem> = entries
         .iter()
         .enumerate()
         .skip(start)
-        .take(layout[1].height as usize)
+        .take(visible_rows)
         .map(|(idx, entry)| {
             let selected = idx == *selected_index;
             let icon = if entry.is_dir { "📁 " } else { "📄 " };

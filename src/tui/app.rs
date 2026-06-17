@@ -454,7 +454,6 @@ pub enum ModalState {
         dir: PathBuf,
         entries: Vec<FileEntry>,
         selected_index: usize,
-        scroll_offset: usize,
         ret: FilePickerReturn,
     },
 }
@@ -1760,20 +1759,28 @@ impl App {
         }
     }
 
-    /// パス欄ならファイルシステム補完を行い true を返す。パス欄でなければ false。
+    /// パス欄で補完が前進したら適用して true（Tabを消費）。
+    /// パス欄でない、または補完で文字列が変わらなかった場合は false を返し、
+    /// 呼び出し側で通常のフィールド送り（Tab）にフォールバックさせる。
+    /// これにより最後尾の Value 欄でも Tab が無反応にならず、次フィールドへ回れる。
     fn try_complete_path_field(&mut self) -> bool {
         let Some(field) = self.current_path_field_mut() else {
             return false;
         };
-        if let Some(completed) = complete_path(field) {
-            *field = completed;
+        match complete_path(field) {
+            Some(completed) if completed != *field => {
+                *field = completed;
+                true
+            }
+            _ => false,
         }
-        true
     }
 
     /// 現在のパス欄の値から開始ディレクトリを決めてファイラーを開く。
     fn open_file_picker(&mut self) {
         let ret = match &self.modal_state {
+            // ファイラーが書き戻すのはファイルパス欄（File/Document）のみ。
+            // Link/Folder の value はパスではないため対象外にする。
             Some(ModalState::AddDeliverable {
                 goal_id,
                 goal_title,
@@ -1781,13 +1788,15 @@ impl App {
                 name,
                 value,
                 ..
-            }) => FilePickerReturn::AddDeliverable {
-                goal_id: goal_id.clone(),
-                goal_title: goal_title.clone(),
-                kind: kind.clone(),
-                name: name.clone(),
-                value: value.clone(),
-            },
+            }) if matches!(kind, DeliverableKind::File | DeliverableKind::Document) => {
+                FilePickerReturn::AddDeliverable {
+                    goal_id: goal_id.clone(),
+                    goal_title: goal_title.clone(),
+                    kind: kind.clone(),
+                    name: name.clone(),
+                    value: value.clone(),
+                }
+            }
             Some(ModalState::UpdateDeliverable {
                 goal_id,
                 deliverable_id,
@@ -1812,7 +1821,6 @@ impl App {
             dir,
             entries,
             selected_index: 0,
-            scroll_offset: 0,
             ret,
         });
     }
@@ -1857,31 +1865,23 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => {
                 if let Some(ModalState::FilePicker {
                     selected_index,
-                    scroll_offset,
                     entries,
                     ..
                 }) = &mut self.modal_state
                     && !entries.is_empty()
                 {
                     *selected_index = selected_index.saturating_sub(1);
-                    if *selected_index < *scroll_offset {
-                        *scroll_offset = *selected_index;
-                    }
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 if let Some(ModalState::FilePicker {
                     selected_index,
-                    scroll_offset,
                     entries,
                     ..
                 }) = &mut self.modal_state
                     && *selected_index + 1 < entries.len()
                 {
                     *selected_index += 1;
-                    if *selected_index >= *scroll_offset + PICKER_VISIBLE_ROWS {
-                        *scroll_offset = *selected_index + 1 - PICKER_VISIBLE_ROWS;
-                    }
                 }
             }
             KeyCode::Left | KeyCode::Char('h') => self.file_picker_go_parent(),
@@ -1896,7 +1896,6 @@ impl App {
             dir,
             entries,
             selected_index,
-            scroll_offset,
             ..
         }) = &mut self.modal_state
             && let Some(parent) = dir.parent()
@@ -1904,7 +1903,6 @@ impl App {
             *dir = parent.to_path_buf();
             *entries = read_dir_entries(dir);
             *selected_index = 0;
-            *scroll_offset = 0;
         }
     }
 
@@ -1928,14 +1926,12 @@ impl App {
                 dir,
                 entries,
                 selected_index,
-                scroll_offset,
                 ..
             }) = &mut self.modal_state
             {
                 *dir = path;
                 *entries = read_dir_entries(dir);
                 *selected_index = 0;
-                *scroll_offset = 0;
             }
         } else {
             self.close_file_picker(Some(path.to_string_lossy().into_owned()));

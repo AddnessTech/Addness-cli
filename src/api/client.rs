@@ -18,6 +18,7 @@ use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+#[derive(Clone)]
 pub struct ApiClient {
     client: Client,
     base_url: String,

@@ -1,0 +1,9 @@
+- generic [ref=e2]:
+  - generic [ref=e6]:
+    - generic [ref=e7]: AddnessCLI
+    - generic [ref=e8]: Goals, comments, and org workflows in a retro terminal shell
+    - generic [ref=e9]:
+      - generic [ref=e10]: "> $ addness goal list --assigned-to me"
+      - generic [ref=e11]: "> $ addness comment create --goal [id] --body PR-ready_"
+      - text: addness-terminal
+  - text: addness-cli

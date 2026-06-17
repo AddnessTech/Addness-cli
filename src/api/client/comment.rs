@@ -30,26 +30,30 @@ impl ApiClient {
         &self,
         params: ListCommentsParams<'_>,
     ) -> Result<CommentsResponse> {
-        let mut query = form_urlencoded::Serializer::new(String::new());
-        if let Some(parent_id) = params.parent_id {
-            query.append_pair("parentId", parent_id);
-        }
-        if let Some(resolved) = params.resolved {
-            query.append_pair("resolved", if resolved { "true" } else { "false" });
-        }
-        if let Some(limit) = params.limit {
-            query.append_pair("limit", &limit.to_string());
-        }
-        if let Some(offset) = params.offset {
-            query.append_pair("offset", &offset.to_string());
-        }
-        if let Some(sort) = params.sort {
-            query.append_pair("sort", sort);
-        }
-        if params.include_replies {
-            query.append_pair("include_replies", "true");
-        }
-        let query = query.finish();
+        // Serializer は非Sendなので、ブロック内で文字列に確定させて drop し、
+        // await をまたいで生存しないようにする（spawn 用に future を Send に保つ）。
+        let query = {
+            let mut query = form_urlencoded::Serializer::new(String::new());
+            if let Some(parent_id) = params.parent_id {
+                query.append_pair("parentId", parent_id);
+            }
+            if let Some(resolved) = params.resolved {
+                query.append_pair("resolved", if resolved { "true" } else { "false" });
+            }
+            if let Some(limit) = params.limit {
+                query.append_pair("limit", &limit.to_string());
+            }
+            if let Some(offset) = params.offset {
+                query.append_pair("offset", &offset.to_string());
+            }
+            if let Some(sort) = params.sort {
+                query.append_pair("sort", sort);
+            }
+            if params.include_replies {
+                query.append_pair("include_replies", "true");
+            }
+            query.finish()
+        };
         let suffix = if query.is_empty() {
             String::new()
         } else {

@@ -23,6 +23,11 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # RUSTSEC-2026-0097: rand unsound only when using a custom logger with
+          # rand::rng(). Not applicable here, and the remaining 0.8.5 is pulled in
+          # transitively by oauth2 with no patched 0.8.x release. The 0.9.x line is
+          # already updated to the patched 0.9.4.
+          ignore: RUSTSEC-2026-0097
 
   secret-patterns:
     name: secret patterns

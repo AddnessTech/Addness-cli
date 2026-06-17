@@ -15,6 +15,66 @@ const INITIAL_COMMENT_DISPLAY_LIMIT: usize = 20;
 const COMMENT_DISPLAY_INCREMENT: usize = 20;
 
 // ---------------------------------------------------------------------------
+// CommentView – global comment visibility mode
+// ---------------------------------------------------------------------------
+
+/// ツリー全体のコメント表示モード。`c` キーで循環する。
+/// いずれもキャッシュ済みコメントの描画切替のみで、追加のAPI取得は行わない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CommentView {
+    /// コメント行を一切表示しない（件数バッジのみ）
+    Hidden,
+    /// 未解決コメントのみ表示（既定）
+    #[default]
+    Unresolved,
+    /// 解決済みを含む全コメントを表示
+    All,
+}
+
+impl CommentView {
+    /// Hidden → Unresolved → All → Hidden の順で循環する。
+    pub fn cycle(self) -> Self {
+        match self {
+            CommentView::Hidden => CommentView::Unresolved,
+            CommentView::Unresolved => CommentView::All,
+            CommentView::All => CommentView::Hidden,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CommentView::Hidden => "hidden",
+            CommentView::Unresolved => "unresolved",
+            CommentView::All => "all",
+        }
+    }
+
+    /// このモードでコメントを表示するか。
+    fn shows_comments(self) -> bool {
+        !matches!(self, CommentView::Hidden)
+    }
+
+    /// このモードで対象コメントを表示対象に含めるか。
+    fn includes(self, comment: &Comment) -> bool {
+        match self {
+            CommentView::Hidden => false,
+            CommentView::Unresolved => comment.resolved_at.is_none(),
+            CommentView::All => true,
+        }
+    }
+}
+
+/// 指定モードで表示対象となるコメント件数を数える。
+fn visible_comment_count(comments: &[Comment], view: CommentView) -> usize {
+    comments.iter().filter(|c| view.includes(c)).count()
+}
+
+/// 未解決コメント件数（バッジ表示用、モード非依存）。
+fn unresolved_comment_count(comments: &[Comment]) -> usize {
+    comments.iter().filter(|c| c.resolved_at.is_none()).count()
+}
+
+// ---------------------------------------------------------------------------
 // Timestamped wrapper
 // ---------------------------------------------------------------------------
 
@@ -126,6 +186,8 @@ pub struct GoalTree {
     pub scroll_offset: usize,
     /// If true, this tree is complete and should not fetch additional data on expand
     pub is_required_to_fetch: bool,
+    /// コメントの表示モード（ツリー全体に適用）
+    pub comment_view: CommentView,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -189,6 +251,8 @@ pub enum TreeRow<'a> {
         children_loaded: bool,
         comments_loaded: bool,
         deliverables_loaded: bool,
+        /// 未解決コメント件数（コメント読込済みのゴールのみ Some）。バッジ表示に使う。
+        unresolved_comments: Option<usize>,
         depth: usize,
         guide: TreeGuide,
     },
@@ -256,6 +320,7 @@ impl GoalTree {
             cursor: 0,
             scroll_offset: 0,
             is_required_to_fetch: true,
+            comment_view: CommentView::default(),
         }
     }
 
@@ -344,6 +409,7 @@ impl GoalTree {
             cursor: 0,
             scroll_offset: 0,
             is_required_to_fetch: true,
+            comment_view: CommentView::default(),
         }
     }
 
@@ -404,6 +470,7 @@ impl GoalTree {
             cursor: 0,
             scroll_offset: 0,
             is_required_to_fetch: false, // This tree is completed, no need to fetch more data
+            comment_view: CommentView::default(),
         };
 
         dbg_log!("Built complete tree with {} roots", tree.roots.len());
@@ -422,17 +489,28 @@ impl GoalTree {
         let root_count = self.roots.len();
         for (idx, root) in self.roots.iter().enumerate() {
             let guide = TreeGuide::root(idx + 1 == root_count);
-            flatten_node(root, guide, &mut rows);
+            flatten_node(root, self.comment_view, guide, &mut rows);
         }
         rows
     }
 
+    /// コメント表示モードを Hidden → Unresolved → All → … と循環させる。
+    /// 行数が変わるため、カーソルが範囲外に残らないようクランプする。
+    pub fn cycle_comment_view(&mut self) {
+        self.comment_view = self.comment_view.cycle();
+        let len = self.flatten().len();
+        if len > 0 && self.cursor >= len {
+            self.cursor = len - 1;
+        }
+    }
+
     pub fn toggle_expand(&mut self) {
+        let view = self.comment_view;
         let rows = self.flatten();
         if let Some(TreeRow::Goal { .. }) = rows.get(self.cursor) {
             let mut idx = 0;
             for root in &mut self.roots {
-                if toggle_at(root, self.cursor, &mut idx) {
+                if toggle_at(root, self.cursor, &mut idx, view) {
                     return;
                 }
             }
@@ -441,11 +519,12 @@ impl GoalTree {
 
     /// Insert fetched children into the Goal node at the current cursor position.
     pub fn set_children_at_cursor(&mut self, children: Vec<GoalChildItem>) {
+        let view = self.comment_view;
         let target = self.cursor;
         let mut idx = 0;
         let mut children = Some(children);
         for root in &mut self.roots {
-            if set_children_at(root, target, &mut idx, &mut children) {
+            if set_children_at(root, target, &mut idx, &mut children, view) {
                 return;
             }
         }
@@ -453,11 +532,12 @@ impl GoalTree {
 
     /// Insert fetched comments into the Goal node at the current cursor position.
     pub fn set_comments_at_cursor(&mut self, comments: Vec<Comment>) {
+        let view = self.comment_view;
         let target = self.cursor;
         let mut idx = 0;
         let mut comments = Some(comments);
         for root in &mut self.roots {
-            if set_comments_at(root, target, &mut idx, &mut comments) {
+            if set_comments_at(root, target, &mut idx, &mut comments, view) {
                 return;
             }
         }
@@ -475,11 +555,12 @@ impl GoalTree {
 
     /// Insert fetched deliverables into the Goal node at the current cursor position.
     pub fn set_deliverables_at_cursor(&mut self, deliverables: Vec<Deliverable>) {
+        let view = self.comment_view;
         let target = self.cursor;
         let mut idx = 0;
         let mut deliverables = Some(deliverables);
         for root in &mut self.roots {
-            if set_deliverables_at(root, target, &mut idx, &mut deliverables) {
+            if set_deliverables_at(root, target, &mut idx, &mut deliverables, view) {
                 return;
             }
         }
@@ -498,10 +579,11 @@ impl GoalTree {
     /// Increase the comment display limit for the goal containing the cursor.
     /// Used when user expands on CommentOmitted row to show more comments.
     pub fn increase_comment_limit(&mut self) {
+        let view = self.comment_view;
         let target = self.cursor;
         let mut idx = 0;
         for root in &mut self.roots {
-            if increase_comment_limit_at(root, target, &mut idx) {
+            if increase_comment_limit_at(root, target, &mut idx, view) {
                 return;
             }
         }
@@ -562,14 +644,21 @@ impl GoalTree {
 // ---------------------------------------------------------------------------
 
 /// Calculate the number of rows occupied by comments when expanded.
-/// Only counts unresolved comments (resolved_at is None).
+/// Counts comments visible under the given `view` (Hidden → 0 rows).
 /// Includes header, up to `limit` most recent items, and omitted row if total > limit.
-fn comment_row_count(comments: &Option<Timestamped<Vec<Comment>>>, limit: usize) -> usize {
+fn comment_row_count(
+    comments: &Option<Timestamped<Vec<Comment>>>,
+    limit: usize,
+    view: CommentView,
+) -> usize {
+    if !view.shows_comments() {
+        return 0;
+    }
     match comments {
         Some(ts) => {
-            let unresolved_count = ts.data.iter().filter(|c| c.resolved_at.is_none()).count();
-            let displayed = unresolved_count.min(limit);
-            let has_omitted = unresolved_count > limit;
+            let visible = visible_comment_count(&ts.data, view);
+            let displayed = visible.min(limit);
+            let has_omitted = visible > limit;
             1 + displayed + if has_omitted { 1 } else { 0 } // header + items + omitted row
         }
         None => 0,
@@ -578,9 +667,15 @@ fn comment_row_count(comments: &Option<Timestamped<Vec<Comment>>>, limit: usize)
 
 fn flatten_node<'a, S: GoalItemAccessor>(
     node: &'a GoalNodeInner<S>,
+    view: CommentView,
     guide: TreeGuide,
     rows: &mut Vec<TreeRow<'a>>,
 ) {
+    let unresolved_badge = node
+        .comments
+        .as_ref()
+        .map(|ts| unresolved_comment_count(&ts.data));
+
     rows.push(TreeRow::Goal {
         goal_id: node.node.id(),
         title: node.node.title(),
@@ -592,6 +687,7 @@ fn flatten_node<'a, S: GoalItemAccessor>(
         children_loaded: node.children.is_some(),
         comments_loaded: node.comments.is_some(),
         deliverables_loaded: node.deliverables.is_some(),
+        unresolved_comments: unresolved_badge,
         depth: guide.depth(),
         guide: guide.clone(),
     });
@@ -600,11 +696,12 @@ fn flatten_node<'a, S: GoalItemAccessor>(
         return;
     }
 
-    let has_comments = node.comments.is_some();
+    // Hidden モードではコメント行を一切生成しない（件数バッジのみで存在を示す）。
+    let show_comments = view.shows_comments() && node.comments.is_some();
     let has_deliverables = node.deliverables.is_some();
     let has_children = node.children.as_ref().is_some_and(|ts| !ts.data.is_empty());
 
-    let detail_guide = guide.child(!has_comments && !has_deliverables && !has_children);
+    let detail_guide = guide.child(!show_comments && !has_deliverables && !has_children);
     rows.push(TreeRow::Detail {
         status: node.node.status(),
         owner_name: node.node.owner().map(|o| o.name.as_str()),
@@ -614,24 +711,26 @@ fn flatten_node<'a, S: GoalItemAccessor>(
         guide: detail_guide,
     });
 
-    if let Some(ref ts) = node.comments {
-        // Filter to only unresolved comments (resolved_at is None)
-        let mut unresolved_comments: Vec<&Comment> =
-            ts.data.iter().filter(|c| c.resolved_at.is_none()).collect();
+    if let Some(ref ts) = node.comments
+        && view.shows_comments()
+    {
+        // 表示モードに合致するコメントのみ対象にする。
+        let mut visible_comments: Vec<&Comment> =
+            ts.data.iter().filter(|c| view.includes(c)).collect();
 
-        let total_unresolved = unresolved_comments.len();
-        let display_count = total_unresolved.min(node.comment_display_limit);
-        let omitted_count = total_unresolved.saturating_sub(node.comment_display_limit);
+        let total_visible = visible_comments.len();
+        let display_count = total_visible.min(node.comment_display_limit);
+        let omitted_count = total_visible.saturating_sub(node.comment_display_limit);
         let comment_guide = guide.child(!has_deliverables && !has_children);
 
         rows.push(TreeRow::CommentHeader {
-            count: total_unresolved,
+            count: total_visible,
             depth: comment_guide.depth(),
             guide: comment_guide.clone(),
         });
 
         // Sort by created_at descending (newest first)
-        unresolved_comments.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        visible_comments.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
         if omitted_count > 0 {
             let omitted_guide = comment_guide.child(display_count == 0);
@@ -642,7 +741,7 @@ fn flatten_node<'a, S: GoalItemAccessor>(
             });
         }
 
-        for (idx, comment) in unresolved_comments.iter().take(display_count).enumerate() {
+        for (idx, comment) in visible_comments.iter().take(display_count).enumerate() {
             let item_guide = comment_guide.child(idx + 1 == display_count);
             rows.push(TreeRow::CommentItem {
                 comment,
@@ -674,7 +773,7 @@ fn flatten_node<'a, S: GoalItemAccessor>(
         let child_count = ts.data.len();
         for (idx, child) in ts.data.iter().enumerate() {
             let child_guide = guide.child(idx + 1 == child_count);
-            flatten_node(child, child_guide, rows);
+            flatten_node(child, view, child_guide, rows);
         }
     }
 }
@@ -683,6 +782,7 @@ fn toggle_at<S: GoalItemAccessor>(
     node: &mut GoalNodeInner<S>,
     target: usize,
     idx: &mut usize,
+    view: CommentView,
 ) -> bool {
     if *idx == target {
         node.expanded = !node.expanded;
@@ -692,13 +792,13 @@ fn toggle_at<S: GoalItemAccessor>(
 
     if node.expanded {
         *idx += 1; // detail row
-        *idx += comment_row_count(&node.comments, node.comment_display_limit);
+        *idx += comment_row_count(&node.comments, node.comment_display_limit, view);
         if let Some(ts) = &node.deliverables {
             *idx += 1 + ts.data.len();
         }
         if let Some(ts) = &mut node.children {
             for child in &mut ts.data {
-                if toggle_at(child, target, idx) {
+                if toggle_at(child, target, idx, view) {
                     return true;
                 }
             }
@@ -713,6 +813,7 @@ fn set_children_at<S: GoalItemAccessor>(
     target: usize,
     idx: &mut usize,
     children: &mut Option<Vec<GoalChildItem>>,
+    view: CommentView,
 ) -> bool {
     if *idx == target {
         if let Some(items) = children.take() {
@@ -735,13 +836,13 @@ fn set_children_at<S: GoalItemAccessor>(
 
     if node.expanded {
         *idx += 1; // detail row
-        *idx += comment_row_count(&node.comments, node.comment_display_limit);
+        *idx += comment_row_count(&node.comments, node.comment_display_limit, view);
         if let Some(ts) = &node.deliverables {
             *idx += 1 + ts.data.len();
         }
         if let Some(ts) = &mut node.children {
             for child in &mut ts.data {
-                if set_children_at(child, target, idx, children) {
+                if set_children_at(child, target, idx, children, view) {
                     return true;
                 }
             }
@@ -756,6 +857,7 @@ fn set_comments_at<S: GoalItemAccessor>(
     target: usize,
     idx: &mut usize,
     comments: &mut Option<Vec<Comment>>,
+    view: CommentView,
 ) -> bool {
     if *idx == target {
         if let Some(items) = comments.take() {
@@ -767,13 +869,13 @@ fn set_comments_at<S: GoalItemAccessor>(
 
     if node.expanded {
         *idx += 1; // detail row
-        *idx += comment_row_count(&node.comments, node.comment_display_limit);
+        *idx += comment_row_count(&node.comments, node.comment_display_limit, view);
         if let Some(ts) = &node.deliverables {
             *idx += 1 + ts.data.len();
         }
         if let Some(ts) = &mut node.children {
             for child in &mut ts.data {
-                if set_comments_at(child, target, idx, comments) {
+                if set_comments_at(child, target, idx, comments, view) {
                     return true;
                 }
             }
@@ -788,6 +890,7 @@ fn set_deliverables_at<S: GoalItemAccessor>(
     target: usize,
     idx: &mut usize,
     deliverables: &mut Option<Vec<Deliverable>>,
+    view: CommentView,
 ) -> bool {
     if *idx == target {
         if let Some(items) = deliverables.take() {
@@ -799,13 +902,13 @@ fn set_deliverables_at<S: GoalItemAccessor>(
 
     if node.expanded {
         *idx += 1; // detail row
-        *idx += comment_row_count(&node.comments, node.comment_display_limit);
+        *idx += comment_row_count(&node.comments, node.comment_display_limit, view);
         if let Some(ts) = &node.deliverables {
             *idx += 1 + ts.data.len();
         }
         if let Some(ts) = &mut node.children {
             for child in &mut ts.data {
-                if set_deliverables_at(child, target, idx, deliverables) {
+                if set_deliverables_at(child, target, idx, deliverables, view) {
                     return true;
                 }
             }
@@ -819,6 +922,7 @@ fn increase_comment_limit_at<S: GoalItemAccessor>(
     node: &mut GoalNodeInner<S>,
     target: usize,
     idx: &mut usize,
+    view: CommentView,
 ) -> bool {
     *idx += 1;
 
@@ -827,7 +931,7 @@ fn increase_comment_limit_at<S: GoalItemAccessor>(
 
         // Calculate comment section indices
         let comment_start = *idx;
-        let comment_rows = comment_row_count(&node.comments, node.comment_display_limit);
+        let comment_rows = comment_row_count(&node.comments, node.comment_display_limit, view);
         let comment_end = comment_start + comment_rows;
 
         // If target is within comment section, increase this node's limit
@@ -843,7 +947,7 @@ fn increase_comment_limit_at<S: GoalItemAccessor>(
         }
         if let Some(ts) = &mut node.children {
             for child in &mut ts.data {
-                if increase_comment_limit_at(child, target, idx) {
+                if increase_comment_limit_at(child, target, idx, view) {
                     return true;
                 }
             }

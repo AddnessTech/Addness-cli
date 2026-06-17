@@ -477,24 +477,39 @@ impl App {
         }
 
         // 全ルートゴールのコメント・成果物を並列取得する（逐次 N 往復 → 概ね 1 往復）。
+        // 専用 helper(get_*_map) は失敗を stderr に出力して握り潰すため、TUI 描画中の
+        // 画面破壊を避ける目的でここでは使わず、失敗は status bar に集約する。
         let client = &self.client;
-        let result = self.api_call(async {
-            let id_refs: Vec<&str> = root_goal_ids.iter().map(String::as_str).collect();
-            let maps = tokio::join!(
-                client.get_comments_map(&id_refs),
-                client.get_deliverables_map(&id_refs),
-            );
-            Ok::<_, anyhow::Error>(maps)
+        let results = self.api_call(async {
+            let futures = root_goal_ids.iter().map(|id| async move {
+                let fetched =
+                    tokio::try_join!(client.list_comments(id), client.get_goal_deliverables(id),);
+                (id.clone(), fetched)
+            });
+            // この join future 自体は常に成功する（個別結果は要素ごとに保持）。
+            Ok::<_, anyhow::Error>(futures::future::join_all(futures).await)
         });
 
-        if let Ok((comments_map, deliverables_map)) = result {
-            for (id, comments) in comments_map {
-                self.goal_tree.set_comments_for_goal_id(&id, comments);
+        let Ok(results) = results else {
+            return;
+        };
+
+        let mut failed = 0usize;
+        for (goal_id, fetched) in results {
+            match fetched {
+                Ok((comments_resp, deliverables_resp)) => {
+                    self.goal_tree
+                        .set_comments_for_goal_id(&goal_id, comments_resp.comments);
+                    self.goal_tree.set_deliverables_for_goal_id(
+                        &goal_id,
+                        deliverables_resp.data.deliverables,
+                    );
+                }
+                Err(_) => failed += 1,
             }
-            for (id, deliverables) in deliverables_map {
-                self.goal_tree
-                    .set_deliverables_for_goal_id(&id, deliverables);
-            }
+        }
+        if failed > 0 {
+            self.error_message = Some(format!("Failed to load details for {failed} goal(s)"));
         }
     }
 

@@ -289,6 +289,105 @@ pub enum ModalState {
     },
 }
 
+/// 起動時にバックグラウンドで取得する初期データ。
+/// `&mut self` を奪わずに別タスクで取得できるよう、所有データだけを持つ。
+struct InitialData {
+    orgs: Vec<Organization>,
+    goal_tree: GoalTree,
+    members_list: Vec<Member>,
+    /// 取得中に起きた最初のエラー（ステータスバーに表示する）。
+    error: Option<String>,
+}
+
+/// 組織・ゴールツリー（ルートゴールの詳細込み）・メンバーを取得する。
+/// `ApiClient` のクローンを所有し、`App` を借用しないため `spawn` できる。
+async fn fetch_initial_data(mut client: ApiClient) -> InitialData {
+    let orgs = match client.list_organizations().await {
+        Ok(resp) => resp.data.organizations,
+        Err(e) => {
+            return InitialData {
+                orgs: Vec::new(),
+                goal_tree: GoalTree::empty(),
+                members_list: Vec::new(),
+                error: Some(format!("Failed to load organizations: {e}")),
+            };
+        }
+    };
+
+    let Some(org_id) = orgs.first().map(|o| o.id.clone()) else {
+        return InitialData {
+            orgs,
+            goal_tree: GoalTree::empty(),
+            members_list: Vec::new(),
+            error: None,
+        };
+    };
+    client.set_org_id(Some(org_id.clone()));
+
+    // ゴールツリーとメンバーを並列取得する。
+    let (tree_res, members_res) = tokio::join!(
+        client.get_goal_tree(&org_id, 2),
+        client.get_members(&org_id)
+    );
+
+    let mut error: Option<String> = None;
+
+    let goal_tree = match tree_res {
+        Ok(resp) => {
+            let mut tree = GoalTree::from_tree_items(resp.data.items);
+            // 自動展開されるルートゴールのコメント・成果物を並列取得して埋める。
+            let root_ids: Vec<String> = tree
+                .flatten()
+                .iter()
+                .filter_map(|row| match row {
+                    TreeRow::Goal { goal_id, depth, .. } if *depth == 0 => {
+                        Some(goal_id.to_string())
+                    }
+                    _ => None,
+                })
+                .collect();
+            if !root_ids.is_empty() {
+                let client = &client;
+                let fetched =
+                    futures::future::join_all(root_ids.into_iter().map(|id| async move {
+                        let r = tokio::try_join!(
+                            client.list_comments(&id),
+                            client.get_goal_deliverables(&id)
+                        );
+                        (id, r)
+                    }))
+                    .await;
+                for (id, r) in fetched {
+                    if let Ok((comments, deliverables)) = r {
+                        tree.set_comments_for_goal_id(&id, comments.comments);
+                        tree.set_deliverables_for_goal_id(&id, deliverables.data.deliverables);
+                    }
+                }
+            }
+            tree
+        }
+        Err(e) => {
+            error = Some(format!("Failed to load goals: {e}"));
+            GoalTree::empty()
+        }
+    };
+
+    let members_list = match members_res {
+        Ok(resp) => resp.data.members,
+        Err(e) => {
+            error.get_or_insert_with(|| format!("Failed to load members: {e}"));
+            Vec::new()
+        }
+    };
+
+    InitialData {
+        orgs,
+        goal_tree,
+        members_list,
+        error,
+    }
+}
+
 pub struct App {
     pub(super) client: ApiClient,
     rt: Handle,
@@ -389,7 +488,26 @@ impl App {
     }
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
-        self.load_initial_data();
+        // 初期データ取得をバックグラウンドタスクで走らせ、その間メインスレッドは
+        // ロゴを波打たせるフレームを一定間隔で描き続ける（取得完了まで）。
+        let mut handle = self.rt.spawn(fetch_initial_data(self.client.clone()));
+        terminal.draw(|frame| ui::draw_loading(frame, 0))?;
+        let mut tick: u64 = 1;
+        while !handle.is_finished() {
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            terminal.draw(|frame| ui::draw_loading(frame, tick))?;
+            tick = tick.wrapping_add(1);
+        }
+        let data = self
+            .rt
+            .block_on(&mut handle)
+            .unwrap_or_else(|_| InitialData {
+                orgs: Vec::new(),
+                goal_tree: GoalTree::empty(),
+                members_list: Vec::new(),
+                error: Some("Failed to load initial data".to_string()),
+            });
+        self.apply_initial_data(data);
 
         while self.running {
             // 表示しようとしているタブのデータを必要になった時点で取得する。
@@ -398,6 +516,30 @@ impl App {
             self.handle_events()?;
         }
         Ok(())
+    }
+
+    /// バックグラウンドで取得した初期データを App の状態へ反映する。
+    fn apply_initial_data(&mut self, data: InitialData) {
+        self.orgs = data.orgs;
+        if !self.orgs.is_empty() {
+            self.current_org_index = 0;
+        }
+        // 後続の遅延ロードのため、選択中の組織IDをクライアントにも反映する。
+        if let Some(org_id) = self.current_org_id().map(|s| s.to_string()) {
+            self.client.set_org_id(Some(org_id));
+        }
+        self.goal_tree = data.goal_tree;
+        self.members = data
+            .members_list
+            .iter()
+            .map(|m| (MemberId::new(m.id.clone()), m.clone()))
+            .collect();
+        self.members_list = data.members_list;
+        self.members_cursor = 0;
+        self.members_scroll_offset = 0;
+        if let Some(err) = data.error {
+            self.error_message = Some(err);
+        }
     }
 
     /// アクティブなタブが未ロードなら取得する（遅延ロード）。
@@ -419,24 +561,59 @@ impl App {
         self.rt.block_on(future)
     }
 
-    fn load_initial_data(&mut self) {
-        // Fetch organizations
-        match self.api_call(self.client.list_organizations()) {
+    /// 現在の組織配下のゴールツリーとメンバーを並列取得する。
+    /// 直列に取ると往復が積み上がるため `tokio::join!` で概ね1往復に畳む。
+    /// 起動時と組織切り替え時の両方から使う。
+    fn load_org_scoped_data(&mut self) {
+        let Some(org_id) = self.current_org_id().map(|s| s.to_string()) else {
+            self.goal_tree = GoalTree::empty();
+            self.members = HashMap::new();
+            self.members_list = vec![];
+            return;
+        };
+
+        self.client.set_org_id(Some(org_id.clone()));
+
+        let client = &self.client;
+        // join future 自体は常に成功する（個別結果は要素ごとに保持）。
+        let (tree_res, members_res) = self
+            .api_call(async {
+                Ok::<_, anyhow::Error>(tokio::join!(
+                    client.get_goal_tree(&org_id, 2),
+                    client.get_members(&org_id),
+                ))
+            })
+            .expect("join future never fails");
+
+        match tree_res {
             Ok(resp) => {
-                self.orgs = resp.data.organizations;
-                if !self.orgs.is_empty() {
-                    self.current_org_index = 0;
-                }
+                self.goal_tree = GoalTree::from_tree_items(resp.data.items);
+                // 自動展開されるルートゴールのコメント・成果物を取得する。
+                self.load_root_goal_details();
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to load organizations: {e}"));
-                return;
+                self.goal_tree = GoalTree::empty();
+                self.error_message = Some(format!("Failed to load goals: {e}"));
             }
         }
 
-        // Goals タブのみ起動時にロードし、Execution(todays) は初回表示まで遅延する。
-        self.load_goal_tree();
-        self.load_members();
+        match members_res {
+            Ok(resp) => {
+                let member_list = resp.data.members;
+                self.members = member_list
+                    .iter()
+                    .map(|m| (MemberId::new(m.id.clone()), m.clone()))
+                    .collect();
+                self.members_list = member_list;
+                self.members_cursor = 0;
+                self.members_scroll_offset = 0;
+            }
+            Err(e) => {
+                self.members = HashMap::new();
+                self.members_list = vec![];
+                self.error_message = Some(format!("Failed to load members: {e}"));
+            }
+        }
     }
 
     fn load_goal_tree(&mut self) {
@@ -561,36 +738,6 @@ impl App {
             Err(e) => {
                 self.todays_goals_tree = GoalTree::empty();
                 self.error_message = Some(format!("Failed to load today's goals: {e}"));
-            }
-        }
-    }
-
-    fn load_members(&mut self) {
-        let Some(org_id) = self.current_org_id().map(|s| s.to_string()) else {
-            self.members = HashMap::new();
-            self.members_list = vec![];
-            return;
-        };
-
-        match self.api_call(self.client.get_members(&org_id)) {
-            Ok(resp) => {
-                let member_list = resp.data.members;
-
-                // Build HashMap for fast lookup
-                self.members = member_list
-                    .iter()
-                    .map(|m| (MemberId::new(m.id.clone()), m.clone()))
-                    .collect();
-
-                // Keep list for display
-                self.members_list = member_list;
-                self.members_cursor = 0;
-                self.members_scroll_offset = 0;
-            }
-            Err(e) => {
-                self.members = HashMap::new();
-                self.members_list = vec![];
-                self.error_message = Some(format!("Failed to load members: {e}"));
             }
         }
     }
@@ -1022,8 +1169,7 @@ impl App {
                 self.show_org_popup = false;
                 if new_index != self.current_org_index {
                     self.current_org_index = new_index;
-                    self.load_goal_tree();
-                    self.load_members();
+                    self.load_org_scoped_data();
                     // Execution は次に表示された時に再ロードする。
                     self.todays_loaded = false;
                     self.todays_goals_tree = GoalTree::empty();

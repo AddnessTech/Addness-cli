@@ -1,26 +1,26 @@
 # Addness CLI
 
 <p align="center">
-  <img src="assets/addness-cli-demo.gif" alt="Addness CLI demo" width="900">
+  <img src="assets/addness-cli-demo.gif" alt="Addness CLI デモ" width="900">
 </p>
 
-Addness CLI is a terminal interface for working with Addness from local development environments, scripts, and AI coding agents.
+Addness CLI は、ローカルの開発環境・スクリプト・AIコーディングエージェントから Addness を操作するためのターミナルインターフェースです。
 
-Use it to inspect goals, update progress, write comments, switch organizations, and connect pull requests back to Addness without leaving the command line.
+コマンドラインから離れることなく、ゴールの確認、進捗の更新、コメントの記入、組織の切り替え、プルリクエストと Addness の紐付けを行えます。
 
-## Features
+## 主な機能
 
-- Browse and inspect Addness goals from the terminal.
-- Update goal status and progress from scripts or local workflows.
-- Create comments on goals.
-- Link GitHub pull requests to Addness goals.
-- Switch between organizations.
-- Use machine-readable JSON output for automation.
-- Run as a single Rust binary on macOS, Linux, and Windows.
+- ターミナルから Addness のゴールを閲覧・確認する。
+- スクリプトやローカルのワークフローからゴールのステータス・進捗を更新する。
+- ゴールにコメントを作成する。
+- GitHub のプルリクエストを Addness のゴールに紐付ける。
+- 組織を切り替える。
+- 自動化向けに機械可読な JSON 出力を使う。
+- macOS・Linux・Windows 上で単一の Rust バイナリとして動作する。
 
-## Installation
+## インストール
 
-macOS and Linux:
+macOS・Linux:
 
 ```bash
 curl -fsSL https://cli.addness.com/install.sh | sh
@@ -32,7 +32,7 @@ Windows PowerShell:
 irm https://cli.addness.com/install.ps1 | iex
 ```
 
-From source:
+ソースから:
 
 ```bash
 git clone https://github.com/AddnessTech/Addness-cli.git
@@ -40,38 +40,38 @@ cd Addness-cli
 cargo build --release
 ```
 
-## Login
+## ログイン
 
-Run `addness login` and complete the browser-based authentication flow.
+`addness login` を実行し、ブラウザでの認証フローを完了してください。
 
-## Usage
+## 使い方
 
-List goals assigned to you:
+自分にアサインされたゴールを一覧表示する:
 
 ```bash
 addness goal list --assigned-to me --status NOT_STARTED
 ```
 
-Use JSON output for scripts and agents:
+スクリプトやエージェント向けに JSON 出力を使う:
 
 ```bash
 addness goal list --assigned-to me --status NOT_STARTED --json
 ```
 
-Update progress:
+進捗を更新する:
 
 ```bash
 addness goal update <goal-id> --status IN_PROGRESS
-addness comment create --goal <goal-id> --body "Implementation started"
+addness comment create --goal <goal-id> --body "実装を開始しました"
 ```
 
-Link a pull request:
+プルリクエストを紐付ける:
 
 ```bash
 addness link pr --goal <goal-id> --url https://github.com/org/repo/pull/42
 ```
 
-Show command help:
+コマンドのヘルプを表示する:
 
 ```bash
 addness --help
@@ -81,9 +81,9 @@ addness comment --help
 addness link --help
 ```
 
-## Development
+## 開発
 
-Addness CLI is written in Rust.
+Addness CLI は Rust で書かれています。
 
 ```bash
 cargo build
@@ -93,22 +93,22 @@ cargo clippy -- -D warnings
 cargo test
 ```
 
-## Contributing
+## コントリビューション
 
-Contributions are welcome through GitHub Pull Requests. Before opening a PR, read [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, review expectations, and merge rules.
+コントリビューションは GitHub のプルリクエストで歓迎しています。PR を作成する前に、開発環境のセットアップ・レビューの方針・マージのルールについて [CONTRIBUTING.md](CONTRIBUTING.md) を読んでください。
 
-Do not include secrets, local settings, customer data, or private screenshots in issues or pull requests.
+Issue やプルリクエストに、シークレット・ローカル設定・顧客データ・非公開のスクリーンショットを含めないでください。
 
-## Security
+## セキュリティ
 
-Please do not report vulnerabilities through public GitHub issues. See [SECURITY.md](SECURITY.md) for the private reporting process.
+脆弱性は公開の GitHub Issue で報告しないでください。非公開での報告手順については [SECURITY.md](SECURITY.md) を参照してください。
 
-## Support
+## サポート
 
-Use GitHub Issues for reproducible bugs, feature requests, and documentation problems. See [SUPPORT.md](SUPPORT.md) for what to include.
+再現可能なバグ・機能要望・ドキュメントの問題には GitHub Issues を利用してください。記載すべき内容は [SUPPORT.md](SUPPORT.md) を参照してください。
 
-## License
+## ライセンス
 
-Addness CLI is released under the [MIT License](LICENSE).
+Addness CLI は [MIT License](LICENSE) の下で公開されています。
 
 Copyright (c) 2026 Addness.

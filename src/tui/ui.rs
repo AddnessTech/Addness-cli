@@ -1617,8 +1617,20 @@ fn draw_react_comment_modal(frame: &mut Frame, app: &App) {
 
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
         .split(inner);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "Pick a reaction:",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        layout[0],
+    );
 
     let mut spans = vec![Span::raw("  ")];
     for (idx, emoji) in emojis.iter().enumerate() {

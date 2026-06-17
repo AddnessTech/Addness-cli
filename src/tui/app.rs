@@ -748,6 +748,9 @@ impl App {
                     .set_comments_for_goal_id(goal_id, comments.clone());
                 self.todays_goals_tree
                     .set_comments_for_goal_id(goal_id, comments);
+                // 削除・解決で行数が減るとカーソルが範囲外/別ノードを指すため再クランプ。
+                self.goal_tree.clamp_cursor();
+                self.todays_goals_tree.clamp_cursor();
             }
             Err(e) => {
                 self.error_message = Some(format!("Failed to reload comments: {e}"));

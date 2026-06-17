@@ -18,7 +18,7 @@ const COMMENT_DISPLAY_INCREMENT: usize = 20;
 // CommentView – global comment visibility mode
 // ---------------------------------------------------------------------------
 
-/// ツリー全体のコメント表示モード。`c` キーで循環する。
+/// ツリー全体のコメント表示モード。`C` キーで循環する。
 /// いずれもキャッシュ済みコメントの描画切替のみで、追加のAPI取得は行わない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CommentView {
@@ -495,9 +495,14 @@ impl GoalTree {
     }
 
     /// コメント表示モードを Hidden → Unresolved → All → … と循環させる。
-    /// 行数が変わるため、カーソルが範囲外に残らないようクランプする。
     pub fn cycle_comment_view(&mut self) {
         self.comment_view = self.comment_view.cycle();
+        self.clamp_cursor();
+    }
+
+    /// 行数が減ってカーソルが範囲外に残らないよう末尾にクランプする。
+    /// 表示モード切替やコメント・成果物の再取得で行数が変わった後に呼ぶ。
+    pub fn clamp_cursor(&mut self) {
         let len = self.flatten().len();
         if len > 0 && self.cursor >= len {
             self.cursor = len - 1;
@@ -1112,5 +1117,142 @@ fn build_child_node_from_todays(
         deliverables: None,
         expanded: true, // Always expanded since we have the complete tree
         comment_display_limit: INITIAL_COMMENT_DISPLAY_LIMIT,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::CommentAuthor;
+
+    fn mk_comment(id: &str, resolved: bool) -> Comment {
+        Comment {
+            id: id.to_string(),
+            content: format!("comment {id}"),
+            commentable_type: "objective".to_string(),
+            commentable_id: "g1".to_string(),
+            parent_id: None,
+            author: CommentAuthor {
+                id: "u1".to_string(),
+                name: "user".to_string(),
+                is_ai_agent: false,
+            },
+            reply_count: 0,
+            resolved_at: resolved.then(|| "2020-01-01T00:00:00Z".to_string()),
+            created_at: format!("2020-01-01T00:00:0{id}Z"),
+            updated_at: "2020-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    fn mk_tree(comments: Vec<Comment>, limit: usize, view: CommentView) -> GoalTree {
+        let node = GoalRootNode {
+            node: GoalTreeItem {
+                id: "g1".to_string(),
+                parent_id: None,
+                title: "G1".to_string(),
+                status: None,
+                order_no: 0.0,
+                is_completed: false,
+                has_children: false,
+                owner: None,
+            },
+            children: None,
+            comments: Some(Timestamped::now(comments)),
+            deliverables: None,
+            expanded: true,
+            comment_display_limit: limit,
+        };
+        GoalTree {
+            roots: vec![node],
+            cursor: 0,
+            scroll_offset: 0,
+            is_required_to_fetch: true,
+            comment_view: view,
+        }
+    }
+
+    /// flatten が実際に生成するコメント行数。
+    fn flattened_comment_rows(tree: &GoalTree) -> usize {
+        tree.flatten()
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    TreeRow::CommentHeader { .. }
+                        | TreeRow::CommentOmitted { .. }
+                        | TreeRow::CommentItem { .. }
+                )
+            })
+            .count()
+    }
+
+    /// flatten のコメント行数と、索引計算に使う comment_row_count が
+    /// 全モード・上限で一致すること（不一致はカーソル計算を壊す）。
+    #[test]
+    fn comment_row_count_matches_flatten_all_views() {
+        let comments = vec![
+            mk_comment("1", false),
+            mk_comment("2", true),
+            mk_comment("3", false),
+            mk_comment("4", true),
+        ];
+        for view in [
+            CommentView::Hidden,
+            CommentView::Unresolved,
+            CommentView::All,
+        ] {
+            for limit in [1usize, 2, 20] {
+                let tree = mk_tree(comments.clone(), limit, view);
+                let expected = comment_row_count(&tree.roots[0].comments, limit, view);
+                assert_eq!(
+                    flattened_comment_rows(&tree),
+                    expected,
+                    "mismatch for view={view:?} limit={limit}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hidden_view_emits_no_comment_rows() {
+        let tree = mk_tree(vec![mk_comment("1", false)], 20, CommentView::Hidden);
+        assert_eq!(flattened_comment_rows(&tree), 0);
+    }
+
+    #[test]
+    fn unresolved_view_excludes_resolved_but_all_includes() {
+        let comments = vec![mk_comment("1", false), mk_comment("2", true)];
+        // unresolved: header + 1 item = 2
+        let unresolved = mk_tree(comments.clone(), 20, CommentView::Unresolved);
+        assert_eq!(flattened_comment_rows(&unresolved), 2);
+        // all: header + 2 items = 3
+        let all = mk_tree(comments, 20, CommentView::All);
+        assert_eq!(flattened_comment_rows(&all), 3);
+    }
+
+    #[test]
+    fn omitted_row_appears_over_limit() {
+        let comments = vec![
+            mk_comment("1", false),
+            mk_comment("2", false),
+            mk_comment("3", false),
+        ];
+        // limit 2: header + 2 items + omitted = 4
+        let tree = mk_tree(comments, 2, CommentView::Unresolved);
+        assert_eq!(flattened_comment_rows(&tree), 4);
+    }
+
+    #[test]
+    fn cycle_clamps_cursor_when_rows_shrink() {
+        // All モードで全行を出し、最終行にカーソルを置く。
+        let comments = vec![mk_comment("1", true), mk_comment("2", true)];
+        let mut tree = mk_tree(comments, 20, CommentView::All);
+        tree.cursor = tree.flatten().len() - 1;
+        // All → Hidden に切り替えるとコメント行が消え、行数が減る。
+        tree.cycle_comment_view();
+        assert!(
+            tree.cursor < tree.flatten().len(),
+            "cursor must stay in range after view change"
+        );
     }
 }

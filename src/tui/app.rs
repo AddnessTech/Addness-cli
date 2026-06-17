@@ -299,6 +299,43 @@ struct InitialData {
     error: Option<String>,
 }
 
+/// ルートゴール（depth==0）のコメント・成果物を並列取得し `tree` に詰める。
+/// 失敗した件数を返す（呼び出し側でステータスバーに集約する）。
+/// 専用 helper(get_*_map) は失敗を stderr に出力して握り潰すため、TUI では使わない。
+/// 起動時のバックグラウンド取得と、組織切り替え時の `load_root_goal_details` で共有する。
+async fn fetch_root_goal_details_into(client: &ApiClient, tree: &mut GoalTree) -> usize {
+    let root_ids: Vec<String> = tree
+        .flatten()
+        .iter()
+        .filter_map(|row| match row {
+            TreeRow::Goal { goal_id, depth, .. } if *depth == 0 => Some(goal_id.to_string()),
+            _ => None,
+        })
+        .collect();
+    if root_ids.is_empty() {
+        return 0;
+    }
+
+    // 逐次 N 往復 → 概ね 1 往復に畳む。
+    let fetched = futures::future::join_all(root_ids.into_iter().map(|id| async move {
+        let r = tokio::try_join!(client.list_comments(&id), client.get_goal_deliverables(&id));
+        (id, r)
+    }))
+    .await;
+
+    let mut failed = 0usize;
+    for (id, r) in fetched {
+        match r {
+            Ok((comments, deliverables)) => {
+                tree.set_comments_for_goal_id(&id, comments.comments);
+                tree.set_deliverables_for_goal_id(&id, deliverables.data.deliverables);
+            }
+            Err(_) => failed += 1,
+        }
+    }
+    failed
+}
+
 /// 組織・ゴールツリー（ルートゴールの詳細込み）・メンバーを取得する。
 /// `ApiClient` のクローンを所有し、`App` を借用しないため `spawn` できる。
 async fn fetch_initial_data(mut client: ApiClient) -> InitialData {
@@ -335,34 +372,10 @@ async fn fetch_initial_data(mut client: ApiClient) -> InitialData {
     let goal_tree = match tree_res {
         Ok(resp) => {
             let mut tree = GoalTree::from_tree_items(resp.data.items);
-            // 自動展開されるルートゴールのコメント・成果物を並列取得して埋める。
-            let root_ids: Vec<String> = tree
-                .flatten()
-                .iter()
-                .filter_map(|row| match row {
-                    TreeRow::Goal { goal_id, depth, .. } if *depth == 0 => {
-                        Some(goal_id.to_string())
-                    }
-                    _ => None,
-                })
-                .collect();
-            if !root_ids.is_empty() {
-                let client = &client;
-                let fetched =
-                    futures::future::join_all(root_ids.into_iter().map(|id| async move {
-                        let r = tokio::try_join!(
-                            client.list_comments(&id),
-                            client.get_goal_deliverables(&id)
-                        );
-                        (id, r)
-                    }))
-                    .await;
-                for (id, r) in fetched {
-                    if let Ok((comments, deliverables)) = r {
-                        tree.set_comments_for_goal_id(&id, comments.comments);
-                        tree.set_deliverables_for_goal_id(&id, deliverables.data.deliverables);
-                    }
-                }
+            // 自動展開されるルートゴールのコメント・成果物を取得して埋める。
+            let failed = fetch_root_goal_details_into(&client, &mut tree).await;
+            if failed > 0 {
+                error.get_or_insert_with(|| format!("Failed to load details for {failed} goal(s)"));
             }
             tree
         }
@@ -529,17 +542,21 @@ impl App {
             self.client.set_org_id(Some(org_id));
         }
         self.goal_tree = data.goal_tree;
-        self.members = data
-            .members_list
-            .iter()
-            .map(|m| (MemberId::new(m.id.clone()), m.clone()))
-            .collect();
-        self.members_list = data.members_list;
-        self.members_cursor = 0;
-        self.members_scroll_offset = 0;
+        self.set_members(data.members_list);
         if let Some(err) = data.error {
             self.error_message = Some(err);
         }
+    }
+
+    /// メンバー一覧をルックアップ用マップと表示用リストに反映し、カーソルを先頭へ戻す。
+    fn set_members(&mut self, list: Vec<Member>) {
+        self.members = list
+            .iter()
+            .map(|m| (MemberId::new(m.id.clone()), m.clone()))
+            .collect();
+        self.members_list = list;
+        self.members_cursor = 0;
+        self.members_scroll_offset = 0;
     }
 
     /// アクティブなタブが未ロードなら取得する（遅延ロード）。
@@ -575,15 +592,12 @@ impl App {
         self.client.set_org_id(Some(org_id.clone()));
 
         let client = &self.client;
-        // join future 自体は常に成功する（個別結果は要素ごとに保持）。
-        let (tree_res, members_res) = self
-            .api_call(async {
-                Ok::<_, anyhow::Error>(tokio::join!(
-                    client.get_goal_tree(&org_id, 2),
-                    client.get_members(&org_id),
-                ))
-            })
-            .expect("join future never fails");
+        let (tree_res, members_res) = self.rt.block_on(async {
+            tokio::join!(
+                client.get_goal_tree(&org_id, 2),
+                client.get_members(&org_id)
+            )
+        });
 
         match tree_res {
             Ok(resp) => {
@@ -598,16 +612,7 @@ impl App {
         }
 
         match members_res {
-            Ok(resp) => {
-                let member_list = resp.data.members;
-                self.members = member_list
-                    .iter()
-                    .map(|m| (MemberId::new(m.id.clone()), m.clone()))
-                    .collect();
-                self.members_list = member_list;
-                self.members_cursor = 0;
-                self.members_scroll_offset = 0;
-            }
+            Ok(resp) => self.set_members(resp.data.members),
             Err(e) => {
                 self.members = HashMap::new();
                 self.members_list = vec![];
@@ -639,60 +644,13 @@ impl App {
     }
 
     fn load_root_goal_details(&mut self) {
-        // Collect root goal IDs from the flattened tree
-        let root_goal_ids: Vec<String> = {
-            let rows = self.goal_tree.flatten();
-            rows.iter()
-                .filter_map(|row| {
-                    if let TreeRow::Goal { goal_id, depth, .. } = row {
-                        if *depth == 0 {
-                            Some(goal_id.to_string())
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        };
-
-        if root_goal_ids.is_empty() {
-            return;
-        }
-
-        // 全ルートゴールのコメント・成果物を並列取得する（逐次 N 往復 → 概ね 1 往復）。
-        // 専用 helper(get_*_map) は失敗を stderr に出力して握り潰すため、TUI 描画中の
-        // 画面破壊を避ける目的でここでは使わず、失敗は status bar に集約する。
-        let client = &self.client;
-        let results = self.api_call(async {
-            let futures = root_goal_ids.iter().map(|id| async move {
-                let fetched =
-                    tokio::try_join!(client.list_comments(id), client.get_goal_deliverables(id),);
-                (id.clone(), fetched)
-            });
-            // この join future 自体は常に成功する（個別結果は要素ごとに保持）。
-            Ok::<_, anyhow::Error>(futures::future::join_all(futures).await)
-        });
-
-        let Ok(results) = results else {
-            return;
-        };
-
-        let mut failed = 0usize;
-        for (goal_id, fetched) in results {
-            match fetched {
-                Ok((comments_resp, deliverables_resp)) => {
-                    self.goal_tree
-                        .set_comments_for_goal_id(&goal_id, comments_resp.comments);
-                    self.goal_tree.set_deliverables_for_goal_id(
-                        &goal_id,
-                        deliverables_resp.data.deliverables,
-                    );
-                }
-                Err(_) => failed += 1,
-            }
-        }
+        // ツリーを一時的に取り出してヘルパーに &mut で渡し、取得後に戻す。
+        // 起動時のバックグラウンド取得と同じ `fetch_root_goal_details_into` を共有する。
+        let mut tree = std::mem::replace(&mut self.goal_tree, GoalTree::empty());
+        let failed = self
+            .rt
+            .block_on(fetch_root_goal_details_into(&self.client, &mut tree));
+        self.goal_tree = tree;
         if failed > 0 {
             self.error_message = Some(format!("Failed to load details for {failed} goal(s)"));
         }

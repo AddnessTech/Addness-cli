@@ -31,7 +31,7 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -62,7 +62,7 @@ jobs:
           "$hash  $ARCHIVE_NAME" | Out-File -Encoding ascii "${ARCHIVE_NAME}.sha256"
           "ARCHIVE_NAME=$ARCHIVE_NAME" | Out-File -Append -Encoding ascii $env:GITHUB_ENV
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
           path: |
@@ -76,19 +76,19 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           sparse-checkout: |
             install.sh
             install.ps1
           sparse-checkout-cone-mode: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
 
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.CLI_RELEASE_ROLE_ARN }}
           aws-region: ap-northeast-1

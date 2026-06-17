@@ -12,7 +12,7 @@ use crate::config::{Credentials, DEFAULT_API_URL, Settings};
 use api::ApiClient;
 use cli::commands::{
     assignment, comment, configure, deliverable, detect, goal, invitation, kpi, link, login,
-    member, org, skills, summary,
+    member, org, skills, summary, update,
 };
 
 #[derive(Parser)]
@@ -109,6 +109,12 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+    },
+    /// Update addness to the latest version via the official installer
+    Update {
+        /// Only check whether an update is available; do not install
+        #[arg(long)]
+        check: bool,
     },
     /// Output AI skills prompt for this CLI
     Skills,
@@ -229,6 +235,7 @@ async fn main() -> Result<()> {
             summary::handle_summary(org.as_deref(), *depth, *json, &client).await
         }
         Some(Commands::DetectGoal { json }) => detect::handle_detect_goal(*json),
+        Some(Commands::Update { check }) => update::handle_update(*check).await,
         Some(Commands::Skills) => skills::handle_skills(),
         Some(Commands::Completions { shell }) => {
             clap_complete::generate(

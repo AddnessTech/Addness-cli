@@ -1,6 +1,6 @@
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
@@ -111,6 +111,109 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.show_help {
         draw_help_overlay(frame);
     }
+}
+
+/// ロード画面に表示する Addness のシンボルロゴ。
+/// インストーラ（install.sh）の起動バナーと同じアートを流用している。
+/// 斜めの形状を内部の空白で表現しているため、各行は等幅にパディングして
+/// ブロックごと中央寄せする（行ごとに中央寄せすると形が崩れる）。
+const LOGO: [&str; 14] = [
+    "                                        .",
+    "                   .:=+*###***+=:.    =:",
+    "               .=*%@@%*=:.    .:=**+#=",
+    "            .:*@@@@*:.            :#%*:",
+    "          .+@@@@@*.            :+%%=. .+=",
+    "         =@@@@@@:          .=*%%+.     ::",
+    "       .*@@@@@@.      .:+*%%%#=.        :",
+    "      .@@@@@@@:  =+*#%%%%%%+:",
+    "     .@@@@@@@+ .*%%%%%%#+:",
+    "    .@@@@@@@@. *%%%%*=.",
+    "    *@@@@@@@+ .%%*=.",
+    "   :@@@@@@@@.",
+    "   #@@@@@@@*",
+    "   ++==::..",
+];
+
+/// ロゴを斜めに流れる波として、セル位置と時刻(tick)から青系の色を決める。
+/// 位相を列・行・時刻の線形結合で作り、sin で明度を揺らす。
+fn wave_color(x: usize, y: usize, tick: u64) -> Color {
+    let phase = x as f32 * 0.35 + y as f32 * 0.7 - tick as f32 * 0.6;
+    let t = (phase.sin() + 1.0) / 2.0; // 0.0..=1.0
+    let lerp = |lo: f32, hi: f32| (lo + (hi - lo) * t) as u8;
+    Color::Rgb(lerp(30.0, 150.0), lerp(110.0, 205.0), lerp(210.0, 255.0))
+}
+
+/// 起動直後、初期データ取得が終わるまで表示するロード画面。
+/// `tick` は描画ごとに増えるカウンタで、ロゴを波打たせるのに使う。
+pub fn draw_loading(frame: &mut Frame, tick: u64) {
+    let area = frame.area();
+
+    let logo_width = LOGO.iter().map(|l| l.width()).max().unwrap_or(0);
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(""));
+
+    // ロゴ＋枠＋上下左右の余白が収まる端末でだけロゴを出し、
+    // 狭ければシンプルな文字表示に切り替える。
+    let show_logo = area.width as usize >= logo_width + 4 && area.height >= 22;
+    if show_logo {
+        for (y, row) in LOGO.iter().enumerate() {
+            // 1文字ずつ波の色を付ける。等幅になるよう末尾を空白で埋め、
+            // 中央寄せでも形が崩れないようにする。
+            let mut spans: Vec<Span> = Vec::with_capacity(logo_width + 1);
+            for (x, ch) in row.chars().enumerate() {
+                if ch == ' ' {
+                    spans.push(Span::raw(" "));
+                } else {
+                    spans.push(Span::styled(
+                        ch.to_string(),
+                        Style::default()
+                            .fg(wave_color(x, y, tick))
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
+            }
+            let pad = logo_width.saturating_sub(row.width());
+            if pad > 0 {
+                spans.push(Span::raw(" ".repeat(pad)));
+            }
+            lines.push(Line::from(spans));
+        }
+        lines.push(Line::from(""));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "Addness",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+
+    lines.push(Line::from(Span::styled(
+        "Goal Management TUI",
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "読み込み中…",
+        Style::default().fg(Color::White),
+    )));
+
+    // border(2) + 中身の行数。
+    let box_height = lines.len() as u16 + 2;
+    let inner_width = if show_logo { logo_width } else { 19 };
+    let box_width = (inner_width as u16 + 4).min(area.width);
+    let x = area.x + area.width.saturating_sub(box_width) / 2;
+    let y = area.y + area.height.saturating_sub(box_height) / 2;
+    let box_area = Rect::new(x, y, box_width, box_height.min(area.height));
+
+    let paragraph = Paragraph::new(lines).alignment(Alignment::Center).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(format!(" addness v{} ", env!("CARGO_PKG_VERSION"))),
+    );
+    frame.render_widget(paragraph, box_area);
 }
 
 fn draw_title_bar(frame: &mut Frame, area: Rect) {

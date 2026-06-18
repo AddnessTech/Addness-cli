@@ -73,11 +73,7 @@ pub async fn check_for_update() {
     if latest != current {
         eprintln!();
         eprintln!("  \x1b[33mA new version of addness is available: v{current} → v{latest}\x1b[0m");
-        if cfg!(windows) {
-            eprintln!("  \x1b[2mUpdate: irm https://cli.addness.com/install.ps1 | iex\x1b[0m");
-        } else {
-            eprintln!("  \x1b[2mUpdate: curl -fsSL https://cli.addness.com/install.sh | sh\x1b[0m");
-        }
+        eprintln!("  \x1b[2mUpdate: addness update\x1b[0m");
         eprintln!();
     }
 }

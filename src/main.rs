@@ -12,7 +12,7 @@ use crate::config::{Credentials, DEFAULT_API_URL, Settings};
 use api::ApiClient;
 use cli::commands::{
     assignment, comment, configure, deliverable, detect, goal, invitation, kpi, link, login,
-    member, org, skills, summary, update,
+    member, org, skills, summary, today, update,
 };
 
 #[derive(Parser)]
@@ -91,6 +91,11 @@ enum Commands {
     Invitation {
         #[command(subcommand)]
         command: invitation::InvitationCommands,
+    },
+    /// Read and write today's todos (today's goals)
+    Today {
+        #[command(subcommand)]
+        command: Option<today::TodayCommands>,
     },
     /// Show progress summary of all goals
     Summary {
@@ -229,6 +234,10 @@ async fn main() -> Result<()> {
         Some(Commands::Invitation { command }) => {
             let client = build_client()?;
             invitation::handle_invitation(command, &client).await
+        }
+        Some(Commands::Today { command }) => {
+            let client = build_client()?;
+            today::handle_today(command.as_ref(), &client).await
         }
         Some(Commands::Summary { org, depth, json }) => {
             let client = build_client()?;

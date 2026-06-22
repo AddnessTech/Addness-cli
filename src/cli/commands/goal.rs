@@ -431,7 +431,7 @@ fn print_context_table(
 /// Parse CLI status into (completed_at, api_status) pair.
 /// COMPLETED sets completed_at to current UTC timestamp.
 /// Others clear completed_at (null).
-fn parse_status(status: &str) -> Result<(Option<Option<String>>, Option<GoalStatus>)> {
+pub(crate) fn parse_status(status: &str) -> Result<(Option<Option<String>>, Option<GoalStatus>)> {
     match status.to_uppercase().as_str() {
         "NOT_STARTED" => Ok((Some(None), Some(GoalStatus::None))),
         "IN_PROGRESS" => Ok((Some(None), Some(GoalStatus::InProgress))),

@@ -1,4 +1,5 @@
 mod app;
+mod codex_pane;
 mod goal_tree;
 mod ui;
 

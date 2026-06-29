@@ -9,6 +9,8 @@ use ratatui::{
 use std::collections::HashMap;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use tui_term::widget::PseudoTerminal;
+
 use super::app::{ActivePane, App, DeliverableFormField, FormField, ModalState};
 use super::goal_tree::{CommentView, TreeRow};
 use crate::api::{DeliverableType, GoalStatus, Member, MemberId};
@@ -79,7 +81,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .split(main_layout[1]);
 
     draw_left_panel(frame, content_layout[0], app);
-    draw_content(frame, content_layout[1], app);
+    if app.codex.is_some() {
+        // 契約併置型: 左にゴール/DoD（契約）、右に codex 本体。
+        draw_codex(frame, content_layout[1], app);
+    } else {
+        draw_content(frame, content_layout[1], app);
+    }
     draw_status_bar(frame, main_layout[2], app);
 
     if app.show_org_popup {
@@ -752,6 +759,7 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
         ActivePane::OrgSelector => "Org",
         ActivePane::Navigation => "Nav",
         ActivePane::Content => "Content",
+        ActivePane::Codex => "codex",
     };
 
     let mut hints = vec![
@@ -914,12 +922,18 @@ fn draw_help_overlay(frame: &mut Frame) {
         section("アクションメニュー (o) の内容"),
         kv(
             "ゴール上",
-            "完了/再開 / コメント追加 / 成果物追加 / 編集 / 削除",
+            "codexで作業 / 完了・再開 / コメント追加 / 成果物追加 / 編集 / 削除",
         ),
         kv(
             "コメント上",
             "返信 / 解決・未解決 / 編集 / 削除 / リアクション",
         ),
+        blank(),
+        section("codex連携 (o →「codexで作業」)"),
+        kv("起動", "選択ゴールの文脈付きでcodexをペイン起動"),
+        kv("F12", "実行中のcodexを終了して戻る"),
+        kv("終了後 c/s/d/v", "還流: コメント / 状態 / 成果物 / DoD判定"),
+        kv("Esc / q", "codexペインを閉じる"),
         blank(),
         section("モーダル共通"),
         kv("Enter", "確定"),
@@ -2064,4 +2078,95 @@ fn draw_members(frame: &mut Frame, area: Rect, app: &mut App, border_color: Colo
 
     let list = List::new(visible_members);
     frame.render_widget(list, inner_area);
+}
+
+/// codex ペインを契約併置型で描画する。
+/// 左に対象ゴール／DoD（契約）、右に PTY 上で動く codex 本体。
+fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(32), Constraint::Min(0)])
+        .split(area);
+
+    // --- 契約ペイン（ゴール + DoD チェックリスト）---
+    let (title, items, checks, assessing) = app
+        .codex
+        .as_ref()
+        .map(|c| {
+            (
+                c.goal_title.clone(),
+                c.dod_items.clone(),
+                c.dod_checks.clone(),
+                c.assessing,
+            )
+        })
+        .unwrap_or_default();
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        title,
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+    let dod_header = if assessing {
+        "── 完了基準 (DoD) ⟳判定中 ──".to_string()
+    } else {
+        "── 完了基準 (DoD) ──".to_string()
+    };
+    lines.push(Line::from(Span::styled(
+        dod_header,
+        Style::default().fg(Color::DarkGray),
+    )));
+    if items.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "（未設定 — codexと決めよう）",
+            Style::default().fg(Color::Yellow),
+        )));
+    } else {
+        for (i, item) in items.iter().enumerate() {
+            let (mark, style) = match checks.get(i).copied().flatten() {
+                Some(true) => ("☑", Style::default().fg(Color::Green)),
+                Some(false) => ("☐", Style::default().fg(Color::Red)),
+                None => ("☐", Style::default().fg(Color::Gray)),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{mark} "), style),
+                Span::raw(item.clone()),
+            ]));
+        }
+    }
+
+    let contract = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(" 契約 "),
+        )
+        .wrap(ratatui::widgets::Wrap { trim: true });
+    frame.render_widget(contract, chunks[0]);
+
+    // --- codex 端末ペイン ---
+    let term_area = chunks[1];
+    let rows = term_area.height.saturating_sub(2);
+    let cols = term_area.width.saturating_sub(2);
+    if let Some(pane) = app.codex.as_mut() {
+        pane.resize(rows, cols);
+        let (title, color) = if pane.finished {
+            (
+                " codex ✓ 終了 — [c]コメント [s]状態 [d]成果物 [v]DoD判定  Esc/qで戻る ",
+                Color::Green,
+            )
+        } else {
+            (" codex ⟳ 実行中 — F12で終了 ", Color::Magenta)
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(color))
+            .title(title);
+        let term = PseudoTerminal::new(pane.screen()).block(block);
+        frame.render_widget(term, term_area);
+    }
 }

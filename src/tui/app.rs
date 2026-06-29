@@ -4,15 +4,17 @@ use ratatui::{
     DefaultTerminal,
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
 };
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, time::Instant};
 use tokio::runtime::Handle;
+use tokio::task::JoinHandle;
 
 use crate::api::{
-    ApiClient, CreateGoalRequest, DeliverableType, GoalStatus, Member, MemberId, Organization,
-    UpdateGoalRequest,
+    ApiClient, ApiResponse, CreateGoalRequest, DeliverableType, Goal, GoalStatus, Member, MemberId,
+    Organization, UpdateGoalRequest,
 };
 use crate::dbg_log;
 
+use super::codex_pane::{self, CodexPane};
 use super::goal_tree::{GoalTree, TreeRow};
 use super::ui;
 
@@ -21,6 +23,8 @@ pub enum ActivePane {
     OrgSelector,
     Navigation,
     Content,
+    /// 埋め込み codex ペインにフォーカス中。キー入力は codex へ転送される。
+    Codex,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +80,7 @@ pub enum DeliverableFormField {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionMenuItem {
+    WorkWithCodex,
     AddDeliverable,
     AddComment,
     CompleteGoal,
@@ -97,6 +102,7 @@ pub enum ActionMenuItem {
 impl ActionMenuItem {
     pub fn label(&self) -> &'static str {
         match self {
+            ActionMenuItem::WorkWithCodex => "codexで作業 ✨",
             ActionMenuItem::AddDeliverable => "add deliverable",
             ActionMenuItem::AddComment => "add comment",
             ActionMenuItem::CompleteGoal => "complete goal ✅",
@@ -570,6 +576,55 @@ async fn fetch_initial_data(mut client: ApiClient) -> InitialData {
     }
 }
 
+/// codex exec が出力した JSON 文字列から DoD 判定結果を取り出す。
+/// `{ "results": [ { "index": <int>, "met": <bool> } ] }` を期待する。
+fn parse_dod_results(content: &str, item_count: usize) -> Option<Vec<(usize, bool)>> {
+    let json_str = extract_json_object(content)?;
+    let value: serde_json::Value = serde_json::from_str(&json_str).ok()?;
+    let arr = value.get("results")?.as_array()?;
+    let mut out = Vec::new();
+    for item in arr {
+        let idx = item.get("index")?.as_u64()? as usize;
+        let met = item.get("met")?.as_bool()?;
+        if idx < item_count {
+            out.push((idx, met));
+        }
+    }
+    Some(out)
+}
+
+/// 文字列中の最初の `{` から最後の `}` までを JSON オブジェクトとして切り出す。
+/// codex の最終メッセージに余計な前後テキストが付いても拾えるようにする。
+fn extract_json_object(s: &str) -> Option<String> {
+    let start = s.find('{')?;
+    let end = s.rfind('}')?;
+    (end > start).then(|| s[start..=end].to_string())
+}
+
+/// DoD 自動判定がハングした場合に強制終了するまでの上限時間。
+const DOD_ASSESSMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// 実行中の DoD 自動判定（codex exec）ジョブ。
+struct DodJob {
+    child: std::process::Child,
+    /// codex に渡した出力先と一時スキーマファイル（完了時に掃除する）。
+    out_path: PathBuf,
+    schema_path: PathBuf,
+    item_count: usize,
+    /// 起動時刻。タイムアウト判定に使う。
+    started: Instant,
+}
+
+impl DodJob {
+    /// 子プロセスを強制終了し（ゾンビ化を防ぐため wait し）、一時ファイルを掃除する。
+    fn cleanup(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_file(&self.out_path);
+        let _ = std::fs::remove_file(&self.schema_path);
+    }
+}
+
 pub struct App {
     pub(super) client: ApiClient,
     rt: Handle,
@@ -610,6 +665,17 @@ pub struct App {
 
     /// Success message to display in status bar (cleared on next key press)
     pub success_message: Option<String>,
+
+    /// 埋め込み codex セッション（起動中のみ Some）
+    pub codex: Option<CodexPane>,
+
+    /// codex 実行中、対象ゴールを低頻度・非ブロッキングで再取得するための
+    /// バックグラウンドタスク（進行中のみ Some）と、前回リフレッシュ時刻。
+    codex_refresh: Option<JoinHandle<Result<ApiResponse<Goal>>>>,
+    last_codex_refresh: Option<Instant>,
+
+    /// DoD 自動判定（codex exec）の実行中ジョブ。
+    codex_dod_job: Option<DodJob>,
 }
 
 impl App {
@@ -637,6 +703,10 @@ impl App {
             error_message: None,
             modal_state: None,
             success_message: None,
+            codex: None,
+            codex_refresh: None,
+            last_codex_refresh: None,
+            codex_dod_job: None,
         }
     }
 
@@ -695,7 +765,17 @@ impl App {
             // 表示しようとしているタブのデータを必要になった時点で取得する。
             self.ensure_active_tab_loaded();
             terminal.draw(|frame| ui::draw(frame, self))?;
-            self.handle_events()?;
+
+            if self.codex.is_some() {
+                // codex は非同期に描画更新するので、キー入力が無くても一定間隔で
+                // PTY 出力を取り込んで再描画する（ブロッキング read は使わない）。
+                if event::poll(std::time::Duration::from_millis(20))? {
+                    self.handle_events()?;
+                }
+                self.update_codex();
+            } else {
+                self.handle_events()?;
+            }
         }
         Ok(())
     }
@@ -1030,6 +1110,7 @@ impl App {
             self.modal_state = Some(ModalState::ActionMenu {
                 title: goal_title,
                 items: vec![
+                    ActionMenuItem::WorkWithCodex,
                     complete_item,
                     ActionMenuItem::AddComment,
                     ActionMenuItem::AddDeliverable,
@@ -1043,6 +1124,304 @@ impl App {
 
         self.error_message =
             Some("Select a goal, deliverable or comment to open actions".to_string());
+    }
+
+    /// 選択中ゴールの文脈を注入して、埋め込み codex セッションを起動する。
+    fn start_codex(&mut self) {
+        let Some((goal_id, title)) = self.selected_goal_context() else {
+            self.error_message = Some("ゴールを選択してから codex を起動してください".to_string());
+            return;
+        };
+
+        // codex 未インストールでもクラッシュさせず、案内を出す。
+        let Some(codex_bin) = codex_pane::codex_path() else {
+            self.error_message = Some(
+                "codex が見つかりません。`brew install codex` 等でインストールしてください"
+                    .to_string(),
+            );
+            return;
+        };
+
+        // DoD（completion criteria）と説明を取得して文脈に含める。失敗しても空で続行する。
+        let (dod, body) = match self.api_call(self.client.get_goal(&goal_id)) {
+            Ok(resp) => (
+                resp.data.description.unwrap_or_default(),
+                resp.data.body.unwrap_or_default(),
+            ),
+            Err(_) => (String::new(), String::new()),
+        };
+
+        // codex のサブプロセスから確実に呼べるよう、addness 自身の絶対パスを渡す。
+        let addness_bin = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.to_str().map(String::from))
+            .unwrap_or_else(|| "addness".to_string());
+        let prompt = codex_pane::build_prompt(&addness_bin, &goal_id, &title, &dod, &body);
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+        match CodexPane::spawn(&codex_bin, &prompt, &cwd, goal_id, title, dod) {
+            Ok(pane) => {
+                self.codex = Some(pane);
+                self.active_pane = ActivePane::Codex;
+            }
+            Err(e) => {
+                self.error_message = Some(format!("codex の起動に失敗しました: {e}"));
+            }
+        }
+    }
+
+    /// codex ペインを閉じる（プロセスを終了させて通常画面へ戻る）。
+    /// codex が Addness に書き戻した子ゴール等を反映するため、ツリーを再読込する。
+    fn close_codex(&mut self) {
+        if let Some(mut pane) = self.codex.take() {
+            pane.kill();
+        }
+        if let Some(mut job) = self.codex_dod_job.take() {
+            job.cleanup();
+        }
+        self.codex_refresh = None;
+        self.last_codex_refresh = None;
+        self.active_pane = ActivePane::Content;
+        // codex の変更（子ゴール作成・状態変更など）をツリーに反映する。
+        self.load_goal_tree();
+    }
+
+    /// PTY 出力の取り込みとプロセス終了検知。codex 起動中に毎フレーム呼ぶ。
+    /// あわせて契約ペイン（DoD/タイトル）のライブ更新と DoD 判定を駆動する。
+    fn update_codex(&mut self) {
+        if let Some(pane) = self.codex.as_mut() {
+            pane.update();
+        }
+        self.poll_codex_refresh();
+        self.maybe_start_codex_refresh();
+        self.poll_dod_job();
+    }
+
+    /// `codex exec` を read-only サンドボックスで起動し、各 DoD 項目が現在の
+    /// 作業ツリーで満たされているかを JSON Schema 付きで判定させる（還流: DoDチェック）。
+    fn start_dod_assessment(&mut self) {
+        if self.codex_dod_job.is_some() {
+            return;
+        }
+        let Some(pane) = self.codex.as_ref() else {
+            return;
+        };
+        if pane.dod_items.is_empty() {
+            self.error_message = Some("DoD が未設定のため判定できません".to_string());
+            return;
+        }
+        let Some(codex_bin) = codex_pane::codex_path() else {
+            self.error_message = Some("codex が見つかりません".to_string());
+            return;
+        };
+
+        let items = pane.dod_items.clone();
+        let goal_id = pane.goal_id.clone();
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let tmp = std::env::temp_dir();
+        let schema_path = tmp.join(format!("addness-dod-schema-{goal_id}.json"));
+        let out_path = tmp.join(format!("addness-dod-out-{goal_id}.json"));
+
+        if std::fs::write(&schema_path, codex_pane::dod_assessment_schema()).is_err() {
+            self.error_message = Some("一時ファイルの書き込みに失敗しました".to_string());
+            return;
+        }
+        let _ = std::fs::remove_file(&out_path);
+
+        let prompt = codex_pane::build_dod_assessment_prompt(&items);
+        let child = std::process::Command::new(&codex_bin)
+            .arg("exec")
+            .args(["-s", "read-only", "--color", "never"])
+            .arg("--output-schema")
+            .arg(&schema_path)
+            .arg("-o")
+            .arg(&out_path)
+            .arg("-C")
+            .arg(&cwd)
+            .arg(&prompt)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+
+        match child {
+            Ok(child) => {
+                self.codex_dod_job = Some(DodJob {
+                    child,
+                    out_path,
+                    schema_path,
+                    item_count: items.len(),
+                    started: Instant::now(),
+                });
+                if let Some(pane) = self.codex.as_mut() {
+                    pane.assessing = true;
+                }
+                self.success_message = Some("DoD 判定を実行中…".to_string());
+            }
+            Err(e) => {
+                self.error_message = Some(format!("DoD 判定の起動に失敗しました: {e}"));
+            }
+        }
+    }
+
+    /// DoD 判定ジョブの完了を非ブロッキングで確認し、結果を契約ペインへ反映する。
+    /// タイムアウト超過時は強制終了する。完了/失敗いずれでも一時ファイルを掃除する。
+    fn poll_dod_job(&mut self) {
+        let Some(job) = self.codex_dod_job.as_mut() else {
+            return;
+        };
+
+        let status = match job.child.try_wait() {
+            Ok(None) => {
+                // まだ実行中。タイムアウト超過なら打ち切る。
+                if job.started.elapsed() >= DOD_ASSESSMENT_TIMEOUT {
+                    let mut job = self.codex_dod_job.take().unwrap();
+                    job.cleanup();
+                    self.set_codex_assessing(false);
+                    self.error_message = Some("DoD 判定がタイムアウトしました".to_string());
+                }
+                return;
+            }
+            Ok(Some(status)) => status,
+            Err(_) => {
+                let mut job = self.codex_dod_job.take().unwrap();
+                job.cleanup();
+                self.set_codex_assessing(false);
+                return;
+            }
+        };
+
+        // 完了。結果を読み出してから一時ファイルを掃除する。
+        let mut job = self.codex_dod_job.take().unwrap();
+        let result = if status.success() {
+            std::fs::read_to_string(&job.out_path)
+                .ok()
+                .and_then(|content| parse_dod_results(&content, job.item_count))
+        } else {
+            None
+        };
+        job.cleanup();
+        self.set_codex_assessing(false);
+
+        match result {
+            Some(results) => {
+                let met = results.iter().filter(|(_, m)| *m).count();
+                let total = results.len();
+                if let Some(pane) = self.codex.as_mut() {
+                    pane.apply_dod_results(&results);
+                }
+                self.success_message = Some(format!("DoD 判定完了: {met}/{total} 達成"));
+            }
+            None if status.success() => {
+                self.error_message = Some("DoD 判定結果の解析に失敗しました".to_string());
+            }
+            None => {
+                self.error_message = Some("DoD 判定に失敗しました".to_string());
+            }
+        }
+    }
+
+    /// 契約ペインの「判定中」フラグを設定する小ヘルパー。
+    fn set_codex_assessing(&mut self, value: bool) {
+        if let Some(pane) = self.codex.as_mut() {
+            pane.assessing = value;
+        }
+    }
+
+    /// 一定間隔（3秒）ごとに、対象ゴールの再取得をバックグラウンドで開始する。
+    /// codex が CLI 経由で書き戻した DoD 更新を契約ペインに反映するため。
+    fn maybe_start_codex_refresh(&mut self) {
+        let Some(pane) = self.codex.as_ref() else {
+            return;
+        };
+        // 終了後は還流フェーズなので、ここでのポーリングは止める。
+        if pane.finished || self.codex_refresh.is_some() {
+            return;
+        }
+        let due = self
+            .last_codex_refresh
+            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(3));
+        if !due {
+            return;
+        }
+        let goal_id = pane.goal_id.clone();
+        let client = self.client.clone();
+        self.codex_refresh = Some(
+            self.rt
+                .spawn(async move { client.get_goal(&goal_id).await }),
+        );
+        self.last_codex_refresh = Some(Instant::now());
+    }
+
+    /// 進行中の再取得タスクが完了していれば、契約ペインへ反映する（非ブロッキング）。
+    fn poll_codex_refresh(&mut self) {
+        let Some(handle) = self.codex_refresh.as_ref() else {
+            return;
+        };
+        if !handle.is_finished() {
+            return;
+        }
+        let handle = self.codex_refresh.take().unwrap();
+        // is_finished が真なので block_on は即座に返る。
+        if let Ok(Ok(resp)) = self.rt.block_on(handle)
+            && let Some(pane) = self.codex.as_mut()
+        {
+            pane.set_dod(resp.data.description.unwrap_or_default());
+            pane.goal_title = resp.data.title;
+        }
+    }
+
+    /// codex ペインへのキー入力処理。
+    /// 実行中は F12 で終了して戻り、それ以外のキーは codex へ転送する。
+    /// 終了後は還流バー（c/s/d）で成果を Addness に書き戻し、Esc/q で閉じる。
+    fn handle_codex_key(&mut self, key: KeyEvent) {
+        let finished = self.codex.as_ref().map(|c| c.finished).unwrap_or(true);
+        if finished {
+            // 還流アクションのキー操作時は、古いステータスメッセージを消して鮮度を保つ
+            // （codex フォーカス中は通常のキー処理を通らずクリアされないため）。
+            if let KeyCode::Char('c' | 's' | 'd' | 'v') = key.code {
+                self.error_message = None;
+                self.success_message = None;
+            }
+            match key.code {
+                KeyCode::Char('c') => self.start_codex_reflow_comment(),
+                KeyCode::Char('s') => self.start_edit_goal_modal(),
+                KeyCode::Char('d') => self.start_add_deliverable_modal(),
+                KeyCode::Char('v') => self.start_dod_assessment(),
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => self.close_codex(),
+                _ => {}
+            }
+            return;
+        }
+        if key.code == KeyCode::F(12) {
+            self.close_codex();
+            return;
+        }
+        if let Some(pane) = self.codex.as_mut() {
+            pane.input(key);
+        }
+    }
+
+    /// codex の作業差分（git diff --stat）をプリフィルして、対象ゴールへの
+    /// 進捗コメントモーダルを開く（還流: コメント）。
+    fn start_codex_reflow_comment(&mut self) {
+        let Some(pane) = self.codex.as_ref() else {
+            return;
+        };
+        let goal_id = pane.goal_id.clone();
+        let goal_title = pane.goal_title.clone();
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let diff = codex_pane::git_diff_stat(&cwd);
+        let body = if diff.trim().is_empty() {
+            String::new()
+        } else {
+            format!("codexでの作業差分:\n{diff}\n\n")
+        };
+        self.modal_state = Some(ModalState::AddComment {
+            goal_id,
+            goal_title,
+            body,
+        });
     }
 
     fn reload_deliverables_for_goal(&mut self, goal_id: &str) {
@@ -1255,6 +1634,13 @@ impl App {
                 return Ok(());
             }
 
+            // codex ペインにフォーカス中はキーを codex へ転送する。
+            // ただし還流モーダルが開いている間はモーダル入力を優先する。
+            if self.active_pane == ActivePane::Codex && self.modal_state.is_none() {
+                self.handle_codex_key(key);
+                return Ok(());
+            }
+
             // Clear error and success messages on any key press
             self.error_message = None;
             self.success_message = None;
@@ -1314,14 +1700,14 @@ impl App {
                 self.active_pane = match self.active_pane {
                     ActivePane::OrgSelector => ActivePane::Navigation,
                     ActivePane::Navigation => ActivePane::Content,
-                    ActivePane::Content => ActivePane::OrgSelector,
+                    ActivePane::Content | ActivePane::Codex => ActivePane::OrgSelector,
                 };
             }
             KeyCode::BackTab => {
                 self.active_pane = match self.active_pane {
                     ActivePane::OrgSelector => ActivePane::Content,
                     ActivePane::Navigation => ActivePane::OrgSelector,
-                    ActivePane::Content => ActivePane::Navigation,
+                    ActivePane::Content | ActivePane::Codex => ActivePane::Navigation,
                 };
             }
             KeyCode::Enter => match self.active_pane {
@@ -2592,6 +2978,7 @@ impl App {
 
     fn run_action_menu_item(&mut self, item: ActionMenuItem) {
         match item {
+            ActionMenuItem::WorkWithCodex => self.start_codex(),
             ActionMenuItem::AddDeliverable => self.start_add_deliverable_modal(),
             ActionMenuItem::AddComment => self.start_add_comment_modal(),
             ActionMenuItem::CompleteGoal => self.do_set_goal_completed(true),
@@ -3210,5 +3597,48 @@ mod picker_interaction_tests {
             app.modal_state,
             Some(ModalState::AddDeliverable { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod dod_tests {
+    use super::{extract_json_object, parse_dod_results};
+
+    #[test]
+    fn extract_json_object_strips_surrounding_text() {
+        let s = "前置き {\"a\":1} 後置き";
+        assert_eq!(extract_json_object(s).as_deref(), Some("{\"a\":1}"));
+    }
+
+    #[test]
+    fn extract_json_object_none_when_no_braces() {
+        assert!(extract_json_object("no json here").is_none());
+    }
+
+    #[test]
+    fn parse_dod_results_basic() {
+        let content = r#"{"results":[{"index":0,"met":true},{"index":1,"met":false}]}"#;
+        let parsed = parse_dod_results(content, 2).unwrap();
+        assert_eq!(parsed, vec![(0, true), (1, false)]);
+    }
+
+    #[test]
+    fn parse_dod_results_with_surrounding_text() {
+        let content = "判定結果です:\n{\"results\":[{\"index\":0,\"met\":true}]}\n以上";
+        let parsed = parse_dod_results(content, 3).unwrap();
+        assert_eq!(parsed, vec![(0, true)]);
+    }
+
+    #[test]
+    fn parse_dod_results_drops_out_of_range_index() {
+        let content = r#"{"results":[{"index":5,"met":true},{"index":0,"met":true}]}"#;
+        let parsed = parse_dod_results(content, 2).unwrap();
+        assert_eq!(parsed, vec![(0, true)]);
+    }
+
+    #[test]
+    fn parse_dod_results_rejects_malformed() {
+        assert!(parse_dod_results("not json", 2).is_none());
+        assert!(parse_dod_results(r#"{"results":"nope"}"#, 2).is_none());
     }
 }

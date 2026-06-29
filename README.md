@@ -81,6 +81,39 @@ addness comment --help
 addness link --help
 ```
 
+## TUI（ターミナル UI）
+
+サブコマンドなしで起動すると、ゴールツリーを操作できる対話的な TUI が開きます:
+
+```bash
+addness
+```
+
+主な操作はアプリ内で `?` を押すとヘルプが表示されます。
+
+### TUI 内での codex 連携
+
+ゴール上でアクションメニュー（`o` または `Space`）から **「codexで作業 ✨」** を選ぶと、
+選択中ゴールの文脈（タイトル・完了基準(DoD)・説明）を渡した状態で
+[codex](https://github.com/openai/codex) をペイン内に起動します。
+codex は Addness を「タスク DB」として扱い、`addness` CLI 経由で DoD の具体化・
+子ゴール作成・進捗コメントを書き戻します（左の契約ペインに DoD がライブ表示されます）。
+
+codex 終了後は還流バーのキーで成果を Addness に反映できます:
+
+- `c` … 作業差分をプリフィルした進捗コメントを投稿
+- `s` … ゴールのステータスを変更
+- `d` … 成果物を登録
+- `v` … `codex exec`（read-only）で各 DoD 項目の達成可否を自動判定し、契約ペインにチェック
+- `F12` … 実行中の codex を終了して戻る / `Esc`・`q` … ペインを閉じる
+
+前提:
+
+- 各ユーザーの環境に [codex](https://github.com/openai/codex) がインストールされ、ログイン済みであること
+  （未インストールの場合はその旨を案内し、TUI はクラッシュしません）。
+- 別パスの codex を使う場合は環境変数 `ADDNESS_CODEX_BIN` で実行ファイルを指定できます。
+- macOS・Linux で動作します（Windows は擬似端末の挙動が未検証です）。
+
 ## 開発
 
 Addness CLI は Rust で書かれています。

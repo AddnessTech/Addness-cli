@@ -2367,13 +2367,12 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
     let value_width = inner_width.saturating_sub(6);
     let prompt_width = inner_width.saturating_sub(2);
 
-    let (state, state_style, work) = if pane.finished {
+    let (state, state_style) = if pane.finished {
         (
             "終了",
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
-            "履歴確認",
         )
     } else if pane.assessing {
         (
@@ -2381,25 +2380,36 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
-            "DoD自動判定",
         )
-    } else if let Some(action) = pane.action.as_deref() {
+    } else if pane.action.is_some() {
         (
             "実行中",
             Style::default()
                 .fg(Color::Magenta)
                 .add_modifier(Modifier::BOLD),
-            action,
         )
-    } else {
+    } else if pane.last_prompt().is_some() {
         (
-            "対話中",
+            "対応中",
             Style::default()
                 .fg(Color::Magenta)
                 .add_modifier(Modifier::BOLD),
-            "codex応答/入力待ち",
+        )
+    } else {
+        (
+            "待機",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
         )
     };
+    let work = codex_work_label(
+        pane.finished,
+        pane.assessing,
+        pane.action.as_deref(),
+        pane.last_prompt(),
+        value_width,
+    );
 
     let prompt = pane
         .last_prompt()
@@ -2418,10 +2428,7 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
         ]),
         Line::from(vec![
             Span::styled("作業 ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                ellipsize_width(work, value_width),
-                Style::default().fg(Color::White),
-            ),
+            Span::styled(work, Style::default().fg(Color::White)),
         ]),
         Line::from(""),
         Line::from(Span::styled(
@@ -2440,6 +2447,28 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
         )
         .wrap(ratatui::widgets::Wrap { trim: true });
     frame.render_widget(panel, area);
+}
+
+fn codex_work_label(
+    finished: bool,
+    assessing: bool,
+    action: Option<&str>,
+    last_prompt: Option<&str>,
+    max_width: usize,
+) -> String {
+    if finished {
+        return ellipsize_width("履歴確認", max_width);
+    }
+    if assessing {
+        return ellipsize_width("DoD自動判定", max_width);
+    }
+    if let Some(action) = action {
+        return ellipsize_width(action, max_width);
+    }
+    if let Some(prompt) = last_prompt {
+        return prompt_preview(&format!("依頼対応: {prompt}"), max_width);
+    }
+    ellipsize_width("入力待ち", max_width)
 }
 
 fn prompt_preview(prompt: &str, max_width: usize) -> String {
@@ -2475,7 +2504,7 @@ fn ellipsize_width(text: &str, max_width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ellipsize_width, prompt_preview};
+    use super::{codex_work_label, ellipsize_width, prompt_preview};
     use unicode_width::UnicodeWidthStr;
 
     #[test]
@@ -2500,5 +2529,28 @@ mod tests {
 
         assert!(preview.ends_with("..."));
         assert!(UnicodeWidthStr::width(preview.as_str()) <= 9);
+    }
+
+    #[test]
+    fn codex_work_label_prefers_action_over_last_prompt() {
+        assert_eq!(
+            codex_work_label(false, false, Some("ゴールを更新中"), Some("実装して"), 80),
+            "ゴールを更新中"
+        );
+    }
+
+    #[test]
+    fn codex_work_label_uses_last_prompt_when_no_action() {
+        let label = codex_work_label(false, false, None, Some("この不具合を直して"), 80);
+
+        assert_eq!(label, "依頼対応: この不具合を直して");
+    }
+
+    #[test]
+    fn codex_work_label_truncates_last_prompt() {
+        let label = codex_work_label(false, false, None, Some("abcdefghijklmnopqrstuvwxyz"), 12);
+
+        assert_eq!(label, "依頼対応:...");
+        assert!(UnicodeWidthStr::width(label.as_str()) <= 12);
     }
 }

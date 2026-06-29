@@ -1277,8 +1277,8 @@ impl App {
             .unwrap_or_else(|| "addness".to_string());
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-        // 対象ゴールは環境変数で伝え、codex の初期プロンプトとして Addness 想起を
-        // 依頼する。PTY への後追い打鍵だと入力欄に入るだけで送信されないことがあるため。
+        // 対象ゴールの軽量コンテキストは環境変数で伝える。起動直後は初期プロンプトを
+        // 送らず、ユーザーがすぐ最初の指示を入力できる状態にする。
         match CodexPane::spawn(
             &codex_bin,
             &cwd,
@@ -1291,7 +1291,7 @@ impl App {
             Ok(mut pane) => {
                 pane.push_activity(format!("{} codex を起動", Local::now().format("%H:%M")));
                 pane.push_activity(format!(
-                    "{} Addness想起を初期プロンプトで依頼",
+                    "{} 軽量コンテキストで即入力可能",
                     Local::now().format("%H:%M")
                 ));
                 self.codex = Some(pane);

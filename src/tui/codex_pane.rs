@@ -169,9 +169,11 @@ impl CodexPane {
             CodexConfigKey::DeveloperInstructions,
             addness_tui_developer_instructions(),
         ));
-        // `codex [PROMPT]` は interactive CLI の正式な初期プロンプト入力。
-        // 画面に残る可能性があるため、ここは短い起動トリガーだけにする。
-        cmd.arg(startup_recall_prompt());
+        // デフォルトでは初期プロンプトを送らず、ユーザーが即入力できる状態で起動する。
+        // 完全な Addness 読込は developer instructions に従って必要時に遅延実行する。
+        if eager_startup_recall_enabled() {
+            cmd.arg(startup_recall_prompt());
+        }
         cmd.cwd(cwd);
         // 親プロセスの環境を引き継ぐ（PATH 等を codex のサブプロセスに渡すため）。
         // vars() は非UTF-8な環境変数があると panic するため vars_os() を使う。
@@ -183,6 +185,8 @@ impl CodexPane {
         cmd.env("ADDNESS_TUI_CODEX", "1");
         cmd.env("ADDNESS_GOAL_ID", &goal_id);
         cmd.env("ADDNESS_GOAL_TITLE", &goal_title);
+        cmd.env("ADDNESS_GOAL_STATUS", &status_label);
+        cmd.env("ADDNESS_GOAL_DOD", &dod);
         cmd.env("ADDNESS_BIN", addness_bin);
 
         let child = pair
@@ -379,6 +383,11 @@ impl CodexPane {
         self.finished && self.input_state.exit_command_sent
     }
 
+    /// ユーザーが codex に最後に送信した入力行。
+    pub fn last_prompt(&self) -> Option<&str> {
+        self.input_state.last_prompt.as_deref()
+    }
+
     /// codex プロセスを終了させる（ペインを閉じる時に呼ぶ）。
     /// kill 後に wait してゾンビプロセス化を防ぐ。
     pub fn kill(&mut self) {
@@ -413,6 +422,7 @@ impl CodexPane {
 struct CodexInputState {
     line: String,
     exit_command_sent: bool,
+    last_prompt: Option<String>,
 }
 
 impl CodexInputState {
@@ -434,7 +444,11 @@ impl CodexInputState {
                 self.line.pop();
             }
             KeyCode::Enter => {
-                if self.line.trim() == "/exit" {
+                let submitted = self.line.trim();
+                if !submitted.is_empty() {
+                    self.last_prompt = Some(submitted.to_string());
+                }
+                if submitted == "/exit" {
                     self.exit_command_sent = true;
                 }
                 self.line.clear();
@@ -451,10 +465,28 @@ fn startup_recall_prompt() -> &'static str {
     "Addness TUIセッションを開始してください。起動時指示に従って対象ゴールを想起してから進めてください。"
 }
 
-fn addness_tui_developer_instructions() -> &'static str {
-    r#"Addness TUIから起動されました。ユーザーの追加入力を待つ前に、必ず Addness CLI を使って対象ゴールを想起してください。
+fn eager_startup_recall_enabled() -> bool {
+    std::env::var("ADDNESS_CODEX_EAGER_RECALL")
+        .ok()
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+}
 
-最初に実行するコマンド:
+fn addness_tui_developer_instructions() -> &'static str {
+    r#"Addness TUIから起動されました。
+
+起動直後は Addness CLI を実行せず、ユーザーの最初の入力を待ってください。
+最初の依頼に軽く応答できる場合は、TUIから渡された軽量コンテキストだけを使って即応して構いません。
+
+軽量コンテキスト:
+- ADDNESS_GOAL_ID: 対象ゴールID
+- ADDNESS_GOAL_TITLE: 対象ゴール名
+- ADDNESS_GOAL_STATUS: 対象ゴールの現在状態
+- ADDNESS_GOAL_DOD: 対象ゴールのDoD/完了基準
+
+実作業の判断、body/コメント/成果物/子ゴールの確認、引き継ぎ、サブエージェント分解が必要になったら、
+作業に入る前に Addness CLI を使って対象ゴールを想起してください。
+
+必要時に実行するコマンド:
 `"$ADDNESS_BIN" goal get "$ADDNESS_GOAL_ID" --json --with-deliverable --with-comment`
 
 Addness はこの組織/プロジェクト専用の作業DB・引き継ぎ点として扱ってください。
@@ -472,7 +504,7 @@ Addness はこの組織/プロジェクト専用の作業DB・引き継ぎ点と
 - DoDが不十分でも、単独でそのまま進められるなら勝手に書き換えず、短く不足を指摘して必要なら質問する。サブエージェントに渡すために契約が必要な場合だけ `"$ADDNESS_BIN" goal update "$ADDNESS_GOAL_ID" --description "..." --json` で具体化する。
 - コメントは構造化フィールドに置けない質問や補足だけに使う。
 
-ここまで確認したら、何を読んだか、Addnessへの書き込みが必要か、次に進めることを短く共有し、明らかに進められる作業があればそのまま着手してください。"#
+Addnessを読んだ場合は、何を読んだか、Addnessへの書き込みが必要か、次に進めることを短く共有してください。"#
 }
 
 enum CodexConfigKey {
@@ -681,6 +713,29 @@ mod tests {
     }
 
     #[test]
+    fn codex_input_state_records_last_prompt_on_enter() {
+        let mut state = CodexInputState::default();
+        for ch in "  cargo test を実行して  ".chars() {
+            state.observe_key(key(KeyCode::Char(ch)));
+        }
+        state.observe_key(key(KeyCode::Enter));
+
+        assert_eq!(state.last_prompt.as_deref(), Some("cargo test を実行して"));
+    }
+
+    #[test]
+    fn codex_input_state_keeps_last_prompt_on_blank_enter() {
+        let mut state = CodexInputState::default();
+        for ch in "最初の依頼".chars() {
+            state.observe_key(key(KeyCode::Char(ch)));
+        }
+        state.observe_key(key(KeyCode::Enter));
+        state.observe_key(key(KeyCode::Enter));
+
+        assert_eq!(state.last_prompt.as_deref(), Some("最初の依頼"));
+    }
+
+    #[test]
     fn codex_input_state_ignores_non_exit_lines() {
         let mut state = CodexInputState::default();
         for ch in "please /exit later".chars() {
@@ -730,13 +785,19 @@ mod tests {
     }
 
     #[test]
-    fn startup_recall_prompt_requires_addness_goal_get() {
+    fn startup_instructions_defer_full_addness_recall_until_needed() {
         let prompt = startup_recall_prompt();
         let instructions = addness_tui_developer_instructions();
 
         assert!(prompt.contains("Addness TUIセッションを開始"));
         assert!(prompt.len() < 80 * 2);
-        assert!(instructions.contains("ユーザーの追加入力を待つ前に"));
+        assert!(instructions.contains("起動直後は Addness CLI を実行せず"));
+        assert!(instructions.contains("ユーザーの最初の入力を待ってください"));
+        assert!(instructions.contains("軽量コンテキスト"));
+        assert!(instructions.contains("ADDNESS_GOAL_TITLE"));
+        assert!(instructions.contains("ADDNESS_GOAL_STATUS"));
+        assert!(instructions.contains("ADDNESS_GOAL_DOD"));
+        assert!(instructions.contains("必要時に実行するコマンド"));
         assert!(instructions.contains("\"$ADDNESS_BIN\" goal get \"$ADDNESS_GOAL_ID\""));
         assert!(instructions.contains("--json --with-deliverable --with-comment"));
         assert!(instructions.contains("組織/プロジェクト専用の作業DB"));

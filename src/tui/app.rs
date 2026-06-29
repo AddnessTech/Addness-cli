@@ -1,16 +1,18 @@
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{Local, Utc};
 use ratatui::{
     DefaultTerminal,
-    crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    crossterm::event::{
+        self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+    },
 };
 use std::{collections::HashMap, path::PathBuf, time::Instant};
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
 use crate::api::{
-    ApiClient, ApiResponse, CreateGoalRequest, DeliverableType, Goal, GoalStatus, Member, MemberId,
-    Organization, UpdateGoalRequest,
+    ApiClient, CreateGoalRequest, DeliverableType, GoalStatus, Member, MemberId, Organization,
+    UpdateGoalRequest,
 };
 use crate::dbg_log;
 
@@ -102,10 +104,10 @@ pub enum ActionMenuItem {
 impl ActionMenuItem {
     pub fn label(&self) -> &'static str {
         match self {
-            ActionMenuItem::WorkWithCodex => "codexで作業 ✨",
+            ActionMenuItem::WorkWithCodex => "codexで作業",
             ActionMenuItem::AddDeliverable => "add deliverable",
             ActionMenuItem::AddComment => "add comment",
-            ActionMenuItem::CompleteGoal => "complete goal ✅",
+            ActionMenuItem::CompleteGoal => "complete goal",
             ActionMenuItem::ReopenGoal => "reopen goal",
             ActionMenuItem::EditGoal => "edit goal",
             ActionMenuItem::DeleteGoal => "delete goal",
@@ -118,7 +120,7 @@ impl ActionMenuItem {
             ActionMenuItem::UnresolveComment => "unresolve comment",
             ActionMenuItem::EditComment => "edit comment",
             ActionMenuItem::DeleteComment => "delete comment",
-            ActionMenuItem::ReactComment => "react (👍)",
+            ActionMenuItem::ReactComment => "react",
         }
     }
 }
@@ -159,10 +161,20 @@ impl GoalDisplayStatus {
 
     pub fn to_emoji_string(&self) -> String {
         match self {
-            GoalDisplayStatus::NotStarted => "🔵 未着手".to_string(),
-            GoalDisplayStatus::InProgress => "⏩ 進行中".to_string(),
-            GoalDisplayStatus::Cancelled => "⏸ 停止中".to_string(),
-            GoalDisplayStatus::Completed => "✅ 完了".to_string(),
+            GoalDisplayStatus::NotStarted => "未着手".to_string(),
+            GoalDisplayStatus::InProgress => "進行中".to_string(),
+            GoalDisplayStatus::Cancelled => "停止中".to_string(),
+            GoalDisplayStatus::Completed => "完了".to_string(),
+        }
+    }
+
+    /// 状態を表す短いマーカー（子ゴールリストのアイコン用、ASCII）。
+    pub fn icon(&self) -> &'static str {
+        match self {
+            GoalDisplayStatus::NotStarted => "[ ]",
+            GoalDisplayStatus::InProgress => "[~]",
+            GoalDisplayStatus::Cancelled => "[-]",
+            GoalDisplayStatus::Completed => "[x]",
         }
     }
 
@@ -604,6 +616,16 @@ fn extract_json_object(s: &str) -> Option<String> {
 /// DoD 自動判定がハングした場合に強制終了するまでの上限時間。
 const DOD_ASSESSMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// codex ペインのライブ更新で取得する Addness 側のスナップショット。
+struct CodexSnapshot {
+    title: String,
+    description: String,
+    status_label: String,
+    comment_count: Option<usize>,
+    /// 子ゴール一覧（id, タイトル, 状態アイコン）。None=取得失敗。
+    children: Option<Vec<(String, String, &'static str)>>,
+}
+
 /// 実行中の DoD 自動判定（codex exec）ジョブ。
 struct DodJob {
     child: std::process::Child,
@@ -671,8 +693,13 @@ pub struct App {
 
     /// codex 実行中、対象ゴールを低頻度・非ブロッキングで再取得するための
     /// バックグラウンドタスク（進行中のみ Some）と、前回リフレッシュ時刻。
-    codex_refresh: Option<JoinHandle<Result<ApiResponse<Goal>>>>,
+    codex_refresh: Option<JoinHandle<Option<CodexSnapshot>>>,
     last_codex_refresh: Option<Instant>,
+    /// 直近に Addness 同期が完了した時刻と回数（左ペインの鼓動表示に使う）。
+    pub(super) last_codex_sync: Option<Instant>,
+    pub(super) codex_sync_tick: u64,
+    /// codex を閉じた直後、UI を即切替してからツリー再読込を遅延実行するためのフラグ。
+    pending_codex_tree_reload: bool,
 
     /// DoD 自動判定（codex exec）の実行中ジョブ。
     codex_dod_job: Option<DodJob>,
@@ -706,6 +733,9 @@ impl App {
             codex: None,
             codex_refresh: None,
             last_codex_refresh: None,
+            last_codex_sync: None,
+            codex_sync_tick: 0,
+            pending_codex_tree_reload: false,
             codex_dod_job: None,
         }
     }
@@ -768,6 +798,17 @@ impl App {
             if needs_redraw {
                 terminal.draw(|frame| ui::draw(frame, self))?;
                 needs_redraw = false;
+            }
+
+            // codex を閉じた直後は、上の描画で UI を切り替えた後にツリーを再読込する。
+            if self.pending_codex_tree_reload {
+                self.pending_codex_tree_reload = false;
+                self.load_goal_tree();
+                if self.todays_loaded {
+                    self.load_todays_goals();
+                }
+                needs_redraw = true;
+                continue;
             }
 
             if self.codex.is_some() {
@@ -1151,27 +1192,76 @@ impl App {
             return;
         };
 
-        // DoD（completion criteria）と説明を取得して文脈に含める。失敗しても空で続行する。
-        let (dod, body) = match self.api_call(self.client.get_goal(&goal_id)) {
-            Ok(resp) => (
-                resp.data.description.unwrap_or_default(),
-                resp.data.body.unwrap_or_default(),
-            ),
-            Err(_) => (String::new(), String::new()),
+        // DoD（completion criteria）と説明・ステータスを取得して文脈に含める。失敗しても空で続行する。
+        let (dod, body, status_label) = match self.api_call(self.client.get_goal(&goal_id)) {
+            Ok(resp) => {
+                let goal = resp.data;
+                let status =
+                    GoalDisplayStatus::from_goal_state(goal.status.as_ref(), goal.is_completed)
+                        .to_emoji_string();
+                (
+                    goal.description.unwrap_or_default(),
+                    goal.body.unwrap_or_default(),
+                    status,
+                )
+            }
+            Err(_) => (String::new(), String::new(), String::new()),
         };
+
+        // 想起: 直近コメント（進捗・考え）と子ゴール（分解）も取り込んで文脈に含める。
+        let recent_comments: Vec<String> = self
+            .api_call(self.client.list_comments(&goal_id))
+            .map(|resp| {
+                let mut v: Vec<String> = resp
+                    .comments
+                    .into_iter()
+                    .rev()
+                    .take(5)
+                    .map(|c| truncate_comment(&c.content))
+                    .collect();
+                v.reverse();
+                v
+            })
+            .unwrap_or_default();
+        let children: Vec<String> = self
+            .api_call(self.client.get_goal_children(&goal_id, 20, 0))
+            .map(|resp| {
+                resp.data
+                    .children
+                    .into_iter()
+                    .map(|c| {
+                        let icon =
+                            GoalDisplayStatus::from_goal_state(c.status.as_ref(), c.is_completed)
+                                .icon();
+                        format!("{icon} {}", c.title)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
         // codex のサブプロセスから確実に呼べるよう、addness 自身の絶対パスを渡す。
         let addness_bin = std::env::current_exe()
             .ok()
             .and_then(|p| p.to_str().map(String::from))
             .unwrap_or_else(|| "addness".to_string());
-        let prompt = codex_pane::build_prompt(&addness_bin, &goal_id, &title, &dod, &body);
+        let prompt = codex_pane::build_prompt(
+            &addness_bin,
+            &goal_id,
+            &title,
+            &dod,
+            &body,
+            &recent_comments,
+            &children,
+        );
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-        match CodexPane::spawn(&codex_bin, &prompt, &cwd, goal_id, title, dod) {
-            Ok(pane) => {
+        match CodexPane::spawn(&codex_bin, &prompt, &cwd, goal_id, title, dod, status_label) {
+            Ok(mut pane) => {
+                pane.push_activity(format!("{} codex を起動", Local::now().format("%H:%M")));
                 self.codex = Some(pane);
                 self.active_pane = ActivePane::Codex;
+                // ホイールスクロール用にマウスキャプチャを有効化（codex 中のみ）。
+                Self::set_mouse_capture(true);
             }
             Err(e) => {
                 self.error_message = Some(format!("codex の起動に失敗しました: {e}"));
@@ -1179,9 +1269,23 @@ impl App {
         }
     }
 
+    /// マウスキャプチャの ON/OFF。通常画面ではテキスト選択を壊さないよう OFF にする。
+    fn set_mouse_capture(enable: bool) {
+        use ratatui::crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+        use ratatui::crossterm::execute;
+        let mut out = std::io::stdout();
+        if enable {
+            let _ = execute!(out, EnableMouseCapture);
+        } else {
+            let _ = execute!(out, DisableMouseCapture);
+        }
+    }
+
     /// codex ペインを閉じる（プロセスを終了させて通常画面へ戻る）。
     /// codex が Addness に書き戻した子ゴール等を反映するため、ツリーを再読込する。
     fn close_codex(&mut self) {
+        // 通常画面に戻るのでマウスキャプチャを解除（テキスト選択を戻す）。
+        Self::set_mouse_capture(false);
         if let Some(mut pane) = self.codex.take() {
             pane.kill();
         }
@@ -1191,11 +1295,9 @@ impl App {
         self.codex_refresh = None;
         self.last_codex_refresh = None;
         self.active_pane = ActivePane::Content;
-        // codex の変更（子ゴール作成・状態変更など）を表示中のツリーへ反映する。
-        self.load_goal_tree();
-        if self.todays_loaded {
-            self.load_todays_goals();
-        }
+        // ツリー再読込はブロッキングなので即時には行わず、UI を先に切り替えてから
+        // 次フレームで実行する（F12 の体感を速くする）。
+        self.pending_codex_tree_reload = true;
     }
 
     /// PTY 出力の取り込みとプロセス終了検知。codex 起動中に毎フレーム呼ぶ。
@@ -1374,10 +1476,39 @@ impl App {
         }
         let goal_id = pane.goal_id.clone();
         let client = self.client.clone();
-        self.codex_refresh = Some(
-            self.rt
-                .spawn(async move { client.get_goal(&goal_id).await }),
-        );
+        self.codex_refresh = Some(self.rt.spawn(async move {
+            // ゴール本体・子ゴール数・コメント数を 1 往復に畳んで取得する。
+            // 子ゴール／コメントの取得は失敗しても本体があれば続行する。
+            let (goal_res, children_res, comments_res) = tokio::join!(
+                client.get_goal(&goal_id),
+                client.get_goal_children(&goal_id, 50, 0),
+                client.list_comments(&goal_id),
+            );
+            let goal = goal_res.ok()?.data;
+            let status_label =
+                GoalDisplayStatus::from_goal_state(goal.status.as_ref(), goal.is_completed)
+                    .to_emoji_string();
+            let children = children_res.ok().map(|r| {
+                r.data
+                    .children
+                    .into_iter()
+                    .map(|c| {
+                        let icon =
+                            GoalDisplayStatus::from_goal_state(c.status.as_ref(), c.is_completed)
+                                .icon();
+                        (c.id, c.title, icon)
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let comment_count = comments_res.ok().map(|r| r.total_count.max(0) as usize);
+            Some(CodexSnapshot {
+                title: goal.title,
+                description: goal.description.unwrap_or_default(),
+                status_label,
+                comment_count,
+                children,
+            })
+        }));
         self.last_codex_refresh = Some(Instant::now());
     }
 
@@ -1392,17 +1523,54 @@ impl App {
         }
         let handle = self.codex_refresh.take().unwrap();
         // is_finished が真なので block_on は即座に返る。
-        if let Ok(Ok(resp)) = self.rt.block_on(handle)
+        if let Ok(Some(snap)) = self.rt.block_on(handle)
             && let Some(pane) = self.codex.as_mut()
         {
-            pane.goal_title = resp.data.title;
-            // DoD 判定の実行中は項目とチェックを作り直さない（番号ずれ防止）。
-            if !pane.assessing {
-                pane.set_dod(resp.data.description.unwrap_or_default());
+            let now = Local::now().format("%H:%M");
+
+            // ステータス変化を検知して更新ログに残す（Addness 側の進行を可視化）。
+            if snap.status_label != pane.status_label {
+                pane.status_label = snap.status_label.clone();
+                pane.status_changed_at = Some(Instant::now());
+                pane.push_activity(format!("{now} ステータス → {}", snap.status_label));
             }
-            return true;
+
+            if snap.title != pane.goal_title {
+                pane.goal_title = snap.title;
+                pane.push_activity(format!("{now} タイトルを更新"));
+            }
+
+            // DoD 判定の実行中は項目とチェックを作り直さない（番号ずれ防止）。
+            if !pane.assessing && pane.set_dod(snap.description) {
+                pane.dod_changed_at = Some(Instant::now());
+                pane.push_activity(format!("{now} DoD を更新"));
+            }
+
+            // 子ゴール一覧の差し替え＋増加検知（codex が Addness に書き込んだサイン）。
+            if let Some(children) = snap.children {
+                let new_n = children.len();
+                let old_n = pane.child_count.unwrap_or(0);
+                if pane.child_count.is_some() && new_n > old_n {
+                    pane.push_activity(format!("{now} 子ゴール +{} (計{new_n})", new_n - old_n));
+                }
+                pane.child_count = Some(new_n);
+                pane.update_children(children);
+            }
+            if let Some(new_n) = snap.comment_count {
+                match pane.comment_count {
+                    Some(old_n) if new_n > old_n => {
+                        pane.push_activity(format!(
+                            "{now} コメント +{} (計{new_n})",
+                            new_n - old_n
+                        ));
+                    }
+                    _ => {}
+                }
+                pane.comment_count = Some(new_n);
+            }
         }
-        false
+        // 同期完了自体を変化として扱い、鼓動表示を更新させる。
+        true
     }
 
     /// codex ペインへのキー入力処理。
@@ -1417,12 +1585,43 @@ impl App {
                 self.error_message = None;
                 self.success_message = None;
             }
+            // 終了後は codex がキーを処理しないので、ログを遡れるようにする。
+            if let Some(pane) = self.codex.as_mut() {
+                let page = pane.page() as isize;
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        pane.scroll_lines(1);
+                        return;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        pane.scroll_lines(-1);
+                        return;
+                    }
+                    KeyCode::PageUp => {
+                        pane.scroll_lines(page);
+                        return;
+                    }
+                    KeyCode::PageDown => {
+                        pane.scroll_lines(-page);
+                        return;
+                    }
+                    KeyCode::Home => {
+                        pane.scroll_to_top();
+                        return;
+                    }
+                    KeyCode::End => {
+                        pane.scroll_to_live();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
             match key.code {
                 KeyCode::Char('c') => self.start_codex_reflow_comment(),
                 KeyCode::Char('s') => self.start_codex_reflow_edit(),
                 KeyCode::Char('d') => self.start_codex_reflow_deliverable(),
                 KeyCode::Char('v') => self.start_dod_assessment(),
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => self.close_codex(),
+                KeyCode::Esc | KeyCode::Char('q') => self.close_codex(),
                 _ => {}
             }
             return;
@@ -1711,7 +1910,25 @@ impl App {
     // -----------------------------------------------------------------------
 
     fn handle_events(&mut self) -> Result<()> {
-        if let Event::Key(key) = event::read()? {
+        let event = event::read()?;
+
+        // マウスホイール（トラックパッド）で codex ログをスクロールする。
+        // マウスキャプチャは codex 使用中のみ有効化している。
+        if let Event::Mouse(me) = event {
+            if self.active_pane == ActivePane::Codex
+                && self.modal_state.is_none()
+                && let Some(pane) = self.codex.as_mut()
+            {
+                match me.kind {
+                    MouseEventKind::ScrollUp => pane.scroll_lines(3),
+                    MouseEventKind::ScrollDown => pane.scroll_lines(-3),
+                    _ => {}
+                }
+            }
+            return Ok(());
+        }
+
+        if let Event::Key(key) = event {
             if key.kind != KeyEventKind::Press {
                 return Ok(());
             }
@@ -3040,7 +3257,7 @@ impl App {
             Ok(_) => {
                 self.success_message = Some(
                     if completed {
-                        "Goal completed ✅"
+                        "Goal completed"
                     } else {
                         "Goal reopened"
                     }

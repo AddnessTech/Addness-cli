@@ -8,6 +8,7 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -58,38 +59,67 @@ pub fn build_prompt(
     title: &str,
     dod: &str,
     body: &str,
+    recent_comments: &[String],
+    children: &[String],
 ) -> String {
     let dod = if dod.trim().is_empty() {
-        "（未設定 — ユーザーと対話して具体化し、addness goal update で書き戻すこと）"
+        "（未設定 — ユーザーと対話して具体化し、書き戻すこと）"
     } else {
         dod.trim()
     };
     let body = if body.trim().is_empty() {
-        "（未設定）"
+        "（未設定 — 現状をまだ誰も書いていない）"
     } else {
         body.trim()
     };
+    let bullet = |items: &[String]| -> String {
+        if items.is_empty() {
+            "（なし）".to_string()
+        } else {
+            items
+                .iter()
+                .map(|l| format!("  - {}", l.trim()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    };
+    let comments = bullet(recent_comments);
+    let children = bullet(children);
 
     format!(
-        r#"あなたは Addness TUI の中から、特定のゴールに対して呼び出されました。
+        r#"あなたは Addness TUI から、特定のゴールに対して呼び出されました。
 
-# Addness が真実源（タスク DB）
-- このプロジェクトの目標・進捗・決定は Addness に集約されています。`addness` CLI で読み書きしてください。
+# このゴールがあなたの作業メモリです（重要）
+他で得た一般的な知識・技術・ノウハウは自由に活用してください。ただし、
+**このプロジェクト固有の「前提・現状・進捗・方針」は、あなたの記憶ではなく
+下記「対象ゴール」に書かれた内容を真実源とします**（他プロジェクト固有の状態を
+持ち込んで混ぜない）。ゴールを「いつでも・どこからでも続きに入れるクリーンな
+引き継ぎ点」として読み書きしてください。
 - addness バイナリ: `{addness_bin}`
-- 使い方が不明なときは `{addness_bin} skills` を実行して確認してください。データ取得は `--json` を付けます。
+- 使い方が不明なときは `{addness_bin} skills` を実行（データ取得は `--json`）。
 
-# 対象ゴール
+# 対象ゴール（想起した状態）
 - ID: {goal_id}
 - タイトル: {title}
-- 完了基準(DoD / 理想の状態): {dod}
-- 説明(現在の状態): {body}
+- 方針 / 完了基準(DoD = 理想の状態): {dod}
+- 現状(body = 現在の状態): {body}
+- これまでの進捗・考え（直近コメント）:
+{comments}
+- 分解済みの子ゴール:
+{children}
 
-# 進め方
-1. まず DoD を確認し、曖昧・不十分なら私（ユーザー）に質問して具体化し、`{addness_bin} goal update {goal_id} --description "..."` で書き戻してください。勝手に確定しないでください。
-2. 理想と現在の差分を埋めるアクションは、子ゴールとして `{addness_bin} goal create --title "..." --parent {goal_id}` で分解してください。
-3. 実装を進め、決定や進捗は `{addness_bin} comment create --goal {goal_id} --body "..."` に記録してください（末尾に「Codexより」と署名）。
+# あなたの責務（このゴールを常にクリーンな引き継ぎ点に保つ）
+0. 他で得た知識・技術は活用してよい。ただしこのプロジェクト固有の状態は上記を真実源とする。
+1. まず上記の現状・方針・進捗を踏まえる。DoD が曖昧ならユーザーに質問して具体化し、
+   `{addness_bin} goal update {goal_id} --description "..."` で方針を書き戻す。
+2. 作業を進めたら、現状を `{addness_bin} goal update {goal_id} --body "..."` で最新化する。
+   次回や別フォルダからでも、これを読めば続きから入れる状態に保つこと。
+3. 理想と現状の差分は子ゴールへ。`{addness_bin} goal create --title "..." --parent {goal_id}`。
+4. 重要な決定・考え・進捗は `{addness_bin} comment create --goal {goal_id} --body "..."`
+   に記録する（末尾に「Codexより」と署名）。
+5. セッションを終える前に、必ず現状(body)と進捗コメントを最新化してから終了する。
 
-まずは対象ゴールの DoD が十分かを確認するところから始めてください。"#
+まずは想起した現状・方針を確認し、足りない情報があればユーザーに尋ねるところから始めてください。"#
     )
 }
 
@@ -109,12 +139,60 @@ pub struct CodexPane {
     /// 契約ペイン表示用に保持する対象ゴールのタイトルと DoD。
     pub goal_title: String,
     pub dod: String,
+    /// codex が参照しているローカルの作業ディレクトリ（cwd）。
+    pub cwd: String,
+    /// 対象ゴールの現在ステータス表示（例: "進行中"）。
+    pub status_label: String,
     /// DoD を行単位に分割した項目（契約ペインのチェックリスト用）。
     pub dod_items: Vec<String>,
     /// 各 DoD 項目の達成判定。None=未判定 / Some(true)=達成 / Some(false)=未達。
     pub dod_checks: Vec<Option<bool>>,
     /// DoD 自動判定（codex exec）を実行中か。
     pub assessing: bool,
+    /// 子ゴール数・コメント数（変化検知で更新ログに反映する。未取得は None）。
+    pub child_count: Option<usize>,
+    pub comment_count: Option<usize>,
+    /// 子ゴールのライブリスト（新着は new_until までハイライト）。
+    pub children: Vec<ChildGoal>,
+    /// codex が直近に実行した addness 操作の表示ラベル（参照/書込中インジケータ）。
+    pub action: Option<String>,
+    /// ステータス・DoD が変化した時刻（変化行を数秒ハイライトするのに使う）。
+    pub status_changed_at: Option<Instant>,
+    pub dod_changed_at: Option<Instant>,
+    /// codex ログのスクロールバック位置（0=最新、増えるほど過去）。
+    pub scrollback: usize,
+    /// Addness 側の更新ログ（codex の書き込みやステータス変化を可視化）。新しいものほど末尾。
+    pub activity: Vec<String>,
+}
+
+/// 子ゴール 1 件の表示用情報。
+pub struct ChildGoal {
+    pub id: String,
+    pub title: String,
+    pub icon: &'static str,
+    /// 新着ハイライトの有効期限（None=通常表示）。
+    pub new_until: Option<Instant>,
+}
+
+/// `addness <サブコマンド…>` 文字列を「いま何をしているか」の表示ラベルへ変換する。
+fn action_label(rest: &str) -> String {
+    let mut it = rest.split_whitespace();
+    let a = it.next().unwrap_or("");
+    let b = it.next().unwrap_or("");
+    match (a, b) {
+        ("goal", "create") => "子ゴールを作成中".to_string(),
+        ("goal", "update") => "ゴールを更新中".to_string(),
+        ("goal", "get" | "list" | "children" | "tree" | "search" | "siblings") => {
+            "ゴールを参照中".to_string()
+        }
+        ("comment", "create") => "コメントを書込中".to_string(),
+        ("comment", _) => "コメントを参照中".to_string(),
+        ("link" | "deliverable", _) => "成果物を登録中".to_string(),
+        ("today", _) => "今日のtodoを更新中".to_string(),
+        ("status" | "summary", _) => "状況を確認中".to_string(),
+        (cmd, _) if !cmd.is_empty() => format!("addness {cmd} 実行中"),
+        _ => "addness を実行中".to_string(),
+    }
 }
 
 /// DoD テキストを行単位の項目リストへ分割する（空行は除外）。
@@ -135,6 +213,7 @@ impl CodexPane {
         goal_id: String,
         goal_title: String,
         dod: String,
+        status_label: String,
     ) -> Result<Self> {
         let rows: u16 = 24;
         let cols: u16 = 80;
@@ -205,11 +284,92 @@ impl CodexPane {
             cols,
             goal_id,
             goal_title,
+            cwd: cwd.display().to_string(),
+            status_label,
             dod_items: split_dod_items(&dod),
             dod_checks: vec![None; split_dod_items(&dod).len()],
             assessing: false,
+            child_count: None,
+            comment_count: None,
+            children: Vec::new(),
+            action: None,
+            status_changed_at: None,
+            dod_changed_at: None,
+            scrollback: 0,
+            activity: Vec::new(),
             dod,
         })
+    }
+
+    /// ログを delta 行スクロールする（正=過去へ、負=最新へ）。
+    pub fn scroll_lines(&mut self, delta: isize) {
+        let target = (self.scrollback as isize + delta).max(0) as usize;
+        self.parser.screen_mut().set_scrollback(target);
+        self.scrollback = self.parser.screen().scrollback();
+    }
+
+    /// 1 ページ分の行数（スクロール量）。
+    pub fn page(&self) -> usize {
+        self.rows.saturating_sub(1).max(1) as usize
+    }
+
+    /// 最古（バッファ先頭）までスクロールする。
+    pub fn scroll_to_top(&mut self) {
+        self.parser.screen_mut().set_scrollback(usize::MAX / 2);
+        self.scrollback = self.parser.screen().scrollback();
+    }
+
+    /// 最新（ライブ）位置へ戻す。
+    pub fn scroll_to_live(&mut self) {
+        self.parser.screen_mut().set_scrollback(0);
+        self.scrollback = 0;
+    }
+
+    /// codex の画面（直近の出力）を走査し、最後に実行された addness 操作を
+    /// 「いま参照/書込中」ラベルとして self.action に反映する。update() から呼ぶ。
+    fn refresh_action(&mut self) {
+        let contents = self.parser.screen().contents();
+        let lines: Vec<&str> = contents.lines().collect();
+        // 画面下部（最近の出力）だけを見て、moved-on したら自然に消えるようにする。
+        let start = lines.len().saturating_sub(10);
+        let mut latest: Option<String> = None;
+        for line in &lines[start..] {
+            if let Some(idx) = line.find("addness ") {
+                let rest = line[idx + "addness ".len()..].trim();
+                latest = Some(action_label(rest));
+            }
+        }
+        self.action = latest;
+    }
+
+    /// 子ゴールのライブリストを差し替える。新規 ID は一定時間ハイライトする。
+    /// 初回（既存が空）の取得では全件を新着扱いしない。
+    pub fn update_children(&mut self, incoming: Vec<(String, String, &'static str)>) {
+        let had_any = !self.children.is_empty();
+        let old_ids: std::collections::HashSet<String> =
+            self.children.iter().map(|c| c.id.clone()).collect();
+        let new_until = Instant::now() + std::time::Duration::from_secs(4);
+        self.children = incoming
+            .into_iter()
+            .map(|(id, title, icon)| {
+                let is_new = had_any && !old_ids.contains(&id);
+                ChildGoal {
+                    new_until: is_new.then_some(new_until),
+                    id,
+                    title,
+                    icon,
+                }
+            })
+            .collect();
+    }
+
+    /// Addness 側の更新ログへ 1 行追加する（古いものから捨てて最大 50 件保持）。
+    pub fn push_activity(&mut self, line: String) {
+        self.activity.push(line);
+        let len = self.activity.len();
+        if len > 50 {
+            self.activity.drain(0..len - 50);
+        }
     }
 
     /// PTY から届いた出力を取り込み、プロセス終了を検知する。毎フレーム呼ぶ。
@@ -219,6 +379,10 @@ impl CodexPane {
         while let Ok(bytes) = self.rx.try_recv() {
             self.parser.process(&bytes);
             changed = true;
+        }
+        // 画面が更新されたら「いま参照/書込中」インジケータを更新する。
+        if changed {
+            self.refresh_action();
         }
         if !self.finished && matches!(self.child.try_wait(), Ok(Some(_))) {
             self.finished = true;
@@ -269,13 +433,15 @@ impl CodexPane {
 
     /// DoD を更新する。テキストが変わった場合のみ項目と判定をリセットする
     /// （ライブ更新で 3 秒ごとに呼ばれても、内容不変ならチェックを保持する）。
-    pub fn set_dod(&mut self, dod: String) {
+    /// DoD を更新する。内容が変わった場合のみ項目・判定を作り直し `true` を返す。
+    pub fn set_dod(&mut self, dod: String) -> bool {
         if dod == self.dod {
-            return;
+            return false;
         }
         self.dod = dod;
         self.dod_items = split_dod_items(&self.dod);
         self.dod_checks = vec![None; self.dod_items.len()];
+        true
     }
 
     /// DoD 自動判定の結果（項目インデックス → 達成可否）を反映する。

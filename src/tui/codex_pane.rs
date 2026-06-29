@@ -168,6 +168,7 @@ impl CodexPane {
         }
         cmd.env("TERM", "xterm-256color");
         // 対象ゴールの文脈を環境変数で渡す（AGENTS.md がこれを使って想起を指示する）。
+        cmd.env("ADDNESS_TUI_CODEX", "1");
         cmd.env("ADDNESS_GOAL_ID", &goal_id);
         cmd.env("ADDNESS_GOAL_TITLE", &goal_title);
         cmd.env("ADDNESS_BIN", addness_bin);

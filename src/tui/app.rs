@@ -1651,54 +1651,66 @@ impl App {
         }
         let handle = self.codex_refresh.take().unwrap();
         // is_finished が真なので block_on は即座に返る。
-        if let Ok(Some(snap)) = self.rt.block_on(handle)
-            && let Some(pane) = self.codex.as_mut()
-        {
-            let now = Local::now().format("%H:%M");
+        let synced = if let Ok(Some(snap)) = self.rt.block_on(handle) {
+            if let Some(pane) = self.codex.as_mut() {
+                let now = Local::now().format("%H:%M");
 
-            // ステータス変化を検知して更新ログに残す（Addness 側の進行を可視化）。
-            if snap.status_label != pane.status_label {
-                pane.status_label = snap.status_label.clone();
-                pane.status_changed_at = Some(Instant::now());
-                pane.push_activity(format!("{now} ステータス → {}", snap.status_label));
-            }
-
-            if snap.title != pane.goal_title {
-                pane.goal_title = snap.title;
-                pane.push_activity(format!("{now} タイトルを更新"));
-            }
-
-            // DoD 判定の実行中は項目とチェックを作り直さない（番号ずれ防止）。
-            if !pane.assessing && pane.set_dod(snap.description) {
-                pane.dod_changed_at = Some(Instant::now());
-                pane.push_activity(format!("{now} DoD を更新"));
-            }
-
-            // 子ゴール一覧の差し替え＋増加検知（codex が Addness に書き込んだサイン）。
-            if let Some(children) = snap.children {
-                let new_n = children.len();
-                let old_n = pane.child_count.unwrap_or(0);
-                if pane.child_count.is_some() && new_n > old_n {
-                    pane.push_activity(format!("{now} 子ゴール +{} (計{new_n})", new_n - old_n));
+                // ステータス変化を検知して更新ログに残す（Addness 側の進行を可視化）。
+                if snap.status_label != pane.status_label {
+                    pane.status_label = snap.status_label.clone();
+                    pane.status_changed_at = Some(Instant::now());
+                    pane.push_activity(format!("{now} ステータス → {}", snap.status_label));
                 }
-                pane.child_count = Some(new_n);
-                pane.update_children(children);
-            }
-            if let Some(new_n) = snap.comment_count {
-                match pane.comment_count {
-                    Some(old_n) if new_n > old_n => {
+
+                if snap.title != pane.goal_title {
+                    pane.goal_title = snap.title;
+                    pane.push_activity(format!("{now} タイトルを更新"));
+                }
+
+                // DoD 判定の実行中は項目とチェックを作り直さない（番号ずれ防止）。
+                if !pane.assessing && pane.set_dod(snap.description) {
+                    pane.dod_changed_at = Some(Instant::now());
+                    pane.push_activity(format!("{now} DoD を更新"));
+                }
+
+                // 子ゴール一覧の差し替え＋増加検知（codex が Addness に書き込んだサイン）。
+                if let Some(children) = snap.children {
+                    let new_n = children.len();
+                    let old_n = pane.child_count.unwrap_or(0);
+                    if pane.child_count.is_some() && new_n > old_n {
                         pane.push_activity(format!(
-                            "{now} コメント +{} (計{new_n})",
+                            "{now} 子ゴール +{} (計{new_n})",
                             new_n - old_n
                         ));
                     }
-                    _ => {}
+                    pane.child_count = Some(new_n);
+                    pane.update_children(children);
                 }
-                pane.comment_count = Some(new_n);
+                if let Some(new_n) = snap.comment_count {
+                    match pane.comment_count {
+                        Some(old_n) if new_n > old_n => {
+                            pane.push_activity(format!(
+                                "{now} コメント +{} (計{new_n})",
+                                new_n - old_n
+                            ));
+                        }
+                        _ => {}
+                    }
+                    pane.comment_count = Some(new_n);
+                }
+                true
+            } else {
+                false
             }
+        } else {
+            false
+        };
+        if synced {
+            // 同期完了自体を変化として扱い、鼓動表示（最終同期時刻＋スピナー）を更新させる。
+            self.last_codex_sync = Some(Instant::now());
+            self.codex_sync_tick = self.codex_sync_tick.wrapping_add(1);
         }
-        // 同期完了自体を変化として扱い、鼓動表示を更新させる。
-        true
+        synced
     }
 
     /// codex ログのスクロールキーを処理する。
@@ -1791,21 +1803,36 @@ impl App {
                 self.error_message = None;
                 self.success_message = None;
             }
+            if key.modifiers.is_empty() {
+                match key.code {
+                    KeyCode::Char('c') => {
+                        self.start_codex_reflow_comment();
+                        return;
+                    }
+                    KeyCode::Char('s') => {
+                        self.start_codex_reflow_edit();
+                        return;
+                    }
+                    KeyCode::Char('d') => {
+                        self.start_codex_reflow_deliverable();
+                        return;
+                    }
+                    KeyCode::Char('v') => {
+                        self.start_dod_assessment();
+                        return;
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        self.close_codex();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
             // 終了後は codex がキーを処理しないので、ログを遡れるようにする。
             if let Some(pane) = self.codex.as_mut()
                 && Self::handle_codex_log_scroll(pane, key, true)
             {
                 return;
-            }
-            if key.modifiers.is_empty() {
-                match key.code {
-                    KeyCode::Char('c') => self.start_codex_reflow_comment(),
-                    KeyCode::Char('s') => self.start_codex_reflow_edit(),
-                    KeyCode::Char('d') => self.start_codex_reflow_deliverable(),
-                    KeyCode::Char('v') => self.start_dod_assessment(),
-                    KeyCode::Esc | KeyCode::Char('q') => self.close_codex(),
-                    _ => {}
-                }
             }
             return;
         }

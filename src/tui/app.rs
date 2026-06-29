@@ -596,8 +596,14 @@ fn parse_dod_results(content: &str, item_count: usize) -> Option<Vec<(usize, boo
     let arr = value.get("results")?.as_array()?;
     let mut out = Vec::new();
     for item in arr {
-        let idx = item.get("index")?.as_u64()? as usize;
-        let met = item.get("met")?.as_bool()?;
+        // 1 件が壊れていても（負の index・型違い等）全体を捨てず、その項目だけ飛ばす。
+        let (Some(idx), Some(met)) = (
+            item.get("index").and_then(|v| v.as_u64()),
+            item.get("met").and_then(|v| v.as_bool()),
+        ) else {
+            continue;
+        };
+        let idx = idx as usize;
         if idx < item_count {
             out.push((idx, met));
         }
@@ -4166,6 +4172,15 @@ mod dod_tests {
     fn parse_dod_results_rejects_malformed() {
         assert!(parse_dod_results("not json", 2).is_none());
         assert!(parse_dod_results(r#"{"results":"nope"}"#, 2).is_none());
+    }
+
+    #[test]
+    fn parse_dod_results_skips_broken_items_without_dropping_all() {
+        // 負の index・型違いの項目は飛ばし、正常な項目は残す。
+        let content =
+            r#"{"results":[{"index":-1,"met":true},{"index":1,"met":"x"},{"index":0,"met":true}]}"#;
+        let parsed = parse_dod_results(content, 2).unwrap();
+        assert_eq!(parsed, vec![(0, true)]);
     }
 
     #[test]

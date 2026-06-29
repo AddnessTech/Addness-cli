@@ -147,6 +147,9 @@ impl CodexPane {
     ) -> Result<Self> {
         let rows: u16 = 24;
         let cols: u16 = 80;
+        // DoD 項目は一度だけ分割し、チェック状態はその件数で初期化する。
+        let dod_items = split_dod_items(&dod);
+        let dod_checks = vec![None; dod_items.len()];
 
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -221,8 +224,8 @@ impl CodexPane {
             goal_title,
             cwd: cwd.display().to_string(),
             status_label,
-            dod_items: split_dod_items(&dod),
-            dod_checks: vec![None; split_dod_items(&dod).len()],
+            dod_items,
+            dod_checks,
             assessing: false,
             child_count: None,
             comment_count: None,
@@ -405,7 +408,7 @@ pub fn dod_assessment_schema() -> String {
         "additionalProperties": false,
         "required": ["index", "met"],
         "properties": {
-          "index": { "type": "integer" },
+          "index": { "type": "integer", "minimum": 0 },
           "met": { "type": "boolean" }
         }
       }

@@ -27,6 +27,9 @@ fn read_text_arg(
 
 fn normalize_due_date(input: &str) -> Result<String> {
     if input.contains('T') {
+        // RFC3339 として実際にパースして妥当性を検証する（不正値を素通しさせない）。
+        chrono::DateTime::parse_from_rfc3339(input)
+            .map_err(|_| anyhow::anyhow!("--due-date must be YYYY-MM-DD or RFC3339"))?;
         return Ok(input.to_string());
     }
     let date = NaiveDate::parse_from_str(input, "%Y-%m-%d")
@@ -402,6 +405,14 @@ mod tests {
             normalize_due_date("2026-07-01T12:30:00Z").unwrap(),
             "2026-07-01T12:30:00Z"
         );
+    }
+
+    #[test]
+    fn normalize_due_date_rejects_invalid_input() {
+        // 'T' を含むだけの不正な値は素通しせず、エラーにする。
+        assert!(normalize_due_date("Tomorrow").is_err());
+        assert!(normalize_due_date("2026-13-99T99:99:99Z").is_err());
+        assert!(normalize_due_date("2026-07-01T12:30:00").is_err());
     }
 }
 

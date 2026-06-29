@@ -36,6 +36,20 @@ pub fn codex_path() -> Option<PathBuf> {
     None
 }
 
+/// 作業ディレクトリの現在のブランチ名を取得する（取得できなければ None）。
+pub fn git_branch(cwd: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
+}
+
 /// 作業ディレクトリの `git diff --stat`（HEAD 比較）を取得する。
 /// 還流コメントのプリフィルに使う。取得できなければ空文字。
 pub fn git_diff_stat(cwd: &Path) -> String {
@@ -53,12 +67,15 @@ pub fn git_diff_stat(cwd: &Path) -> String {
 ///
 /// 「Addness が真実源」「DoD が不十分なら対話で具体化」という方針を明示し、
 /// `addness` CLI の絶対パスを渡して PATH 取りこぼしを回避する。
+#[allow(clippy::too_many_arguments)]
 pub fn build_prompt(
     addness_bin: &str,
     goal_id: &str,
     title: &str,
     dod: &str,
     body: &str,
+    cwd: &str,
+    branch: &str,
     recent_comments: &[String],
     children: &[String],
 ) -> String {
@@ -103,21 +120,28 @@ pub fn build_prompt(
 - タイトル: {title}
 - 方針 / 完了基準(DoD = 理想の状態): {dod}
 - 現状(body = 現在の状態): {body}
+- 作業環境: フォルダ=`{cwd}` / ブランチ=`{branch}`
 - これまでの進捗・考え（直近コメント）:
 {comments}
 - 分解済みの子ゴール:
 {children}
 
-# あなたの責務（このゴールを常にクリーンな引き継ぎ点に保つ）
-0. 他で得た知識・技術は活用してよい。ただしこのプロジェクト固有の状態は上記を真実源とする。
-1. まず上記の現状・方針・進捗を踏まえる。DoD が曖昧ならユーザーに質問して具体化し、
-   `{addness_bin} goal update {goal_id} --description "..."` で方針を書き戻す。
-2. 作業を進めたら、現状を `{addness_bin} goal update {goal_id} --body "..."` で最新化する。
-   次回や別フォルダからでも、これを読めば続きから入れる状態に保つこと。
-3. 理想と現状の差分は子ゴールへ。`{addness_bin} goal create --title "..." --parent {goal_id}`。
-4. 重要な決定・考え・進捗は `{addness_bin} comment create --goal {goal_id} --body "..."`
-   に記録する（末尾に「Codexより」と署名）。
-5. セッションを終える前に、必ず現状(body)と進捗コメントを最新化してから終了する。
+# 書き込み先のルール（重要）
+ログをコメント（チャット）に溜めないでください。情報は原則として**構造化された場所**に書きます。
+- **現状 → body**: `{addness_bin} goal update {goal_id} --body "..."`
+  進捗・現在地・次の一手はここに集約。**作業環境（フォルダ=`{cwd}` / ブランチ=`{branch}`）も
+  body に含めて記録**し、別フォルダ/別セッションからでも続きに入れるようにする。
+- **方針 → DoD**: `{addness_bin} goal update {goal_id} --description "..."`
+- **分解 → 子ゴール**: `{addness_bin} goal create --title "..." --parent {goal_id}`
+- **成果物 → deliverable / link**: PR や生成物は `{addness_bin} link` / `{addness_bin} deliverable`。
+- **コメントは最終手段**: `{addness_bin} comment create` は「どの構造化フィールドに置くべきか
+  判断できない情報」や「ユーザーへの質問」だけに使う（末尾に「Codexより」と署名）。
+
+# 進め方
+1. 他で得た一般知識は活用してよいが、このプロジェクト固有の状態は上記ゴールを真実源とする。
+2. 現状・方針・進捗を踏まえる。DoD が曖昧ならユーザーに質問してから DoD を書き戻す。
+3. 作業を進めたら body（現状＋作業環境）を最新化。差分は子ゴールへ分解。
+4. セッションを終える前に、必ず body を最新化してから終了する。
 
 まずは想起した現状・方針を確認し、足りない情報があればユーザーに尋ねるところから始めてください。"#
     )

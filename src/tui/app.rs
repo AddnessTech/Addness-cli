@@ -1244,16 +1244,21 @@ impl App {
             .ok()
             .and_then(|p| p.to_str().map(String::from))
             .unwrap_or_else(|| "addness".to_string());
+        // 作業環境（フォルダ・ブランチ）も想起情報に含める。
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let cwd_str = cwd.display().to_string();
+        let branch = codex_pane::git_branch(&cwd).unwrap_or_else(|| "(不明)".to_string());
         let prompt = codex_pane::build_prompt(
             &addness_bin,
             &goal_id,
             &title,
             &dod,
             &body,
+            &cwd_str,
+            &branch,
             &recent_comments,
             &children,
         );
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
         match CodexPane::spawn(&codex_bin, &prompt, &cwd, goal_id, title, dod, status_label) {
             Ok(mut pane) => {

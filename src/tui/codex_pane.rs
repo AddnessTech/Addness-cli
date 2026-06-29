@@ -162,8 +162,14 @@ impl CodexPane {
             .context("PTY の確保に失敗しました")?;
 
         let mut cmd = CommandBuilder::new(codex_bin);
+        // 長い運用ルールはチャットに残さず developer_instructions として渡す。
+        cmd.arg("-c");
+        cmd.arg(codex_config_arg(
+            CodexConfigKey::DeveloperInstructions,
+            addness_tui_developer_instructions(),
+        ));
         // `codex [PROMPT]` は interactive CLI の正式な初期プロンプト入力。
-        // PTY への後追い打鍵は codex の初期化タイミングに依存して落ちるため使わない。
+        // 画面に残る可能性があるため、ここは短い起動トリガーだけにする。
         cmd.arg(startup_recall_prompt());
         cmd.cwd(cwd);
         // 親プロセスの環境を引き継ぐ（PATH 等を codex のサブプロセスに渡すため）。
@@ -396,7 +402,11 @@ impl CodexPane {
 }
 
 fn startup_recall_prompt() -> &'static str {
-    r#"Addness TUIから起動されました。これは初期プロンプトです。ユーザーの追加入力を待つ前に、必ず Addness CLI を使って対象ゴールを想起してください。
+    "Addness TUIセッションを開始してください。起動時指示に従って対象ゴールを想起してから進めてください。"
+}
+
+fn addness_tui_developer_instructions() -> &'static str {
+    r#"Addness TUIから起動されました。ユーザーの追加入力を待つ前に、必ず Addness CLI を使って対象ゴールを想起してください。
 
 最初に実行するコマンド:
 `"$ADDNESS_BIN" goal get "$ADDNESS_GOAL_ID" --json --with-deliverable --with-comment`
@@ -417,6 +427,40 @@ Addness はこの組織/プロジェクト専用の作業DB・引き継ぎ点と
 - コメントは構造化フィールドに置けない質問や補足だけに使う。
 
 ここまで確認したら、何を読んだか、Addnessへの書き込みが必要か、次に進めることを短く共有し、明らかに進められる作業があればそのまま着手してください。"#
+}
+
+enum CodexConfigKey {
+    DeveloperInstructions,
+}
+
+impl CodexConfigKey {
+    fn as_str(&self) -> &'static str {
+        match self {
+            CodexConfigKey::DeveloperInstructions => "developer_instructions",
+        }
+    }
+}
+
+fn codex_config_arg(key: CodexConfigKey, value: &str) -> String {
+    format!("{}={}", key.as_str(), toml_basic_string(value))
+}
+
+fn toml_basic_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// DoD 自動判定で codex に強制する出力 JSON Schema。
@@ -594,13 +638,29 @@ mod tests {
     #[test]
     fn startup_recall_prompt_requires_addness_goal_get() {
         let prompt = startup_recall_prompt();
+        let instructions = addness_tui_developer_instructions();
 
-        assert!(prompt.contains("ユーザーの追加入力を待つ前に"));
-        assert!(prompt.contains("\"$ADDNESS_BIN\" goal get \"$ADDNESS_GOAL_ID\""));
-        assert!(prompt.contains("--json --with-deliverable --with-comment"));
-        assert!(prompt.contains("組織/プロジェクト専用の作業DB"));
-        assert!(prompt.contains("起動しただけでは Addness に書き込まない"));
-        assert!(prompt.contains("サブエージェント/分担/並列作業/別セッションへの引き継ぎ"));
-        assert!(prompt.contains("goal update \"$ADDNESS_GOAL_ID\" --description"));
+        assert!(prompt.contains("Addness TUIセッションを開始"));
+        assert!(prompt.len() < 80 * 2);
+        assert!(instructions.contains("ユーザーの追加入力を待つ前に"));
+        assert!(instructions.contains("\"$ADDNESS_BIN\" goal get \"$ADDNESS_GOAL_ID\""));
+        assert!(instructions.contains("--json --with-deliverable --with-comment"));
+        assert!(instructions.contains("組織/プロジェクト専用の作業DB"));
+        assert!(instructions.contains("起動しただけでは Addness に書き込まない"));
+        assert!(instructions.contains("サブエージェント/分担/並列作業/別セッションへの引き継ぎ"));
+        assert!(instructions.contains("goal update \"$ADDNESS_GOAL_ID\" --description"));
+    }
+
+    #[test]
+    fn codex_config_arg_escapes_developer_instructions_as_toml() {
+        let arg = codex_config_arg(
+            CodexConfigKey::DeveloperInstructions,
+            "quote: \" / path: C:\\tmp\nnext\tline",
+        );
+
+        assert_eq!(
+            arg,
+            "developer_instructions=\"quote: \\\" / path: C:\\\\tmp\\nnext\\tline\""
+        );
     }
 }

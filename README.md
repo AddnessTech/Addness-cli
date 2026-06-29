@@ -62,6 +62,8 @@ addness goal list --assigned-to me --status NOT_STARTED --json
 
 ```bash
 addness goal update <goal-id> --status IN_PROGRESS
+addness goal update <goal-id> --body "現在の状態や次にやること"
+addness goal update <goal-id> --due-date 2026-07-01
 addness comment create --goal <goal-id> --body "実装を開始しました"
 ```
 
@@ -69,6 +71,12 @@ addness comment create --goal <goal-id> --body "実装を開始しました"
 
 ```bash
 addness link pr --goal <goal-id> --url https://github.com/org/repo/pull/42
+```
+
+リンク成果物を追加する:
+
+```bash
+addness deliverable add --goal <goal-id> --link-url https://example.com --name "参考リンク"
 ```
 
 コマンドのヘルプを表示する:
@@ -80,6 +88,45 @@ addness org --help
 addness comment --help
 addness link --help
 ```
+
+## TUI（ターミナル UI）
+
+サブコマンドなしで起動すると、ゴールツリーを操作できる対話的な TUI が開きます:
+
+```bash
+addness
+```
+
+主な操作はアプリ内で `?` を押すとヘルプが表示されます。
+
+### TUI 内での codex 連携
+
+ゴール上でアクションメニュー（`o` または `Space`）から **「codexで作業」** を選ぶと、
+選択中ゴールの文脈（タイトル・完了基準(DoD)・説明）を渡した状態で
+[codex](https://github.com/openai/codex) をペイン内に起動します。
+codex は Addness を「タスク DB」として扱い、`addness` CLI 経由で DoD の具体化・
+子ゴール作成・進捗コメントを書き戻します。
+左の Addness ペインには、対象ゴールのステータス、DoD、子ゴール、コメント数、
+Addness への更新ログがライブ表示されるため、codex の作業と Addness 上の進捗を
+同じ画面で追えます。
+codex の終了時またはペインを閉じる時には、作業フォルダ・ブランチ・git status・
+diff stat が対象ゴールの body に自動記録されます。
+
+codex 終了後は還流バーのキーで成果を Addness に反映できます:
+
+- `c` … 作業差分をプリフィルした進捗コメントを投稿
+- `s` … ゴールのステータスを変更
+- `d` … 成果物を登録
+- `v` … `codex exec`（read-only）で各 DoD 項目の達成可否を自動判定し、契約ペインにチェック
+- `Alt+↑↓` / `Alt+PgUp/PgDn` … 実行中の codex ログをスクロール（`Esc` または `Alt+End` でライブへ戻る）
+- `F12` … 実行中の codex を終了して戻る / `Esc`・`q` … ペインを閉じる
+
+前提:
+
+- 各ユーザーの環境に [codex](https://github.com/openai/codex) がインストールされ、ログイン済みであること
+  （未インストールの場合はその旨を案内し、TUI はクラッシュしません）。
+- 別パスの codex を使う場合は環境変数 `ADDNESS_CODEX_BIN` で実行ファイルを指定できます。
+- macOS・Linux で動作します（Windows は擬似端末の挙動が未検証です）。
 
 ## 開発
 

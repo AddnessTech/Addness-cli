@@ -12,6 +12,7 @@ pub mod member;
 pub mod org;
 pub mod skills;
 pub mod summary;
+pub mod today;
 pub mod update;
 
 use anyhow::Result;

@@ -7,21 +7,24 @@ use crate::api::{ApiClient, DeliverableType};
 
 #[derive(Subcommand)]
 pub enum DeliverableCommands {
-    /// Add a deliverable (text/markdown content or a file like an image) to a goal
+    /// Add a deliverable (text/markdown content, link URL, or a file like an image) to a goal
     Add {
         /// Goal ID
         #[arg(long)]
         goal: String,
-        /// Inline text/markdown content (mutually exclusive with --file and --content-file)
-        #[arg(long, conflicts_with_all = ["file", "content_file"])]
+        /// Inline text/markdown content (mutually exclusive with --file, --content-file, and --link-url)
+        #[arg(long, conflicts_with_all = ["file", "content_file", "link_url"])]
         content: Option<String>,
-        /// Read text/markdown content from a local file (mutually exclusive with --content and --file)
-        #[arg(long, conflicts_with_all = ["content", "file"])]
+        /// Read text/markdown content from a local file (mutually exclusive with --content, --file, and --link-url)
+        #[arg(long, conflicts_with_all = ["content", "file", "link_url"])]
         content_file: Option<PathBuf>,
+        /// Add a link deliverable with this URL
+        #[arg(long, conflicts_with_all = ["content", "content_file", "file"])]
+        link_url: Option<String>,
         /// Upload a local file (image, pdf, etc.) as a file deliverable
-        #[arg(long, conflicts_with_all = ["content", "content_file"])]
+        #[arg(long, conflicts_with_all = ["content", "content_file", "link_url"])]
         file: Option<PathBuf>,
-        /// Display name (required for inline --content; auto-derived from filename otherwise)
+        /// Display name (required for inline --content and --link-url; auto-derived from filename otherwise)
         #[arg(long)]
         name: Option<String>,
         /// Output as JSON
@@ -45,10 +48,10 @@ pub enum DeliverableCommands {
         /// Deliverable ID
         id: String,
         /// New content (markdown)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "content_file")]
         content: Option<String>,
         /// New content from a file
-        #[arg(long)]
+        #[arg(long, conflicts_with = "content")]
         content_file: Option<PathBuf>,
         /// Mention member IDs (UUID), repeatable
         #[arg(long)]
@@ -158,10 +161,25 @@ pub async fn handle_deliverable(cmd: &DeliverableCommands, client: &ApiClient) -
             goal,
             content,
             content_file,
+            link_url,
             file,
             name,
             json,
-        } => add_deliverable(client, goal, content, content_file, file, name, *json).await,
+        } => {
+            add_deliverable(
+                client,
+                AddDeliverableInput {
+                    goal,
+                    content,
+                    content_file,
+                    link_url,
+                    file,
+                    name,
+                    json: *json,
+                },
+            )
+            .await
+        }
         DeliverableCommands::List { goal, json } => list_deliverables(client, goal, *json).await,
         DeliverableCommands::Update {
             goal,
@@ -300,15 +318,27 @@ async fn list_deliverables(client: &ApiClient, goal: &str, json: bool) -> Result
     Ok(())
 }
 
-async fn add_deliverable(
-    client: &ApiClient,
-    goal: &str,
-    content: &Option<String>,
-    content_file: &Option<PathBuf>,
-    file: &Option<PathBuf>,
-    name: &Option<String>,
+struct AddDeliverableInput<'a> {
+    goal: &'a str,
+    content: &'a Option<String>,
+    content_file: &'a Option<PathBuf>,
+    link_url: &'a Option<String>,
+    file: &'a Option<PathBuf>,
+    name: &'a Option<String>,
     json: bool,
-) -> Result<()> {
+}
+
+async fn add_deliverable(client: &ApiClient, input: AddDeliverableInput<'_>) -> Result<()> {
+    let AddDeliverableInput {
+        goal,
+        content,
+        content_file,
+        link_url,
+        file,
+        name,
+        json,
+    } = input;
+
     if let Some(text) = content {
         let display = name
             .clone()
@@ -334,6 +364,19 @@ async fn add_deliverable(
         return Ok(());
     }
 
+    if let Some(url) = link_url {
+        let display = name
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("--name is required when using --link-url"))?;
+        let resp = client.create_link_deliverable(goal, url, &display).await?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&resp.data)?);
+        } else {
+            println!("Added link deliverable: {display} ({})", resp.data.id);
+        }
+        return Ok(());
+    }
+
     if let Some(path) = file {
         let resp = client
             .create_file_deliverable_from_path(goal, path, name.as_deref())
@@ -342,7 +385,7 @@ async fn add_deliverable(
         return Ok(());
     }
 
-    bail!("Specify one of --content, --content-file, or --file");
+    bail!("Specify one of --content, --content-file, --link-url, or --file");
 }
 
 fn emit_create_result(

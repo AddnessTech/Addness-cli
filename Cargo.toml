@@ -1,6 +1,6 @@
 [package]
 name = "addness-cli"
-version = "0.4.6"
+version = "0.5.0"
 edition = "2024"
 description = "Command-line interface for Addness"
 license = "MIT"
@@ -37,3 +37,5 @@ spki = "0.7"
 clap_complete = "4.6.0"
 regex = "1.12.3"
 ratatui = "0.30.0"
+portable-pty = "0.9"
+tui-term = "0.3"

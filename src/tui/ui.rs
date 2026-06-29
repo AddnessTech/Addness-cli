@@ -2315,7 +2315,7 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
         let log_inner_h = panes[2].height.saturating_sub(2) as usize;
         let mut log_lines: Vec<Line> = if pane.activity.is_empty() {
             vec![Line::from(Span::styled(
-                "codex の Addness 読込/書込がここに出ます",
+                "body/DoD/子ゴール/通知の読込・書込がここに出ます",
                 Style::default().fg(COLOR_MUTED),
             ))]
         } else {
@@ -2340,7 +2340,7 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(COLOR_PANEL))
-                    .title(" Addness メモリ "),
+                    .title(" Addness 更新 "),
             )
             .wrap(ratatui::widgets::Wrap { trim: true });
         frame.render_widget(log, panes[2]);

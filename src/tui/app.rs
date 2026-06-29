@@ -6,7 +6,7 @@ use ratatui::{
         self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
     },
 };
-use std::{collections::HashMap, path::PathBuf, time::Instant};
+use std::{collections::HashMap, io::Write, path::PathBuf, time::Instant};
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
@@ -16,7 +16,7 @@ use crate::api::{
 };
 use crate::dbg_log;
 
-use super::codex_pane::{self, CodexPane};
+use super::codex_pane::{self, CodexPane, TerminalNotice};
 use super::goal_tree::{GoalTree, TreeRow};
 use super::ui;
 
@@ -679,13 +679,13 @@ fn codex_work_memo(cwd: &str, session_state: &str, last_prompt: Option<&str>) ->
         .unwrap_or_else(|| "未記録".to_string());
 
     format!(
-        "## Codex作業メモ\n\
+        "## Codex自動メモ(機械)\n\
          - 更新: {}\n\
          - セッション: {session_state}\n\
          - 最後の依頼: {prompt_text}\n\
          - 作業フォルダ: {cwd}\n\
          - ブランチ: {branch}\n\
-         - 現在地: プロジェクト固有の判断・決定・次の手は `## Codex作業メモ` / `## Codex決定ログ` / `## PR/Release Traceability` へ集約する\n\
+         - 現在地: プロジェクト固有の判断・決定・次の手は `## Codex作業メモ` / `## Codex決定ログ` / `## PR/Release Traceability` へ集約する（この機械メモは自動更新なので編集不要）\n\
          - git status:\n\
          ```text\n\
          {status_text}\n\
@@ -734,6 +734,20 @@ fn ensure_codex_memory_sections(body: String) -> String {
         CODEX_TRACEABILITY_END,
         &traceability,
     )
+}
+
+/// codex 作業メモを既存 body へ統合した body 更新リクエストを作る。
+/// 同期・非同期どちらの記録経路もこれを使い、body 合成ロジックを一本化する。
+fn codex_body_update_request(existing_body: Option<&str>, record: &str) -> UpdateGoalRequest {
+    let body = ensure_codex_memory_sections(upsert_codex_auto_record(existing_body, record));
+    UpdateGoalRequest {
+        status: None,
+        completed_at: None,
+        title: None,
+        description: None,
+        body: Some(body),
+        due_date: None,
+    }
 }
 
 fn upsert_codex_auto_record(existing: Option<&str>, record: &str) -> String {
@@ -817,6 +831,44 @@ impl DodJob {
         let _ = std::fs::remove_file(&self.out_path);
         let _ = std::fs::remove_file(&self.schema_path);
     }
+}
+
+fn emit_terminal_notification(notice: &TerminalNotice) {
+    let title = terminal_notification_text(&notice.title, 80);
+    let message = terminal_notification_text(&notice.message, 240);
+    if message.is_empty() {
+        return;
+    }
+
+    let mut stdout = std::io::stdout();
+    let _ = write!(
+        stdout,
+        "\x07\x1b]9;{message}\x07\x1b]777;notify;{title};{message}\x07"
+    );
+    let _ = stdout.flush();
+}
+
+fn terminal_notification_text(input: &str, max_chars: usize) -> String {
+    let collapsed = input
+        .chars()
+        .filter_map(|ch| match ch {
+            '\n' | '\r' | '\t' => Some(' '),
+            ';' => Some(' '),
+            ch if ch.is_control() => None,
+            ch => Some(ch),
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if collapsed.chars().count() <= max_chars {
+        return collapsed;
+    }
+
+    let keep = max_chars.saturating_sub(3);
+    let mut out = collapsed.chars().take(keep).collect::<String>();
+    out.push_str("...");
+    out
 }
 
 pub struct App {
@@ -1400,11 +1452,11 @@ impl App {
             Ok(mut pane) => {
                 pane.push_activity(format!("{} codex を起動", Local::now().format("%H:%M")));
                 pane.push_activity(format!(
-                    "{} 軽量コンテキストで即入力可能",
+                    "{} 軽量コンテキストで入力待ち",
                     Local::now().format("%H:%M")
                 ));
                 pane.push_activity(format!(
-                    "{} 実依頼でAddness想起/作業メモ化",
+                    "{} body/DoD/子ゴール/通知をここに表示",
                     Local::now().format("%H:%M")
                 ));
                 self.codex = Some(pane);
@@ -1448,24 +1500,18 @@ impl App {
                 return false;
             }
         };
-        let body =
-            ensure_codex_memory_sections(upsert_codex_auto_record(goal.body.as_deref(), &record));
-        let req = UpdateGoalRequest {
-            status: None,
-            completed_at: None,
-            title: None,
-            description: None,
-            body: Some(body),
-            due_date: None,
-        };
+        let req = codex_body_update_request(goal.body.as_deref(), &record);
 
         match self.api_call(self.client.update_goal(goal_id, &req)) {
             Ok(_) => {
-                self.success_message = Some("Codex作業メモをAddnessに書き込みました".to_string());
+                self.success_message =
+                    Some("Codex作業メモをAddnessの現状(body)に書き込みました".to_string());
                 true
             }
             Err(e) => {
-                self.error_message = Some(format!("Codex作業メモの書き込みに失敗しました: {e}"));
+                self.error_message = Some(format!(
+                    "Codex作業メモの現状(body)書き込みに失敗しました: {e}"
+                ));
                 false
             }
         }
@@ -1497,18 +1543,7 @@ impl App {
             .unwrap_or_default();
             let result = async {
                 let goal = client.get_goal(&goal_id).await?.data;
-                let body = ensure_codex_memory_sections(upsert_codex_auto_record(
-                    goal.body.as_deref(),
-                    &record,
-                ));
-                let req = UpdateGoalRequest {
-                    status: None,
-                    completed_at: None,
-                    title: None,
-                    description: None,
-                    body: Some(body),
-                    due_date: None,
-                };
+                let req = codex_body_update_request(goal.body.as_deref(), &record);
                 client.update_goal(&goal_id, &req).await?;
                 Ok::<(), anyhow::Error>(())
             }
@@ -1517,17 +1552,17 @@ impl App {
             match result {
                 Ok(()) => CodexBodyRecordOutcome {
                     ok: true,
-                    message: "Codex作業メモ → body".to_string(),
+                    message: "現状(body)に作業メモを書込".to_string(),
                 },
                 Err(e) => CodexBodyRecordOutcome {
                     ok: false,
-                    message: format!("Codex作業メモに失敗: {e}"),
+                    message: format!("現状(body)の作業メモに失敗: {e}"),
                 },
             }
         }));
         if let Some(pane) = self.codex.as_mut() {
             let now = Local::now().format("%H:%M");
-            pane.push_activity(format!("{now} Codex作業メモを予約"));
+            pane.push_activity(format!("{now} 現状(body)の作業メモを予約"));
         }
         true
     }
@@ -1588,9 +1623,9 @@ impl App {
             let now = Local::now().format("%H:%M");
             if ok {
                 pane.last_addness_write_at = Some(Instant::now());
-                pane.push_activity(format!("{now} Codex作業メモ → body"));
+                pane.push_activity(format!("{now} 現状(body)に終了メモを書込"));
             } else {
-                pane.push_activity(format!("{now} Codex作業メモに失敗"));
+                pane.push_activity(format!("{now} 現状(body)の終了メモに失敗"));
             }
         }
         true
@@ -1639,9 +1674,15 @@ impl App {
     fn update_codex(&mut self) -> bool {
         let mut changed = false;
         let mut close_after_exit_command = false;
+        let mut terminal_notice = None;
         if let Some(pane) = self.codex.as_mut() {
             changed |= pane.update();
             close_after_exit_command = pane.should_close_after_exit_command();
+            terminal_notice = pane.take_terminal_notice();
+        }
+        if let Some(notice) = terminal_notice {
+            emit_terminal_notification(&notice);
+            changed = true;
         }
         changed |= self.maybe_start_codex_prompt_body_record();
         changed |= self.poll_codex_body_record_job();
@@ -1889,13 +1930,13 @@ impl App {
 
                 if snap.title != pane.goal_title {
                     pane.goal_title = snap.title;
-                    pane.push_activity(format!("{now} タイトルを更新"));
+                    pane.push_activity(format!("{now} タイトルを書込反映"));
                 }
 
                 // DoD 判定の実行中は項目とチェックを作り直さない（番号ずれ防止）。
                 if !pane.assessing && pane.set_dod(snap.description) {
                     pane.dod_changed_at = Some(Instant::now());
-                    pane.push_activity(format!("{now} DoD を更新"));
+                    pane.push_activity(format!("{now} 方針(DoD)を書込反映"));
                 }
 
                 // 子ゴール一覧の差し替え＋増加検知（codex が Addness に書き込んだサイン）。
@@ -1915,7 +1956,7 @@ impl App {
                     match pane.comment_count {
                         Some(old_n) if new_n > old_n => {
                             pane.push_activity(format!(
-                                "{now} コメント +{} (計{new_n})",
+                                "{now} コメント/通知 +{} (計{new_n})",
                                 new_n - old_n
                             ));
                         }
@@ -2106,7 +2147,7 @@ impl App {
             if pane.scrollback > 0 {
                 pane.scroll_to_live();
             }
-            pane.submit_line(codex_pane::resume_prompt());
+            pane.submit_system_line(codex_pane::resume_prompt());
             let now = Local::now().format("%H:%M");
             pane.push_activity(format!("{now} F9 再開プロンプトを送信"));
             self.success_message = Some("Addnessから再開するプロンプトを送信しました".to_string());

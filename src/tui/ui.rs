@@ -2145,7 +2145,7 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
             at.is_some_and(|t| now.duration_since(t) < std::time::Duration::from_secs(4))
         };
 
-        let status_panel_h = if chunks[0].height >= 22 { 8 } else { 7 };
+        let status_panel_h = if chunks[0].height >= 24 { 10 } else { 9 };
         let panes = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -2279,7 +2279,7 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
         let log_inner_h = panes[2].height.saturating_sub(2) as usize;
         let mut log_lines: Vec<Line> = if pane.activity.is_empty() {
             vec![Line::from(Span::styled(
-                "codex が Addness を更新するとここに出ます",
+                "codex の Addness 読込/書込がここに出ます",
                 Style::default().fg(Color::DarkGray),
             ))]
         } else {
@@ -2306,7 +2306,7 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Blue))
-                    .title(" Addness の更新 "),
+                    .title(" Addness メモリ "),
             )
             .wrap(ratatui::widgets::Wrap { trim: true });
         frame.render_widget(log, panes[2]);
@@ -2413,6 +2413,18 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
         pane.last_prompt(),
         value_width,
     );
+    let memory = codex_memory_label(
+        pane.last_addness_read_at,
+        pane.last_addness_write_at,
+        value_width,
+    );
+    let memory_style = if pane.last_addness_write_at.is_some() {
+        Style::default().fg(Color::Green)
+    } else if pane.last_addness_read_at.is_some() {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
 
     let prompt = pane
         .last_prompt()
@@ -2433,6 +2445,10 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
             Span::styled("作業 ", Style::default().fg(Color::DarkGray)),
             Span::styled(work, Style::default().fg(Color::White)),
         ]),
+        Line::from(vec![
+            Span::styled("記憶 ", Style::default().fg(Color::DarkGray)),
+            Span::styled(memory, memory_style),
+        ]),
         Line::from(""),
         Line::from(Span::styled(
             "最後の送信",
@@ -2450,6 +2466,30 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
         )
         .wrap(ratatui::widgets::Wrap { trim: true });
     frame.render_widget(panel, area);
+}
+
+fn codex_memory_label(
+    last_read_at: Option<Instant>,
+    last_write_at: Option<Instant>,
+    max_width: usize,
+) -> String {
+    let label = if let Some(t) = last_write_at {
+        format!("Addness書込 {}前", elapsed_compact(t))
+    } else if let Some(t) = last_read_at {
+        format!("Addness読込 {}前", elapsed_compact(t))
+    } else {
+        "Addness未読".to_string()
+    };
+    ellipsize_width(&label, max_width)
+}
+
+fn elapsed_compact(t: Instant) -> String {
+    let secs = t.elapsed().as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m", secs / 60)
+    }
 }
 
 fn codex_work_label(

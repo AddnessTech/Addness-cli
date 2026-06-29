@@ -654,6 +654,46 @@ fn git_branch_name(cwd: &str) -> String {
     }
 }
 
+fn codex_work_memo(cwd: &str, session_state: &str, last_prompt: Option<&str>) -> String {
+    let cwd_path = PathBuf::from(cwd);
+    let diff = codex_pane::git_diff_stat(&cwd_path);
+    let status = git_status_short(cwd);
+    let branch = git_branch_name(cwd);
+    let diff_text = if diff.trim().is_empty() {
+        "差分なし".to_string()
+    } else {
+        diff
+    };
+    let status_text = if status.trim().is_empty() {
+        "差分なし".to_string()
+    } else {
+        status
+    };
+    let prompt_text = last_prompt
+        .map(|p| p.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| "未記録".to_string());
+
+    format!(
+        "## Codex作業メモ\n\
+         - 更新: {}\n\
+         - セッション: {session_state}\n\
+         - 最後の依頼: {prompt_text}\n\
+         - 作業フォルダ: {cwd}\n\
+         - ブランチ: {branch}\n\
+         - 現在地: プロジェクト固有の判断・決定・次の手はこのブロックへ集約する\n\
+         - git status:\n\
+         ```text\n\
+         {status_text}\n\
+         ```\n\
+         - git diff --stat HEAD:\n\
+         ```text\n\
+         {diff_text}\n\
+         ```",
+        Local::now().format("%Y-%m-%d %H:%M")
+    )
+}
+
 fn upsert_codex_auto_record(existing: Option<&str>, record: &str) -> String {
     let existing = existing.unwrap_or("").trim();
     let block = format!("{CODEX_AUTO_RECORD_START}\n{record}\n{CODEX_AUTO_RECORD_END}");
@@ -701,6 +741,11 @@ struct DodJob {
     item_count: usize,
     /// 起動時刻。タイムアウト判定に使う。
     started: Instant,
+}
+
+struct CodexBodyRecordOutcome {
+    ok: bool,
+    message: String,
 }
 
 impl DodJob {
@@ -769,6 +814,8 @@ pub struct App {
 
     /// DoD 自動判定（codex exec）の実行中ジョブ。
     codex_dod_job: Option<DodJob>,
+    /// 最初の実依頼など、節目の Codex 作業メモを body に非同期記録するジョブ。
+    codex_body_record_job: Option<JoinHandle<CodexBodyRecordOutcome>>,
 }
 
 impl App {
@@ -803,6 +850,7 @@ impl App {
             codex_sync_tick: 0,
             pending_codex_tree_reload: false,
             codex_dod_job: None,
+            codex_body_record_job: None,
         }
     }
 
@@ -1294,6 +1342,10 @@ impl App {
                     "{} 軽量コンテキストで即入力可能",
                     Local::now().format("%H:%M")
                 ));
+                pane.push_activity(format!(
+                    "{} 実依頼でAddness想起/作業メモ化",
+                    Local::now().format("%H:%M")
+                ));
                 self.codex = Some(pane);
                 self.active_pane = ActivePane::Codex;
                 // ホイールスクロール用にマウスキャプチャを有効化（codex 中のみ）。
@@ -1324,37 +1376,9 @@ impl App {
         goal_id: &str,
         cwd: &str,
         session_state: &str,
+        last_prompt: Option<&str>,
     ) -> bool {
-        let cwd_path = PathBuf::from(cwd);
-        let diff = codex_pane::git_diff_stat(&cwd_path);
-        let status = git_status_short(cwd);
-        let branch = git_branch_name(cwd);
-        let diff_text = if diff.trim().is_empty() {
-            "差分なし".to_string()
-        } else {
-            diff
-        };
-        let status_text = if status.trim().is_empty() {
-            "差分なし".to_string()
-        } else {
-            status
-        };
-        let record = format!(
-            "## Codex自動記録\n\
-             - 更新: {}\n\
-             - セッション: {session_state}\n\
-             - 作業フォルダ: {cwd}\n\
-             - ブランチ: {branch}\n\
-             - git status:\n\
-             ```text\n\
-             {status_text}\n\
-             ```\n\
-             - git diff --stat HEAD:\n\
-             ```text\n\
-             {diff_text}\n\
-             ```",
-            Local::now().format("%Y-%m-%d %H:%M")
-        );
+        let record = codex_work_memo(cwd, session_state, last_prompt);
 
         let goal = match self.api_call(self.client.get_goal(goal_id)) {
             Ok(resp) => resp.data,
@@ -1375,21 +1399,102 @@ impl App {
 
         match self.api_call(self.client.update_goal(goal_id, &req)) {
             Ok(_) => {
-                self.success_message = Some("Codex自動記録をAddnessに書き込みました".to_string());
+                self.success_message = Some("Codex作業メモをAddnessに書き込みました".to_string());
                 true
             }
             Err(e) => {
-                self.error_message = Some(format!("Codex自動記録の書き込みに失敗しました: {e}"));
+                self.error_message = Some(format!("Codex作業メモの書き込みに失敗しました: {e}"));
                 false
             }
         }
     }
 
+    fn maybe_start_codex_prompt_body_record(&mut self) -> bool {
+        if self.codex_body_record_job.is_some() {
+            return false;
+        }
+        let Some((goal_id, cwd, prompt)) = self.codex.as_mut().and_then(|pane| {
+            if pane.finished {
+                return None;
+            }
+            let prompt = pane.prompt_needs_body_record()?.to_string();
+            pane.mark_body_recorded_prompt();
+            Some((pane.goal_id.clone(), pane.cwd.clone(), prompt))
+        }) else {
+            return false;
+        };
+
+        let record = codex_work_memo(&cwd, "依頼受付", Some(&prompt));
+        let client = self.client.clone();
+        self.codex_body_record_job = Some(self.rt.spawn(async move {
+            let result = async {
+                let goal = client.get_goal(&goal_id).await?.data;
+                let body = upsert_codex_auto_record(goal.body.as_deref(), &record);
+                let req = UpdateGoalRequest {
+                    status: None,
+                    completed_at: None,
+                    title: None,
+                    description: None,
+                    body: Some(body),
+                    due_date: None,
+                };
+                client.update_goal(&goal_id, &req).await?;
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+
+            match result {
+                Ok(()) => CodexBodyRecordOutcome {
+                    ok: true,
+                    message: "Codex作業メモ → body".to_string(),
+                },
+                Err(e) => CodexBodyRecordOutcome {
+                    ok: false,
+                    message: format!("Codex作業メモに失敗: {e}"),
+                },
+            }
+        }));
+        if let Some(pane) = self.codex.as_mut() {
+            let now = Local::now().format("%H:%M");
+            pane.push_activity(format!("{now} Codex作業メモを予約"));
+        }
+        true
+    }
+
+    fn poll_codex_body_record_job(&mut self) -> bool {
+        let Some(handle) = self.codex_body_record_job.as_ref() else {
+            return false;
+        };
+        if !handle.is_finished() {
+            return false;
+        }
+        let handle = self.codex_body_record_job.take().unwrap();
+        let outcome = self
+            .rt
+            .block_on(handle)
+            .unwrap_or_else(|e| CodexBodyRecordOutcome {
+                ok: false,
+                message: format!("Codex作業メモに失敗: {e}"),
+            });
+        if let Some(pane) = self.codex.as_mut() {
+            let now = Local::now().format("%H:%M");
+            if outcome.ok {
+                pane.last_addness_write_at = Some(Instant::now());
+            }
+            pane.push_activity(format!("{now} {}", outcome.message));
+        }
+        true
+    }
+
     fn maybe_record_finished_codex_session(&mut self) -> bool {
-        let Some((goal_id, cwd)) = self.codex.as_mut().and_then(|pane| {
+        let Some((goal_id, cwd, last_prompt)) = self.codex.as_mut().and_then(|pane| {
             if pane.finished && !pane.auto_record_attempted {
                 pane.auto_record_attempted = true;
-                Some((pane.goal_id.clone(), pane.cwd.clone()))
+                Some((
+                    pane.goal_id.clone(),
+                    pane.cwd.clone(),
+                    pane.last_prompt().map(str::to_string),
+                ))
             } else {
                 None
             }
@@ -1397,13 +1502,19 @@ impl App {
             return false;
         };
 
-        let ok = self.record_codex_session_to_goal_body(&goal_id, &cwd, "codex終了");
+        let ok = self.record_codex_session_to_goal_body(
+            &goal_id,
+            &cwd,
+            "codex終了",
+            last_prompt.as_deref(),
+        );
         if let Some(pane) = self.codex.as_mut() {
             let now = Local::now().format("%H:%M");
             if ok {
-                pane.push_activity(format!("{now} Codex自動記録 → body"));
+                pane.last_addness_write_at = Some(Instant::now());
+                pane.push_activity(format!("{now} Codex作業メモ → body"));
             } else {
-                pane.push_activity(format!("{now} Codex自動記録に失敗"));
+                pane.push_activity(format!("{now} Codex作業メモに失敗"));
             }
         }
         true
@@ -1422,12 +1533,20 @@ impl App {
                 } else {
                     "codex中断/ペイン終了"
                 };
-                self.record_codex_session_to_goal_body(&pane.goal_id, &pane.cwd, state);
+                self.record_codex_session_to_goal_body(
+                    &pane.goal_id,
+                    &pane.cwd,
+                    state,
+                    pane.last_prompt(),
+                );
             }
             pane.kill();
         }
         if let Some(mut job) = self.codex_dod_job.take() {
             job.cleanup();
+        }
+        if let Some(job) = self.codex_body_record_job.take() {
+            job.abort();
         }
         self.codex_refresh = None;
         self.last_codex_refresh = None;
@@ -1447,6 +1566,8 @@ impl App {
             changed |= pane.update();
             close_after_exit_command = pane.should_close_after_exit_command();
         }
+        changed |= self.maybe_start_codex_prompt_body_record();
+        changed |= self.poll_codex_body_record_job();
         changed |= self.maybe_record_finished_codex_session();
         if close_after_exit_command {
             self.close_codex();

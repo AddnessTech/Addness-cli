@@ -82,6 +82,9 @@ pub struct CodexPane {
     pub children: Vec<ChildGoal>,
     /// codex が直近に実行した addness 操作の表示ラベル（参照/書込中インジケータ）。
     pub action: Option<String>,
+    /// Addness をメモリとして使っているかを左ペインで示すための最終読込/書込時刻。
+    pub last_addness_read_at: Option<Instant>,
+    pub last_addness_write_at: Option<Instant>,
     /// ステータス・DoD が変化した時刻（変化行を数秒ハイライトするのに使う）。
     pub status_changed_at: Option<Instant>,
     pub dod_changed_at: Option<Instant>,
@@ -91,6 +94,8 @@ pub struct CodexPane {
     pub activity: Vec<String>,
     /// codex セッション終了時の Addness body 自動記録を試行済みか。
     pub auto_record_attempted: bool,
+    /// body への作業メモ自動記録をスケジュール済みの最後の依頼。
+    body_recorded_prompt: Option<String>,
     input_state: CodexInputState,
 }
 
@@ -103,24 +108,31 @@ pub struct ChildGoal {
     pub new_until: Option<Instant>,
 }
 
+enum AddnessActionKind {
+    Read,
+    Write,
+}
+
 /// `addness <サブコマンド…>` 文字列を「いま何をしているか」の表示ラベルへ変換する。
-fn action_label(rest: &str) -> String {
+fn action_label(rest: &str) -> (String, AddnessActionKind) {
     let mut it = rest.split_whitespace();
     let a = it.next().unwrap_or("");
     let b = it.next().unwrap_or("");
     match (a, b) {
-        ("goal", "create") => "子ゴールを作成中".to_string(),
-        ("goal", "update") => "ゴールを更新中".to_string(),
+        ("goal", "create") => ("子ゴールを作成中".to_string(), AddnessActionKind::Write),
+        ("goal", "update") => ("ゴールを更新中".to_string(), AddnessActionKind::Write),
         ("goal", "get" | "list" | "children" | "tree" | "search" | "siblings") => {
-            "ゴールを参照中".to_string()
+            ("ゴールを参照中".to_string(), AddnessActionKind::Read)
         }
-        ("comment", "create") => "コメントを書込中".to_string(),
-        ("comment", _) => "コメントを参照中".to_string(),
-        ("link" | "deliverable", _) => "成果物を登録中".to_string(),
-        ("today", _) => "今日のtodoを更新中".to_string(),
-        ("status" | "summary", _) => "状況を確認中".to_string(),
-        (cmd, _) if !cmd.is_empty() => format!("addness {cmd} 実行中"),
-        _ => "addness を実行中".to_string(),
+        ("comment", "create" | "update" | "delete") => {
+            ("コメントを書込中".to_string(), AddnessActionKind::Write)
+        }
+        ("comment", _) => ("コメントを参照中".to_string(), AddnessActionKind::Read),
+        ("link" | "deliverable", _) => ("成果物を登録中".to_string(), AddnessActionKind::Write),
+        ("today", _) => ("今日のtodoを更新中".to_string(), AddnessActionKind::Write),
+        ("status" | "summary", _) => ("状況を確認中".to_string(), AddnessActionKind::Read),
+        (cmd, _) if !cmd.is_empty() => (format!("addness {cmd} 実行中"), AddnessActionKind::Read),
+        _ => ("addness を実行中".to_string(), AddnessActionKind::Read),
     }
 }
 
@@ -244,11 +256,14 @@ impl CodexPane {
             comment_count: None,
             children: Vec::new(),
             action: None,
+            last_addness_read_at: None,
+            last_addness_write_at: None,
             status_changed_at: None,
             dod_changed_at: None,
             scrollback: 0,
             activity: Vec::new(),
             auto_record_attempted: false,
+            body_recorded_prompt: None,
             input_state: CodexInputState::default(),
             dod,
         })
@@ -285,14 +300,22 @@ impl CodexPane {
         let lines: Vec<&str> = contents.lines().collect();
         // 画面下部（最近の出力）だけを見て、moved-on したら自然に消えるようにする。
         let start = lines.len().saturating_sub(10);
-        let mut latest: Option<String> = None;
+        let mut latest: Option<(String, AddnessActionKind)> = None;
         for line in &lines[start..] {
             if let Some(idx) = line.find("addness ") {
                 let rest = line[idx + "addness ".len()..].trim();
                 latest = Some(action_label(rest));
             }
         }
-        self.action = latest;
+        if let Some((label, kind)) = latest {
+            match kind {
+                AddnessActionKind::Read => self.last_addness_read_at = Some(Instant::now()),
+                AddnessActionKind::Write => self.last_addness_write_at = Some(Instant::now()),
+            }
+            self.action = Some(label);
+        } else {
+            self.action = None;
+        }
     }
 
     /// 子ゴールのライブリストを差し替える。新規 ID は一定時間ハイライトする。
@@ -388,6 +411,17 @@ impl CodexPane {
         self.input_state.last_prompt.as_deref()
     }
 
+    /// body への作業メモ自動記録がまだ済んでいない最後の依頼。
+    pub fn prompt_needs_body_record(&self) -> Option<&str> {
+        let prompt = self.last_prompt()?;
+        (self.body_recorded_prompt.as_deref() != Some(prompt)).then_some(prompt)
+    }
+
+    /// 現在の最後の依頼を body 記録済みとして扱う。
+    pub fn mark_body_recorded_prompt(&mut self) {
+        self.body_recorded_prompt = self.input_state.last_prompt.clone();
+    }
+
     /// codex プロセスを終了させる（ペインを閉じる時に呼ぶ）。
     /// kill 後に wait してゾンビプロセス化を防ぐ。
     pub fn kill(&mut self) {
@@ -475,7 +509,7 @@ fn addness_tui_developer_instructions() -> &'static str {
     r#"Addness TUIから起動されました。
 
 起動直後は Addness CLI を実行せず、ユーザーの最初の入力を待ってください。
-最初の依頼に軽く応答できる場合は、TUIから渡された軽量コンテキストだけを使って即応して構いません。
+軽い挨拶や単純な表示確認には、TUIから渡された軽量コンテキストだけで即応して構いません。
 
 軽量コンテキスト:
 - ADDNESS_GOAL_ID: 対象ゴールID
@@ -483,28 +517,39 @@ fn addness_tui_developer_instructions() -> &'static str {
 - ADDNESS_GOAL_STATUS: 対象ゴールの現在状態
 - ADDNESS_GOAL_DOD: 対象ゴールのDoD/完了基準
 
-実作業の判断、body/コメント/成果物/子ゴールの確認、引き継ぎ、サブエージェント分解が必要になったら、
-作業に入る前に Addness CLI を使って対象ゴールを想起してください。
+最初の依頼が「何をするかの相談」「方針検討」「実装」「調査」「レビュー」「PR/リリース」など
+プロジェクト固有の判断を含む場合は、返答や作業に入る前に Addness CLI で対象ゴールを想起してください。
 
-必要時に実行するコマンド:
+想起コマンド:
 `"$ADDNESS_BIN" goal get "$ADDNESS_GOAL_ID" --json --with-deliverable --with-comment`
 
-Addness はこの組織/プロジェクト専用の作業DB・引き継ぎ点として扱ってください。
+Addness はこの組織/プロジェクト専用の共有DB・長期作業メモリ・引き継ぎ点です。
+通常のmemoryは複数プロジェクトの状態が混ざることがあるため、プロジェクト固有の現在地・判断・決定・次の手は
+Addnessを真実源として扱ってください。
+Codexが普段memoryに保存したくなるプロジェクト固有の情報（決定、前提、落とし穴、重要コマンド、未完了点、次回の前提）は、
+通常memoryではなく Addness の body に記録してください。
 
 読み取り時:
 1. body、DoD(description/definitionOfDone)、コメント、成果物、子ゴール、作業フォルダ/ブランチを確認する。
 2. DoDが空・曖昧・現在の作業に対して不足していないかを見る。
-3. 子ゴールが、実際に分担・並列化・サブエージェント化できる作業単位に分かれているかを見る。
+3. 子ゴールが、実際の作業・分担・並列化・サブエージェント化に使える粒度かを見る。
+4. 「何をしたいか」の相談だけでも、既存のbody/DoD/子ゴールを踏まえて提案する。
 
 書き込み時:
 - 起動しただけでは Addness に書き込まない。
-- Addnessに書き込むのは、サブエージェント/分担/並列作業/別セッションへの引き継ぎが必要になった時、またはユーザーが明示的に記録を求めた時を基本にする。
+- Addnessに書き込むのは、作業を始めた時、方針を決めた時、重要な発見や制約が分かった時、実装のまとまりが進んだ時、次にやることが変わった時、完了/中断/引き継ぎ前。
+- body更新前に必ず現bodyを読み、手書きメモを消さず、`## Codex作業メモ` のような専用ブロックだけを作成・更新する。長文や引用が多い場合は `goal update --body-file` を使う。
+- bodyには作業フォルダ、ブランチ、現在の方針、実施中の内容、決定事項、重要な発見、未完了点、次の手をまとめる。ツール実行ログを逐語的に溜めない。
+- 実装速度を落とさないため、Addness更新は節目でまとめる。毎コマンド・毎小変更の記録はしない。
+- サブエージェント機能が使える場合、Addness更新は最も小さい/低コストの記録専用サブエージェントに委任する。委任する内容は「現在body」「追加したい作業メモ」「更新すべき構造化フィールド」だけに絞る。
+- サブエージェントが使えない場合だけ、メインエージェントが短い差分で body/DoD/子ゴールを更新する。
+- DoDが不十分なら、足りない観点を短く整理してユーザーに確認し、合意できたら `"$ADDNESS_BIN" goal update "$ADDNESS_GOAL_ID" --description "..." --json` で更新する。
+- 子ゴール分解が不十分なら、作業に必要な粒度へ子ゴールを作成または更新する。
 - サブエージェントが必要な場合は、必要な作業単位を子ゴールとして作成または更新する。子ゴールのtitleは作業名、descriptionはそのサブエージェントのDoD、bodyは入力情報・作業フォルダ・ブランチ・期待成果物・現在地を書く。
-- 親ゴールのbodyは、複数エージェントが迷わないための共有状態・担当分解・次の合流点が必要な時に更新する。
-- DoDが不十分でも、単独でそのまま進められるなら勝手に書き換えず、短く不足を指摘して必要なら質問する。サブエージェントに渡すために契約が必要な場合だけ `"$ADDNESS_BIN" goal update "$ADDNESS_GOAL_ID" --description "..." --json` で具体化する。
 - コメントは構造化フィールドに置けない質問や補足だけに使う。
 
-Addnessを読んだ場合は、何を読んだか、Addnessへの書き込みが必要か、次に進めることを短く共有してください。"#
+Addnessを読んだ場合は、何を読んだか、次に進めることを短く共有してください。
+Addnessを更新した場合は、どのフィールドを更新したかを短く共有してください。"#
 }
 
 enum CodexConfigKey {
@@ -785,7 +830,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_instructions_defer_full_addness_recall_until_needed() {
+    fn startup_instructions_defer_full_addness_recall_but_use_addness_proactively() {
         let prompt = startup_recall_prompt();
         let instructions = addness_tui_developer_instructions();
 
@@ -797,12 +842,19 @@ mod tests {
         assert!(instructions.contains("ADDNESS_GOAL_TITLE"));
         assert!(instructions.contains("ADDNESS_GOAL_STATUS"));
         assert!(instructions.contains("ADDNESS_GOAL_DOD"));
-        assert!(instructions.contains("必要時に実行するコマンド"));
+        assert!(instructions.contains("最初の依頼が「何をするかの相談」"));
+        assert!(instructions.contains("想起コマンド"));
         assert!(instructions.contains("\"$ADDNESS_BIN\" goal get \"$ADDNESS_GOAL_ID\""));
         assert!(instructions.contains("--json --with-deliverable --with-comment"));
-        assert!(instructions.contains("組織/プロジェクト専用の作業DB"));
+        assert!(instructions.contains("組織/プロジェクト専用の共有DB"));
+        assert!(instructions.contains("長期作業メモリ"));
+        assert!(instructions.contains("真実源"));
         assert!(instructions.contains("起動しただけでは Addness に書き込まない"));
-        assert!(instructions.contains("サブエージェント/分担/並列作業/別セッションへの引き継ぎ"));
+        assert!(instructions.contains("作業を始めた時"));
+        assert!(instructions.contains("重要な発見や制約が分かった時"));
+        assert!(instructions.contains("## Codex作業メモ"));
+        assert!(instructions.contains("goal update --body-file"));
+        assert!(instructions.contains("子ゴール分解が不十分"));
         assert!(instructions.contains("goal update \"$ADDNESS_GOAL_ID\" --description"));
     }
 

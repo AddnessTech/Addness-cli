@@ -616,6 +616,66 @@ fn extract_json_object(s: &str) -> Option<String> {
 /// DoD 自動判定がハングした場合に強制終了するまでの上限時間。
 const DOD_ASSESSMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+const CODEX_AUTO_RECORD_START: &str = "<!-- addness:codex:auto-record:start -->";
+const CODEX_AUTO_RECORD_END: &str = "<!-- addness:codex:auto-record:end -->";
+
+fn git_status_short(cwd: &str) -> String {
+    let output = std::process::Command::new("git")
+        .args(["status", "--short"])
+        .current_dir(cwd)
+        .output();
+    match output {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => String::new(),
+    }
+}
+
+fn git_branch_name(cwd: &str) -> String {
+    let output = std::process::Command::new("git")
+        .args(["branch", "--show-current"])
+        .current_dir(cwd)
+        .output();
+    match output {
+        Ok(o) if o.status.success() => {
+            let branch = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if branch.is_empty() {
+                "(detached)".to_string()
+            } else {
+                branch
+            }
+        }
+        _ => "(unknown)".to_string(),
+    }
+}
+
+fn upsert_codex_auto_record(existing: Option<&str>, record: &str) -> String {
+    let existing = existing.unwrap_or("").trim();
+    let block = format!("{CODEX_AUTO_RECORD_START}\n{record}\n{CODEX_AUTO_RECORD_END}");
+
+    if let (Some(start), Some(end)) = (
+        existing.find(CODEX_AUTO_RECORD_START),
+        existing.find(CODEX_AUTO_RECORD_END),
+    ) {
+        let end = end + CODEX_AUTO_RECORD_END.len();
+        let mut next = String::new();
+        next.push_str(existing[..start].trim_end());
+        if !next.is_empty() {
+            next.push_str("\n\n");
+        }
+        next.push_str(&block);
+        let tail = existing[end..].trim_start();
+        if !tail.is_empty() {
+            next.push_str("\n\n");
+            next.push_str(tail);
+        }
+        next
+    } else if existing.is_empty() {
+        block
+    } else {
+        format!("{existing}\n\n{block}")
+    }
+}
+
 /// codex ペインのライブ更新で取得する Addness 側のスナップショット。
 struct CodexSnapshot {
     title: String,
@@ -1247,12 +1307,113 @@ impl App {
         }
     }
 
+    /// codex セッションの作業状況を対象ゴールの body に自動記録する。
+    /// body 全体は壊さず、専用ブロックだけを追記・差し替えする。
+    fn record_codex_session_to_goal_body(
+        &mut self,
+        goal_id: &str,
+        cwd: &str,
+        session_state: &str,
+    ) -> bool {
+        let cwd_path = PathBuf::from(cwd);
+        let diff = codex_pane::git_diff_stat(&cwd_path);
+        let status = git_status_short(cwd);
+        let branch = git_branch_name(cwd);
+        let diff_text = if diff.trim().is_empty() {
+            "差分なし".to_string()
+        } else {
+            diff
+        };
+        let status_text = if status.trim().is_empty() {
+            "差分なし".to_string()
+        } else {
+            status
+        };
+        let record = format!(
+            "## Codex自動記録\n\
+             - 更新: {}\n\
+             - セッション: {session_state}\n\
+             - 作業フォルダ: {cwd}\n\
+             - ブランチ: {branch}\n\
+             - git status:\n\
+             ```text\n\
+             {status_text}\n\
+             ```\n\
+             - git diff --stat HEAD:\n\
+             ```text\n\
+             {diff_text}\n\
+             ```",
+            Local::now().format("%Y-%m-%d %H:%M")
+        );
+
+        let goal = match self.api_call(self.client.get_goal(goal_id)) {
+            Ok(resp) => resp.data,
+            Err(e) => {
+                self.error_message = Some(format!("Codex自動記録の取得に失敗しました: {e}"));
+                return false;
+            }
+        };
+        let body = upsert_codex_auto_record(goal.body.as_deref(), &record);
+        let req = UpdateGoalRequest {
+            status: None,
+            completed_at: None,
+            title: None,
+            description: None,
+            body: Some(body),
+            due_date: None,
+        };
+
+        match self.api_call(self.client.update_goal(goal_id, &req)) {
+            Ok(_) => {
+                self.success_message = Some("Codex自動記録をAddnessに書き込みました".to_string());
+                true
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Codex自動記録の書き込みに失敗しました: {e}"));
+                false
+            }
+        }
+    }
+
+    fn maybe_record_finished_codex_session(&mut self) -> bool {
+        let Some((goal_id, cwd)) = self.codex.as_mut().and_then(|pane| {
+            if pane.finished && !pane.auto_record_attempted {
+                pane.auto_record_attempted = true;
+                Some((pane.goal_id.clone(), pane.cwd.clone()))
+            } else {
+                None
+            }
+        }) else {
+            return false;
+        };
+
+        let ok = self.record_codex_session_to_goal_body(&goal_id, &cwd, "codex終了");
+        if let Some(pane) = self.codex.as_mut() {
+            let now = Local::now().format("%H:%M");
+            if ok {
+                pane.push_activity(format!("{now} Codex自動記録 → body"));
+            } else {
+                pane.push_activity(format!("{now} Codex自動記録に失敗"));
+            }
+        }
+        true
+    }
+
     /// codex ペインを閉じる（プロセスを終了させて通常画面へ戻る）。
     /// codex が Addness に書き戻した子ゴール等を反映するため、ツリーを再読込する。
     fn close_codex(&mut self) {
         // 通常画面に戻るのでマウスキャプチャを解除（テキスト選択を戻す）。
         Self::set_mouse_capture(false);
         if let Some(mut pane) = self.codex.take() {
+            if !pane.auto_record_attempted {
+                pane.auto_record_attempted = true;
+                let state = if pane.finished {
+                    "codex終了"
+                } else {
+                    "codex中断/ペイン終了"
+                };
+                self.record_codex_session_to_goal_body(&pane.goal_id, &pane.cwd, state);
+            }
             pane.kill();
         }
         if let Some(mut job) = self.codex_dod_job.take() {
@@ -1274,6 +1435,7 @@ impl App {
         if let Some(pane) = self.codex.as_mut() {
             changed |= pane.update();
         }
+        changed |= self.maybe_record_finished_codex_session();
         changed |= self.poll_codex_refresh();
         self.maybe_start_codex_refresh();
         changed |= self.poll_dod_job();
@@ -3234,6 +3396,7 @@ impl App {
             status: Some(api_status),
             completed_at,
             body: None,
+            due_date: None,
         };
 
         match self.api_call(self.client.update_goal(&goal_id, &req)) {
@@ -3277,6 +3440,7 @@ impl App {
                 title: None,
                 description: None,
                 body: None,
+                due_date: None,
             }
         } else {
             UpdateGoalRequest {
@@ -3285,6 +3449,7 @@ impl App {
                 title: None,
                 description: None,
                 body: None,
+                due_date: None,
             }
         };
 
@@ -3936,7 +4101,7 @@ mod picker_interaction_tests {
 
 #[cfg(test)]
 mod dod_tests {
-    use super::{extract_json_object, parse_dod_results};
+    use super::{extract_json_object, parse_dod_results, upsert_codex_auto_record};
 
     #[test]
     fn extract_json_object_strips_surrounding_text() {
@@ -3974,5 +4139,23 @@ mod dod_tests {
     fn parse_dod_results_rejects_malformed() {
         assert!(parse_dod_results("not json", 2).is_none());
         assert!(parse_dod_results(r#"{"results":"nope"}"#, 2).is_none());
+    }
+
+    #[test]
+    fn upsert_codex_auto_record_appends_to_existing_body() {
+        let body = upsert_codex_auto_record(Some("手書きメモ"), "自動記録1");
+
+        assert!(body.contains("手書きメモ"));
+        assert!(body.contains("自動記録1"));
+    }
+
+    #[test]
+    fn upsert_codex_auto_record_replaces_existing_block() {
+        let first = upsert_codex_auto_record(Some("手書きメモ"), "自動記録1");
+        let second = upsert_codex_auto_record(Some(&first), "自動記録2");
+
+        assert!(second.contains("手書きメモ"));
+        assert!(!second.contains("自動記録1"));
+        assert!(second.contains("自動記録2"));
     }
 }

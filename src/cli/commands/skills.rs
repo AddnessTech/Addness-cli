@@ -103,6 +103,8 @@ addness goal update <GOAL_ID> --title "新しいタイトル"
 addness goal update <GOAL_ID> --description "完了基準"
 addness goal update <GOAL_ID> --body "現在の状態"
 addness goal update <GOAL_ID> --body-file ./status.md
+addness goal update <GOAL_ID> --due-date 2026-07-01
+addness goal update <GOAL_ID> --clear-due-date
 addness goal update <GOAL_ID> --status NOT_STARTED --title "タイトル変更" --json
 ```
 
@@ -149,6 +151,9 @@ addness link pr --goal <GOAL_ID> --url https://github.com/org/repo/pull/42
 addness link pr --goal <GOAL_ID> --url <PR_URL> --name "PR #42: 機能追加"
 addness link pr --goal <GOAL_ID> --url <PR_URL> --comment "実装完了"
 addness link pr --goal <GOAL_ID> --url <PR_URL> --json
+
+# 成果物を追加
+addness deliverable add --goal <GOAL_ID> --link-url https://example.com --name "参考リンク"
 
 # 進捗を記録（コメント + オプションでステータス更新）
 addness link progress --goal <GOAL_ID> --message "設計レビュー完了"

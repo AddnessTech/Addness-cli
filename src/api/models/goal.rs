@@ -108,6 +108,8 @@ pub struct UpdateGoalRequest {
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
+    #[serde(rename = "dueDate", skip_serializing_if = "Option::is_none")]
+    pub due_date: Option<Option<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -264,19 +266,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn update_goal_request_serializes_body_separately_from_dod() {
+    fn update_goal_request_serializes_writable_goal_fields() {
         let req = UpdateGoalRequest {
             status: None,
             completed_at: None,
             title: None,
             description: Some("完了基準".to_string()),
             body: Some("現在の状態".to_string()),
+            due_date: Some(Some("2026-07-01".to_string())),
         };
 
         let value = serde_json::to_value(req).unwrap();
 
         assert_eq!(value["definitionOfDone"], "完了基準");
         assert_eq!(value["body"], "現在の状態");
+        assert_eq!(value["dueDate"], "2026-07-01");
         assert!(value.get("description").is_none());
+    }
+
+    #[test]
+    fn update_goal_request_can_clear_due_date() {
+        let req = UpdateGoalRequest {
+            status: None,
+            completed_at: None,
+            title: None,
+            description: None,
+            body: None,
+            due_date: Some(None),
+        };
+
+        let value = serde_json::to_value(req).unwrap();
+
+        assert!(value.get("dueDate").is_some());
+        assert!(value["dueDate"].is_null());
     }
 }

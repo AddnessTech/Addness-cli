@@ -1,4 +1,5 @@
 use anyhow::{Result, bail};
+use chrono::NaiveDate;
 use clap::Subcommand;
 
 use crate::api::{
@@ -22,6 +23,15 @@ fn read_text_arg(
         (Some(_), Some(_)) => bail!("Specify only one of {inline_flag} or {file_flag}"),
         (None, None) => Ok(None),
     }
+}
+
+fn normalize_due_date(input: &str) -> Result<String> {
+    if input.contains('T') {
+        return Ok(input.to_string());
+    }
+    let date = NaiveDate::parse_from_str(input, "%Y-%m-%d")
+        .map_err(|_| anyhow::anyhow!("--due-date must be YYYY-MM-DD or RFC3339"))?;
+    Ok(format!("{}T00:00:00Z", date.format("%Y-%m-%d")))
 }
 
 #[derive(Subcommand)]
@@ -117,7 +127,7 @@ pub enum GoalCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Update a goal's status, title, definition of done, or body
+    /// Update a goal's status, title, definition of done, body, or due date
     Update {
         /// Goal ID
         id: String,
@@ -139,6 +149,12 @@ pub enum GoalCommands {
         /// Body/current state from a file path (alternative to --body)
         #[arg(long)]
         body_file: Option<String>,
+        /// Due date/current deadline (YYYY-MM-DD or RFC3339) - replaces the current value
+        #[arg(long, conflicts_with = "clear_due_date", value_name = "DATE")]
+        due_date: Option<String>,
+        /// Clear the current due date
+        #[arg(long, conflicts_with = "due_date")]
+        clear_due_date: bool,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -365,6 +381,27 @@ impl GoalNode {
             deliverables,
             children,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_due_date;
+
+    #[test]
+    fn normalize_due_date_accepts_yyyy_mm_dd() {
+        assert_eq!(
+            normalize_due_date("2026-07-01").unwrap(),
+            "2026-07-01T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn normalize_due_date_keeps_rfc3339() {
+        assert_eq!(
+            normalize_due_date("2026-07-01T12:30:00Z").unwrap(),
+            "2026-07-01T12:30:00Z"
+        );
     }
 }
 
@@ -719,6 +756,8 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
             description_file,
             body,
             body_file,
+            due_date,
+            clear_due_date,
             json,
         } => {
             let (completed_at, goal_status) = if let Some(s) = status {
@@ -735,6 +774,14 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
             )?;
             let body_text =
                 read_text_arg(body.as_ref(), body_file.as_ref(), "--body", "--body-file")?;
+            let due_date = if *clear_due_date {
+                Some(None)
+            } else {
+                due_date
+                    .as_ref()
+                    .map(|d| normalize_due_date(d).map(Some))
+                    .transpose()?
+            };
 
             let mut req = UpdateGoalRequest {
                 status: goal_status,
@@ -742,6 +789,7 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
                 title: None,
                 description: desc,
                 body: body_text,
+                due_date,
             };
 
             if let Some(t) = title {
@@ -753,8 +801,11 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
                 && req.title.is_none()
                 && req.description.is_none()
                 && req.body.is_none()
+                && req.due_date.is_none()
             {
-                bail!("Nothing to update. Specify --status, --title, --description, or --body.");
+                bail!(
+                    "Nothing to update. Specify --status, --title, --description, --body, or --due-date."
+                );
             }
 
             let resp: ApiResponse<Goal> = client.update_goal(id, &req).await?;

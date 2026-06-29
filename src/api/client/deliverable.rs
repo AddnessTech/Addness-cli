@@ -30,7 +30,7 @@ impl ApiClient {
         goal_id: &str,
         url: &str,
         display_name: &str,
-    ) -> Result<ApiResponse<Deliverable>> {
+    ) -> Result<ApiResponse<DeliverableCreateData>> {
         let body = CreateDeliverableRequest {
             node_type: DeliverableType::Link,
             display_name: display_name.to_string(),

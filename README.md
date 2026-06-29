@@ -63,6 +63,7 @@ addness goal list --assigned-to me --status NOT_STARTED --json
 ```bash
 addness goal update <goal-id> --status IN_PROGRESS
 addness goal update <goal-id> --body "現在の状態や次にやること"
+addness goal update <goal-id> --due-date 2026-07-01
 addness comment create --goal <goal-id> --body "実装を開始しました"
 ```
 
@@ -70,6 +71,12 @@ addness comment create --goal <goal-id> --body "実装を開始しました"
 
 ```bash
 addness link pr --goal <goal-id> --url https://github.com/org/repo/pull/42
+```
+
+リンク成果物を追加する:
+
+```bash
+addness deliverable add --goal <goal-id> --link-url https://example.com --name "参考リンク"
 ```
 
 コマンドのヘルプを表示する:
@@ -102,6 +109,8 @@ codex は Addness を「タスク DB」として扱い、`addness` CLI 経由で
 左の Addness ペインには、対象ゴールのステータス、DoD、子ゴール、コメント数、
 Addness への更新ログがライブ表示されるため、codex の作業と Addness 上の進捗を
 同じ画面で追えます。
+codex の終了時またはペインを閉じる時には、作業フォルダ・ブランチ・git status・
+diff stat が対象ゴールの body に自動記録されます。
 
 codex 終了後は還流バーのキーで成果を Addness に反映できます:
 

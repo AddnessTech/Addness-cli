@@ -89,6 +89,8 @@ pub struct CodexPane {
     pub scrollback: usize,
     /// Addness 側の更新ログ（codex の書き込みやステータス変化を可視化）。新しいものほど末尾。
     pub activity: Vec<String>,
+    /// codex セッション終了時の Addness body 自動記録を試行済みか。
+    pub auto_record_attempted: bool,
 }
 
 /// 子ゴール 1 件の表示用情報。
@@ -229,6 +231,7 @@ impl CodexPane {
             dod_changed_at: None,
             scrollback: 0,
             activity: Vec::new(),
+            auto_record_attempted: false,
             dod,
         })
     }

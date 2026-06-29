@@ -105,6 +105,7 @@ pub async fn handle_today(cmd: Option<&TodayCommands>, client: &ApiClient) -> Re
                 title: None,
                 description: None,
                 body: None,
+                due_date: None,
             };
             update_and_report(id, &req, "Completed", *json, client).await
         }
@@ -115,6 +116,7 @@ pub async fn handle_today(cmd: Option<&TodayCommands>, client: &ApiClient) -> Re
                 title: None,
                 description: None,
                 body: None,
+                due_date: None,
             };
             update_and_report(id, &req, "Reopened", *json, client).await
         }
@@ -126,6 +128,7 @@ pub async fn handle_today(cmd: Option<&TodayCommands>, client: &ApiClient) -> Re
                 title: None,
                 description: None,
                 body: None,
+                due_date: None,
             };
             update_and_report(id, &req, "Updated", *json, client).await
         }

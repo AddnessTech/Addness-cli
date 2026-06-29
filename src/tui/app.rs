@@ -761,20 +761,29 @@ impl App {
             });
         self.apply_initial_data(data);
 
+        let mut needs_redraw = true;
         while self.running {
             // 表示しようとしているタブのデータを必要になった時点で取得する。
             self.ensure_active_tab_loaded();
-            terminal.draw(|frame| ui::draw(frame, self))?;
+            if needs_redraw {
+                terminal.draw(|frame| ui::draw(frame, self))?;
+                needs_redraw = false;
+            }
 
             if self.codex.is_some() {
                 // codex は非同期に描画更新するので、キー入力が無くても一定間隔で
-                // PTY 出力を取り込んで再描画する（ブロッキング read は使わない）。
+                // PTY 出力を取り込む（ブロッキング read は使わない）。変化があった
+                // フレームだけ再描画し、アイドル時の無駄な再描画を避ける。
                 if event::poll(std::time::Duration::from_millis(20))? {
                     self.handle_events()?;
+                    needs_redraw = true;
                 }
-                self.update_codex();
+                if self.update_codex() {
+                    needs_redraw = true;
+                }
             } else {
                 self.handle_events()?;
+                needs_redraw = true;
             }
         }
         Ok(())
@@ -1182,19 +1191,25 @@ impl App {
         self.codex_refresh = None;
         self.last_codex_refresh = None;
         self.active_pane = ActivePane::Content;
-        // codex の変更（子ゴール作成・状態変更など）をツリーに反映する。
+        // codex の変更（子ゴール作成・状態変更など）を表示中のツリーへ反映する。
         self.load_goal_tree();
+        if self.todays_loaded {
+            self.load_todays_goals();
+        }
     }
 
     /// PTY 出力の取り込みとプロセス終了検知。codex 起動中に毎フレーム呼ぶ。
     /// あわせて契約ペイン（DoD/タイトル）のライブ更新と DoD 判定を駆動する。
-    fn update_codex(&mut self) {
+    /// 画面に影響する変化があれば `true` を返す（再描画判定に使う）。
+    fn update_codex(&mut self) -> bool {
+        let mut changed = false;
         if let Some(pane) = self.codex.as_mut() {
-            pane.update();
+            changed |= pane.update();
         }
-        self.poll_codex_refresh();
+        changed |= self.poll_codex_refresh();
         self.maybe_start_codex_refresh();
-        self.poll_dod_job();
+        changed |= self.poll_dod_job();
+        changed
     }
 
     /// `codex exec` を read-only サンドボックスで起動し、各 DoD 項目が現在の
@@ -1219,8 +1234,10 @@ impl App {
         let goal_id = pane.goal_id.clone();
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let tmp = std::env::temp_dir();
-        let schema_path = tmp.join(format!("addness-dod-schema-{goal_id}.json"));
-        let out_path = tmp.join(format!("addness-dod-out-{goal_id}.json"));
+        // プロセスIDを混ぜて、複数の TUI セッションが同一ゴールを判定しても衝突しないようにする。
+        let pid = std::process::id();
+        let schema_path = tmp.join(format!("addness-dod-schema-{goal_id}-{pid}.json"));
+        let out_path = tmp.join(format!("addness-dod-out-{goal_id}-{pid}.json"));
 
         if std::fs::write(&schema_path, codex_pane::dod_assessment_schema()).is_err() {
             self.error_message = Some("一時ファイルの書き込みに失敗しました".to_string());
@@ -1259,6 +1276,8 @@ impl App {
                 self.success_message = Some("DoD 判定を実行中…".to_string());
             }
             Err(e) => {
+                // 起動失敗時は書き込んだスキーマファイルを残さない。
+                let _ = std::fs::remove_file(&schema_path);
                 self.error_message = Some(format!("DoD 判定の起動に失敗しました: {e}"));
             }
         }
@@ -1266,9 +1285,10 @@ impl App {
 
     /// DoD 判定ジョブの完了を非ブロッキングで確認し、結果を契約ペインへ反映する。
     /// タイムアウト超過時は強制終了する。完了/失敗いずれでも一時ファイルを掃除する。
-    fn poll_dod_job(&mut self) {
+    /// 状態が変化した場合は `true` を返す（再描画判定に使う）。
+    fn poll_dod_job(&mut self) -> bool {
         let Some(job) = self.codex_dod_job.as_mut() else {
-            return;
+            return false;
         };
 
         let status = match job.child.try_wait() {
@@ -1279,15 +1299,16 @@ impl App {
                     job.cleanup();
                     self.set_codex_assessing(false);
                     self.error_message = Some("DoD 判定がタイムアウトしました".to_string());
+                    return true;
                 }
-                return;
+                return false;
             }
             Ok(Some(status)) => status,
             Err(_) => {
                 let mut job = self.codex_dod_job.take().unwrap();
                 job.cleanup();
                 self.set_codex_assessing(false);
-                return;
+                return true;
             }
         };
 
@@ -1304,13 +1325,19 @@ impl App {
         self.set_codex_assessing(false);
 
         match result {
-            Some(results) => {
-                let met = results.iter().filter(|(_, m)| *m).count();
-                let total = results.len();
+            Some(results) if !results.is_empty() => {
                 if let Some(pane) = self.codex.as_mut() {
                     pane.apply_dod_results(&results);
+                    // 達成数・総数は実際の項目数とチェック状態から数える
+                    // （codex が一部省略・重複しても表示が破綻しないように）。
+                    let met = pane.dod_checks.iter().filter(|c| **c == Some(true)).count();
+                    let total = pane.dod_items.len();
+                    self.success_message = Some(format!("DoD 判定完了: {met}/{total} 達成"));
                 }
-                self.success_message = Some(format!("DoD 判定完了: {met}/{total} 達成"));
+            }
+            Some(_) => {
+                // 空の results。judge が判定できなかったとみなす。
+                self.error_message = Some("DoD 判定結果が空でした".to_string());
             }
             None if status.success() => {
                 self.error_message = Some("DoD 判定結果の解析に失敗しました".to_string());
@@ -1319,6 +1346,7 @@ impl App {
                 self.error_message = Some("DoD 判定に失敗しました".to_string());
             }
         }
+        true
     }
 
     /// 契約ペインの「判定中」フラグを設定する小ヘルパー。
@@ -1354,21 +1382,27 @@ impl App {
     }
 
     /// 進行中の再取得タスクが完了していれば、契約ペインへ反映する（非ブロッキング）。
-    fn poll_codex_refresh(&mut self) {
+    /// 反映して画面が変わった場合は `true` を返す。
+    fn poll_codex_refresh(&mut self) -> bool {
         let Some(handle) = self.codex_refresh.as_ref() else {
-            return;
+            return false;
         };
         if !handle.is_finished() {
-            return;
+            return false;
         }
         let handle = self.codex_refresh.take().unwrap();
         // is_finished が真なので block_on は即座に返る。
         if let Ok(Ok(resp)) = self.rt.block_on(handle)
             && let Some(pane) = self.codex.as_mut()
         {
-            pane.set_dod(resp.data.description.unwrap_or_default());
             pane.goal_title = resp.data.title;
+            // DoD 判定の実行中は項目とチェックを作り直さない（番号ずれ防止）。
+            if !pane.assessing {
+                pane.set_dod(resp.data.description.unwrap_or_default());
+            }
+            return true;
         }
+        false
     }
 
     /// codex ペインへのキー入力処理。
@@ -1385,8 +1419,8 @@ impl App {
             }
             match key.code {
                 KeyCode::Char('c') => self.start_codex_reflow_comment(),
-                KeyCode::Char('s') => self.start_edit_goal_modal(),
-                KeyCode::Char('d') => self.start_add_deliverable_modal(),
+                KeyCode::Char('s') => self.start_codex_reflow_edit(),
+                KeyCode::Char('d') => self.start_codex_reflow_deliverable(),
                 KeyCode::Char('v') => self.start_dod_assessment(),
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => self.close_codex(),
                 _ => {}
@@ -1421,6 +1455,54 @@ impl App {
             goal_id,
             goal_title,
             body,
+        });
+    }
+
+    /// codex 対象ゴールの編集モーダルを開く（還流: ステータス）。
+    /// ツリーのカーソルではなく `pane.goal_id` を対象にするため、ツリー再読込で
+    /// カーソルがずれても正しいゴールを編集できる。
+    fn start_codex_reflow_edit(&mut self) {
+        let Some(goal_id) = self.codex.as_ref().map(|c| c.goal_id.clone()) else {
+            return;
+        };
+        match self.api_call(self.client.get_goal(&goal_id)) {
+            Ok(resp) => {
+                let goal = resp.data;
+                let current_status =
+                    GoalDisplayStatus::from_goal_state(goal.status.as_ref(), goal.is_completed);
+                let allowed_statuses = current_status.allowed_transitions();
+                self.modal_state = Some(ModalState::EditGoal {
+                    goal_id: goal.id,
+                    title: goal.title,
+                    description: goal.description.unwrap_or_default(),
+                    current_status,
+                    selected_status_index: 0,
+                    allowed_statuses,
+                    current_field: FormField::Title,
+                });
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Failed to load goal: {e}"));
+            }
+        }
+    }
+
+    /// codex 対象ゴールへの成果物追加モーダルを開く（還流: 成果物）。
+    fn start_codex_reflow_deliverable(&mut self) {
+        let Some((goal_id, goal_title)) = self
+            .codex
+            .as_ref()
+            .map(|c| (c.goal_id.clone(), c.goal_title.clone()))
+        else {
+            return;
+        };
+        self.modal_state = Some(ModalState::AddDeliverable {
+            goal_id,
+            goal_title,
+            kind: DeliverableKind::File,
+            name: String::new(),
+            value: String::new(),
+            current_field: DeliverableFormField::Kind,
         });
     }
 

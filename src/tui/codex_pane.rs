@@ -153,7 +153,8 @@ impl CodexPane {
         cmd.arg(prompt);
         cmd.cwd(cwd);
         // 親プロセスの環境を引き継ぐ（PATH 等を codex のサブプロセスに渡すため）。
-        for (key, value) in std::env::vars() {
+        // vars() は非UTF-8な環境変数があると panic するため vars_os() を使う。
+        for (key, value) in std::env::vars_os() {
             cmd.env(key, value);
         }
         cmd.env("TERM", "xterm-256color");
@@ -180,12 +181,15 @@ impl CodexPane {
             let mut buf = [0u8; 8192];
             loop {
                 match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break, // EOF
                     Ok(n) => {
                         if tx.send(buf[..n].to_vec()).is_err() {
                             break;
                         }
                     }
+                    // 一時的な割り込み（SIGWINCH 等による EINTR）は EOF ではないので継続。
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
                 }
             }
         });
@@ -209,13 +213,18 @@ impl CodexPane {
     }
 
     /// PTY から届いた出力を取り込み、プロセス終了を検知する。毎フレーム呼ぶ。
-    pub fn update(&mut self) {
+    /// 画面に影響する変化（出力取り込み or 終了検知）があれば `true` を返す。
+    pub fn update(&mut self) -> bool {
+        let mut changed = false;
         while let Ok(bytes) = self.rx.try_recv() {
             self.parser.process(&bytes);
+            changed = true;
         }
         if !self.finished && matches!(self.child.try_wait(), Ok(Some(_))) {
             self.finished = true;
+            changed = true;
         }
+        changed
     }
 
     /// 描画領域に合わせて PTY と vt100 のサイズを更新する（変化時のみ）。

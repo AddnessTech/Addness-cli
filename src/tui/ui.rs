@@ -755,6 +755,29 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     let current_section = app.sidebar_items[app.sidebar_index];
+
+    // codex フォーカス中は通常のキーが codex へ転送されるため、専用のヒントを出す。
+    if app.active_pane == ActivePane::Codex {
+        let finished = app.codex.as_ref().map(|c| c.finished).unwrap_or(true);
+        let hint = if finished {
+            " [c]コメント  [s]状態  [d]成果物  [v]DoD判定  Esc/q: 閉じる "
+        } else {
+            " キー入力は codex へ転送  |  F12: codex終了して戻る "
+        };
+        let status = Paragraph::new(Line::from(Span::styled(
+            hint,
+            Style::default().fg(Color::Magenta),
+        )))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Magenta))
+                .title(" codex "),
+        );
+        frame.render_widget(status, area);
+        return;
+    }
+
     let pane_label = match app.active_pane {
         ActivePane::OrgSelector => "Org",
         ActivePane::Navigation => "Nav",
@@ -2089,64 +2112,54 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
         .split(area);
 
     // --- 契約ペイン（ゴール + DoD チェックリスト）---
-    let (title, items, checks, assessing) = app
-        .codex
-        .as_ref()
-        .map(|c| {
-            (
-                c.goal_title.clone(),
-                c.dod_items.clone(),
-                c.dod_checks.clone(),
-                c.assessing,
-            )
-        })
-        .unwrap_or_default();
-
-    let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(Span::styled(
-        title,
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::from(""));
-    let dod_header = if assessing {
-        "── 完了基準 (DoD) ⟳判定中 ──".to_string()
-    } else {
-        "── 完了基準 (DoD) ──".to_string()
-    };
-    lines.push(Line::from(Span::styled(
-        dod_header,
-        Style::default().fg(Color::DarkGray),
-    )));
-    if items.is_empty() {
+    // 不変借用のまま描画し、毎フレームの clone を避ける（端末ペインは後段で可変借用）。
+    if let Some(pane) = app.codex.as_ref() {
+        let mut lines: Vec<Line> = Vec::new();
         lines.push(Line::from(Span::styled(
-            "（未設定 — codexと決めよう）",
-            Style::default().fg(Color::Yellow),
+            pane.goal_title.as_str(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )));
-    } else {
-        for (i, item) in items.iter().enumerate() {
-            let (mark, style) = match checks.get(i).copied().flatten() {
-                Some(true) => ("☑", Style::default().fg(Color::Green)),
-                Some(false) => ("☐", Style::default().fg(Color::Red)),
-                None => ("☐", Style::default().fg(Color::Gray)),
-            };
-            lines.push(Line::from(vec![
-                Span::styled(format!("{mark} "), style),
-                Span::raw(item.clone()),
-            ]));
+        lines.push(Line::from(""));
+        let dod_header = if pane.assessing {
+            "── 完了基準 (DoD) ⟳判定中 ──"
+        } else {
+            "── 完了基準 (DoD) ──"
+        };
+        lines.push(Line::from(Span::styled(
+            dod_header,
+            Style::default().fg(Color::DarkGray),
+        )));
+        if pane.dod_items.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "（未設定 — codexと決めよう）",
+                Style::default().fg(Color::Yellow),
+            )));
+        } else {
+            for (i, item) in pane.dod_items.iter().enumerate() {
+                let (mark, style) = match pane.dod_checks.get(i).copied().flatten() {
+                    Some(true) => ("[x]", Style::default().fg(Color::Green)),
+                    Some(false) => ("[ ]", Style::default().fg(Color::Red)),
+                    None => ("[ ]", Style::default().fg(Color::Gray)),
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{mark} "), style),
+                    Span::raw(item.as_str()),
+                ]));
+            }
         }
-    }
 
-    let contract = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
-                .title(" 契約 "),
-        )
-        .wrap(ratatui::widgets::Wrap { trim: true });
-    frame.render_widget(contract, chunks[0]);
+        let contract = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title(" 契約 "),
+            )
+            .wrap(ratatui::widgets::Wrap { trim: true });
+        frame.render_widget(contract, chunks[0]);
+    }
 
     // --- codex 端末ペイン ---
     let term_area = chunks[1];

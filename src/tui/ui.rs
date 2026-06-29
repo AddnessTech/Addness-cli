@@ -13,6 +13,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use tui_term::widget::PseudoTerminal;
 
 use super::app::{ActivePane, App, DeliverableFormField, FormField, ModalState};
+use super::codex_pane::CodexPane;
 use super::goal_tree::{CommentView, TreeRow};
 use crate::api::{DeliverableType, GoalStatus, Member, MemberId};
 
@@ -2141,10 +2142,17 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
             at.is_some_and(|t| now.duration_since(t) < std::time::Duration::from_secs(4))
         };
 
+        let status_panel_h = if chunks[0].height >= 22 { 8 } else { 7 };
         let panes = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(0), Constraint::Length(8)])
+            .constraints([
+                Constraint::Length(status_panel_h),
+                Constraint::Min(0),
+                Constraint::Length(8),
+            ])
             .split(chunks[0]);
+
+        draw_codex_status_panel(frame, panes[0], pane);
 
         let mut lines: Vec<Line> = Vec::new();
 
@@ -2262,10 +2270,10 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
                     .title(sync_label),
             )
             .wrap(ratatui::widgets::Wrap { trim: true });
-        frame.render_widget(contract, panes[0]);
+        frame.render_widget(contract, panes[1]);
 
         // 下段: Addness の更新ログ（新しいものほど下。最新行は強調）
-        let log_inner_h = panes[1].height.saturating_sub(2) as usize;
+        let log_inner_h = panes[2].height.saturating_sub(2) as usize;
         let mut log_lines: Vec<Line> = if pane.activity.is_empty() {
             vec![Line::from(Span::styled(
                 "codex が Addness を更新するとここに出ます",
@@ -2298,7 +2306,7 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
                     .title(" Addness の更新 "),
             )
             .wrap(ratatui::widgets::Wrap { trim: true });
-        frame.render_widget(log, panes[1]);
+        frame.render_widget(log, panes[2]);
     }
 
     // --- codex 端末ペイン ---
@@ -2351,5 +2359,146 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
                 frame.set_cursor_position((term_area.x + 1 + ccol, term_area.y + 1 + crow));
             }
         }
+    }
+}
+
+fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let value_width = inner_width.saturating_sub(6);
+    let prompt_width = inner_width.saturating_sub(2);
+
+    let (state, state_style, work) = if pane.finished {
+        (
+            "終了",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+            "履歴確認",
+        )
+    } else if pane.assessing {
+        (
+            "判定中",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+            "DoD自動判定",
+        )
+    } else if let Some(action) = pane.action.as_deref() {
+        (
+            "実行中",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+            action,
+        )
+    } else {
+        (
+            "対話中",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+            "codex応答/入力待ち",
+        )
+    };
+
+    let prompt = pane
+        .last_prompt()
+        .map(|p| prompt_preview(p, prompt_width))
+        .unwrap_or_else(|| "（まだありません）".to_string());
+    let prompt_style = if pane.last_prompt().is_some() {
+        Style::default().fg(Color::White)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("状態 ", Style::default().fg(Color::DarkGray)),
+            Span::styled(state, state_style),
+        ]),
+        Line::from(vec![
+            Span::styled("作業 ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                ellipsize_width(work, value_width),
+                Style::default().fg(Color::White),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "最後の送信",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(prompt, prompt_style)),
+    ];
+
+    let panel = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Magenta))
+                .title(" Codex 現在地 "),
+        )
+        .wrap(ratatui::widgets::Wrap { trim: true });
+    frame.render_widget(panel, area);
+}
+
+fn prompt_preview(prompt: &str, max_width: usize) -> String {
+    let normalized = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    ellipsize_width(&normalized, max_width)
+}
+
+fn ellipsize_width(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_string();
+    }
+    if max_width <= 3 {
+        return ".".repeat(max_width);
+    }
+
+    let limit = max_width - 3;
+    let mut out = String::new();
+    let mut width = 0usize;
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width > limit {
+            break;
+        }
+        out.push(ch);
+        width += ch_width;
+    }
+    out.push_str("...");
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ellipsize_width, prompt_preview};
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn prompt_preview_collapses_whitespace() {
+        assert_eq!(
+            prompt_preview("  これを\n\n実行して\tください  ", 80),
+            "これを 実行して ください"
+        );
+    }
+
+    #[test]
+    fn prompt_preview_truncates_to_width() {
+        let preview = prompt_preview("abcdefghijklmnopqrstuvwxyz", 10);
+
+        assert_eq!(preview, "abcdefg...");
+        assert!(UnicodeWidthStr::width(preview.as_str()) <= 10);
+    }
+
+    #[test]
+    fn ellipsize_width_respects_wide_characters() {
+        let preview = ellipsize_width("日本語の長いプロンプト", 9);
+
+        assert!(preview.ends_with("..."));
+        assert!(UnicodeWidthStr::width(preview.as_str()) <= 9);
     }
 }

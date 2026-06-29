@@ -91,6 +91,7 @@ pub struct CodexPane {
     pub activity: Vec<String>,
     /// codex セッション終了時の Addness body 自動記録を試行済みか。
     pub auto_record_attempted: bool,
+    input_state: CodexInputState,
 }
 
 /// 子ゴール 1 件の表示用情報。
@@ -244,6 +245,7 @@ impl CodexPane {
             scrollback: 0,
             activity: Vec::new(),
             auto_record_attempted: false,
+            input_state: CodexInputState::default(),
             dod,
         })
     }
@@ -363,12 +365,18 @@ impl CodexPane {
 
     /// キー入力を端末バイト列へ変換して PTY へ書き込む。
     pub fn input(&mut self, key: KeyEvent) {
+        self.input_state.observe_key(key);
         let bytes = encode_key(key);
         if bytes.is_empty() {
             return;
         }
         let _ = self.writer.write_all(&bytes);
         let _ = self.writer.flush();
+    }
+
+    /// ユーザーが codex 内で `/exit` を送信し、その結果プロセスも終了しているか。
+    pub fn should_close_after_exit_command(&self) -> bool {
+        self.finished && self.input_state.exit_command_sent
     }
 
     /// codex プロセスを終了させる（ペインを閉じる時に呼ぶ）。
@@ -397,6 +405,44 @@ impl CodexPane {
             if let Some(slot) = self.dod_checks.get_mut(i) {
                 *slot = Some(met);
             }
+        }
+    }
+}
+
+#[derive(Default)]
+struct CodexInputState {
+    line: String,
+    exit_command_sent: bool,
+}
+
+impl CodexInputState {
+    fn observe_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            return;
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            if let KeyCode::Char('c' | 'C' | 'u' | 'U') = key.code {
+                self.line.clear();
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Char(c) => self.line.push(c),
+            KeyCode::Backspace => {
+                self.line.pop();
+            }
+            KeyCode::Enter => {
+                if self.line.trim() == "/exit" {
+                    self.exit_command_sent = true;
+                }
+                self.line.clear();
+            }
+            KeyCode::Esc => {
+                self.line.clear();
+            }
+            _ => {}
         }
     }
 }
@@ -619,6 +665,54 @@ mod tests {
             encode_key(key_mod(KeyCode::Char('x'), KeyModifiers::ALT)),
             vec![0x1b, b'x']
         );
+    }
+
+    #[test]
+    fn codex_input_state_detects_exit_command_on_enter() {
+        let mut state = CodexInputState::default();
+        for ch in "/exit".chars() {
+            state.observe_key(key(KeyCode::Char(ch)));
+        }
+        assert!(!state.exit_command_sent);
+
+        state.observe_key(key(KeyCode::Enter));
+
+        assert!(state.exit_command_sent);
+    }
+
+    #[test]
+    fn codex_input_state_ignores_non_exit_lines() {
+        let mut state = CodexInputState::default();
+        for ch in "please /exit later".chars() {
+            state.observe_key(key(KeyCode::Char(ch)));
+        }
+        state.observe_key(key(KeyCode::Enter));
+
+        assert!(!state.exit_command_sent);
+    }
+
+    #[test]
+    fn codex_input_state_handles_backspace_before_exit() {
+        let mut state = CodexInputState::default();
+        for ch in "/exitt".chars() {
+            state.observe_key(key(KeyCode::Char(ch)));
+        }
+        state.observe_key(key(KeyCode::Backspace));
+        state.observe_key(key(KeyCode::Enter));
+
+        assert!(state.exit_command_sent);
+    }
+
+    #[test]
+    fn codex_input_state_clears_line_on_ctrl_u() {
+        let mut state = CodexInputState::default();
+        for ch in "/exit".chars() {
+            state.observe_key(key(KeyCode::Char(ch)));
+        }
+        state.observe_key(key_mod(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        state.observe_key(key(KeyCode::Enter));
+
+        assert!(!state.exit_command_sent);
     }
 
     #[test]

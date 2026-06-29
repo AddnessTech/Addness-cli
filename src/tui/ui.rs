@@ -1092,35 +1092,21 @@ fn draw_create_goal_modal(frame: &mut Frame, app: &App) {
         ])
         .split(inner);
 
-    // Title field
-    let title_focused = *current_field == FormField::Title;
-    let title_border = if title_focused {
-        Color::Cyan
-    } else {
-        Color::DarkGray
-    };
-    let title_widget = Paragraph::new(title.as_str()).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(title_border))
-            .title(" Title * "),
+    // Title / Description fields（draw_text_field でカーソル・全角幅対応を共通化）
+    draw_text_field(
+        frame,
+        field_layout[0],
+        " Title * ",
+        title,
+        *current_field == FormField::Title,
     );
-    frame.render_widget(title_widget, field_layout[0]);
-
-    // Description field
-    let desc_focused = *current_field == FormField::Description;
-    let desc_border = if desc_focused {
-        Color::Cyan
-    } else {
-        Color::DarkGray
-    };
-    let desc_widget = Paragraph::new(description.as_str()).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(desc_border))
-            .title(" Description "),
+    draw_text_field(
+        frame,
+        field_layout[1],
+        " Description ",
+        description,
+        *current_field == FormField::Description,
     );
-    frame.render_widget(desc_widget, field_layout[1]);
 
     // Parent Goal (read-only)
     let parent_text = parent_goal_title
@@ -1192,35 +1178,21 @@ fn draw_edit_goal_modal(frame: &mut Frame, app: &App) {
         ])
         .split(inner);
 
-    // Title field
-    let title_focused = *current_field == FormField::Title;
-    let title_border = if title_focused {
-        Color::Cyan
-    } else {
-        Color::DarkGray
-    };
-    let title_widget = Paragraph::new(title.as_str()).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(title_border))
-            .title(" Title * "),
+    // Title / Description fields（draw_text_field でカーソル・全角幅対応を共通化）
+    draw_text_field(
+        frame,
+        field_layout[0],
+        " Title * ",
+        title,
+        *current_field == FormField::Title,
     );
-    frame.render_widget(title_widget, field_layout[0]);
-
-    // Description field
-    let desc_focused = *current_field == FormField::Description;
-    let desc_border = if desc_focused {
-        Color::Cyan
-    } else {
-        Color::DarkGray
-    };
-    let desc_widget = Paragraph::new(description.as_str()).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(desc_border))
-            .title(" Description "),
+    draw_text_field(
+        frame,
+        field_layout[1],
+        " Description ",
+        description,
+        *current_field == FormField::Description,
     );
-    frame.render_widget(desc_widget, field_layout[1]);
 
     // Status field - show current status and allowed transitions
     let status_focused = *current_field == FormField::Status;
@@ -2003,6 +1975,21 @@ fn draw_text_field(frame: &mut Frame, area: Rect, title: &str, text: &str, focus
             .title(title.to_string()),
     );
     frame.render_widget(widget, area);
+
+    // フォーカス中は本物の端末カーソルを文末（表示幅基準）へ置く。
+    // これで可視カーソルが出るうえ、日本語入力時に IME の変換ウィンドウが
+    // 正しい位置に出る（全角は 2 セルとして数える）。caret は末尾固定。
+    if focused {
+        let inner_w = area.width.saturating_sub(2);
+        let inner_h = area.height.saturating_sub(2);
+        if inner_w > 0 && inner_h > 0 {
+            let last_line = text.rsplit('\n').next().unwrap_or("");
+            let line_idx = text.matches('\n').count() as u16;
+            let col = (UnicodeWidthStr::width(last_line) as u16).min(inner_w.saturating_sub(1));
+            let row = line_idx.min(inner_h.saturating_sub(1));
+            frame.set_cursor_position((area.x + 1 + col, area.y + 1 + row));
+        }
+    }
 }
 
 fn draw_readonly_field(frame: &mut Frame, area: Rect, title: &str, text: &str, focused: bool) {
@@ -2181,5 +2168,17 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
             .title(title);
         let term = PseudoTerminal::new(pane.screen()).block(block);
         frame.render_widget(term, term_area);
+
+        // 本物の端末カーソルを codex のカーソル位置へ移動する。
+        // tui-term は偽カーソルを描くだけなので、これをやらないと日本語入力時に
+        // IME の変換ウィンドウが正しい位置に出ない（vt100 の桁は全角考慮済み）。
+        let screen = pane.screen();
+        if !screen.hide_cursor() {
+            let (crow, ccol) = screen.cursor_position();
+            if crow < rows && ccol < cols {
+                // term_area の枠（上・左の罫線）を 1 ずつオフセット。
+                frame.set_cursor_position((term_area.x + 1 + ccol, term_area.y + 1 + crow));
+            }
+        }
     }
 }

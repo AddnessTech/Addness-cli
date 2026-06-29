@@ -12,7 +12,7 @@ use crate::config::{Credentials, DEFAULT_API_URL, Settings};
 use api::ApiClient;
 use cli::commands::{
     assignment, comment, configure, deliverable, detect, goal, invitation, kpi, link, login,
-    member, org, skills, summary, today, update,
+    member, notification, org, skills, summary, today, update,
 };
 
 #[derive(Parser)]
@@ -86,6 +86,11 @@ enum Commands {
     Member {
         #[command(subcommand)]
         command: member::MemberCommands,
+    },
+    /// Send Codex work notifications via goal comments and terminal notices
+    Notification {
+        #[command(subcommand)]
+        command: notification::NotificationCommands,
     },
     /// Manage invitations and invite links
     Invitation {
@@ -230,6 +235,10 @@ async fn main() -> Result<()> {
         Some(Commands::Member { command }) => {
             let client = build_client()?;
             member::handle_member(command, &client).await
+        }
+        Some(Commands::Notification { command }) => {
+            let client = build_client()?;
+            notification::handle_notification(command, &client).await
         }
         Some(Commands::Invitation { command }) => {
             let client = build_client()?;

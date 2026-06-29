@@ -129,6 +129,12 @@ addness comment create --goal <GOAL_ID> --body-file ./comment.md
 printf "確認お願いします" | addness comment create --goal <GOAL_ID> --body -
 addness comment create --goal <GOAL_ID> --parent <COMMENT_ID> --body "返信です"
 
+# 作業完了・確認依頼・ブロック通知を送る（対象ゴールへの通知用コメント + 端末通知）
+addness notification send --goal <GOAL_ID> --kind done --body "作業が完了しました"
+addness notification send --goal <GOAL_ID> --kind review --body "確認お願いします" --json
+printf "完了しました" | addness notification send --goal <GOAL_ID> --kind done --body -
+addness notification send --goal <GOAL_ID> --kind review --body "確認お願いします" --mention <ORG_MEMBER_ID>
+
 # コメント編集・削除・解決
 addness comment update <COMMENT_ID> --body "更新後の本文"
 addness comment delete <COMMENT_ID> --force
@@ -220,6 +226,7 @@ addness detect-goal --json
 - 最初に `addness status --json` で認証状態を確認してください。
 - 組織が未設定の場合は `addness org list --json` で一覧を取得し、`addness org switch <ID>` で設定してください。
 - 決定や進捗は `addness comment create --goal <ID> --body "..."` に記録してください。コメント末尾にはAIであることが分かる署名（例: 「Codexより」）を付け、人間のコメントと区別してください。
+- ユーザーへ作業完了通知を送りたい場合は `addness notification send --goal <ID> --kind done --body "..."` を使ってください。確認依頼は `--kind review`、ブロック中は `--kind blocked` です。対象ゴールへ通知用コメントを残し、同時に端末へ BEL/OSC 通知を送ります。TUI codex セッションでは `ADDNESS_GOAL_ID` があるため `--goal` を省略できます。
 
 ### 作業完了時
 - 作業完了時は `addness link progress --goal <ID> --message "内容" --status COMPLETED` で進捗を記録してください。

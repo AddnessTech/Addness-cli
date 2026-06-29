@@ -17,6 +17,14 @@ use super::codex_pane::CodexPane;
 use super::goal_tree::{CommentView, TreeRow};
 use crate::api::{DeliverableType, GoalStatus, Member, MemberId};
 
+const COLOR_ADDNESS: Color = Color::Rgb(91, 171, 255);
+const COLOR_CODEX: Color = Color::Rgb(207, 140, 255);
+const COLOR_MEMORY: Color = Color::Rgb(84, 214, 190);
+const COLOR_SUCCESS: Color = Color::Rgb(101, 218, 123);
+const COLOR_WARN: Color = Color::Rgb(236, 188, 80);
+const COLOR_MUTED: Color = Color::Rgb(112, 122, 138);
+const COLOR_PANEL: Color = Color::Rgb(65, 81, 105);
+
 /// Replace @uuid mentions in text with @member_name
 fn replace_member_mentions(text: &str, members: &HashMap<MemberId, Member>) -> String {
     let mut result = String::new();
@@ -782,18 +790,18 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
     if app.active_pane == ActivePane::Codex {
         let finished = app.codex.as_ref().map(|c| c.finished).unwrap_or(true);
         let hint = if finished {
-            " [c]コメント  [s]状態  [d]成果物  [v]DoD判定  Esc/q: 閉じる "
+            " [c]コメント  [s]状態  [d]成果物(PR/Release)  [v]DoD判定  Esc/q: 閉じる "
         } else {
-            " 入力はcodexへ転送  |  Shift+↑↓/PgUp/PgDn: ログ  |  F12: 終了 "
+            " 入力はcodexへ転送  |  F9:Addnessから再開  |  Shift+↑↓/PgUp/PgDn: ログ  |  F12: 終了 "
         };
         let status = Paragraph::new(Line::from(Span::styled(
             hint,
-            Style::default().fg(Color::Magenta),
+            Style::default().fg(COLOR_CODEX),
         )))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Magenta))
+                .border_style(Style::default().fg(COLOR_CODEX))
                 .title(" codex "),
         );
         frame.render_widget(status, area);
@@ -976,13 +984,17 @@ fn draw_help_overlay(frame: &mut Frame) {
         blank(),
         section("codex連携 (o →「codexで作業」)"),
         kv("起動", "選択ゴールの文脈付きでcodexをペイン起動"),
+        kv("F9", "Addnessの作業メモ・決定ログから再開"),
         kv("Shift+↑↓", "実行中のcodexログをスクロール"),
         kv(
             "Shift+PgUp/PgDn",
             "実行中のcodexログをページ単位でスクロール",
         ),
         kv("F12", "実行中のcodexを終了して戻る"),
-        kv("終了後 c/s/d/v", "還流: コメント / 状態 / 成果物 / DoD判定"),
+        kv(
+            "終了後 c/s/d/v",
+            "還流: コメント / 状態 / 成果物(PR・Release) / DoD判定",
+        ),
         kv("Esc / q", "codexペインを閉じる"),
         blank(),
         section("モーダル共通"),
@@ -2145,7 +2157,7 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
             at.is_some_and(|t| now.duration_since(t) < std::time::Duration::from_secs(4))
         };
 
-        let status_panel_h = if chunks[0].height >= 22 { 8 } else { 7 };
+        let status_panel_h = if chunks[0].height >= 26 { 11 } else { 10 };
         let panes = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -2164,7 +2176,7 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
             lines.push(Line::from(Span::styled(
                 format!("» {action}"),
                 Style::default()
-                    .fg(Color::Magenta)
+                    .fg(COLOR_MEMORY)
                     .add_modifier(Modifier::BOLD),
             )));
             lines.push(Line::from(""));
@@ -2174,18 +2186,18 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
         lines.push(Line::from(Span::styled(
             pane.goal_title.as_str(),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(COLOR_ADDNESS)
                 .add_modifier(Modifier::BOLD),
         )));
 
         // ステータス（変化直後はハイライト）
         let status_style = if recently(pane.status_changed_at) {
-            Style::default().fg(Color::Black).bg(Color::Yellow)
+            Style::default().fg(Color::Black).bg(COLOR_WARN)
         } else {
             Style::default().fg(Color::White)
         };
         lines.push(Line::from(vec![
-            Span::styled("状態: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("状態: ", Style::default().fg(COLOR_MUTED)),
             Span::styled(pane.status_label.as_str(), status_style),
         ]));
 
@@ -2197,18 +2209,28 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
             let filled = met * width / total.max(1);
             let bar: String = "▓".repeat(filled) + &"░".repeat(width - filled);
             lines.push(Line::from(vec![
-                Span::styled("DoD ", Style::default().fg(Color::DarkGray)),
-                Span::styled(bar, Style::default().fg(Color::Green)),
+                Span::styled("DoD ", Style::default().fg(COLOR_MUTED)),
+                Span::styled(bar, Style::default().fg(COLOR_SUCCESS)),
                 Span::styled(format!(" {met}/{total}"), Style::default().fg(Color::White)),
+            ]));
+        }
+        if let Some(n) = pane.deliverable_count {
+            lines.push(Line::from(vec![
+                Span::styled("成果物: ", Style::default().fg(COLOR_MUTED)),
+                Span::styled(n.to_string(), Style::default().fg(COLOR_MEMORY)),
+                Span::styled(
+                    format!("  Trace {}", pane.trace_links.len()),
+                    Style::default().fg(COLOR_MUTED),
+                ),
             ]));
         }
         lines.push(Line::from(""));
 
         // DoD チェックリスト（更新直後はヘッダをハイライト）
         let dod_header_style = if recently(pane.dod_changed_at) {
-            Style::default().fg(Color::Black).bg(Color::Yellow)
+            Style::default().fg(Color::Black).bg(COLOR_WARN)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(COLOR_MUTED)
         };
         let dod_header = if pane.assessing {
             "── 完了基準 (DoD) ⟳判定中 ──"
@@ -2219,18 +2241,32 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
         if pane.dod_items.is_empty() {
             lines.push(Line::from(Span::styled(
                 "（未設定 — codexと決めよう）",
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(COLOR_WARN),
             )));
         } else {
             for (i, item) in pane.dod_items.iter().enumerate() {
                 let (mark, style) = match pane.dod_checks.get(i).copied().flatten() {
-                    Some(true) => ("[x]", Style::default().fg(Color::Green)),
+                    Some(true) => ("[x]", Style::default().fg(COLOR_SUCCESS)),
                     Some(false) => ("[ ]", Style::default().fg(Color::Red)),
-                    None => ("[ ]", Style::default().fg(Color::Gray)),
+                    None => ("[ ]", Style::default().fg(COLOR_MUTED)),
                 };
                 lines.push(Line::from(vec![
                     Span::styled(format!("{mark} "), style),
                     Span::raw(item.as_str()),
+                ]));
+            }
+        }
+
+        if !pane.trace_links.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "── PR / Release ──",
+                Style::default().fg(COLOR_MUTED),
+            )));
+            for link in &pane.trace_links {
+                lines.push(Line::from(vec![
+                    Span::styled("↗ ", Style::default().fg(COLOR_MEMORY)),
+                    Span::styled(link.as_str(), Style::default().fg(Color::White)),
                 ]));
             }
         }
@@ -2243,18 +2279,18 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
                 pane.child_count.unwrap_or(0),
                 pane.comment_count.unwrap_or(0)
             ),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(COLOR_MUTED),
         )));
         if pane.children.is_empty() {
             lines.push(Line::from(Span::styled(
                 "（まだありません）",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(COLOR_MUTED),
             )));
         } else {
             for child in &pane.children {
                 let is_new = child.new_until.is_some_and(|t| t > now);
                 let title_style = if is_new {
-                    Style::default().fg(Color::Black).bg(Color::Green)
+                    Style::default().fg(Color::Black).bg(COLOR_SUCCESS)
                 } else {
                     Style::default().fg(Color::White)
                 };
@@ -2269,7 +2305,7 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan))
+                    .border_style(Style::default().fg(COLOR_ADDNESS))
                     .title(sync_label),
             )
             .wrap(ratatui::widgets::Wrap { trim: true });
@@ -2279,8 +2315,8 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
         let log_inner_h = panes[2].height.saturating_sub(2) as usize;
         let mut log_lines: Vec<Line> = if pane.activity.is_empty() {
             vec![Line::from(Span::styled(
-                "codex が Addness を更新するとここに出ます",
-                Style::default().fg(Color::DarkGray),
+                "body/DoD/子ゴール/通知の読込・書込がここに出ます",
+                Style::default().fg(COLOR_MUTED),
             ))]
         } else {
             let n = pane.activity.len();
@@ -2290,9 +2326,7 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
                 .skip(n.saturating_sub(log_inner_h.max(1)))
                 .map(|(i, l)| {
                     let style = if i + 1 == n {
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD)
+                        Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(Color::White)
                     };
@@ -2305,8 +2339,8 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Blue))
-                    .title(" Addness の更新 "),
+                    .border_style(Style::default().fg(COLOR_PANEL))
+                    .title(" Addness 更新 "),
             )
             .wrap(ratatui::widgets::Wrap { trim: true });
         frame.render_widget(log, panes[2]);
@@ -2328,19 +2362,19 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
                 " codex 終了 — ↑↓: ログを遡る  [c]コメント [s]状態 [d]成果物 [v]DoD判定  Esc/q: 戻る "
                     .to_string()
             };
-            (t, Color::Green)
+            (t, COLOR_SUCCESS)
         } else if pane.scrollback > 0 {
             (
                 format!(
                     " codex 実行中 ▲履歴 -{} — Shift+↓/End or Esc: ライブへ戻る ",
                     pane.scrollback
                 ),
-                Color::Yellow,
+                COLOR_WARN,
             )
         } else {
             (
-                " codex 実行中 — Shift+↑↓/PgUp/PgDn: ログ  F12: 終了 ".to_string(),
-                Color::Magenta,
+                " codex 実行中 — F9:Addness再開  Shift+↑↓/PgUp/PgDn:ログ  F12:終了 ".to_string(),
+                COLOR_CODEX,
             )
         };
         let block = Block::default()
@@ -2374,35 +2408,33 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
         (
             "終了",
             Style::default()
-                .fg(Color::Green)
+                .fg(COLOR_SUCCESS)
                 .add_modifier(Modifier::BOLD),
         )
     } else if pane.assessing {
         (
             "判定中",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD),
         )
     } else if pane.action.is_some() {
         (
             "実行中",
             Style::default()
-                .fg(Color::Magenta)
+                .fg(COLOR_MEMORY)
                 .add_modifier(Modifier::BOLD),
         )
     } else if pane.last_prompt().is_some() {
         (
             "対応中",
             Style::default()
-                .fg(Color::Magenta)
+                .fg(COLOR_CODEX)
                 .add_modifier(Modifier::BOLD),
         )
     } else {
         (
             "待機",
             Style::default()
-                .fg(Color::Magenta)
+                .fg(COLOR_CODEX)
                 .add_modifier(Modifier::BOLD),
         )
     };
@@ -2413,6 +2445,18 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
         pane.last_prompt(),
         value_width,
     );
+    let memory = codex_memory_label(
+        pane.last_addness_read_at,
+        pane.last_addness_write_at,
+        value_width,
+    );
+    let memory_style = if pane.last_addness_write_at.is_some() {
+        Style::default().fg(COLOR_SUCCESS)
+    } else if pane.last_addness_read_at.is_some() {
+        Style::default().fg(COLOR_MEMORY)
+    } else {
+        Style::default().fg(COLOR_MUTED)
+    };
 
     let prompt = pane
         .last_prompt()
@@ -2421,23 +2465,24 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
     let prompt_style = if pane.last_prompt().is_some() {
         Style::default().fg(Color::White)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(COLOR_MUTED)
     };
 
     let lines = vec![
         Line::from(vec![
-            Span::styled("状態 ", Style::default().fg(Color::DarkGray)),
+            Span::styled("状態 ", Style::default().fg(COLOR_MUTED)),
             Span::styled(state, state_style),
         ]),
         Line::from(vec![
-            Span::styled("作業 ", Style::default().fg(Color::DarkGray)),
+            Span::styled("作業 ", Style::default().fg(COLOR_MUTED)),
             Span::styled(work, Style::default().fg(Color::White)),
         ]),
+        Line::from(vec![
+            Span::styled("記憶 ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(memory, memory_style),
+        ]),
         Line::from(""),
-        Line::from(Span::styled(
-            "最後の送信",
-            Style::default().fg(Color::DarkGray),
-        )),
+        Line::from(Span::styled("最後の送信", Style::default().fg(COLOR_MUTED))),
         Line::from(Span::styled(prompt, prompt_style)),
     ];
 
@@ -2445,11 +2490,35 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Magenta))
+                .border_style(Style::default().fg(COLOR_CODEX))
                 .title(" Codex 現在地 "),
         )
         .wrap(ratatui::widgets::Wrap { trim: true });
     frame.render_widget(panel, area);
+}
+
+fn codex_memory_label(
+    last_read_at: Option<Instant>,
+    last_write_at: Option<Instant>,
+    max_width: usize,
+) -> String {
+    let label = if let Some(t) = last_write_at {
+        format!("Addness書込 {}前", elapsed_compact(t))
+    } else if let Some(t) = last_read_at {
+        format!("Addness読込 {}前", elapsed_compact(t))
+    } else {
+        "Addness未読".to_string()
+    };
+    ellipsize_width(&label, max_width)
+}
+
+fn elapsed_compact(t: Instant) -> String {
+    let secs = t.elapsed().as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m", secs / 60)
+    }
 }
 
 fn codex_work_label(

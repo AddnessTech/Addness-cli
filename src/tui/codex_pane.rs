@@ -78,10 +78,16 @@ pub struct CodexPane {
     /// 子ゴール数・コメント数（変化検知で更新ログに反映する。未取得は None）。
     pub child_count: Option<usize>,
     pub comment_count: Option<usize>,
+    pub deliverable_count: Option<usize>,
+    /// PR / Release / tag など、作業の成果物トレースとして見せるリンク名。
+    pub trace_links: Vec<String>,
     /// 子ゴールのライブリスト（新着は new_until までハイライト）。
     pub children: Vec<ChildGoal>,
     /// codex が直近に実行した addness 操作の表示ラベル（参照/書込中インジケータ）。
     pub action: Option<String>,
+    /// Addness をメモリとして使っているかを左ペインで示すための最終読込/書込時刻。
+    pub last_addness_read_at: Option<Instant>,
+    pub last_addness_write_at: Option<Instant>,
     /// ステータス・DoD が変化した時刻（変化行を数秒ハイライトするのに使う）。
     pub status_changed_at: Option<Instant>,
     pub dod_changed_at: Option<Instant>,
@@ -89,8 +95,12 @@ pub struct CodexPane {
     pub scrollback: usize,
     /// Addness 側の更新ログ（codex の書き込みやステータス変化を可視化）。新しいものほど末尾。
     pub activity: Vec<String>,
+    /// ホスト端末へ通知済みの Codex イベントキー。画面上に同じ確認待ちが残る間の連打を防ぐ。
+    last_terminal_notice_key: Option<String>,
     /// codex セッション終了時の Addness body 自動記録を試行済みか。
     pub auto_record_attempted: bool,
+    /// 最初の実依頼の body 自動記録を済み（再試行しない）とするフラグ。
+    body_record_done: bool,
     input_state: CodexInputState,
 }
 
@@ -103,24 +113,92 @@ pub struct ChildGoal {
     pub new_until: Option<Instant>,
 }
 
+/// ホスト側 TUI が端末へ通知すべき Codex イベント。
+pub struct TerminalNotice {
+    pub title: String,
+    pub message: String,
+}
+
+enum AddnessActionKind {
+    Read,
+    Write,
+}
+
+fn rest_has_flag(rest: &str, flag: &str) -> bool {
+    let with_eq = format!("{flag}=");
+    rest.split_whitespace()
+        .any(|part| part == flag || part.starts_with(&with_eq))
+}
+
+fn rest_has_any_flag(rest: &str, flags: &[&str]) -> bool {
+    flags.iter().any(|flag| rest_has_flag(rest, flag))
+}
+
+fn rest_flag_value(rest: &str, flag: &str) -> Option<String> {
+    let with_eq = format!("{flag}=");
+    let mut parts = rest.split_whitespace();
+    while let Some(part) = parts.next() {
+        if part == flag {
+            return parts.next().map(trim_flag_value);
+        }
+        if let Some(value) = part.strip_prefix(&with_eq) {
+            return Some(trim_flag_value(value));
+        }
+    }
+    None
+}
+
+fn trim_flag_value(value: &str) -> String {
+    value.trim_matches('"').trim_matches('\'').to_string()
+}
+
 /// `addness <サブコマンド…>` 文字列を「いま何をしているか」の表示ラベルへ変換する。
-fn action_label(rest: &str) -> String {
+fn action_label(rest: &str) -> (String, AddnessActionKind) {
     let mut it = rest.split_whitespace();
     let a = it.next().unwrap_or("");
     let b = it.next().unwrap_or("");
     match (a, b) {
-        ("goal", "create") => "子ゴールを作成中".to_string(),
-        ("goal", "update") => "ゴールを更新中".to_string(),
-        ("goal", "get" | "list" | "children" | "tree" | "search" | "siblings") => {
-            "ゴールを参照中".to_string()
+        ("goal", "create") => ("子ゴールを書込中".to_string(), AddnessActionKind::Write),
+        ("goal", "update") if rest_has_any_flag(rest, &["--body", "--body-file"]) => {
+            ("現状(body)を書込中".to_string(), AddnessActionKind::Write)
         }
-        ("comment", "create") => "コメントを書込中".to_string(),
-        ("comment", _) => "コメントを参照中".to_string(),
-        ("link" | "deliverable", _) => "成果物を登録中".to_string(),
-        ("today", _) => "今日のtodoを更新中".to_string(),
-        ("status" | "summary", _) => "状況を確認中".to_string(),
-        (cmd, _) if !cmd.is_empty() => format!("addness {cmd} 実行中"),
-        _ => "addness を実行中".to_string(),
+        ("goal", "update") if rest_has_any_flag(rest, &["--description", "--description-file"]) => {
+            ("方針(DoD)を書込中".to_string(), AddnessActionKind::Write)
+        }
+        ("goal", "update") if rest_has_flag(rest, "--status") => {
+            ("ステータスを書込中".to_string(), AddnessActionKind::Write)
+        }
+        ("goal", "update") if rest_has_flag(rest, "--title") => {
+            ("タイトルを書込中".to_string(), AddnessActionKind::Write)
+        }
+        ("goal", "update") if rest_has_any_flag(rest, &["--due-date", "--clear-due-date"]) => {
+            ("期限を書込中".to_string(), AddnessActionKind::Write)
+        }
+        ("goal", "update") => ("ゴールを書込中".to_string(), AddnessActionKind::Write),
+        ("goal", "get" | "list" | "children" | "tree" | "search" | "siblings") => {
+            ("ゴール文脈を読込中".to_string(), AddnessActionKind::Read)
+        }
+        ("comment", "create" | "update" | "delete" | "resolve" | "unresolve" | "react") => {
+            ("コメントを書込中".to_string(), AddnessActionKind::Write)
+        }
+        ("comment", _) => ("コメントを参照中".to_string(), AddnessActionKind::Read),
+        ("notification", "send") => {
+            let label = match rest_flag_value(rest, "--kind").as_deref() {
+                Some("done") => "作業完了通知を送信中",
+                Some("review") => "確認依頼通知を送信中",
+                Some("blocked") => "ブロック通知を送信中",
+                _ => "通知コメントを送信中",
+            };
+            (label.to_string(), AddnessActionKind::Write)
+        }
+        ("notification", _) => ("通知を処理中".to_string(), AddnessActionKind::Read),
+        ("link", "pr") => ("PRリンクを書込中".to_string(), AddnessActionKind::Write),
+        ("link", "progress") => ("進捗コメントを書込中".to_string(), AddnessActionKind::Write),
+        ("link" | "deliverable", _) => ("成果物を書込中".to_string(), AddnessActionKind::Write),
+        ("today", _) => ("今日のtodoを更新中".to_string(), AddnessActionKind::Write),
+        ("status" | "summary", _) => ("状況を確認中".to_string(), AddnessActionKind::Read),
+        (cmd, _) if !cmd.is_empty() => (format!("addness {cmd} 実行中"), AddnessActionKind::Read),
+        _ => ("addness を実行中".to_string(), AddnessActionKind::Read),
     }
 }
 
@@ -131,6 +209,149 @@ fn split_dod_items(dod: &str) -> Vec<String> {
         .filter(|l| !l.is_empty())
         .map(|l| l.to_string())
         .collect()
+}
+
+fn terminal_notice_candidate(
+    screen_contents: &str,
+    action: Option<&str>,
+    finished: bool,
+) -> Option<(String, TerminalNotice)> {
+    if let Some(notice) = decision_prompt_notice(screen_contents) {
+        return Some(notice);
+    }
+
+    if let Some(action) = action
+        && let Some(notice) = action_terminal_notice(action)
+    {
+        return Some(notice);
+    }
+
+    if finished {
+        return Some((
+            "finished".to_string(),
+            TerminalNotice {
+                title: "Codex 終了".to_string(),
+                message: "Codex セッションが終了しました".to_string(),
+            },
+        ));
+    }
+
+    None
+}
+
+fn decision_prompt_notice(screen_contents: &str) -> Option<(String, TerminalNotice)> {
+    let lines = screen_contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let start = lines.len().saturating_sub(18);
+    let tail = &lines[start..];
+    if tail.is_empty() {
+        return None;
+    }
+
+    let tail_text = tail.join("\n");
+    if !looks_like_decision_prompt(&tail_text) {
+        return None;
+    }
+
+    let prompt_line = tail
+        .iter()
+        .rev()
+        .find(|line| looks_like_decision_prompt(line))
+        .copied()
+        .unwrap_or_else(|| tail.last().copied().unwrap_or(""));
+    let summary_start = tail.len().saturating_sub(4);
+    let summary = compact_notice_text(&tail[summary_start..].join(" / "), 180);
+    let key = format!("decision:{}", compact_notice_text(prompt_line, 120));
+    let message = if summary.is_empty() {
+        "Codex が判断待ちです".to_string()
+    } else {
+        format!("Codex が判断待ちです: {summary}")
+    };
+
+    Some((
+        key,
+        TerminalNotice {
+            title: "Codex 確認待ち".to_string(),
+            message,
+        },
+    ))
+}
+
+fn looks_like_decision_prompt(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let has_choice = lower.contains("y/n")
+        || lower.contains("yes/no")
+        || lower.contains("yes / no")
+        || lower.contains("[yes]")
+        || lower.contains("[no]")
+        || lower.contains("(yes)")
+        || lower.contains("(no)");
+    let has_english_prompt = lower.contains("do you want")
+        || lower.contains("approval")
+        || lower.contains("approve")
+        || lower.contains("allow")
+        || lower.contains("permission")
+        || lower.contains("confirm")
+        || lower.contains("continue")
+        || lower.contains("proceed");
+    let has_japanese_prompt = text.contains("承認")
+        || text.contains("許可")
+        || text.contains("確認")
+        || text.contains("続行")
+        || text.contains("実行しますか")
+        || text.contains("よろしいですか")
+        || text.contains("選択してください")
+        || text.contains("判断");
+    let has_question = lower.contains('?')
+        || text.contains('？')
+        || text.contains("しますか")
+        || text.contains("してください");
+
+    has_choice || ((has_english_prompt || has_japanese_prompt) && has_question)
+}
+
+fn action_terminal_notice(action: &str) -> Option<(String, TerminalNotice)> {
+    let (key, title, message) = match action {
+        "作業完了通知を送信中" => (
+            "action:done",
+            "Codex 作業完了",
+            "Codex が作業完了通知を送信しています",
+        ),
+        "確認依頼通知を送信中" => (
+            "action:review",
+            "Codex 確認依頼",
+            "Codex が確認依頼通知を送信しています",
+        ),
+        "ブロック通知を送信中" => (
+            "action:blocked",
+            "Codex ブロック中",
+            "Codex がブロック通知を送信しています",
+        ),
+        _ => return None,
+    };
+
+    Some((
+        key.to_string(),
+        TerminalNotice {
+            title: title.to_string(),
+            message: message.to_string(),
+        },
+    ))
+}
+
+fn compact_notice_text(input: &str, max_chars: usize) -> String {
+    let collapsed = input.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max_chars {
+        return collapsed;
+    }
+
+    let keep = max_chars.saturating_sub(3);
+    let mut out = collapsed.chars().take(keep).collect::<String>();
+    out.push_str("...");
+    out
 }
 
 impl CodexPane {
@@ -242,13 +463,19 @@ impl CodexPane {
             assessing: false,
             child_count: None,
             comment_count: None,
+            deliverable_count: None,
+            trace_links: Vec::new(),
             children: Vec::new(),
             action: None,
+            last_addness_read_at: None,
+            last_addness_write_at: None,
             status_changed_at: None,
             dod_changed_at: None,
             scrollback: 0,
             activity: Vec::new(),
+            last_terminal_notice_key: None,
             auto_record_attempted: false,
+            body_record_done: false,
             input_state: CodexInputState::default(),
             dod,
         })
@@ -285,14 +512,22 @@ impl CodexPane {
         let lines: Vec<&str> = contents.lines().collect();
         // 画面下部（最近の出力）だけを見て、moved-on したら自然に消えるようにする。
         let start = lines.len().saturating_sub(10);
-        let mut latest: Option<String> = None;
+        let mut latest: Option<(String, AddnessActionKind)> = None;
         for line in &lines[start..] {
             if let Some(idx) = line.find("addness ") {
                 let rest = line[idx + "addness ".len()..].trim();
                 latest = Some(action_label(rest));
             }
         }
-        self.action = latest;
+        if let Some((label, kind)) = latest {
+            match kind {
+                AddnessActionKind::Read => self.last_addness_read_at = Some(Instant::now()),
+                AddnessActionKind::Write => self.last_addness_write_at = Some(Instant::now()),
+            }
+            self.action = Some(label);
+        } else {
+            self.action = None;
+        }
     }
 
     /// 子ゴールのライブリストを差し替える。新規 ID は一定時間ハイライトする。
@@ -344,6 +579,25 @@ impl CodexPane {
         changed
     }
 
+    /// Codex の画面状態から、ホスト端末へ流すべき通知を 1 件だけ取り出す。
+    pub fn take_terminal_notice(&mut self) -> Option<TerminalNotice> {
+        let candidate = terminal_notice_candidate(
+            &self.parser.screen().contents(),
+            self.action.as_deref(),
+            self.finished,
+        );
+        let Some((key, notice)) = candidate else {
+            self.last_terminal_notice_key = None;
+            return None;
+        };
+
+        if self.last_terminal_notice_key.as_deref() == Some(key.as_str()) {
+            return None;
+        }
+        self.last_terminal_notice_key = Some(key);
+        Some(notice)
+    }
+
     /// 描画領域に合わせて PTY と vt100 のサイズを更新する（変化時のみ）。
     pub fn resize(&mut self, rows: u16, cols: u16) {
         let rows = rows.max(1);
@@ -378,6 +632,19 @@ impl CodexPane {
         let _ = self.writer.flush();
     }
 
+    /// TUI 側の操作からシステムプロンプト（F9 再開など）を codex に送信する。
+    /// ユーザーの作業依頼ではないので last_prompt は更新しない
+    /// （「最後の送信」表示や body 記録の核を定型文で汚さないため）。
+    pub fn submit_system_line(&mut self, line: &str) {
+        let submitted = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if submitted.is_empty() {
+            return;
+        }
+        let _ = self.writer.write_all(submitted.as_bytes());
+        let _ = self.writer.write_all(b"\r");
+        let _ = self.writer.flush();
+    }
+
     /// ユーザーが codex 内で `/exit` を送信し、その結果プロセスも終了しているか。
     pub fn should_close_after_exit_command(&self) -> bool {
         self.finished && self.input_state.exit_command_sent
@@ -386,6 +653,21 @@ impl CodexPane {
     /// ユーザーが codex に最後に送信した入力行。
     pub fn last_prompt(&self) -> Option<&str> {
         self.input_state.last_prompt.as_deref()
+    }
+
+    /// 最初の実依頼を一度だけ body へ自動記録する。記録済み（or 失敗済み）なら None。
+    /// 失敗しても再試行はせず、終了/中断時の記録に委ねる（best-effort）。
+    /// 以降の節目は LLM 自身の `## Codex作業メモ` 更新に任せ、毎依頼の書き込みを避ける。
+    pub fn prompt_needs_body_record(&self) -> Option<&str> {
+        if self.body_record_done {
+            return None;
+        }
+        self.last_prompt()
+    }
+
+    /// 最初の実依頼の自動記録を済み（再試行しない）として扱う。
+    pub fn mark_body_recorded_prompt(&mut self) {
+        self.body_record_done = true;
     }
 
     /// codex プロセスを終了させる（ペインを閉じる時に呼ぶ）。
@@ -426,6 +708,15 @@ struct CodexInputState {
 }
 
 impl CodexInputState {
+    fn record_submitted(&mut self, submitted: &str) {
+        if !submitted.is_empty() {
+            self.last_prompt = Some(submitted.to_string());
+        }
+        if submitted == "/exit" {
+            self.exit_command_sent = true;
+        }
+    }
+
     fn observe_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::ALT) {
             return;
@@ -444,13 +735,8 @@ impl CodexInputState {
                 self.line.pop();
             }
             KeyCode::Enter => {
-                let submitted = self.line.trim();
-                if !submitted.is_empty() {
-                    self.last_prompt = Some(submitted.to_string());
-                }
-                if submitted == "/exit" {
-                    self.exit_command_sent = true;
-                }
+                let submitted = self.line.trim().to_string();
+                self.record_submitted(&submitted);
                 self.line.clear();
             }
             KeyCode::Esc => {
@@ -465,6 +751,10 @@ fn startup_recall_prompt() -> &'static str {
     "Addness TUIセッションを開始してください。起動時指示に従って対象ゴールを想起してから進めてください。"
 }
 
+pub fn resume_prompt() -> &'static str {
+    "Addnessの対象ゴールを読み、前回の続きから再開してください。bodyの `## Codex作業メモ` / `## Codex決定ログ` / `## PR/Release Traceability`、DoD、子ゴール、コメント、成果物を確認し、前回の続き・未完了・次の一手を短く整理してから進めてください。"
+}
+
 fn eager_startup_recall_enabled() -> bool {
     std::env::var("ADDNESS_CODEX_EAGER_RECALL")
         .ok()
@@ -475,7 +765,7 @@ fn addness_tui_developer_instructions() -> &'static str {
     r#"Addness TUIから起動されました。
 
 起動直後は Addness CLI を実行せず、ユーザーの最初の入力を待ってください。
-最初の依頼に軽く応答できる場合は、TUIから渡された軽量コンテキストだけを使って即応して構いません。
+軽い挨拶や単純な表示確認には、TUIから渡された軽量コンテキストだけで即応して構いません。
 
 軽量コンテキスト:
 - ADDNESS_GOAL_ID: 対象ゴールID
@@ -483,28 +773,45 @@ fn addness_tui_developer_instructions() -> &'static str {
 - ADDNESS_GOAL_STATUS: 対象ゴールの現在状態
 - ADDNESS_GOAL_DOD: 対象ゴールのDoD/完了基準
 
-実作業の判断、body/コメント/成果物/子ゴールの確認、引き継ぎ、サブエージェント分解が必要になったら、
-作業に入る前に Addness CLI を使って対象ゴールを想起してください。
+最初の依頼が「何をするかの相談」「方針検討」「実装」「調査」「レビュー」「PR/リリース」など
+プロジェクト固有の判断を含む場合は、返答や作業に入る前に Addness CLI で対象ゴールを想起してください。
 
-必要時に実行するコマンド:
+想起コマンド:
 `"$ADDNESS_BIN" goal get "$ADDNESS_GOAL_ID" --json --with-deliverable --with-comment`
 
-Addness はこの組織/プロジェクト専用の作業DB・引き継ぎ点として扱ってください。
+Addness はこの組織/プロジェクト専用の共有DB・長期作業メモリ・引き継ぎ点です。
+通常のmemoryは複数プロジェクトの状態が混ざることがあるため、プロジェクト固有の現在地・判断・決定・次の手は
+Addnessを真実源として扱ってください。
+Codexが普段memoryに保存したくなるプロジェクト固有の情報（決定、前提、落とし穴、重要コマンド、未完了点、次回の前提）は、
+通常memoryではなく Addness の body に記録してください。
 
 読み取り時:
 1. body、DoD(description/definitionOfDone)、コメント、成果物、子ゴール、作業フォルダ/ブランチを確認する。
 2. DoDが空・曖昧・現在の作業に対して不足していないかを見る。
-3. 子ゴールが、実際に分担・並列化・サブエージェント化できる作業単位に分かれているかを見る。
+3. 子ゴールが、実際の作業・分担・並列化・サブエージェント化に使える粒度かを見る。
+4. 「何をしたいか」の相談だけでも、既存のbody/DoD/子ゴールを踏まえて提案する。
 
 書き込み時:
 - 起動しただけでは Addness に書き込まない。
-- Addnessに書き込むのは、サブエージェント/分担/並列作業/別セッションへの引き継ぎが必要になった時、またはユーザーが明示的に記録を求めた時を基本にする。
+- Addnessに書き込むのは、作業を始めた時、方針を決めた時、重要な発見や制約が分かった時、実装のまとまりが進んだ時、次にやることが変わった時、完了/中断/引き継ぎ前。
+- `## Codex自動メモ(機械)`（`<!-- addness:codex:auto-record:start -->` / `<!-- addness:codex:auto-record:end -->` で囲まれた領域）はTUIが自動更新するので読むだけにし、編集しない。あなたが所有・更新するのは `## Codex作業メモ`（判断・方針・次の手を散文で）/`## Codex決定ログ`/`## PR/Release Traceability`。
+- body更新前に必ず現bodyを読み、手書きメモや上記の自動メモを消さず、自分の専用ブロックだけを作成・更新する。長文や引用が多い場合は `goal update --body-file` を使う。
+- bodyには作業フォルダ、ブランチ、現在の方針、実施中の内容、決定事項、重要な発見、未完了点、次の手をまとめる。ツール実行ログを逐語的に溜めない。
+- 決定事項は body の `## Codex決定ログ` に追記する。形式は `- YYYY-MM-DD HH:MM - 決定: ... / 理由: ... / 影響: ...`。
+- 再開を求められたら body の `## Codex作業メモ`、`## Codex決定ログ`、`## PR/Release Traceability`、DoD、子ゴール、コメント、成果物を読んで、前回の続き・未完了・次の一手を短く整理してから進める。
+- PRを作成したら `"$ADDNESS_BIN" link pr --goal "$ADDNESS_GOAL_ID" --url "<PR_URL>" --name "<name>" --json` で紐づける。
+- tag/releaseを作成したら `"$ADDNESS_BIN" deliverable add --goal "$ADDNESS_GOAL_ID" --link-url "<release-or-tag-url>" --name "Release <version>" --json` で紐づけ、body の `## PR/Release Traceability` にPR・tag・release URL・CI結果を残す。
+- ユーザーに通知したい時（作業完了、確認依頼、ブロック中など）は `"$ADDNESS_BIN" notification send --kind done --body "<通知内容>" --json` のように送る。これは対象ゴールへの通知用コメントを作り、同時にTUIが動いている端末へ通知する。完了は `--kind done`、確認依頼は `--kind review`、ブロック中は `--kind blocked`。必要なら `--mention <ORG_MEMBER_ID>` を付ける。
+- 実装速度を落とさないため、Addness更新は節目でまとめる。毎コマンド・毎小変更の記録はしない。
+- サブエージェント機能が使える場合、Addness更新は最も小さい/低コストの記録専用サブエージェントに委任する。委任する内容は「現在body」「追加したい作業メモ」「更新すべき構造化フィールド」だけに絞る。
+- サブエージェントが使えない場合だけ、メインエージェントが短い差分で body/DoD/子ゴールを更新する。
+- DoDが不十分なら、足りない観点を短く整理してユーザーに確認し、合意できたら `"$ADDNESS_BIN" goal update "$ADDNESS_GOAL_ID" --description "..." --json` で更新する。
+- 子ゴール分解が不十分なら、作業に必要な粒度へ子ゴールを作成または更新する。
 - サブエージェントが必要な場合は、必要な作業単位を子ゴールとして作成または更新する。子ゴールのtitleは作業名、descriptionはそのサブエージェントのDoD、bodyは入力情報・作業フォルダ・ブランチ・期待成果物・現在地を書く。
-- 親ゴールのbodyは、複数エージェントが迷わないための共有状態・担当分解・次の合流点が必要な時に更新する。
-- DoDが不十分でも、単独でそのまま進められるなら勝手に書き換えず、短く不足を指摘して必要なら質問する。サブエージェントに渡すために契約が必要な場合だけ `"$ADDNESS_BIN" goal update "$ADDNESS_GOAL_ID" --description "..." --json` で具体化する。
 - コメントは構造化フィールドに置けない質問や補足だけに使う。
 
-Addnessを読んだ場合は、何を読んだか、Addnessへの書き込みが必要か、次に進めることを短く共有してください。"#
+Addnessを読んだ場合は、何を読んだか、次に進めることを短く共有してください。
+Addnessを更新した場合は、body/DoD/子ゴール/コメント/成果物/通知のどれを更新したかを短く共有してください。"#
 }
 
 enum CodexConfigKey {
@@ -724,6 +1031,15 @@ mod tests {
     }
 
     #[test]
+    fn codex_input_state_record_submitted_tracks_resume_prompt() {
+        let mut state = CodexInputState::default();
+        state.record_submitted(resume_prompt());
+
+        assert_eq!(state.last_prompt.as_deref(), Some(resume_prompt()));
+        assert!(!state.exit_command_sent);
+    }
+
+    #[test]
     fn codex_input_state_keeps_last_prompt_on_blank_enter() {
         let mut state = CodexInputState::default();
         for ch in "最初の依頼".chars() {
@@ -785,11 +1101,72 @@ mod tests {
     }
 
     #[test]
-    fn startup_instructions_defer_full_addness_recall_until_needed() {
+    fn action_label_shows_goal_body_update_as_current_state_write() {
+        let (label, kind) = action_label("goal update goal-1 --body-file /tmp/status.md --json");
+
+        assert_eq!(label, "現状(body)を書込中");
+        assert!(matches!(kind, AddnessActionKind::Write));
+    }
+
+    #[test]
+    fn action_label_shows_goal_description_update_as_dod_write() {
+        let (label, kind) = action_label("goal update goal-1 --description \"DoD\" --json");
+
+        assert_eq!(label, "方針(DoD)を書込中");
+        assert!(matches!(kind, AddnessActionKind::Write));
+    }
+
+    #[test]
+    fn action_label_shows_notification_send() {
+        let (label, kind) =
+            action_label("notification send --kind done --body \"完了しました\" --json");
+
+        assert_eq!(label, "作業完了通知を送信中");
+        assert!(matches!(kind, AddnessActionKind::Write));
+    }
+
+    #[test]
+    fn terminal_notice_detects_yes_no_prompt() {
+        let (_, notice) =
+            terminal_notice_candidate("Do you want to allow this command?\n[y/N]", None, false)
+                .unwrap();
+
+        assert_eq!(notice.title, "Codex 確認待ち");
+        assert!(notice.message.contains("判断待ち"));
+    }
+
+    #[test]
+    fn terminal_notice_detects_japanese_approval_prompt() {
+        let (_, notice) = terminal_notice_candidate(
+            "このコマンドの実行を許可しますか？\n1. はい\n2. いいえ",
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(notice.title, "Codex 確認待ち");
+    }
+
+    #[test]
+    fn terminal_notice_ignores_plain_output() {
+        assert!(terminal_notice_candidate("cargo test finished", None, false).is_none());
+    }
+
+    #[test]
+    fn terminal_notice_reports_notification_action() {
+        let (_, notice) =
+            terminal_notice_candidate("", Some("作業完了通知を送信中"), false).unwrap();
+
+        assert_eq!(notice.title, "Codex 作業完了");
+    }
+
+    #[test]
+    fn startup_instructions_defer_full_addness_recall_but_use_addness_proactively() {
         let prompt = startup_recall_prompt();
         let instructions = addness_tui_developer_instructions();
 
         assert!(prompt.contains("Addness TUIセッションを開始"));
+        assert!(resume_prompt().contains("前回の続き"));
         assert!(prompt.len() < 80 * 2);
         assert!(instructions.contains("起動直後は Addness CLI を実行せず"));
         assert!(instructions.contains("ユーザーの最初の入力を待ってください"));
@@ -797,12 +1174,24 @@ mod tests {
         assert!(instructions.contains("ADDNESS_GOAL_TITLE"));
         assert!(instructions.contains("ADDNESS_GOAL_STATUS"));
         assert!(instructions.contains("ADDNESS_GOAL_DOD"));
-        assert!(instructions.contains("必要時に実行するコマンド"));
+        assert!(instructions.contains("最初の依頼が「何をするかの相談」"));
+        assert!(instructions.contains("想起コマンド"));
         assert!(instructions.contains("\"$ADDNESS_BIN\" goal get \"$ADDNESS_GOAL_ID\""));
         assert!(instructions.contains("--json --with-deliverable --with-comment"));
-        assert!(instructions.contains("組織/プロジェクト専用の作業DB"));
+        assert!(instructions.contains("組織/プロジェクト専用の共有DB"));
+        assert!(instructions.contains("長期作業メモリ"));
+        assert!(instructions.contains("真実源"));
         assert!(instructions.contains("起動しただけでは Addness に書き込まない"));
-        assert!(instructions.contains("サブエージェント/分担/並列作業/別セッションへの引き継ぎ"));
+        assert!(instructions.contains("作業を始めた時"));
+        assert!(instructions.contains("重要な発見や制約が分かった時"));
+        assert!(instructions.contains("## Codex作業メモ"));
+        assert!(instructions.contains("## Codex決定ログ"));
+        assert!(instructions.contains("## PR/Release Traceability"));
+        assert!(instructions.contains("link pr --goal"));
+        assert!(instructions.contains("deliverable add --goal"));
+        assert!(instructions.contains("notification send --kind done"));
+        assert!(instructions.contains("goal update --body-file"));
+        assert!(instructions.contains("子ゴール分解が不十分"));
         assert!(instructions.contains("goal update \"$ADDNESS_GOAL_ID\" --description"));
     }
 

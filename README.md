@@ -104,19 +104,25 @@ addness
 ゴール上でアクションメニュー（`o` または `Space`）から **「codexで作業」** を選ぶと、
 選択中ゴールの文脈（タイトル・完了基準(DoD)・説明）を渡した状態で
 [codex](https://github.com/openai/codex) をペイン内に起動します。
-起動直後には対象ゴールを `addness goal get --json --with-deliverable --with-comment`
-で読む起動指示を codex に渡します。長い運用ルールはチャット本文ではなく
-`developer_instructions` に渡し、チャットに残る初期プロンプトは短い起動トリガーだけにします。
+起動直後は軽量コンテキストだけで即入力でき、実依頼を受けた時に必要に応じて
+`addness goal get --json --with-deliverable --with-comment` で対象ゴールを読みます。
+長い運用ルールはチャット本文ではなく `developer_instructions` に渡します。
 codex は Addness をその組織/プロジェクト専用の
 作業DBとして読み、DoD や子ゴール分解の不足を確認します。Addness への書き込みは、
 サブエージェント・分担・並列作業・別セッションへの引き継ぎが必要な時を基本にします。
 codex は Addness を「タスク DB」として扱い、`addness` CLI 経由で DoD の具体化・
 子ゴール作成・進捗コメントを書き戻します。
 左の Addness ペインには、対象ゴールのステータス、DoD、子ゴール、コメント数、
-Addness への更新ログがライブ表示されるため、codex の作業と Addness 上の進捗を
-同じ画面で追えます。
+Addness への更新ログがライブ表示されます。更新ログは `body`、`DoD`、子ゴール、
+コメント/通知、成果物など、どの領域が動いたか分かる文言で出ます。
 codex の終了時またはペインを閉じる時には、作業フォルダ・ブランチ・git status・
 diff stat が対象ゴールの body に自動記録されます。
+codex が作業完了を通知したい時は
+`addness notification send --kind done --body "実装が完了しました"` を使えます。
+確認依頼は `--kind review`、ブロック中は `--kind blocked` です。TUI から起動した
+codex では対象ゴール ID が環境変数で渡されるため、`--goal` は省略できます。
+通知は Addness には対象ゴールのコメントとして残し、同時に TUI が動いている端末へ
+BEL/OSC で送ります。Codex が yes/no や承認判断待ちになった時も端末通知します。
 
 codex 終了後は還流バーのキーで成果を Addness に反映できます:
 

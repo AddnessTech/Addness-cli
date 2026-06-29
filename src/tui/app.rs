@@ -1277,8 +1277,8 @@ impl App {
             .unwrap_or_else(|| "addness".to_string());
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-        // 初期プロンプトは渡さない（codex を空の状態で開く）。対象ゴールは
-        // 環境変数 + AGENTS.md 経由で codex に伝え、codex が自分で想起する。
+        // 対象ゴールは環境変数で伝え、起動後に PTY 入力として Addness 想起を
+        // 依頼する。codex 側がユーザー入力待ちで止まっても、最初に文脈を読ませるため。
         match CodexPane::spawn(
             &codex_bin,
             &cwd,
@@ -1440,6 +1440,13 @@ impl App {
         let mut changed = false;
         if let Some(pane) = self.codex.as_mut() {
             changed |= pane.update();
+            if pane.maybe_send_startup_recall() {
+                pane.push_activity(format!(
+                    "{} Addness想起を自動依頼",
+                    Local::now().format("%H:%M")
+                ));
+                changed = true;
+            }
         }
         changed |= self.maybe_record_finished_codex_session();
         changed |= self.poll_codex_refresh();

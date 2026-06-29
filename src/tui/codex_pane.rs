@@ -127,7 +127,7 @@ fn action_label(rest: &str) -> (String, AddnessActionKind) {
         ("goal", "get" | "list" | "children" | "tree" | "search" | "siblings") => {
             ("ゴールを参照中".to_string(), AddnessActionKind::Read)
         }
-        ("comment", "create" | "update" | "delete") => {
+        ("comment", "create" | "update" | "delete" | "resolve" | "unresolve" | "react") => {
             ("コメントを書込中".to_string(), AddnessActionKind::Write)
         }
         ("comment", _) => ("コメントを参照中".to_string(), AddnessActionKind::Read),
@@ -521,7 +521,7 @@ fn startup_recall_prompt() -> &'static str {
 }
 
 pub fn resume_prompt() -> &'static str {
-    "Addnessの対象ゴールを読み、前回の続きから再開してください。bodyのCodex作業メモ/Codex決定ログ/PR・Release Traceability、DoD、子ゴール、コメント、成果物を確認し、前回の続き・未完了・次の一手を短く整理してから進めてください。"
+    "Addnessの対象ゴールを読み、前回の続きから再開してください。bodyの `## Codex作業メモ` / `## Codex決定ログ` / `## PR/Release Traceability`、DoD、子ゴール、コメント、成果物を確認し、前回の続き・未完了・次の一手を短く整理してから進めてください。"
 }
 
 fn eager_startup_recall_enabled() -> bool {

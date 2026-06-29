@@ -685,7 +685,7 @@ fn codex_work_memo(cwd: &str, session_state: &str, last_prompt: Option<&str>) ->
          - 最後の依頼: {prompt_text}\n\
          - 作業フォルダ: {cwd}\n\
          - ブランチ: {branch}\n\
-         - 現在地: プロジェクト固有の判断・決定・次の手は `Codex作業メモ` / `Codex決定ログ` / `PR・Release Traceability` へ集約する\n\
+         - 現在地: プロジェクト固有の判断・決定・次の手は `## Codex作業メモ` / `## Codex決定ログ` / `## PR/Release Traceability` へ集約する\n\
          - git status:\n\
          ```text\n\
          {status_text}\n\
@@ -699,7 +699,12 @@ fn codex_work_memo(cwd: &str, session_state: &str, last_prompt: Option<&str>) ->
 }
 
 fn ensure_codex_block(existing: String, start: &str, end: &str, block_body: &str) -> String {
-    if existing.contains(start) && existing.contains(end) {
+    // codex が body を書き直して不可視マーカーを落としても、見出し（`## ...`）が
+    // 残っていれば既存とみなし、空ブロックを重複追加しない。
+    let heading = block_body.lines().next().unwrap_or("").trim();
+    let has_markers = existing.contains(start) && existing.contains(end);
+    let has_heading = !heading.is_empty() && existing.contains(heading);
+    if has_markers || has_heading {
         existing
     } else if existing.trim().is_empty() {
         format!("{start}\n{block_body}\n{end}")
@@ -760,13 +765,14 @@ fn upsert_codex_auto_record(existing: Option<&str>, record: &str) -> String {
 }
 
 fn codex_trace_link_label(name: &str, url: Option<&str>) -> Option<String> {
-    let haystack = format!("{} {}", name, url.unwrap_or("")).to_lowercase();
-    let kind = if haystack.contains("/pull/") || haystack.contains(" pull ") {
+    // URL のパス構造で判定する。`release`/`tag` のベア部分一致は
+    // `staging`（s-tag-ing）や `press release` を誤検知するため使わない。
+    let haystack = format!("{name} {}", url.unwrap_or("")).to_lowercase();
+    let kind = if haystack.contains("/pull/") {
         "PR"
     } else if haystack.contains("/releases")
         || haystack.contains("/tag/")
-        || haystack.contains("release")
-        || haystack.contains("tag")
+        || haystack.contains("/tags/")
     {
         "Release"
     } else {
@@ -1480,9 +1486,15 @@ impl App {
             return false;
         };
 
-        let record = codex_work_memo(&cwd, "依頼受付", Some(&prompt));
         let client = self.client.clone();
         self.codex_body_record_job = Some(self.rt.spawn(async move {
+            // git status/diff のサブプロセスは UI スレッドを固めないよう
+            // ブロッキングプールで作る。
+            let record = tokio::task::spawn_blocking(move || {
+                codex_work_memo(&cwd, "依頼受付", Some(&prompt))
+            })
+            .await
+            .unwrap_or_default();
             let result = async {
                 let goal = client.get_goal(&goal_id).await?.data;
                 let body = ensure_codex_memory_sections(upsert_codex_auto_record(
@@ -1546,6 +1558,11 @@ impl App {
     }
 
     fn maybe_record_finished_codex_session(&mut self) -> bool {
+        // 非同期の作業メモ記録が進行中の間は、同じ body を二重に read-modify-write して
+        // 互いの記録を上書きし合わないよう、ジョブ完了（poll で take）を待ってから終了記録する。
+        if self.codex_body_record_job.is_some() {
+            return false;
+        }
         let Some((goal_id, cwd, last_prompt)) = self.codex.as_mut().and_then(|pane| {
             if pane.finished && !pane.auto_record_attempted {
                 pane.auto_record_attempted = true;
@@ -1584,6 +1601,10 @@ impl App {
     fn close_codex(&mut self) {
         // 通常画面に戻るのでマウスキャプチャを解除（テキスト選択を戻す）。
         Self::set_mouse_capture(false);
+        // 進行中の非同期作業メモ記録を先に止め、この後の同期終了記録と body を奪い合わせない。
+        if let Some(job) = self.codex_body_record_job.take() {
+            job.abort();
+        }
         if let Some(mut pane) = self.codex.take() {
             if !pane.auto_record_attempted {
                 pane.auto_record_attempted = true;
@@ -1603,9 +1624,6 @@ impl App {
         }
         if let Some(mut job) = self.codex_dod_job.take() {
             job.cleanup();
-        }
-        if let Some(job) = self.codex_body_record_job.take() {
-            job.abort();
         }
         self.codex_refresh = None;
         self.last_codex_refresh = None;
@@ -4368,8 +4386,9 @@ mod picker_interaction_tests {
 #[cfg(test)]
 mod dod_tests {
     use super::{
-        codex_trace_link_label, ensure_codex_memory_sections, extract_json_object,
-        parse_dod_results, upsert_codex_auto_record,
+        CODEX_DECISION_LOG_END, CODEX_DECISION_LOG_START, CODEX_TRACEABILITY_END,
+        CODEX_TRACEABILITY_START, codex_trace_link_label, ensure_codex_memory_sections,
+        extract_json_object, parse_dod_results, upsert_codex_auto_record,
     };
 
     #[test]
@@ -4466,5 +4485,29 @@ mod dod_tests {
             Some("Release: Release v0.5.7")
         );
         assert!(codex_trace_link_label("Design note", Some("https://example.com")).is_none());
+        // ベア部分一致で誤検知していたケース（"staging" は s-tag-ing を含む）。
+        assert!(
+            codex_trace_link_label("staging環境デプロイ", Some("https://example.com/staging"))
+                .is_none()
+        );
+        assert!(
+            codex_trace_link_label("press release draft", Some("https://example.com/doc"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn ensure_codex_memory_sections_skips_when_only_heading_remains() {
+        let seeded = ensure_codex_memory_sections(String::new());
+        // codex が body を編集して不可視マーカーだけ落とした状況を模す。
+        let without_markers = seeded
+            .replace(CODEX_DECISION_LOG_START, "")
+            .replace(CODEX_DECISION_LOG_END, "")
+            .replace(CODEX_TRACEABILITY_START, "")
+            .replace(CODEX_TRACEABILITY_END, "");
+        let again = ensure_codex_memory_sections(without_markers);
+
+        assert_eq!(again.matches("## Codex決定ログ").count(), 1);
+        assert_eq!(again.matches("## PR/Release Traceability").count(), 1);
     }
 }

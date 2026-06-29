@@ -924,6 +924,9 @@ pub struct App {
     pub(super) codex_sync_tick: u64,
     /// codex を閉じた直後、UI を即切替してからツリー再読込を遅延実行するためのフラグ。
     pending_codex_tree_reload: bool,
+    /// 次の描画前に画面を全クリアする（codex ⇄ 通常UI の構造遷移やリサイズで
+    /// 前画面の残像が残らないようにするため）。
+    needs_full_clear: bool,
 
     /// DoD 自動判定（codex exec）の実行中ジョブ。
     codex_dod_job: Option<DodJob>,
@@ -962,6 +965,7 @@ impl App {
             last_codex_sync: None,
             codex_sync_tick: 0,
             pending_codex_tree_reload: false,
+            needs_full_clear: false,
             codex_dod_job: None,
             codex_body_record_job: None,
         }
@@ -1018,11 +1022,18 @@ impl App {
             });
         self.apply_initial_data(data);
 
+        // ロード画面（ロゴ）から本UIへ切り替わる初回フレームの残像を消す。
+        self.needs_full_clear = true;
         let mut needs_redraw = true;
         while self.running {
             // 表示しようとしているタブのデータを必要になった時点で取得する。
             self.ensure_active_tab_loaded();
             if needs_redraw {
+                // 構造遷移・リサイズ時は差分描画前に画面を全消去し、残像を断つ。
+                if self.needs_full_clear {
+                    terminal.clear()?;
+                    self.needs_full_clear = false;
+                }
                 terminal.draw(|frame| ui::draw(frame, self))?;
                 needs_redraw = false;
             }
@@ -1461,6 +1472,8 @@ impl App {
                 ));
                 self.codex = Some(pane);
                 self.active_pane = ActivePane::Codex;
+                // 通常UI → codex の構造遷移。前画面の残像を消すため全クリアする。
+                self.needs_full_clear = true;
                 // ホイールスクロール用にマウスキャプチャを有効化（codex 中のみ）。
                 Self::set_mouse_capture(true);
             }
@@ -1663,6 +1676,8 @@ impl App {
         self.codex_refresh = None;
         self.last_codex_refresh = None;
         self.active_pane = ActivePane::Content;
+        // codex → 通常UI の構造遷移。前画面の残像を消すため全クリアする。
+        self.needs_full_clear = true;
         // ツリー再読込はブロッキングなので即時には行わず、UI を先に切り替えてから
         // 次フレームで実行する（F12 の体感を速くする）。
         self.pending_codex_tree_reload = true;
@@ -2430,6 +2445,12 @@ impl App {
 
     fn handle_events(&mut self) -> Result<()> {
         let event = event::read()?;
+
+        // 端末リサイズ時はレイアウトが変わり前サイズの残像が出るため、全クリアを予約する。
+        if let Event::Resize(_, _) = event {
+            self.needs_full_clear = true;
+            return Ok(());
+        }
 
         // マウスホイール（トラックパッド）で codex ログをスクロールする。
         // マウスキャプチャは codex 使用中のみ有効化している。

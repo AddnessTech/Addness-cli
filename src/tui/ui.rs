@@ -784,7 +784,7 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
         let hint = if finished {
             " [c]コメント  [s]状態  [d]成果物  [v]DoD判定  Esc/q: 閉じる "
         } else {
-            " 入力はcodexへ転送  |  Alt+↑↓/PgUp/PgDn: ログ  |  F12: 終了 "
+            " 入力はcodexへ転送  |  Shift+↑↓/PgUp/PgDn: ログ  |  F12: 終了 "
         };
         let status = Paragraph::new(Line::from(Span::styled(
             hint,
@@ -976,8 +976,11 @@ fn draw_help_overlay(frame: &mut Frame) {
         blank(),
         section("codex連携 (o →「codexで作業」)"),
         kv("起動", "選択ゴールの文脈付きでcodexをペイン起動"),
-        kv("Alt+↑↓", "実行中のcodexログをスクロール"),
-        kv("Alt+PgUp/PgDn", "実行中のcodexログをページ単位でスクロール"),
+        kv("Shift+↑↓", "実行中のcodexログをスクロール"),
+        kv(
+            "Shift+PgUp/PgDn",
+            "実行中のcodexログをページ単位でスクロール",
+        ),
         kv("F12", "実行中のcodexを終了して戻る"),
         kv("終了後 c/s/d/v", "還流: コメント / 状態 / 成果物 / DoD判定"),
         kv("Esc / q", "codexペインを閉じる"),
@@ -2329,14 +2332,14 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
         } else if pane.scrollback > 0 {
             (
                 format!(
-                    " codex 実行中 ▲履歴 -{} — Alt+↓/End or Esc: ライブへ戻る ",
+                    " codex 実行中 ▲履歴 -{} — Shift+↓/End or Esc: ライブへ戻る ",
                     pane.scrollback
                 ),
                 Color::Yellow,
             )
         } else {
             (
-                " codex 実行中 — Alt+↑↓/PgUp/PgDn: ログ  F12: 終了 ".to_string(),
+                " codex 実行中 — Shift+↑↓/PgUp/PgDn: ログ  F12: 終了 ".to_string(),
                 Color::Magenta,
             )
         };

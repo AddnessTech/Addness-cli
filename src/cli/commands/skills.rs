@@ -100,6 +100,9 @@ addness goal search <KEYWORD> --json
 addness goal update <GOAL_ID> --status IN_PROGRESS
 addness goal update <GOAL_ID> --status COMPLETED
 addness goal update <GOAL_ID> --title "新しいタイトル"
+addness goal update <GOAL_ID> --description "完了基準"
+addness goal update <GOAL_ID> --body "現在の状態"
+addness goal update <GOAL_ID> --body-file ./status.md
 addness goal update <GOAL_ID> --status NOT_STARTED --title "タイトル変更" --json
 ```
 
@@ -204,6 +207,7 @@ addness detect-goal --json
 ### DoD（完了基準）の確認と具体化
 - 取り組む前に、対象ゴールのDoD（`--description` の内容）が十分かを確認してください。
 - 曖昧・不十分なら、人間に質問して具体化し、`addness goal update <ID> --description "..."`（または `--description-file`）で書き戻してください。勝手に確定しないでください。
+- 作業環境・現在地・未完了点・次にやることは、コメントではなく `addness goal update <ID> --body "..."`（または `--body-file`）で現状欄に集約してください。
 - 理想と現在の差分を埋めるアクションは、子ゴールとして `addness goal create --title "..." --parent <ID>` で分解してください。
 
 ### 作業中

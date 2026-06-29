@@ -106,6 +106,8 @@ pub struct UpdateGoalRequest {
     pub title: Option<String>,
     #[serde(rename = "definitionOfDone", skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -255,4 +257,26 @@ pub struct GoalSearchItem {
     pub title: String,
     #[serde(default)]
     pub owner: Option<Owner>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_goal_request_serializes_body_separately_from_dod() {
+        let req = UpdateGoalRequest {
+            status: None,
+            completed_at: None,
+            title: None,
+            description: Some("完了基準".to_string()),
+            body: Some("現在の状態".to_string()),
+        };
+
+        let value = serde_json::to_value(req).unwrap();
+
+        assert_eq!(value["definitionOfDone"], "完了基準");
+        assert_eq!(value["body"], "現在の状態");
+        assert!(value.get("description").is_none());
+    }
 }

@@ -10,11 +10,16 @@ use crate::cli::output::{
     print_children_table, print_goals_table, print_search_results, resolve_status,
 };
 
-fn read_text_arg(inline: Option<&String>, file: Option<&String>) -> Result<Option<String>> {
+fn read_text_arg(
+    inline: Option<&String>,
+    file: Option<&String>,
+    inline_flag: &str,
+    file_flag: &str,
+) -> Result<Option<String>> {
     match (inline, file) {
         (Some(s), None) => Ok(Some(s.clone())),
         (None, Some(p)) => Ok(Some(std::fs::read_to_string(p)?)),
-        (Some(_), Some(_)) => bail!("Specify only one of --description or --description-file"),
+        (Some(_), Some(_)) => bail!("Specify only one of {inline_flag} or {file_flag}"),
         (None, None) => Ok(None),
     }
 }
@@ -112,7 +117,7 @@ pub enum GoalCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Update a goal's status, title, or description
+    /// Update a goal's status, title, definition of done, or body
     Update {
         /// Goal ID
         id: String,
@@ -128,6 +133,12 @@ pub enum GoalCommands {
         /// Description from a file path (alternative to --description)
         #[arg(long)]
         description_file: Option<String>,
+        /// Body/current state - replaces the current value
+        #[arg(long)]
+        body: Option<String>,
+        /// Body/current state from a file path (alternative to --body)
+        #[arg(long)]
+        body_file: Option<String>,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -706,6 +717,8 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
             title,
             description,
             description_file,
+            body,
+            body_file,
             json,
         } => {
             let (completed_at, goal_status) = if let Some(s) = status {
@@ -714,13 +727,21 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
                 (None, None)
             };
 
-            let desc = read_text_arg(description.as_ref(), description_file.as_ref())?;
+            let desc = read_text_arg(
+                description.as_ref(),
+                description_file.as_ref(),
+                "--description",
+                "--description-file",
+            )?;
+            let body_text =
+                read_text_arg(body.as_ref(), body_file.as_ref(), "--body", "--body-file")?;
 
             let mut req = UpdateGoalRequest {
                 status: goal_status,
                 completed_at,
                 title: None,
                 description: desc,
+                body: body_text,
             };
 
             if let Some(t) = title {
@@ -731,8 +752,9 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
                 && req.completed_at.is_none()
                 && req.title.is_none()
                 && req.description.is_none()
+                && req.body.is_none()
             {
-                bail!("Nothing to update. Specify --status, --title, or --description.");
+                bail!("Nothing to update. Specify --status, --title, --description, or --body.");
             }
 
             let resp: ApiResponse<Goal> = client.update_goal(id, &req).await?;

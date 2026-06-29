@@ -1539,8 +1539,86 @@ impl App {
         true
     }
 
+    /// codex ログのスクロールキーを処理する。
+    ///
+    /// codex 実行中は通常キーを codex 側へ渡す必要があるため、Alt/Ctrl/Shift 付きの
+    /// ナビゲーションキーだけを横取りする。終了後は codex がキーを処理しないので、
+    /// 通常の矢印・PgUp/PgDn・Home/End もログ操作に使える。
+    fn handle_codex_log_scroll(pane: &mut CodexPane, key: KeyEvent, allow_plain: bool) -> bool {
+        let modified = key
+            .modifiers
+            .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        let plain = key.modifiers.is_empty();
+        let can_scroll_nav = allow_plain || modified;
+        let can_scroll_chars = (allow_plain && plain) || key.modifiers.contains(KeyModifiers::ALT);
+        let page = pane.page() as isize;
+
+        if can_scroll_nav {
+            match key.code {
+                KeyCode::Up => {
+                    pane.scroll_lines(1);
+                    return true;
+                }
+                KeyCode::Down => {
+                    pane.scroll_lines(-1);
+                    return true;
+                }
+                KeyCode::PageUp => {
+                    pane.scroll_lines(page);
+                    return true;
+                }
+                KeyCode::PageDown => {
+                    pane.scroll_lines(-page);
+                    return true;
+                }
+                KeyCode::Home => {
+                    pane.scroll_to_top();
+                    return true;
+                }
+                KeyCode::End => {
+                    pane.scroll_to_live();
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
+        if can_scroll_chars {
+            match key.code {
+                KeyCode::Char('k') => {
+                    pane.scroll_lines(1);
+                    return true;
+                }
+                KeyCode::Char('j') => {
+                    pane.scroll_lines(-1);
+                    return true;
+                }
+                KeyCode::Char('u') => {
+                    pane.scroll_lines(page);
+                    return true;
+                }
+                KeyCode::Char('d') => {
+                    pane.scroll_lines(-page);
+                    return true;
+                }
+                KeyCode::Char('g') => {
+                    pane.scroll_to_top();
+                    return true;
+                }
+                KeyCode::Char('G') => {
+                    pane.scroll_to_live();
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
+        false
+    }
+
     /// codex ペインへのキー入力処理。
-    /// 実行中は F12 で終了して戻り、それ以外のキーは codex へ転送する。
+    /// 実行中は F12 で終了、修飾キー付きナビゲーションでログをスクロールし、
+    /// それ以外のキーは codex へ転送する。
     /// 終了後は還流バー（c/s/d）で成果を Addness に書き戻し、Esc/q で閉じる。
     fn handle_codex_key(&mut self, key: KeyEvent) {
         let finished = self.codex.as_ref().map(|c| c.finished).unwrap_or(true);
@@ -1552,43 +1630,20 @@ impl App {
                 self.success_message = None;
             }
             // 終了後は codex がキーを処理しないので、ログを遡れるようにする。
-            if let Some(pane) = self.codex.as_mut() {
-                let page = pane.page() as isize;
+            if let Some(pane) = self.codex.as_mut()
+                && Self::handle_codex_log_scroll(pane, key, true)
+            {
+                return;
+            }
+            if key.modifiers.is_empty() {
                 match key.code {
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        pane.scroll_lines(1);
-                        return;
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        pane.scroll_lines(-1);
-                        return;
-                    }
-                    KeyCode::PageUp => {
-                        pane.scroll_lines(page);
-                        return;
-                    }
-                    KeyCode::PageDown => {
-                        pane.scroll_lines(-page);
-                        return;
-                    }
-                    KeyCode::Home => {
-                        pane.scroll_to_top();
-                        return;
-                    }
-                    KeyCode::End => {
-                        pane.scroll_to_live();
-                        return;
-                    }
+                    KeyCode::Char('c') => self.start_codex_reflow_comment(),
+                    KeyCode::Char('s') => self.start_codex_reflow_edit(),
+                    KeyCode::Char('d') => self.start_codex_reflow_deliverable(),
+                    KeyCode::Char('v') => self.start_dod_assessment(),
+                    KeyCode::Esc | KeyCode::Char('q') => self.close_codex(),
                     _ => {}
                 }
-            }
-            match key.code {
-                KeyCode::Char('c') => self.start_codex_reflow_comment(),
-                KeyCode::Char('s') => self.start_codex_reflow_edit(),
-                KeyCode::Char('d') => self.start_codex_reflow_deliverable(),
-                KeyCode::Char('v') => self.start_dod_assessment(),
-                KeyCode::Esc | KeyCode::Char('q') => self.close_codex(),
-                _ => {}
             }
             return;
         }
@@ -1597,6 +1652,17 @@ impl App {
             return;
         }
         if let Some(pane) = self.codex.as_mut() {
+            if Self::handle_codex_log_scroll(pane, key, false) {
+                return;
+            }
+            if pane.scrollback > 0 && key.code == KeyCode::Esc {
+                pane.scroll_to_live();
+                return;
+            }
+            // 過去ログを見たまま通常入力すると入力位置が見えないので、入力前にライブへ戻す。
+            if pane.scrollback > 0 {
+                pane.scroll_to_live();
+            }
             pane.input(key);
         }
     }
@@ -3167,6 +3233,7 @@ impl App {
             description: Some(description),
             status: Some(api_status),
             completed_at,
+            body: None,
         };
 
         match self.api_call(self.client.update_goal(&goal_id, &req)) {
@@ -3209,6 +3276,7 @@ impl App {
                 completed_at: Some(Some(Utc::now().to_rfc3339())),
                 title: None,
                 description: None,
+                body: None,
             }
         } else {
             UpdateGoalRequest {
@@ -3216,6 +3284,7 @@ impl App {
                 completed_at: Some(None),
                 title: None,
                 description: None,
+                body: None,
             }
         };
 

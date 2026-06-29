@@ -8,7 +8,7 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -91,9 +91,6 @@ pub struct CodexPane {
     pub activity: Vec<String>,
     /// codex セッション終了時の Addness body 自動記録を試行済みか。
     pub auto_record_attempted: bool,
-    /// 起動直後に Addness の対象ゴールを想起させる初回プロンプトを送信済みか。
-    startup_recall_sent: bool,
-    startup_recall_at: Instant,
 }
 
 /// 子ゴール 1 件の表示用情報。
@@ -137,8 +134,8 @@ fn split_dod_items(dod: &str) -> Vec<String> {
 
 impl CodexPane {
     /// codex を PTY 上で起動する。
-    /// 対象ゴールの文脈は環境変数で渡し、起動後に短い初回プロンプトを PTY へ
-    /// 投入して codex に Addness CLI での想起を促す。
+    /// 対象ゴールの文脈は環境変数で渡し、codex の初期プロンプト引数として
+    /// Addness CLI での想起指示を渡す。
     pub fn spawn(
         codex_bin: &Path,
         cwd: &Path,
@@ -164,8 +161,10 @@ impl CodexPane {
             })
             .context("PTY の確保に失敗しました")?;
 
-        // プロンプト引数は渡さない（会話に大きな初期メッセージを出さないため）。
         let mut cmd = CommandBuilder::new(codex_bin);
+        // `codex [PROMPT]` は interactive CLI の正式な初期プロンプト入力。
+        // PTY への後追い打鍵は codex の初期化タイミングに依存して落ちるため使わない。
+        cmd.arg(startup_recall_prompt());
         cmd.cwd(cwd);
         // 親プロセスの環境を引き継ぐ（PATH 等を codex のサブプロセスに渡すため）。
         // vars() は非UTF-8な環境変数があると panic するため vars_os() を使う。
@@ -239,27 +238,8 @@ impl CodexPane {
             scrollback: 0,
             activity: Vec::new(),
             auto_record_attempted: false,
-            startup_recall_sent: false,
-            startup_recall_at: Instant::now(),
             dod,
         })
-    }
-
-    /// 起動直後に codex へ短い初期指示を投入し、対象ゴールの Addness 文脈を
-    /// 自動で読ませる。codex TUI の初期描画を待つため、少し遅延して 1 回だけ送る。
-    pub fn maybe_send_startup_recall(&mut self) -> bool {
-        if self.startup_recall_sent
-            || self.finished
-            || self.startup_recall_at.elapsed() < Duration::from_millis(900)
-        {
-            return false;
-        }
-        self.startup_recall_sent = true;
-        let prompt = startup_recall_prompt();
-        let _ = self.writer.write_all(prompt.as_bytes());
-        let _ = self.writer.write_all(b"\r");
-        let _ = self.writer.flush();
-        true
     }
 
     /// ログを delta 行スクロールする（正=過去へ、負=最新へ）。
@@ -416,12 +396,19 @@ impl CodexPane {
 }
 
 fn startup_recall_prompt() -> &'static str {
-    r#"Addness TUIから起動されました。返信する前に必ず Addness CLI を使って対象ゴールを想起してください。
+    r#"Addness TUIから起動されました。これは初期プロンプトです。ユーザーの追加入力を待つ前に、必ず Addness CLI を使って対象ゴールの想起と整理を実行してください。
 
-実行するコマンド:
+最初に実行するコマンド:
 `"$ADDNESS_BIN" goal get "$ADDNESS_GOAL_ID" --json --with-deliverable --with-comment`
 
-body/DoD/コメント/成果物を確認し、現在地と次に進めることを短く共有してから待機してください。"#
+取得結果を読んだら、次の順で進めてください。
+1. body、DoD(description/definitionOfDone)、コメント、成果物、子ゴール、作業フォルダ/ブランチを確認する。
+2. DoDが空・曖昧・現在の作業に対して不足している場合は、ゴール本文やコメントから合理的に補える範囲で具体化し、`"$ADDNESS_BIN" goal update "$ADDNESS_GOAL_ID" --description "..." --json` で更新する。判断に必要な情報が足りない場合だけ、最小限の質問をする。
+3. 子ゴールが未作成、または理想と現状の差分を埋める分解として不十分な場合は、`"$ADDNESS_BIN" goal create --parent "$ADDNESS_GOAL_ID" --title "..." --description "..." --json` で必要な子ゴールを作る。
+4. 現在地、作業フォルダ、ブランチ、次に進めることを `"$ADDNESS_BIN" goal update "$ADDNESS_GOAL_ID" --body "..." --json` でbodyに集約する。
+5. ここまで終えてから、何を確認・更新したかと次に進めることを短く共有し、明らかに進められる作業があればそのまま着手する。
+
+コメントは構造化フィールドに置けない質問や補足だけに使ってください。"#
 }
 
 /// DoD 自動判定で codex に強制する出力 JSON Schema。
@@ -600,8 +587,11 @@ mod tests {
     fn startup_recall_prompt_requires_addness_goal_get() {
         let prompt = startup_recall_prompt();
 
-        assert!(prompt.contains("返信する前に必ず Addness CLI"));
+        assert!(prompt.contains("ユーザーの追加入力を待つ前に"));
         assert!(prompt.contains("\"$ADDNESS_BIN\" goal get \"$ADDNESS_GOAL_ID\""));
         assert!(prompt.contains("--json --with-deliverable --with-comment"));
+        assert!(prompt.contains("goal update \"$ADDNESS_GOAL_ID\" --description"));
+        assert!(prompt.contains("goal create --parent \"$ADDNESS_GOAL_ID\""));
+        assert!(prompt.contains("goal update \"$ADDNESS_GOAL_ID\" --body"));
     }
 }

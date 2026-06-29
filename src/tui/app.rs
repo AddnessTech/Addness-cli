@@ -624,6 +624,10 @@ const DOD_ASSESSMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 
 const CODEX_AUTO_RECORD_START: &str = "<!-- addness:codex:auto-record:start -->";
 const CODEX_AUTO_RECORD_END: &str = "<!-- addness:codex:auto-record:end -->";
+const CODEX_DECISION_LOG_START: &str = "<!-- addness:codex:decision-log:start -->";
+const CODEX_DECISION_LOG_END: &str = "<!-- addness:codex:decision-log:end -->";
+const CODEX_TRACEABILITY_START: &str = "<!-- addness:codex:traceability:start -->";
+const CODEX_TRACEABILITY_END: &str = "<!-- addness:codex:traceability:end -->";
 
 fn git_status_short(cwd: &str) -> String {
     let output = std::process::Command::new("git")
@@ -681,7 +685,7 @@ fn codex_work_memo(cwd: &str, session_state: &str, last_prompt: Option<&str>) ->
          - 最後の依頼: {prompt_text}\n\
          - 作業フォルダ: {cwd}\n\
          - ブランチ: {branch}\n\
-         - 現在地: プロジェクト固有の判断・決定・次の手はこのブロックへ集約する\n\
+         - 現在地: プロジェクト固有の判断・決定・次の手は `Codex作業メモ` / `Codex決定ログ` / `PR・Release Traceability` へ集約する\n\
          - git status:\n\
          ```text\n\
          {status_text}\n\
@@ -691,6 +695,39 @@ fn codex_work_memo(cwd: &str, session_state: &str, last_prompt: Option<&str>) ->
          {diff_text}\n\
          ```",
         Local::now().format("%Y-%m-%d %H:%M")
+    )
+}
+
+fn ensure_codex_block(existing: String, start: &str, end: &str, block_body: &str) -> String {
+    if existing.contains(start) && existing.contains(end) {
+        existing
+    } else if existing.trim().is_empty() {
+        format!("{start}\n{block_body}\n{end}")
+    } else {
+        format!("{}\n\n{start}\n{block_body}\n{end}", existing.trim_end())
+    }
+}
+
+fn ensure_codex_memory_sections(body: String) -> String {
+    let decision_log = "## Codex決定ログ\n\
+        - （決定が出たら `YYYY-MM-DD HH:MM - 決定: ... / 理由: ... / 影響: ...` の形で追記）"
+        .replace("\n        ", "\n");
+    let traceability = "## PR/Release Traceability\n\
+        - PR: 未登録\n\
+        - tag/release: 未登録\n\
+        - CI: 未記録"
+        .replace("\n        ", "\n");
+    let body = ensure_codex_block(
+        body,
+        CODEX_DECISION_LOG_START,
+        CODEX_DECISION_LOG_END,
+        &decision_log,
+    );
+    ensure_codex_block(
+        body,
+        CODEX_TRACEABILITY_START,
+        CODEX_TRACEABILITY_END,
+        &traceability,
     )
 }
 
@@ -722,12 +759,30 @@ fn upsert_codex_auto_record(existing: Option<&str>, record: &str) -> String {
     }
 }
 
+fn codex_trace_link_label(name: &str, url: Option<&str>) -> Option<String> {
+    let haystack = format!("{} {}", name, url.unwrap_or("")).to_lowercase();
+    let kind = if haystack.contains("/pull/") || haystack.contains(" pull ") {
+        "PR"
+    } else if haystack.contains("/releases")
+        || haystack.contains("/tag/")
+        || haystack.contains("release")
+        || haystack.contains("tag")
+    {
+        "Release"
+    } else {
+        return None;
+    };
+    Some(format!("{kind}: {name}"))
+}
+
 /// codex ペインのライブ更新で取得する Addness 側のスナップショット。
 struct CodexSnapshot {
     title: String,
     description: String,
     status_label: String,
     comment_count: Option<usize>,
+    deliverable_count: Option<usize>,
+    trace_links: Vec<String>,
     /// 子ゴール一覧（id, タイトル, 状態アイコン）。None=取得失敗。
     children: Option<Vec<(String, String, &'static str)>>,
 }
@@ -1387,7 +1442,8 @@ impl App {
                 return false;
             }
         };
-        let body = upsert_codex_auto_record(goal.body.as_deref(), &record);
+        let body =
+            ensure_codex_memory_sections(upsert_codex_auto_record(goal.body.as_deref(), &record));
         let req = UpdateGoalRequest {
             status: None,
             completed_at: None,
@@ -1429,7 +1485,10 @@ impl App {
         self.codex_body_record_job = Some(self.rt.spawn(async move {
             let result = async {
                 let goal = client.get_goal(&goal_id).await?.data;
-                let body = upsert_codex_auto_record(goal.body.as_deref(), &record);
+                let body = ensure_codex_memory_sections(upsert_codex_auto_record(
+                    goal.body.as_deref(),
+                    &record,
+                ));
                 let req = UpdateGoalRequest {
                     status: None,
                     completed_at: None,
@@ -1744,10 +1803,11 @@ impl App {
         self.codex_refresh = Some(self.rt.spawn(async move {
             // ゴール本体・子ゴール数・コメント数を 1 往復に畳んで取得する。
             // 子ゴール／コメントの取得は失敗しても本体があれば続行する。
-            let (goal_res, children_res, comments_res) = tokio::join!(
+            let (goal_res, children_res, comments_res, deliverables_res) = tokio::join!(
                 client.get_goal(&goal_id),
                 client.get_goal_children(&goal_id, 50, 0),
                 client.list_comments(&goal_id),
+                client.get_goal_deliverables(&goal_id),
             );
             let goal = goal_res.ok()?.data;
             let status_label =
@@ -1766,11 +1826,21 @@ impl App {
                     .collect::<Vec<_>>()
             });
             let comment_count = comments_res.ok().map(|r| r.total_count.max(0) as usize);
+            let deliverables = deliverables_res.ok().map(|r| r.data.deliverables);
+            let deliverable_count = deliverables.as_ref().map(Vec::len);
+            let trace_links = deliverables
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|d| codex_trace_link_label(&d.display_name, d.link_url.as_deref()))
+                .take(3)
+                .collect::<Vec<_>>();
             Some(CodexSnapshot {
                 title: goal.title,
                 description: goal.description.unwrap_or_default(),
                 status_label,
                 comment_count,
+                deliverable_count,
+                trace_links,
                 children,
             })
         }));
@@ -1834,6 +1904,24 @@ impl App {
                         _ => {}
                     }
                     pane.comment_count = Some(new_n);
+                }
+                if let Some(new_n) = snap.deliverable_count {
+                    match pane.deliverable_count {
+                        Some(old_n) if new_n > old_n => {
+                            pane.push_activity(format!(
+                                "{now} 成果物 +{} (計{new_n})",
+                                new_n - old_n
+                            ));
+                        }
+                        _ => {}
+                    }
+                    pane.deliverable_count = Some(new_n);
+                }
+                if snap.trace_links != pane.trace_links {
+                    pane.trace_links = snap.trace_links;
+                    if !pane.trace_links.is_empty() {
+                        pane.push_activity(format!("{now} PR/Release traceを更新"));
+                    }
                 }
                 true
             } else {
@@ -1975,6 +2063,10 @@ impl App {
             self.close_codex();
             return;
         }
+        if key.code == KeyCode::F(9) {
+            self.send_codex_resume_prompt();
+            return;
+        }
         if let Some(pane) = self.codex.as_mut() {
             if Self::handle_codex_log_scroll(pane, key, false) {
                 return;
@@ -1988,6 +2080,18 @@ impl App {
                 pane.scroll_to_live();
             }
             pane.input(key);
+        }
+    }
+
+    fn send_codex_resume_prompt(&mut self) {
+        if let Some(pane) = self.codex.as_mut() {
+            if pane.scrollback > 0 {
+                pane.scroll_to_live();
+            }
+            pane.submit_line(codex_pane::resume_prompt());
+            let now = Local::now().format("%H:%M");
+            pane.push_activity(format!("{now} F9 再開プロンプトを送信"));
+            self.success_message = Some("Addnessから再開するプロンプトを送信しました".to_string());
         }
     }
 
@@ -4263,7 +4367,10 @@ mod picker_interaction_tests {
 
 #[cfg(test)]
 mod dod_tests {
-    use super::{extract_json_object, parse_dod_results, upsert_codex_auto_record};
+    use super::{
+        codex_trace_link_label, ensure_codex_memory_sections, extract_json_object,
+        parse_dod_results, upsert_codex_auto_record,
+    };
 
     #[test]
     fn extract_json_object_strips_surrounding_text() {
@@ -4328,5 +4435,36 @@ mod dod_tests {
         assert!(second.contains("手書きメモ"));
         assert!(!second.contains("自動記録1"));
         assert!(second.contains("自動記録2"));
+    }
+
+    #[test]
+    fn ensure_codex_memory_sections_adds_decision_and_trace_blocks_once() {
+        let first = ensure_codex_memory_sections("手書きメモ".to_string());
+        let second = ensure_codex_memory_sections(first.clone());
+
+        assert!(second.contains("手書きメモ"));
+        assert_eq!(second.matches("## Codex決定ログ").count(), 1);
+        assert_eq!(second.matches("## PR/Release Traceability").count(), 1);
+    }
+
+    #[test]
+    fn codex_trace_link_label_detects_pr_and_release_links() {
+        assert_eq!(
+            codex_trace_link_label(
+                "AddnessTech/Addness-cli#92",
+                Some("https://github.com/AddnessTech/Addness-cli/pull/92")
+            )
+            .as_deref(),
+            Some("PR: AddnessTech/Addness-cli#92")
+        );
+        assert_eq!(
+            codex_trace_link_label(
+                "Release v0.5.7",
+                Some("https://github.com/AddnessTech/Addness-cli/releases/tag/v0.5.7")
+            )
+            .as_deref(),
+            Some("Release: Release v0.5.7")
+        );
+        assert!(codex_trace_link_label("Design note", Some("https://example.com")).is_none());
     }
 }

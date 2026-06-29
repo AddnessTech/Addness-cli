@@ -78,6 +78,9 @@ pub struct CodexPane {
     /// 子ゴール数・コメント数（変化検知で更新ログに反映する。未取得は None）。
     pub child_count: Option<usize>,
     pub comment_count: Option<usize>,
+    pub deliverable_count: Option<usize>,
+    /// PR / Release / tag など、作業の成果物トレースとして見せるリンク名。
+    pub trace_links: Vec<String>,
     /// 子ゴールのライブリスト（新着は new_until までハイライト）。
     pub children: Vec<ChildGoal>,
     /// codex が直近に実行した addness 操作の表示ラベル（参照/書込中インジケータ）。
@@ -254,6 +257,8 @@ impl CodexPane {
             assessing: false,
             child_count: None,
             comment_count: None,
+            deliverable_count: None,
+            trace_links: Vec::new(),
             children: Vec::new(),
             action: None,
             last_addness_read_at: None,
@@ -401,6 +406,18 @@ impl CodexPane {
         let _ = self.writer.flush();
     }
 
+    /// TUI 側の操作から 1 行のプロンプトを codex に送信する。
+    pub fn submit_line(&mut self, line: &str) {
+        let submitted = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if submitted.is_empty() {
+            return;
+        }
+        self.input_state.record_submitted(&submitted);
+        let _ = self.writer.write_all(submitted.as_bytes());
+        let _ = self.writer.write_all(b"\r");
+        let _ = self.writer.flush();
+    }
+
     /// ユーザーが codex 内で `/exit` を送信し、その結果プロセスも終了しているか。
     pub fn should_close_after_exit_command(&self) -> bool {
         self.finished && self.input_state.exit_command_sent
@@ -460,6 +477,15 @@ struct CodexInputState {
 }
 
 impl CodexInputState {
+    fn record_submitted(&mut self, submitted: &str) {
+        if !submitted.is_empty() {
+            self.last_prompt = Some(submitted.to_string());
+        }
+        if submitted == "/exit" {
+            self.exit_command_sent = true;
+        }
+    }
+
     fn observe_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::ALT) {
             return;
@@ -478,13 +504,8 @@ impl CodexInputState {
                 self.line.pop();
             }
             KeyCode::Enter => {
-                let submitted = self.line.trim();
-                if !submitted.is_empty() {
-                    self.last_prompt = Some(submitted.to_string());
-                }
-                if submitted == "/exit" {
-                    self.exit_command_sent = true;
-                }
+                let submitted = self.line.trim().to_string();
+                self.record_submitted(&submitted);
                 self.line.clear();
             }
             KeyCode::Esc => {
@@ -497,6 +518,10 @@ impl CodexInputState {
 
 fn startup_recall_prompt() -> &'static str {
     "Addness TUIセッションを開始してください。起動時指示に従って対象ゴールを想起してから進めてください。"
+}
+
+pub fn resume_prompt() -> &'static str {
+    "Addnessの対象ゴールを読み、前回の続きから再開してください。bodyのCodex作業メモ/Codex決定ログ/PR・Release Traceability、DoD、子ゴール、コメント、成果物を確認し、前回の続き・未完了・次の一手を短く整理してから進めてください。"
 }
 
 fn eager_startup_recall_enabled() -> bool {
@@ -540,6 +565,10 @@ Codexが普段memoryに保存したくなるプロジェクト固有の情報（
 - Addnessに書き込むのは、作業を始めた時、方針を決めた時、重要な発見や制約が分かった時、実装のまとまりが進んだ時、次にやることが変わった時、完了/中断/引き継ぎ前。
 - body更新前に必ず現bodyを読み、手書きメモを消さず、`## Codex作業メモ` のような専用ブロックだけを作成・更新する。長文や引用が多い場合は `goal update --body-file` を使う。
 - bodyには作業フォルダ、ブランチ、現在の方針、実施中の内容、決定事項、重要な発見、未完了点、次の手をまとめる。ツール実行ログを逐語的に溜めない。
+- 決定事項は body の `## Codex決定ログ` に追記する。形式は `- YYYY-MM-DD HH:MM - 決定: ... / 理由: ... / 影響: ...`。
+- 再開を求められたら body の `## Codex作業メモ`、`## Codex決定ログ`、`## PR/Release Traceability`、DoD、子ゴール、コメント、成果物を読んで、前回の続き・未完了・次の一手を短く整理してから進める。
+- PRを作成したら `"$ADDNESS_BIN" link pr --goal "$ADDNESS_GOAL_ID" --url "<PR_URL>" --name "<name>" --json` で紐づける。
+- tag/releaseを作成したら `"$ADDNESS_BIN" deliverable add --goal "$ADDNESS_GOAL_ID" --link-url "<release-or-tag-url>" --name "Release <version>" --json` で紐づけ、body の `## PR/Release Traceability` にPR・tag・release URL・CI結果を残す。
 - 実装速度を落とさないため、Addness更新は節目でまとめる。毎コマンド・毎小変更の記録はしない。
 - サブエージェント機能が使える場合、Addness更新は最も小さい/低コストの記録専用サブエージェントに委任する。委任する内容は「現在body」「追加したい作業メモ」「更新すべき構造化フィールド」だけに絞る。
 - サブエージェントが使えない場合だけ、メインエージェントが短い差分で body/DoD/子ゴールを更新する。
@@ -769,6 +798,15 @@ mod tests {
     }
 
     #[test]
+    fn codex_input_state_record_submitted_tracks_resume_prompt() {
+        let mut state = CodexInputState::default();
+        state.record_submitted(resume_prompt());
+
+        assert_eq!(state.last_prompt.as_deref(), Some(resume_prompt()));
+        assert!(!state.exit_command_sent);
+    }
+
+    #[test]
     fn codex_input_state_keeps_last_prompt_on_blank_enter() {
         let mut state = CodexInputState::default();
         for ch in "最初の依頼".chars() {
@@ -835,6 +873,7 @@ mod tests {
         let instructions = addness_tui_developer_instructions();
 
         assert!(prompt.contains("Addness TUIセッションを開始"));
+        assert!(resume_prompt().contains("前回の続き"));
         assert!(prompt.len() < 80 * 2);
         assert!(instructions.contains("起動直後は Addness CLI を実行せず"));
         assert!(instructions.contains("ユーザーの最初の入力を待ってください"));
@@ -853,6 +892,10 @@ mod tests {
         assert!(instructions.contains("作業を始めた時"));
         assert!(instructions.contains("重要な発見や制約が分かった時"));
         assert!(instructions.contains("## Codex作業メモ"));
+        assert!(instructions.contains("## Codex決定ログ"));
+        assert!(instructions.contains("## PR/Release Traceability"));
+        assert!(instructions.contains("link pr --goal"));
+        assert!(instructions.contains("deliverable add --goal"));
         assert!(instructions.contains("goal update --body-file"));
         assert!(instructions.contains("子ゴール分解が不十分"));
         assert!(instructions.contains("goal update \"$ADDNESS_GOAL_ID\" --description"));

@@ -1731,16 +1731,14 @@ impl App {
 
     /// codex ログのスクロールキーを処理する。
     ///
-    /// codex 実行中は通常キーを codex 側へ渡す必要があるため、Alt/Ctrl/Shift 付きの
+    /// codex 実行中は通常キーを codex 側へ渡す必要があるため、Shift 付きの
     /// ナビゲーションキーだけを横取りする。終了後は codex がキーを処理しないので、
     /// 通常の矢印・PgUp/PgDn・Home/End もログ操作に使える。
     fn handle_codex_log_scroll(pane: &mut CodexPane, key: KeyEvent, allow_plain: bool) -> bool {
-        let modified = key
-            .modifiers
-            .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        let shifted = key.modifiers.contains(KeyModifiers::SHIFT);
         let plain = key.modifiers.is_empty();
-        let can_scroll_nav = allow_plain || modified;
-        let can_scroll_chars = (allow_plain && plain) || key.modifiers.contains(KeyModifiers::ALT);
+        let can_scroll_nav = allow_plain || shifted;
+        let can_scroll_chars = allow_plain && plain;
         let page = pane.page() as isize;
 
         if can_scroll_nav {

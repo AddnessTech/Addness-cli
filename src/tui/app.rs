@@ -1277,8 +1277,8 @@ impl App {
             .unwrap_or_else(|| "addness".to_string());
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-        // 対象ゴールは環境変数で伝え、起動後に PTY 入力として Addness 想起を
-        // 依頼する。codex 側がユーザー入力待ちで止まっても、最初に文脈を読ませるため。
+        // 対象ゴールは環境変数で伝え、codex の初期プロンプトとして Addness 想起を
+        // 依頼する。PTY への後追い打鍵だと入力欄に入るだけで送信されないことがあるため。
         match CodexPane::spawn(
             &codex_bin,
             &cwd,
@@ -1290,6 +1290,10 @@ impl App {
         ) {
             Ok(mut pane) => {
                 pane.push_activity(format!("{} codex を起動", Local::now().format("%H:%M")));
+                pane.push_activity(format!(
+                    "{} Addness想起を初期プロンプトで依頼",
+                    Local::now().format("%H:%M")
+                ));
                 self.codex = Some(pane);
                 self.active_pane = ActivePane::Codex;
                 // ホイールスクロール用にマウスキャプチャを有効化（codex 中のみ）。
@@ -1440,13 +1444,6 @@ impl App {
         let mut changed = false;
         if let Some(pane) = self.codex.as_mut() {
             changed |= pane.update();
-            if pane.maybe_send_startup_recall() {
-                pane.push_activity(format!(
-                    "{} Addness想起を自動依頼",
-                    Local::now().format("%H:%M")
-                ));
-                changed = true;
-            }
         }
         changed |= self.maybe_record_finished_codex_session();
         changed |= self.poll_codex_refresh();

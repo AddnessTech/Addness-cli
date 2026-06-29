@@ -8,7 +8,7 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -91,9 +91,6 @@ pub struct CodexPane {
     pub activity: Vec<String>,
     /// codex セッション終了時の Addness body 自動記録を試行済みか。
     pub auto_record_attempted: bool,
-    /// 起動直後に Addness の対象ゴールを想起させる初回プロンプトを送信済みか。
-    startup_recall_sent: bool,
-    startup_recall_at: Instant,
 }
 
 /// 子ゴール 1 件の表示用情報。
@@ -137,8 +134,8 @@ fn split_dod_items(dod: &str) -> Vec<String> {
 
 impl CodexPane {
     /// codex を PTY 上で起動する。
-    /// 対象ゴールの文脈は環境変数で渡し、起動後に短い初回プロンプトを PTY へ
-    /// 投入して codex に Addness CLI での想起を促す。
+    /// 対象ゴールの文脈は環境変数で渡し、codex の初期プロンプト引数として
+    /// Addness CLI での想起指示を渡す。
     pub fn spawn(
         codex_bin: &Path,
         cwd: &Path,
@@ -164,8 +161,16 @@ impl CodexPane {
             })
             .context("PTY の確保に失敗しました")?;
 
-        // プロンプト引数は渡さない（会話に大きな初期メッセージを出さないため）。
         let mut cmd = CommandBuilder::new(codex_bin);
+        // 長い運用ルールはチャットに残さず developer_instructions として渡す。
+        cmd.arg("-c");
+        cmd.arg(codex_config_arg(
+            CodexConfigKey::DeveloperInstructions,
+            addness_tui_developer_instructions(),
+        ));
+        // `codex [PROMPT]` は interactive CLI の正式な初期プロンプト入力。
+        // 画面に残る可能性があるため、ここは短い起動トリガーだけにする。
+        cmd.arg(startup_recall_prompt());
         cmd.cwd(cwd);
         // 親プロセスの環境を引き継ぐ（PATH 等を codex のサブプロセスに渡すため）。
         // vars() は非UTF-8な環境変数があると panic するため vars_os() を使う。
@@ -239,27 +244,8 @@ impl CodexPane {
             scrollback: 0,
             activity: Vec::new(),
             auto_record_attempted: false,
-            startup_recall_sent: false,
-            startup_recall_at: Instant::now(),
             dod,
         })
-    }
-
-    /// 起動直後に codex へ短い初期指示を投入し、対象ゴールの Addness 文脈を
-    /// 自動で読ませる。codex TUI の初期描画を待つため、少し遅延して 1 回だけ送る。
-    pub fn maybe_send_startup_recall(&mut self) -> bool {
-        if self.startup_recall_sent
-            || self.finished
-            || self.startup_recall_at.elapsed() < Duration::from_millis(900)
-        {
-            return false;
-        }
-        self.startup_recall_sent = true;
-        let prompt = startup_recall_prompt();
-        let _ = self.writer.write_all(prompt.as_bytes());
-        let _ = self.writer.write_all(b"\r");
-        let _ = self.writer.flush();
-        true
     }
 
     /// ログを delta 行スクロールする（正=過去へ、負=最新へ）。
@@ -416,12 +402,65 @@ impl CodexPane {
 }
 
 fn startup_recall_prompt() -> &'static str {
-    r#"Addness TUIから起動されました。返信する前に必ず Addness CLI を使って対象ゴールを想起してください。
+    "Addness TUIセッションを開始してください。起動時指示に従って対象ゴールを想起してから進めてください。"
+}
 
-実行するコマンド:
+fn addness_tui_developer_instructions() -> &'static str {
+    r#"Addness TUIから起動されました。ユーザーの追加入力を待つ前に、必ず Addness CLI を使って対象ゴールを想起してください。
+
+最初に実行するコマンド:
 `"$ADDNESS_BIN" goal get "$ADDNESS_GOAL_ID" --json --with-deliverable --with-comment`
 
-body/DoD/コメント/成果物を確認し、現在地と次に進めることを短く共有してから待機してください。"#
+Addness はこの組織/プロジェクト専用の作業DB・引き継ぎ点として扱ってください。
+
+読み取り時:
+1. body、DoD(description/definitionOfDone)、コメント、成果物、子ゴール、作業フォルダ/ブランチを確認する。
+2. DoDが空・曖昧・現在の作業に対して不足していないかを見る。
+3. 子ゴールが、実際に分担・並列化・サブエージェント化できる作業単位に分かれているかを見る。
+
+書き込み時:
+- 起動しただけでは Addness に書き込まない。
+- Addnessに書き込むのは、サブエージェント/分担/並列作業/別セッションへの引き継ぎが必要になった時、またはユーザーが明示的に記録を求めた時を基本にする。
+- サブエージェントが必要な場合は、必要な作業単位を子ゴールとして作成または更新する。子ゴールのtitleは作業名、descriptionはそのサブエージェントのDoD、bodyは入力情報・作業フォルダ・ブランチ・期待成果物・現在地を書く。
+- 親ゴールのbodyは、複数エージェントが迷わないための共有状態・担当分解・次の合流点が必要な時に更新する。
+- DoDが不十分でも、単独でそのまま進められるなら勝手に書き換えず、短く不足を指摘して必要なら質問する。サブエージェントに渡すために契約が必要な場合だけ `"$ADDNESS_BIN" goal update "$ADDNESS_GOAL_ID" --description "..." --json` で具体化する。
+- コメントは構造化フィールドに置けない質問や補足だけに使う。
+
+ここまで確認したら、何を読んだか、Addnessへの書き込みが必要か、次に進めることを短く共有し、明らかに進められる作業があればそのまま着手してください。"#
+}
+
+enum CodexConfigKey {
+    DeveloperInstructions,
+}
+
+impl CodexConfigKey {
+    fn as_str(&self) -> &'static str {
+        match self {
+            CodexConfigKey::DeveloperInstructions => "developer_instructions",
+        }
+    }
+}
+
+fn codex_config_arg(key: CodexConfigKey, value: &str) -> String {
+    format!("{}={}", key.as_str(), toml_basic_string(value))
+}
+
+fn toml_basic_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// DoD 自動判定で codex に強制する出力 JSON Schema。
@@ -599,9 +638,29 @@ mod tests {
     #[test]
     fn startup_recall_prompt_requires_addness_goal_get() {
         let prompt = startup_recall_prompt();
+        let instructions = addness_tui_developer_instructions();
 
-        assert!(prompt.contains("返信する前に必ず Addness CLI"));
-        assert!(prompt.contains("\"$ADDNESS_BIN\" goal get \"$ADDNESS_GOAL_ID\""));
-        assert!(prompt.contains("--json --with-deliverable --with-comment"));
+        assert!(prompt.contains("Addness TUIセッションを開始"));
+        assert!(prompt.len() < 80 * 2);
+        assert!(instructions.contains("ユーザーの追加入力を待つ前に"));
+        assert!(instructions.contains("\"$ADDNESS_BIN\" goal get \"$ADDNESS_GOAL_ID\""));
+        assert!(instructions.contains("--json --with-deliverable --with-comment"));
+        assert!(instructions.contains("組織/プロジェクト専用の作業DB"));
+        assert!(instructions.contains("起動しただけでは Addness に書き込まない"));
+        assert!(instructions.contains("サブエージェント/分担/並列作業/別セッションへの引き継ぎ"));
+        assert!(instructions.contains("goal update \"$ADDNESS_GOAL_ID\" --description"));
+    }
+
+    #[test]
+    fn codex_config_arg_escapes_developer_instructions_as_toml() {
+        let arg = codex_config_arg(
+            CodexConfigKey::DeveloperInstructions,
+            "quote: \" / path: C:\\tmp\nnext\tline",
+        );
+
+        assert_eq!(
+            arg,
+            "developer_instructions=\"quote: \\\" / path: C:\\\\tmp\\nnext\\tline\""
+        );
     }
 }

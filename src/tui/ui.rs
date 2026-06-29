@@ -7,6 +7,7 @@ use ratatui::{
 };
 
 use std::collections::HashMap;
+use std::time::Instant;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use tui_term::widget::PseudoTerminal;
@@ -73,18 +74,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ])
         .split(frame.area());
 
-    draw_title_bar(frame, main_layout[0]);
+    draw_title_bar(frame, main_layout[0], app);
 
-    let content_layout = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(24), Constraint::Min(0)])
-        .split(main_layout[1]);
-
-    draw_left_panel(frame, content_layout[0], app);
     if app.codex.is_some() {
-        // 契約併置型: 左にゴール/DoD（契約）、右に codex 本体。
-        draw_codex(frame, content_layout[1], app);
+        // codex 使用中は org/navigation を出さず（切り替えないため）、
+        // 全幅を「Addnessの進行が見えるペイン + codex本体」に使う。
+        draw_codex(frame, main_layout[1], app);
     } else {
+        let content_layout = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(24), Constraint::Min(0)])
+            .split(main_layout[1]);
+
+        draw_left_panel(frame, content_layout[0], app);
         draw_content(frame, content_layout[1], app);
     }
     draw_status_bar(frame, main_layout[2], app);
@@ -223,23 +225,42 @@ pub fn draw_loading(frame: &mut Frame, tick: u64) {
     frame.render_widget(paragraph, box_area);
 }
 
-fn draw_title_bar(frame: &mut Frame, area: Rect) {
-    let title = Paragraph::new(Line::from(vec![
-        Span::styled(
-            " Addness ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            "- Goal Management TUI",
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]))
-    .block(
+fn draw_title_bar(frame: &mut Frame, area: Rect, app: &App) {
+    // codex 使用中は、参照しているローカルフォルダ（cwd）を出して文脈を明示する。
+    let line = if let Some(pane) = app.codex.as_ref() {
+        Line::from(vec![
+            Span::styled(
+                " codex ",
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("作業フォルダ: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(pane.cwd.as_str(), Style::default().fg(Color::White)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(
+                " Addness ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "- Goal Management TUI",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+    };
+    let border = if app.codex.is_some() {
+        Color::Magenta
+    } else {
+        Color::Cyan
+    };
+    let title = Paragraph::new(line).block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
+            .border_style(Style::default().fg(border))
             .title(format!(" addness v{} ", env!("CARGO_PKG_VERSION"))),
     );
     frame.render_widget(title, area);
@@ -632,12 +653,12 @@ fn render_tree_row(
 
 fn format_status(is_completed: bool, status: Option<&GoalStatus>) -> &'static str {
     if is_completed {
-        "✅ 完了"
+        "完了"
     } else {
         match status {
-            Some(GoalStatus::InProgress) => "⏩ 進行中",
-            Some(GoalStatus::Cancelled) => "⏸ 停止中",
-            _ => "🔵 未着手",
+            Some(GoalStatus::InProgress) => "進行中",
+            Some(GoalStatus::Cancelled) => "停止中",
+            _ => "未着手",
         }
     }
 }
@@ -1255,7 +1276,7 @@ fn draw_delete_goal_modal(frame: &mut Frame, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Red))
-        .title(" ⚠️  削除の確認 ")
+        .title(" 削除の確認 ")
         .title_bottom(
             Line::from(" ←→/hl: 選択 | Enter: 実行 | Esc: キャンセル ")
                 .style(Style::default().fg(Color::DarkGray)),
@@ -1289,7 +1310,7 @@ fn draw_delete_goal_modal(frame: &mut Frame, app: &App) {
 
     // Warning message
     let warning = Paragraph::new(Line::from(vec![
-        Span::styled("⚠️  ", Style::default().fg(Color::Red)),
+        Span::styled("! ", Style::default().fg(Color::Red)),
         Span::styled(
             "この操作は取り消せません。本当に削除しますか？",
             Style::default().fg(Color::Red),
@@ -2079,7 +2100,7 @@ fn draw_members(frame: &mut Frame, area: Rect, app: &mut App, border_color: Colo
                 Style::default().fg(Color::White)
             };
 
-            let prefix = if is_current_user { "👤 " } else { "  " };
+            let prefix = if is_current_user { "* " } else { "  " };
             let content = format!("{}{}", prefix, member.name);
 
             ListItem::new(content).style(style)
@@ -2093,31 +2114,95 @@ fn draw_members(frame: &mut Frame, area: Rect, app: &mut App, border_color: Colo
 /// codex ペインを契約併置型で描画する。
 /// 左に対象ゴール／DoD（契約）、右に PTY 上で動く codex 本体。
 fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
+    // 左の Addness ペインは固定幅で広めに取り、進行が読み取りやすいようにする。
+    let addness_w = (area.width / 3).clamp(28, 52);
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(32), Constraint::Min(0)])
+        .constraints([Constraint::Length(addness_w), Constraint::Min(0)])
         .split(area);
 
-    // --- 契約ペイン（ゴール + DoD チェックリスト）---
-    // 不変借用のまま描画し、毎フレームの clone を避ける（端末ペインは後段で可変借用）。
+    // 同期の鼓動（スピナー＋最終同期からの経過秒）。可変借用前に App から読む。
+    let sync_label = {
+        const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let s = SPIN[(app.codex_sync_tick as usize) % SPIN.len()];
+        match app.last_codex_sync {
+            Some(t) => format!(" Addness ゴール  {s} 同期{}s前 ", t.elapsed().as_secs()),
+            None => " Addness ゴール  ⟳ 同期待ち ".to_string(),
+        }
+    };
+
+    // --- Addness ペイン（参照中 + ゴール状態 + DoD + 子ゴール + 更新ログ）---
+    // 上段=ゴール/DoD/子ゴール、下段=Addnessの更新ログ。不変借用のまま描いて clone を避ける。
     if let Some(pane) = app.codex.as_ref() {
+        let now = Instant::now();
+        let recently = |at: Option<Instant>| {
+            at.is_some_and(|t| now.duration_since(t) < std::time::Duration::from_secs(4))
+        };
+
+        let panes = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(8)])
+            .split(chunks[0]);
+
         let mut lines: Vec<Line> = Vec::new();
+
+        // 「いま参照/書込中」インジケータ（codex の操作をリアルタイム表示）
+        if let Some(action) = &pane.action {
+            lines.push(Line::from(Span::styled(
+                format!("» {action}"),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(""));
+        }
+
+        // ゴール名
         lines.push(Line::from(Span::styled(
             pane.goal_title.as_str(),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )));
+
+        // ステータス（変化直後はハイライト）
+        let status_style = if recently(pane.status_changed_at) {
+            Style::default().fg(Color::Black).bg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(vec![
+            Span::styled("状態: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(pane.status_label.as_str(), status_style),
+        ]));
+
+        // DoD 進捗バー
+        if !pane.dod_items.is_empty() {
+            let met = pane.dod_checks.iter().filter(|c| **c == Some(true)).count();
+            let total = pane.dod_items.len();
+            let width = 10usize;
+            let filled = met * width / total.max(1);
+            let bar: String = "▓".repeat(filled) + &"░".repeat(width - filled);
+            lines.push(Line::from(vec![
+                Span::styled("DoD ", Style::default().fg(Color::DarkGray)),
+                Span::styled(bar, Style::default().fg(Color::Green)),
+                Span::styled(format!(" {met}/{total}"), Style::default().fg(Color::White)),
+            ]));
+        }
         lines.push(Line::from(""));
+
+        // DoD チェックリスト（更新直後はヘッダをハイライト）
+        let dod_header_style = if recently(pane.dod_changed_at) {
+            Style::default().fg(Color::Black).bg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
         let dod_header = if pane.assessing {
             "── 完了基準 (DoD) ⟳判定中 ──"
         } else {
             "── 完了基準 (DoD) ──"
         };
-        lines.push(Line::from(Span::styled(
-            dod_header,
-            Style::default().fg(Color::DarkGray),
-        )));
+        lines.push(Line::from(Span::styled(dod_header, dod_header_style)));
         if pane.dod_items.is_empty() {
             lines.push(Line::from(Span::styled(
                 "（未設定 — codexと決めよう）",
@@ -2137,15 +2222,81 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
             }
         }
 
+        // 子ゴールのライブリスト（新着は数秒ハイライト）
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "── 子ゴール ({}) ・ コメント {} ──",
+                pane.child_count.unwrap_or(0),
+                pane.comment_count.unwrap_or(0)
+            ),
+            Style::default().fg(Color::DarkGray),
+        )));
+        if pane.children.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "（まだありません）",
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            for child in &pane.children {
+                let is_new = child.new_until.is_some_and(|t| t > now);
+                let title_style = if is_new {
+                    Style::default().fg(Color::Black).bg(Color::Green)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                lines.push(Line::from(vec![
+                    Span::raw(format!("{} ", child.icon)),
+                    Span::styled(child.title.as_str(), title_style),
+                ]));
+            }
+        }
+
         let contract = Paragraph::new(lines)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Cyan))
-                    .title(" 契約 "),
+                    .title(sync_label),
             )
             .wrap(ratatui::widgets::Wrap { trim: true });
-        frame.render_widget(contract, chunks[0]);
+        frame.render_widget(contract, panes[0]);
+
+        // 下段: Addness の更新ログ（新しいものほど下。最新行は強調）
+        let log_inner_h = panes[1].height.saturating_sub(2) as usize;
+        let mut log_lines: Vec<Line> = if pane.activity.is_empty() {
+            vec![Line::from(Span::styled(
+                "codex が Addness を更新するとここに出ます",
+                Style::default().fg(Color::DarkGray),
+            ))]
+        } else {
+            let n = pane.activity.len();
+            pane.activity
+                .iter()
+                .enumerate()
+                .skip(n.saturating_sub(log_inner_h.max(1)))
+                .map(|(i, l)| {
+                    let style = if i + 1 == n {
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    Line::from(Span::styled(l.as_str(), style))
+                })
+                .collect()
+        };
+        log_lines.truncate(log_inner_h.max(1));
+        let log = Paragraph::new(log_lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Blue))
+                    .title(" Addness の更新 "),
+            )
+            .wrap(ratatui::widgets::Wrap { trim: true });
+        frame.render_widget(log, panes[1]);
     }
 
     // --- codex 端末ペイン ---
@@ -2155,12 +2306,18 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
     if let Some(pane) = app.codex.as_mut() {
         pane.resize(rows, cols);
         let (title, color) = if pane.finished {
-            (
-                " codex ✓ 終了 — [c]コメント [s]状態 [d]成果物 [v]DoD判定  Esc/qで戻る ",
-                Color::Green,
-            )
+            let t = if pane.scrollback > 0 {
+                format!(
+                    " codex 終了 ▲履歴 -{} — ↑↓/PgUp/PgDn/Home/End: ログ  Esc/qで戻る ",
+                    pane.scrollback
+                )
+            } else {
+                " codex 終了 — ↑↓: ログを遡る  [c]コメント [s]状態 [d]成果物 [v]DoD判定  Esc/q: 戻る "
+                    .to_string()
+            };
+            (t, Color::Green)
         } else {
-            (" codex ⟳ 実行中 — F12で終了 ", Color::Magenta)
+            (" codex 実行中 — F12で終了 ".to_string(), Color::Magenta)
         };
         let block = Block::default()
             .borders(Borders::ALL)
@@ -2172,8 +2329,9 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
         // 本物の端末カーソルを codex のカーソル位置へ移動する。
         // tui-term は偽カーソルを描くだけなので、これをやらないと日本語入力時に
         // IME の変換ウィンドウが正しい位置に出ない（vt100 の桁は全角考慮済み）。
+        // 履歴を遡っている間はカーソルを動かさない（過去位置に飛ぶのを防ぐ）。
         let screen = pane.screen();
-        if !screen.hide_cursor() {
+        if pane.scrollback == 0 && !screen.hide_cursor() {
             let (crow, ccol) = screen.cursor_position();
             if crow < rows && ccol < cols {
                 // term_area の枠（上・左の罫線）を 1 ずつオフセット。

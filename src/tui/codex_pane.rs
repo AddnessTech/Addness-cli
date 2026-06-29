@@ -396,19 +396,27 @@ impl CodexPane {
 }
 
 fn startup_recall_prompt() -> &'static str {
-    r#"Addness TUIから起動されました。これは初期プロンプトです。ユーザーの追加入力を待つ前に、必ず Addness CLI を使って対象ゴールの想起と整理を実行してください。
+    r#"Addness TUIから起動されました。これは初期プロンプトです。ユーザーの追加入力を待つ前に、必ず Addness CLI を使って対象ゴールを想起してください。
 
 最初に実行するコマンド:
 `"$ADDNESS_BIN" goal get "$ADDNESS_GOAL_ID" --json --with-deliverable --with-comment`
 
-取得結果を読んだら、次の順で進めてください。
-1. body、DoD(description/definitionOfDone)、コメント、成果物、子ゴール、作業フォルダ/ブランチを確認する。
-2. DoDが空・曖昧・現在の作業に対して不足している場合は、ゴール本文やコメントから合理的に補える範囲で具体化し、`"$ADDNESS_BIN" goal update "$ADDNESS_GOAL_ID" --description "..." --json` で更新する。判断に必要な情報が足りない場合だけ、最小限の質問をする。
-3. 子ゴールが未作成、または理想と現状の差分を埋める分解として不十分な場合は、`"$ADDNESS_BIN" goal create --parent "$ADDNESS_GOAL_ID" --title "..." --description "..." --json` で必要な子ゴールを作る。
-4. 現在地、作業フォルダ、ブランチ、次に進めることを `"$ADDNESS_BIN" goal update "$ADDNESS_GOAL_ID" --body "..." --json` でbodyに集約する。
-5. ここまで終えてから、何を確認・更新したかと次に進めることを短く共有し、明らかに進められる作業があればそのまま着手する。
+Addness はこの組織/プロジェクト専用の作業DB・引き継ぎ点として扱ってください。
 
-コメントは構造化フィールドに置けない質問や補足だけに使ってください。"#
+読み取り時:
+1. body、DoD(description/definitionOfDone)、コメント、成果物、子ゴール、作業フォルダ/ブランチを確認する。
+2. DoDが空・曖昧・現在の作業に対して不足していないかを見る。
+3. 子ゴールが、実際に分担・並列化・サブエージェント化できる作業単位に分かれているかを見る。
+
+書き込み時:
+- 起動しただけでは Addness に書き込まない。
+- Addnessに書き込むのは、サブエージェント/分担/並列作業/別セッションへの引き継ぎが必要になった時、またはユーザーが明示的に記録を求めた時を基本にする。
+- サブエージェントが必要な場合は、必要な作業単位を子ゴールとして作成または更新する。子ゴールのtitleは作業名、descriptionはそのサブエージェントのDoD、bodyは入力情報・作業フォルダ・ブランチ・期待成果物・現在地を書く。
+- 親ゴールのbodyは、複数エージェントが迷わないための共有状態・担当分解・次の合流点が必要な時に更新する。
+- DoDが不十分でも、単独でそのまま進められるなら勝手に書き換えず、短く不足を指摘して必要なら質問する。サブエージェントに渡すために契約が必要な場合だけ `"$ADDNESS_BIN" goal update "$ADDNESS_GOAL_ID" --description "..." --json` で具体化する。
+- コメントは構造化フィールドに置けない質問や補足だけに使う。
+
+ここまで確認したら、何を読んだか、Addnessへの書き込みが必要か、次に進めることを短く共有し、明らかに進められる作業があればそのまま着手してください。"#
 }
 
 /// DoD 自動判定で codex に強制する出力 JSON Schema。
@@ -590,8 +598,9 @@ mod tests {
         assert!(prompt.contains("ユーザーの追加入力を待つ前に"));
         assert!(prompt.contains("\"$ADDNESS_BIN\" goal get \"$ADDNESS_GOAL_ID\""));
         assert!(prompt.contains("--json --with-deliverable --with-comment"));
+        assert!(prompt.contains("組織/プロジェクト専用の作業DB"));
+        assert!(prompt.contains("起動しただけでは Addness に書き込まない"));
+        assert!(prompt.contains("サブエージェント/分担/並列作業/別セッションへの引き継ぎ"));
         assert!(prompt.contains("goal update \"$ADDNESS_GOAL_ID\" --description"));
-        assert!(prompt.contains("goal create --parent \"$ADDNESS_GOAL_ID\""));
-        assert!(prompt.contains("goal update \"$ADDNESS_GOAL_ID\" --body"));
     }
 }

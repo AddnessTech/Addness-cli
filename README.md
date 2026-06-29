@@ -105,9 +105,9 @@ addness
 選択中ゴールの文脈（タイトル・完了基準(DoD)・説明）を渡した状態で
 [codex](https://github.com/openai/codex) をペイン内に起動します。
 起動直後には対象ゴールを `addness goal get --json --with-deliverable --with-comment`
-で読む初期プロンプトを codex に渡します。codex は Addness 上の現在地を確認し、
-DoD が不十分なら具体化、子ゴール分解が足りなければ作成、body への現在地集約を
-行ってから作業に入ります。
+で読む初期プロンプトを codex に渡します。codex は Addness をその組織/プロジェクト専用の
+作業DBとして読み、DoD や子ゴール分解の不足を確認します。Addness への書き込みは、
+サブエージェント・分担・並列作業・別セッションへの引き継ぎが必要な時を基本にします。
 codex は Addness を「タスク DB」として扱い、`addness` CLI 経由で DoD の具体化・
 子ゴール作成・進捗コメントを書き戻します。
 左の Addness ペインには、対象ゴールのステータス、DoD、子ゴール、コメント数、

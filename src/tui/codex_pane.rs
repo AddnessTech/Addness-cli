@@ -8,7 +8,7 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -91,6 +91,9 @@ pub struct CodexPane {
     pub activity: Vec<String>,
     /// codex セッション終了時の Addness body 自動記録を試行済みか。
     pub auto_record_attempted: bool,
+    /// 起動直後に Addness の対象ゴールを想起させる初回プロンプトを送信済みか。
+    startup_recall_sent: bool,
+    startup_recall_at: Instant,
 }
 
 /// 子ゴール 1 件の表示用情報。
@@ -134,8 +137,8 @@ fn split_dod_items(dod: &str) -> Vec<String> {
 
 impl CodexPane {
     /// codex を PTY 上で起動する。
-    /// 初期プロンプトは渡さない（codex を空の状態で開く）。対象ゴールの文脈は
-    /// 環境変数 + AGENTS.md 経由で渡し、codex が自分で想起する。
+    /// 対象ゴールの文脈は環境変数で渡し、起動後に短い初回プロンプトを PTY へ
+    /// 投入して codex に Addness CLI での想起を促す。
     pub fn spawn(
         codex_bin: &Path,
         cwd: &Path,
@@ -236,8 +239,27 @@ impl CodexPane {
             scrollback: 0,
             activity: Vec::new(),
             auto_record_attempted: false,
+            startup_recall_sent: false,
+            startup_recall_at: Instant::now(),
             dod,
         })
+    }
+
+    /// 起動直後に codex へ短い初期指示を投入し、対象ゴールの Addness 文脈を
+    /// 自動で読ませる。codex TUI の初期描画を待つため、少し遅延して 1 回だけ送る。
+    pub fn maybe_send_startup_recall(&mut self) -> bool {
+        if self.startup_recall_sent
+            || self.finished
+            || self.startup_recall_at.elapsed() < Duration::from_millis(900)
+        {
+            return false;
+        }
+        self.startup_recall_sent = true;
+        let prompt = startup_recall_prompt();
+        let _ = self.writer.write_all(prompt.as_bytes());
+        let _ = self.writer.write_all(b"\r");
+        let _ = self.writer.flush();
+        true
     }
 
     /// ログを delta 行スクロールする（正=過去へ、負=最新へ）。
@@ -391,6 +413,15 @@ impl CodexPane {
             }
         }
     }
+}
+
+fn startup_recall_prompt() -> &'static str {
+    r#"Addness TUIから起動されました。返信する前に必ず Addness CLI を使って対象ゴールを想起してください。
+
+実行するコマンド:
+`"$ADDNESS_BIN" goal get "$ADDNESS_GOAL_ID" --json --with-deliverable --with-comment`
+
+body/DoD/コメント/成果物を確認し、現在地と次に進めることを短く共有してから待機してください。"#
 }
 
 /// DoD 自動判定で codex に強制する出力 JSON Schema。
@@ -563,5 +594,14 @@ mod tests {
     #[test]
     fn split_dod_items_empty() {
         assert!(split_dod_items("   \n\n").is_empty());
+    }
+
+    #[test]
+    fn startup_recall_prompt_requires_addness_goal_get() {
+        let prompt = startup_recall_prompt();
+
+        assert!(prompt.contains("返信する前に必ず Addness CLI"));
+        assert!(prompt.contains("\"$ADDNESS_BIN\" goal get \"$ADDNESS_GOAL_ID\""));
+        assert!(prompt.contains("--json --with-deliverable --with-comment"));
     }
 }

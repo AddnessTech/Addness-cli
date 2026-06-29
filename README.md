@@ -104,6 +104,8 @@ addness
 ゴール上でアクションメニュー（`o` または `Space`）から **「codexで作業」** を選ぶと、
 選択中ゴールの文脈（タイトル・完了基準(DoD)・説明）を渡した状態で
 [codex](https://github.com/openai/codex) をペイン内に起動します。
+起動直後には対象ゴールを `addness goal get --json --with-deliverable --with-comment`
+で読むよう codex に自動依頼するため、最初の会話から Addness 上の現在地を踏まえて応答します。
 codex は Addness を「タスク DB」として扱い、`addness` CLI 経由で DoD の具体化・
 子ゴール作成・進捗コメントを書き戻します。
 左の Addness ペインには、対象ゴールのステータス、DoD、子ゴール、コメント数、

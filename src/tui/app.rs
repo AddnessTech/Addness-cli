@@ -1442,10 +1442,16 @@ impl App {
     /// 画面に影響する変化があれば `true` を返す（再描画判定に使う）。
     fn update_codex(&mut self) -> bool {
         let mut changed = false;
+        let mut close_after_exit_command = false;
         if let Some(pane) = self.codex.as_mut() {
             changed |= pane.update();
+            close_after_exit_command = pane.should_close_after_exit_command();
         }
         changed |= self.maybe_record_finished_codex_session();
+        if close_after_exit_command {
+            self.close_codex();
+            return true;
+        }
         changed |= self.poll_codex_refresh();
         self.maybe_start_codex_refresh();
         changed |= self.poll_dod_job();

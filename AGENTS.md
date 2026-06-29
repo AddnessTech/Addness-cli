@@ -45,9 +45,11 @@
 - `addness detect-goal` — 現在の git ブランチ名から対象ゴール ID を推定
 
 ### 作業の進め方（想起 → 作業 → 引き継ぎ点の更新）
-1. **想起** — 作業前に対象ゴールを `addness goal get <ID> --json --with-comment` で読み、
-   現状・方針・直近の進捗を把握する。`addness detect-goal` でブランチから ID を推定できる。
-   ここに書かれた内容だけを前提にし、他プロジェクトの記憶と混同しない。
+1. **想起** — 作業を始める前に対象ゴールを読んで現状・方針・直近の進捗を把握する。
+   - **Addness TUI から起動された場合、対象ゴール ID は環境変数 `ADDNESS_GOAL_ID` にある**
+     （addness バイナリは `ADDNESS_BIN`）。`"$ADDNESS_BIN" goal get "$ADDNESS_GOAL_ID" --json --with-comment`
+     で想起すること。設定が無ければ `addness detect-goal` でブランチから推定する。
+   - ここに書かれた内容だけを前提にし、他プロジェクト固有の状態と混同しない。
 2. **DoD（方針）の具体化** — DoD が曖昧・不十分なら**ユーザーと対話して具体化**し、
    `addness goal update <ID> --description "..."` で書き戻す。勝手に決めず質問してから固める。
 3. **現状(body)の最新化** — 作業を進めたら現状を `addness goal update <ID> --body "..."` で

@@ -1192,75 +1192,36 @@ impl App {
             return;
         };
 
-        // DoD（completion criteria）と説明・ステータスを取得して文脈に含める。失敗しても空で続行する。
-        let (dod, body, status_label) = match self.api_call(self.client.get_goal(&goal_id)) {
+        // DoD・ステータスを取得して左ペインの初期表示に使う。失敗しても空で続行する。
+        let (dod, status_label) = match self.api_call(self.client.get_goal(&goal_id)) {
             Ok(resp) => {
                 let goal = resp.data;
                 let status =
                     GoalDisplayStatus::from_goal_state(goal.status.as_ref(), goal.is_completed)
                         .to_emoji_string();
-                (
-                    goal.description.unwrap_or_default(),
-                    goal.body.unwrap_or_default(),
-                    status,
-                )
+                (goal.description.unwrap_or_default(), status)
             }
-            Err(_) => (String::new(), String::new(), String::new()),
+            Err(_) => (String::new(), String::new()),
         };
-
-        // 想起: 直近コメント（進捗・考え）と子ゴール（分解）も取り込んで文脈に含める。
-        let recent_comments: Vec<String> = self
-            .api_call(self.client.list_comments(&goal_id))
-            .map(|resp| {
-                let mut v: Vec<String> = resp
-                    .comments
-                    .into_iter()
-                    .rev()
-                    .take(5)
-                    .map(|c| truncate_comment(&c.content))
-                    .collect();
-                v.reverse();
-                v
-            })
-            .unwrap_or_default();
-        let children: Vec<String> = self
-            .api_call(self.client.get_goal_children(&goal_id, 20, 0))
-            .map(|resp| {
-                resp.data
-                    .children
-                    .into_iter()
-                    .map(|c| {
-                        let icon =
-                            GoalDisplayStatus::from_goal_state(c.status.as_ref(), c.is_completed)
-                                .icon();
-                        format!("{icon} {}", c.title)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
 
         // codex のサブプロセスから確実に呼べるよう、addness 自身の絶対パスを渡す。
         let addness_bin = std::env::current_exe()
             .ok()
             .and_then(|p| p.to_str().map(String::from))
             .unwrap_or_else(|| "addness".to_string());
-        // 作業環境（フォルダ・ブランチ）も想起情報に含める。
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let cwd_str = cwd.display().to_string();
-        let branch = codex_pane::git_branch(&cwd).unwrap_or_else(|| "(不明)".to_string());
-        let prompt = codex_pane::build_prompt(
-            &addness_bin,
-            &goal_id,
-            &title,
-            &dod,
-            &body,
-            &cwd_str,
-            &branch,
-            &recent_comments,
-            &children,
-        );
 
-        match CodexPane::spawn(&codex_bin, &prompt, &cwd, goal_id, title, dod, status_label) {
+        // 初期プロンプトは渡さない（codex を空の状態で開く）。対象ゴールは
+        // 環境変数 + AGENTS.md 経由で codex に伝え、codex が自分で想起する。
+        match CodexPane::spawn(
+            &codex_bin,
+            &cwd,
+            &addness_bin,
+            goal_id,
+            title,
+            dod,
+            status_label,
+        ) {
             Ok(mut pane) => {
                 pane.push_activity(format!("{} codex を起動", Local::now().format("%H:%M")));
                 self.codex = Some(pane);

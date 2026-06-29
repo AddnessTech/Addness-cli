@@ -36,20 +36,6 @@ pub fn codex_path() -> Option<PathBuf> {
     None
 }
 
-/// 作業ディレクトリの現在のブランチ名を取得する（取得できなければ None）。
-pub fn git_branch(cwd: &Path) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .current_dir(cwd)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if s.is_empty() { None } else { Some(s) }
-}
-
 /// 作業ディレクトリの `git diff --stat`（HEAD 比較）を取得する。
 /// 還流コメントのプリフィルに使う。取得できなければ空文字。
 pub fn git_diff_stat(cwd: &Path) -> String {
@@ -61,90 +47,6 @@ pub fn git_diff_stat(cwd: &Path) -> String {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
         _ => String::new(),
     }
-}
-
-/// 対象ゴールの文脈を、codex に渡す初期プロンプトへ整形する。
-///
-/// 「Addness が真実源」「DoD が不十分なら対話で具体化」という方針を明示し、
-/// `addness` CLI の絶対パスを渡して PATH 取りこぼしを回避する。
-#[allow(clippy::too_many_arguments)]
-pub fn build_prompt(
-    addness_bin: &str,
-    goal_id: &str,
-    title: &str,
-    dod: &str,
-    body: &str,
-    cwd: &str,
-    branch: &str,
-    recent_comments: &[String],
-    children: &[String],
-) -> String {
-    let dod = if dod.trim().is_empty() {
-        "（未設定 — ユーザーと対話して具体化し、書き戻すこと）"
-    } else {
-        dod.trim()
-    };
-    let body = if body.trim().is_empty() {
-        "（未設定 — 現状をまだ誰も書いていない）"
-    } else {
-        body.trim()
-    };
-    let bullet = |items: &[String]| -> String {
-        if items.is_empty() {
-            "（なし）".to_string()
-        } else {
-            items
-                .iter()
-                .map(|l| format!("  - {}", l.trim()))
-                .collect::<Vec<_>>()
-                .join("\n")
-        }
-    };
-    let comments = bullet(recent_comments);
-    let children = bullet(children);
-
-    format!(
-        r#"あなたは Addness TUI から、特定のゴールに対して呼び出されました。
-
-# このゴールがあなたの作業メモリです（重要）
-他で得た一般的な知識・技術・ノウハウは自由に活用してください。ただし、
-**このプロジェクト固有の「前提・現状・進捗・方針」は、あなたの記憶ではなく
-下記「対象ゴール」に書かれた内容を真実源とします**（他プロジェクト固有の状態を
-持ち込んで混ぜない）。ゴールを「いつでも・どこからでも続きに入れるクリーンな
-引き継ぎ点」として読み書きしてください。
-- addness バイナリ: `{addness_bin}`
-- 使い方が不明なときは `{addness_bin} skills` を実行（データ取得は `--json`）。
-
-# 対象ゴール（想起した状態）
-- ID: {goal_id}
-- タイトル: {title}
-- 方針 / 完了基準(DoD = 理想の状態): {dod}
-- 現状(body = 現在の状態): {body}
-- 作業環境: フォルダ=`{cwd}` / ブランチ=`{branch}`
-- これまでの進捗・考え（直近コメント）:
-{comments}
-- 分解済みの子ゴール:
-{children}
-
-# 書き込み先のルール（重要）
-ログをコメント（チャット）に溜めないでください。情報は原則として**構造化された場所**に書きます。
-- **現状 → body**: `{addness_bin} goal update {goal_id} --body "..."`
-  進捗・現在地・次の一手はここに集約。**作業環境（フォルダ=`{cwd}` / ブランチ=`{branch}`）も
-  body に含めて記録**し、別フォルダ/別セッションからでも続きに入れるようにする。
-- **方針 → DoD**: `{addness_bin} goal update {goal_id} --description "..."`
-- **分解 → 子ゴール**: `{addness_bin} goal create --title "..." --parent {goal_id}`
-- **成果物 → deliverable / link**: PR や生成物は `{addness_bin} link` / `{addness_bin} deliverable`。
-- **コメントは最終手段**: `{addness_bin} comment create` は「どの構造化フィールドに置くべきか
-  判断できない情報」や「ユーザーへの質問」だけに使う（末尾に「Codexより」と署名）。
-
-# 進め方
-1. 他で得た一般知識は活用してよいが、このプロジェクト固有の状態は上記ゴールを真実源とする。
-2. 現状・方針・進捗を踏まえる。DoD が曖昧ならユーザーに質問してから DoD を書き戻す。
-3. 作業を進めたら body（現状＋作業環境）を最新化。差分は子ゴールへ分解。
-4. セッションを終える前に、必ず body を最新化してから終了する。
-
-まずは想起した現状・方針を確認し、足りない情報があればユーザーに尋ねるところから始めてください。"#
-    )
 }
 
 /// 埋め込み codex セッションの状態。
@@ -230,10 +132,12 @@ fn split_dod_items(dod: &str) -> Vec<String> {
 
 impl CodexPane {
     /// codex を PTY 上で起動する。
+    /// 初期プロンプトは渡さない（codex を空の状態で開く）。対象ゴールの文脈は
+    /// 環境変数 + AGENTS.md 経由で渡し、codex が自分で想起する。
     pub fn spawn(
         codex_bin: &Path,
-        prompt: &str,
         cwd: &Path,
+        addness_bin: &str,
         goal_id: String,
         goal_title: String,
         dod: String,
@@ -252,8 +156,8 @@ impl CodexPane {
             })
             .context("PTY の確保に失敗しました")?;
 
+        // プロンプト引数は渡さない（会話に大きな初期メッセージを出さないため）。
         let mut cmd = CommandBuilder::new(codex_bin);
-        cmd.arg(prompt);
         cmd.cwd(cwd);
         // 親プロセスの環境を引き継ぐ（PATH 等を codex のサブプロセスに渡すため）。
         // vars() は非UTF-8な環境変数があると panic するため vars_os() を使う。
@@ -261,6 +165,10 @@ impl CodexPane {
             cmd.env(key, value);
         }
         cmd.env("TERM", "xterm-256color");
+        // 対象ゴールの文脈を環境変数で渡す（AGENTS.md がこれを使って想起を指示する）。
+        cmd.env("ADDNESS_GOAL_ID", &goal_id);
+        cmd.env("ADDNESS_GOAL_TITLE", &goal_title);
+        cmd.env("ADDNESS_BIN", addness_bin);
 
         let child = pair
             .slave

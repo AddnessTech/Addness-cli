@@ -26,6 +26,7 @@ dependencies = [
  "ratatui",
  "regex",
  "reqwest",
+ "semver",
  "serde",
  "serde_json",
  "spki",

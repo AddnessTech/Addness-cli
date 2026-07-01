@@ -807,25 +807,6 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
         } else {
             " 入力してEnterでcodex exec --json  |  Trackpad/矢印:履歴  |  F9:Addness再開  |  F12:終了 "
         };
-        let hint = app
-            .codex_last_scroll_input
-            .as_ref()
-            .map(|input| {
-                if finished {
-                    format!(
-                        " 操作: {input} | [c]コメント [s]状態 [d]成果物 [v]DoD判定 Esc/q:閉じる "
-                    )
-                } else if running {
-                    format!(
-                        " 操作: {input} | codex exec実行中 Ctrl-C:ターン中断 Trackpad/矢印:履歴 "
-                    )
-                } else {
-                    format!(
-                        " 操作: {input} | Enter:codex exec送信 Trackpad/矢印:履歴 F9:Addness再開 "
-                    )
-                }
-            })
-            .unwrap_or_else(|| hint.to_string());
         let status = Paragraph::new(Line::from(Span::styled(
             hint,
             Style::default().fg(COLOR_CODEX),
@@ -2340,11 +2321,7 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
         let max_contract_scroll =
             rendered_lines_height(&lines, contract_inner_w).saturating_sub(contract_inner_h.max(1));
         app.codex_contract_scroll = app.codex_contract_scroll.min(max_contract_scroll);
-        let contract_title = if app.codex_contract_scroll > 0 {
-            format!("{sync_label} ▲スクロール -{} ", app.codex_contract_scroll)
-        } else {
-            sync_label
-        };
+        let contract_title = sync_label;
         let contract = Paragraph::new(lines)
             .block(
                 Block::default()
@@ -2376,11 +2353,7 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
             all_activity_lines[start..end].to_vec()
         };
         log_lines.truncate(log_inner_h.max(1));
-        let log_title = if app.codex_activity_scroll > 0 {
-            format!(" Addness 更新 ▲スクロール -{} ", app.codex_activity_scroll)
-        } else {
-            " Addness 更新 ".to_string()
-        };
+        let log_title = " Addness 更新 ".to_string();
         let log = Paragraph::new(log_lines).block(
             Block::default()
                 .borders(Borders::ALL)
@@ -2399,10 +2372,7 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
         pane.resize(rows, cols);
         let (title, color) = if pane.finished {
             let t = if pane.scrollback > 0 {
-                format!(
-                    " codex exec 終了 ▲スクロール -{} — ↑↓/PgUp/PgDn/Home/End: ログ  Esc/qで戻る ",
-                    pane.scrollback
-                )
+                " codex exec 終了 — ↑↓/PgUp/PgDn/Home/End: ログ  Esc/qで戻る ".to_string()
             } else {
                 " codex exec 終了 — ↑↓: ログ  [c]コメント [s]状態 [d]成果物 [v]DoD判定  Esc/q: 戻る "
                     .to_string()
@@ -2421,10 +2391,7 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
             )
         } else if pane.scrollback > 0 {
             (
-                format!(
-                    " codex exec ▲スクロール -{} — Esc: ライブへ戻る ",
-                    pane.scrollback
-                ),
+                " codex exec --json — Esc: ライブへ戻る ".to_string(),
                 COLOR_WARN,
             )
         } else {
@@ -3925,7 +3892,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_status_bar_prioritizes_scroll_diagnostic_without_last_label() {
+    fn codex_status_bar_hides_scroll_diagnostic_without_last_label() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let client = ApiClient::new("t", "http://localhost").unwrap();
         let mut app = App::new(client, rt.handle().clone());
@@ -3935,8 +3902,12 @@ mod tests {
         let text = render_status_text(&app, 80);
 
         assert!(
-            text.contains("mouse ScrollUp -> codex 0->3"),
-            "status should expose scroll diagnostic near the front:\n{text}"
+            !text.contains("mouse ScrollUp -> codex 0->3"),
+            "status should not expose release-noisy scroll diagnostics:\n{text}"
+        );
+        assert!(
+            !text.contains("操作:"),
+            "status should not expose operation diagnostics:\n{text}"
         );
         assert!(
             !text.contains("last:"),

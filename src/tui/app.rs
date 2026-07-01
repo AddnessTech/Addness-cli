@@ -2508,7 +2508,7 @@ impl App {
         if Self::point_in_area(self.codex_status_area, mouse.column, mouse.row)
             || Self::point_in_area(self.codex_contract_area, mouse.column, mouse.row)
         {
-            Self::scroll_index(&mut self.codex_contract_scroll, delta);
+            Self::scroll_document_offset(&mut self.codex_contract_scroll, delta);
             let batch = Self::mouse_scroll_batch_label(event_count);
             self.codex_last_scroll_input =
                 Some(format!("mouse {:?}{batch} -> Addnessゴール", mouse.kind));
@@ -2570,6 +2570,10 @@ impl App {
         } else {
             *offset = offset.saturating_sub((-delta) as usize);
         }
+    }
+
+    fn scroll_document_offset(offset: &mut usize, delta: isize) {
+        Self::scroll_index(offset, -delta);
     }
 
     fn point_in_area(area: Option<Rect>, column: u16, row: u16) -> bool {
@@ -5115,10 +5119,26 @@ mod codex_mouse_tests {
             CODEX_WHEEL_LINES,
             1,
         );
-        assert_eq!(app.codex_contract_scroll, CODEX_WHEEL_LINES as usize);
+        assert_eq!(app.codex_contract_scroll, 0);
         assert_eq!(
             app.codex_last_scroll_input.as_deref(),
             Some("mouse ScrollUp -> Addnessゴール")
+        );
+
+        app.handle_codex_mouse_scroll(
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 2,
+                row: 6,
+                modifiers: KeyModifiers::NONE,
+            },
+            -CODEX_WHEEL_LINES,
+            1,
+        );
+        assert_eq!(app.codex_contract_scroll, CODEX_WHEEL_LINES as usize);
+        assert_eq!(
+            app.codex_last_scroll_input.as_deref(),
+            Some("mouse ScrollDown -> Addnessゴール")
         );
 
         app.handle_codex_mouse_scroll(
@@ -5147,7 +5167,7 @@ mod codex_mouse_tests {
             CODEX_WHEEL_LINES,
             1,
         );
-        assert_eq!(app.codex_contract_scroll, (CODEX_WHEEL_LINES * 2) as usize);
+        assert_eq!(app.codex_contract_scroll, 0);
     }
 
     #[test]

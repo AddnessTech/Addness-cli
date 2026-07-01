@@ -6,14 +6,13 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
 
+use serde_json::Value;
 use std::collections::HashMap;
 use std::time::Instant;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use tui_term::widget::PseudoTerminal;
-
 use super::app::{ActivePane, App, DeliverableFormField, FormField, ModalState};
-use super::codex_pane::CodexPane;
+use super::codex_pane::{CODEX_LOG_PREFIX_WIDTH, CodexLogKind, CodexLogLine, CodexPane};
 use super::goal_tree::{CommentView, TreeRow};
 use crate::api::{DeliverableType, GoalStatus, Member, MemberId};
 
@@ -24,6 +23,7 @@ const COLOR_SUCCESS: Color = Color::Rgb(101, 218, 123);
 const COLOR_WARN: Color = Color::Rgb(236, 188, 80);
 const COLOR_MUTED: Color = Color::Rgb(112, 122, 138);
 const COLOR_PANEL: Color = Color::Rgb(65, 81, 105);
+const CODEX_TOOL_OUTPUT_PREVIEW_CHARS: usize = 160;
 
 /// Replace @uuid mentions in text with @member_name
 fn replace_member_mentions(text: &str, members: &HashMap<MemberId, Member>) -> String {
@@ -91,6 +91,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_codex(frame, main_layout[1], app);
     } else {
         app.codex_terminal_area = None;
+        app.codex_status_area = None;
         app.codex_contract_area = None;
         app.codex_activity_area = None;
         let content_layout = Layout::default()
@@ -792,22 +793,33 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
     // codex フォーカス中は通常のキーが codex へ転送されるため、専用のヒントを出す。
     if app.active_pane == ActivePane::Codex {
         let finished = app.codex.as_ref().map(|c| c.finished).unwrap_or(true);
+        let running = app
+            .codex
+            .as_ref()
+            .map(|c| c.is_turn_running())
+            .unwrap_or(false);
         let hint = if finished {
             " [c]コメント  [s]状態  [d]成果物(PR/Release)  [v]DoD判定  Esc/q: 閉じる "
+        } else if running {
+            " codex exec --json 実行中  |  Ctrl-C:ターン中断  |  Trackpad/矢印:履歴  |  F12:終了 "
         } else {
-            " 入力はcodexへ転送  |  Trackpad/ホイール: 枠スクロール  |  F9:Addness再開  |  F12:終了 "
+            " 入力してEnterでcodex exec --json  |  Trackpad/矢印:履歴  |  F9:Addness再開  |  F12:終了 "
         };
         let hint = app
             .codex_last_scroll_input
             .as_ref()
-            .map(|last| {
+            .map(|input| {
                 if finished {
                     format!(
-                        " last: {last} | [c]コメント [s]状態 [d]成果物 [v]DoD判定 Esc/q:閉じる "
+                        " 操作: {input} | [c]コメント [s]状態 [d]成果物 [v]DoD判定 Esc/q:閉じる "
+                    )
+                } else if running {
+                    format!(
+                        " 操作: {input} | codex exec実行中 Ctrl-C:ターン中断 Trackpad/矢印:履歴 "
                     )
                 } else {
                     format!(
-                        " last: {last} | Trackpad/ホイール:枠スクロール F9:Addness再開 F12:終了 "
+                        " 操作: {input} | Enter:codex exec送信 Trackpad/矢印:履歴 F9:Addness再開 "
                     )
                 }
             })
@@ -2147,7 +2159,7 @@ fn draw_members(frame: &mut Frame, area: Rect, app: &mut App, border_color: Colo
 }
 
 /// codex ペインを契約併置型で描画する。
-/// 左に対象ゴール／DoD（契約）、右に PTY 上で動く codex 本体。
+/// 左に対象ゴール／DoD（契約）、右に `codex exec --json` の会話履歴を描画する。
 fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
     // 左の Addness ペインは固定幅で広めに取り、進行が読み取りやすいようにする。
     let addness_w = (area.width / 3).clamp(28, 52);
@@ -2183,6 +2195,7 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
                 Constraint::Length(8),
             ])
             .split(chunks[0]);
+        app.codex_status_area = Some(panes[0]);
         app.codex_contract_area = Some(panes[1]);
         app.codex_activity_area = Some(panes[2]);
 
@@ -2321,7 +2334,9 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
         }
 
         let contract_inner_h = panes[1].height.saturating_sub(2) as usize;
-        let max_contract_scroll = lines.len().saturating_sub(contract_inner_h.max(1));
+        let contract_inner_w = panes[1].width.saturating_sub(2) as usize;
+        let max_contract_scroll =
+            rendered_lines_height(&lines, contract_inner_w).saturating_sub(contract_inner_h.max(1));
         app.codex_contract_scroll = app.codex_contract_scroll.min(max_contract_scroll);
         let contract_title = if app.codex_contract_scroll > 0 {
             format!("{sync_label} ▲スクロール -{} ", app.codex_contract_scroll)
@@ -2348,26 +2363,15 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
                 Style::default().fg(COLOR_MUTED),
             ))]
         } else {
-            let n = pane.activity.len();
             let view_h = log_inner_h.max(1);
+            let log_inner_w = panes[2].width.saturating_sub(2) as usize;
+            let all_activity_lines = codex_activity_lines(&pane.activity, log_inner_w);
+            let n = all_activity_lines.len();
             let max_activity_scroll = n.saturating_sub(view_h);
             app.codex_activity_scroll = app.codex_activity_scroll.min(max_activity_scroll);
             let end = n.saturating_sub(app.codex_activity_scroll);
             let start = end.saturating_sub(view_h);
-            pane.activity
-                .iter()
-                .enumerate()
-                .skip(start)
-                .take(end.saturating_sub(start))
-                .map(|(i, l)| {
-                    let style = if i + 1 == n {
-                        Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::White)
-                    };
-                    Line::from(Span::styled(l.as_str(), style))
-                })
-                .collect()
+            all_activity_lines[start..end].to_vec()
         };
         log_lines.truncate(log_inner_h.max(1));
         let log_title = if app.codex_activity_scroll > 0 {
@@ -2375,18 +2379,16 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
         } else {
             " Addness 更新 ".to_string()
         };
-        let log = Paragraph::new(log_lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(COLOR_PANEL))
-                    .title(log_title),
-            )
-            .wrap(ratatui::widgets::Wrap { trim: true });
+        let log = Paragraph::new(log_lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(COLOR_PANEL))
+                .title(log_title),
+        );
         frame.render_widget(log, panes[2]);
     }
 
-    // --- codex 端末ペイン ---
+    // --- codex 会話ペイン ---
     let term_area = chunks[1];
     app.codex_terminal_area = Some(term_area);
     let rows = term_area.height.saturating_sub(2);
@@ -2396,26 +2398,35 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
         let (title, color) = if pane.finished {
             let t = if pane.scrollback > 0 {
                 format!(
-                    " codex 終了 ▲スクロール -{} — ↑↓/PgUp/PgDn/Home/End: ログ  Esc/qで戻る ",
+                    " codex exec 終了 ▲スクロール -{} — ↑↓/PgUp/PgDn/Home/End: ログ  Esc/qで戻る ",
                     pane.scrollback
                 )
             } else {
-                " codex 終了 — ↑↓: ログを遡る  [c]コメント [s]状態 [d]成果物 [v]DoD判定  Esc/q: 戻る "
+                " codex exec 終了 — ↑↓: ログ  [c]コメント [s]状態 [d]成果物 [v]DoD判定  Esc/q: 戻る "
                     .to_string()
             };
             (t, COLOR_SUCCESS)
+        } else if pane.is_turn_running() {
+            (
+                " codex exec --json 実行中 — JSONLをAddnessで表示  Ctrl-C:ターン中断  F12:終了 "
+                    .to_string(),
+                COLOR_CODEX,
+            )
         } else if pane.scrollback > 0 {
             (
                 format!(
-                    " codex 実行中 ▲スクロール -{} — Esc: ライブへ戻る ",
+                    " codex exec ▲スクロール -{} — Esc: ライブへ戻る ",
                     pane.scrollback
                 ),
                 COLOR_WARN,
             )
         } else {
+            let thread = pane
+                .thread_id()
+                .map(|id| format!("  thread:{}", short_thread_id(id)))
+                .unwrap_or_default();
             (
-                " codex 実行中 — Trackpad/ホイール:枠スクロール  F9:Addness再開  F12:終了 "
-                    .to_string(),
+                format!(" codex exec --json 入力待ち{thread}  F9:Addness再開  F12:終了 "),
                 COLOR_CODEX,
             )
         };
@@ -2423,22 +2434,579 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(color))
             .title(title);
-        let screen_view = pane.screen_view();
-        let term = PseudoTerminal::new(&screen_view).block(block);
-        frame.render_widget(term, term_area);
+        draw_codex_exec_panel(frame, term_area, block, pane);
+    }
+}
 
-        // 本物の端末カーソルを codex のカーソル位置へ移動する。
-        // tui-term は偽カーソルを描くだけなので、これをやらないと日本語入力時に
-        // IME の変換ウィンドウが正しい位置に出ない（vt100 の桁は全角考慮済み）。
-        // 履歴を遡っている間はカーソルを動かさない（過去位置に飛ぶのを防ぐ）。
-        if let Some((crow, ccol)) = pane.visible_cursor_position()
-            && crow < rows
-            && ccol < cols
-        {
-            // term_area の枠（上・左の罫線）を 1 ずつオフセット。
-            frame.set_cursor_position((term_area.x + 1 + ccol, term_area.y + 1 + crow));
+fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: &mut CodexPane) {
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let input_h = if inner.height >= 4 { 2 } else { 1 };
+    let header_h = u16::from(inner.height >= 6);
+    let constraints = if header_h > 0 {
+        vec![
+            Constraint::Length(header_h),
+            Constraint::Min(0),
+            Constraint::Length(input_h),
+        ]
+    } else {
+        vec![Constraint::Min(0), Constraint::Length(input_h)]
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(inner);
+    let (header_chunk, history_chunk, input_chunk) = if header_h > 0 {
+        (Some(chunks[0]), chunks[1], chunks[2])
+    } else {
+        (None, chunks[0], chunks[1])
+    };
+
+    if let Some(header_chunk) = header_chunk {
+        frame.render_widget(
+            Paragraph::new(codex_header_line(pane, header_chunk.width as usize)),
+            header_chunk,
+        );
+    }
+
+    let filtered_log = pane.filtered_log_lines();
+    let history_width = history_chunk.width as usize;
+    let all_history_lines = codex_log_lines(&filtered_log, history_width);
+    let history_height = history_chunk.height as usize;
+    pane.sync_rendered_history_metrics(all_history_lines.len(), history_height);
+    let end = all_history_lines.len().saturating_sub(pane.scrollback);
+    let start = end.saturating_sub(history_height);
+    let mut history_lines = all_history_lines[start..end].to_vec();
+    dim_command_output_lines(&mut history_lines);
+    let history = if history_lines.is_empty() {
+        Paragraph::new(Line::from(Span::styled(
+            "入力待ち",
+            Style::default().fg(COLOR_MUTED),
+        )))
+    } else {
+        Paragraph::new(
+            history_lines
+                .into_iter()
+                .map(|line| line.line)
+                .collect::<Vec<_>>(),
+        )
+    };
+    frame.render_widget(history, history_chunk);
+
+    let input_width = input_chunk.width.saturating_sub(2) as usize;
+    let status_width = input_chunk.width as usize;
+    let status = codex_runtime_status(pane, status_width);
+    let search_prefix = "  search: ";
+    let prompt = if pane.is_search_editing() {
+        format!(
+            "{search_prefix}{}",
+            ellipsize_width(
+                pane.search_query(),
+                input_width.saturating_sub(search_prefix.len())
+            )
+        )
+    } else if pane.is_turn_running() {
+        "  Ctrl-C:中断  Ctrl-T:表示  Ctrl-F:検索  Ctrl-L:解除".to_string()
+    } else if pane.finished {
+        "  Esc/q:戻る  c/s/d/v:還流  Ctrl-T:表示  Ctrl-F:検索".to_string()
+    } else {
+        let input = ellipsize_width(pane.input_line(), input_width.saturating_sub(4));
+        format!("> {input}")
+    };
+    let input_style = if pane.is_search_editing() {
+        Style::default().fg(COLOR_MEMORY)
+    } else if pane.is_turn_running() {
+        Style::default().fg(COLOR_WARN)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let input_lines = if input_chunk.height <= 1 {
+        vec![Line::from(Span::styled(prompt, input_style))]
+    } else {
+        vec![
+            Line::from(Span::styled(status, Style::default().fg(COLOR_MUTED))),
+            Line::from(Span::styled(prompt, input_style)),
+        ]
+    };
+    frame.render_widget(Paragraph::new(input_lines), input_chunk);
+
+    if pane.is_search_editing() && pane.scrollback == 0 {
+        let cursor_col = (UnicodeWidthStr::width(search_prefix)
+            + UnicodeWidthStr::width(pane.search_query()))
+        .min(input_chunk.width.saturating_sub(1) as usize) as u16;
+        let cursor_row = if input_chunk.height <= 1 {
+            input_chunk.y
+        } else {
+            input_chunk.y + 1
+        };
+        frame.set_cursor_position((input_chunk.x + cursor_col, cursor_row));
+    } else if !pane.is_turn_running() && !pane.finished && pane.scrollback == 0 {
+        let cursor_col = (2 + UnicodeWidthStr::width(pane.input_line()))
+            .min(input_chunk.width.saturating_sub(1) as usize) as u16;
+        let cursor_row = if input_chunk.height <= 1 {
+            input_chunk.y
+        } else {
+            input_chunk.y + 1
+        };
+        frame.set_cursor_position((input_chunk.x + cursor_col, cursor_row));
+    }
+}
+
+fn codex_header_line(pane: &CodexPane, max_width: usize) -> Line<'static> {
+    let state = if pane.finished {
+        "DONE"
+    } else if pane.is_turn_running() {
+        "● RUNNING"
+    } else {
+        "READY"
+    };
+    let search = if pane.search_query().is_empty() {
+        if pane.is_search_editing() {
+            "search:input".to_string()
+        } else {
+            "search:off".to_string()
+        }
+    } else if pane.is_search_editing() {
+        format!("search:{}*", pane.search_query())
+    } else {
+        format!("search:{}", pane.search_query())
+    };
+    let thread = pane
+        .thread_id()
+        .map(short_thread_id)
+        .unwrap_or_else(|| "new".to_string());
+    let text = format!(
+        " {state} | filter:{} | {search} | thread:{thread} | {} | Ctrl-T/F/L",
+        pane.log_filter_label(),
+        pane.history_label()
+    );
+    let style = if pane.is_turn_running() {
+        Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(COLOR_MUTED)
+    };
+    Line::from(Span::styled(ellipsize_width(&text, max_width), style))
+}
+
+fn rendered_lines_height(lines: &[Line<'_>], width: usize) -> usize {
+    lines
+        .iter()
+        .map(|line| rendered_text_height(&line_text_plain(line), width))
+        .sum()
+}
+
+fn rendered_text_height(text: &str, width: usize) -> usize {
+    let width = width.max(1);
+    let mut total = 0usize;
+    for segment in text.replace('\r', "").split('\n') {
+        if segment.is_empty() {
+            total += 1;
+        } else {
+            let segment_width = UnicodeWidthStr::width(segment);
+            total += segment_width.saturating_add(width - 1) / width;
         }
     }
+    total.max(1)
+}
+
+fn line_text_plain(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
+fn codex_activity_lines(activity: &[String], width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let last_index = activity.len().saturating_sub(1);
+    let mut out = Vec::new();
+    for (idx, text) in activity.iter().enumerate() {
+        let style = if idx == last_index {
+            Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        for part in wrap_log_text(text, width) {
+            out.push(Line::from(Span::styled(part, style)));
+        }
+    }
+    out
+}
+
+#[derive(Clone)]
+struct RenderedCodexLine {
+    is_command_output: bool,
+    line: Line<'static>,
+}
+
+fn codex_log_lines(lines: &[&CodexLogLine], max_width: usize) -> Vec<RenderedCodexLine> {
+    lines
+        .iter()
+        .flat_map(|line| {
+            let mut rendered = Vec::new();
+            if matches!(line.kind, CodexLogKind::Turn | CodexLogKind::Tool) {
+                rendered.push(codex_separator_line(line.kind, max_width));
+            }
+            rendered.extend(codex_log_entry_lines(line, max_width));
+            rendered
+        })
+        .collect()
+}
+
+fn codex_separator_line(kind: CodexLogKind, max_width: usize) -> RenderedCodexLine {
+    let (head, fill, color) = match kind {
+        CodexLogKind::Turn => ("-----+ ", '-', COLOR_CODEX),
+        CodexLogKind::Tool => (".....+ ", '.', COLOR_PANEL),
+        _ => ("     | ", '-', COLOR_PANEL),
+    };
+    let fill_width = max_width
+        .saturating_sub(UnicodeWidthStr::width(head))
+        .max(1);
+    RenderedCodexLine {
+        is_command_output: false,
+        line: Line::from(vec![
+            Span::styled(head, Style::default().fg(color)),
+            Span::styled(
+                fill.to_string().repeat(fill_width),
+                Style::default().fg(color),
+            ),
+        ]),
+    }
+}
+
+fn codex_log_entry_lines(line: &CodexLogLine, max_width: usize) -> Vec<RenderedCodexLine> {
+    let (prefix, prefix_style, text_style) = codex_log_prefix(line);
+    let continuation = "     | ";
+    let content_width = max_width.saturating_sub(CODEX_LOG_PREFIX_WIDTH).max(1);
+    let text = codex_log_display_text(line);
+    let wrapped = wrap_log_text(&text, content_width);
+    let mut lines = Vec::with_capacity(wrapped.len().max(1));
+    for (idx, part) in wrapped.into_iter().enumerate() {
+        let prefix_text = if idx == 0 { prefix } else { continuation };
+        let style = if idx == 0 {
+            prefix_style
+        } else {
+            Style::default().fg(COLOR_PANEL)
+        };
+        let is_command_output = matches!(line.kind, CodexLogKind::Tool) && idx > 0;
+        lines.push(RenderedCodexLine {
+            is_command_output,
+            line: Line::from(vec![
+                Span::styled(prefix_text, style),
+                Span::styled(part, text_style),
+            ]),
+        });
+    }
+    lines
+}
+
+fn codex_log_prefix(line: &CodexLogLine) -> (&'static str, Style, Style) {
+    match line.kind {
+        CodexLogKind::User => (
+            "YOU  | ",
+            Style::default()
+                .fg(COLOR_ADDNESS)
+                .add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::White),
+        ),
+        CodexLogKind::Assistant => (
+            "CODEX| ",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::White),
+        ),
+        CodexLogKind::Tool => codex_tool_prefix(&line.text),
+        CodexLogKind::Turn => (
+            "TURN | ",
+            Style::default()
+                .fg(COLOR_CODEX)
+                .add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(COLOR_CODEX)
+                .add_modifier(Modifier::BOLD),
+        ),
+        CodexLogKind::System => (
+            "INFO | ",
+            Style::default().fg(COLOR_MUTED),
+            Style::default().fg(COLOR_MUTED),
+        ),
+        CodexLogKind::Error => (
+            "ERR! | ",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Red),
+        ),
+        CodexLogKind::Event => (
+            "EVT  | ",
+            Style::default().fg(COLOR_WARN),
+            Style::default().fg(COLOR_WARN),
+        ),
+    }
+}
+
+fn codex_tool_prefix(text: &str) -> (&'static str, Style, Style) {
+    if text.contains("exit 0") {
+        (
+            "OK   | ",
+            Style::default()
+                .fg(COLOR_SUCCESS)
+                .add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::White),
+        )
+    } else if text.contains("exit ") {
+        (
+            "ERR  | ",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Red),
+        )
+    } else if text.contains("output_delta") || text.contains('\n') {
+        (
+            "OUT  | ",
+            Style::default().fg(COLOR_MEMORY),
+            Style::default().fg(Color::White),
+        )
+    } else {
+        (
+            "RUN  | ",
+            Style::default()
+                .fg(COLOR_MEMORY)
+                .add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::White),
+        )
+    }
+}
+
+fn codex_log_display_text(line: &CodexLogLine) -> String {
+    let text = line.text.replace('\r', "");
+    if !matches!(line.kind, CodexLogKind::Tool) {
+        return text;
+    }
+    summarize_tool_display_text(strip_tool_event_prefix(&text))
+}
+
+fn strip_tool_event_prefix(text: &str) -> &str {
+    let Some((head, tail)) = text.split_once(": ") else {
+        return text;
+    };
+    let head = head.to_ascii_lowercase();
+    if head.contains("exec")
+        || head.contains("tool")
+        || head.contains("function")
+        || head.contains("mcp")
+        || head.contains("apply_patch")
+        || head.contains("shell")
+    {
+        tail
+    } else {
+        text
+    }
+}
+
+fn wrap_log_text(text: &str, max_width: usize) -> Vec<String> {
+    let max_width = max_width.max(1);
+    let normalized = text.replace('\r', "");
+    let mut out = Vec::new();
+    for segment in normalized.split('\n') {
+        if segment.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+
+        let mut line = String::new();
+        let mut width = 0usize;
+        for ch in segment.chars() {
+            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if width > 0 && width + ch_width > max_width {
+                out.push(line);
+                line = String::new();
+                width = 0;
+            }
+            line.push(ch);
+            width += ch_width;
+        }
+        out.push(line);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+fn summarize_tool_display_text(text: &str) -> String {
+    let normalized = text.replace('\r', "");
+    let Some((head, tail)) = normalized.split_once('\n') else {
+        return normalized;
+    };
+    let output = tail.trim();
+    if output.is_empty() {
+        return head.to_string();
+    }
+
+    if let Some(summary) = special_tool_summary(head, output) {
+        return format!("{head}\n  {summary}");
+    }
+
+    let line_count = output.lines().count();
+    let char_count = output.chars().count();
+    let preview = tool_output_preview(output, CODEX_TOOL_OUTPUT_PREVIEW_CHARS);
+    format!("{head}\n  output: {line_count} lines / {char_count} chars 省略 — {preview}")
+}
+
+fn special_tool_summary(head: &str, output: &str) -> Option<String> {
+    let lower = head.to_ascii_lowercase();
+
+    if lower.contains("cargo test") {
+        if let Some(line) = output.lines().find(|line| line.contains("test result:")) {
+            return Some(format!("tests: {}", compact_summary_line(line)));
+        }
+        if lower.contains("exit 0") {
+            return Some("tests: ok".to_string());
+        }
+    }
+
+    if lower.contains("cargo clippy") {
+        if let Some(line) = output.lines().rev().find(|line| line.contains("Finished ")) {
+            return Some(format!("clippy: {}", compact_summary_line(line)));
+        }
+        if lower.contains("exit 0") {
+            return Some("clippy: ok".to_string());
+        }
+    }
+
+    if lower.contains("cargo build") {
+        if let Some(line) = output.lines().rev().find(|line| line.contains("Finished ")) {
+            return Some(format!("build: {}", compact_summary_line(line)));
+        }
+        if lower.contains("exit 0") {
+            return Some("build: ok".to_string());
+        }
+    }
+
+    if lower.contains("git diff") || lower.contains("git status") {
+        if let Some(line) = output.lines().rev().find(|line| line.contains("changed")) {
+            return Some(format!("diff: {}", compact_summary_line(line)));
+        }
+        if output.trim().is_empty() {
+            return Some("git: no output".to_string());
+        }
+    }
+
+    if looks_like_addness_command(head)
+        && let Some(summary) = json_output_summary(output)
+    {
+        return Some(format!("addness: {summary}"));
+    }
+
+    None
+}
+
+fn looks_like_addness_command(head: &str) -> bool {
+    let lower = head.to_ascii_lowercase();
+    lower.contains("addness")
+        || lower.contains("$addness_bin")
+        || lower.contains(" goal get ")
+        || lower.contains(" goal list ")
+        || lower.contains(" goal children ")
+        || lower.contains(" comment list ")
+        || lower.contains(" deliverable ")
+}
+
+fn json_output_summary(output: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(output.trim()).ok()?;
+    if let Some(title) = json_title(&value) {
+        return Some(format!("goal: {}", compact_summary_line(title)));
+    }
+    match value {
+        Value::Array(items) => Some(format!("json array {} items", items.len())),
+        Value::Object(map) => Some(format!("json object {} keys", map.len())),
+        _ => Some("json value".to_string()),
+    }
+}
+
+fn json_title(value: &Value) -> Option<&str> {
+    value
+        .get("title")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("name").and_then(Value::as_str))
+        .or_else(|| {
+            value
+                .get("goal")
+                .and_then(|goal| goal.get("title"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            value
+                .get("data")
+                .and_then(|data| data.get("title"))
+                .and_then(Value::as_str)
+        })
+}
+
+fn compact_summary_line(text: &str) -> String {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    ellipsize_width(&normalized, 140)
+}
+
+fn tool_output_preview(text: &str, max_chars: usize) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max_chars {
+        return collapsed;
+    }
+    let mut preview = collapsed.chars().take(max_chars).collect::<String>();
+    preview.push_str("...");
+    preview
+}
+
+fn dim_command_output_lines(lines: &mut [RenderedCodexLine]) {
+    for line in lines.iter_mut().filter(|line| line.is_command_output) {
+        for span in &mut line.line.spans {
+            span.style = span.style.add_modifier(Modifier::DIM);
+        }
+    }
+}
+
+fn codex_runtime_status(pane: &CodexPane, max_width: usize) -> String {
+    let state = if pane.finished {
+        "DONE"
+    } else if pane.is_turn_running() {
+        "RUNNING"
+    } else {
+        "READY"
+    };
+    let history = pane.history_label();
+    let fixed_width = UnicodeWidthStr::width(state)
+        .saturating_add(UnicodeWidthStr::width(history.as_str()))
+        .saturating_add(8);
+    let detail = if pane.is_turn_running() {
+        if let Some(command) = pane.current_command() {
+            ellipsize_width(
+                &format!("● 実行中: {command}"),
+                max_width.saturating_sub(fixed_width),
+            )
+        } else {
+            ellipsize_width("● Codex応答中", max_width.saturating_sub(fixed_width))
+        }
+    } else {
+        codex_work_label(
+            pane.finished,
+            pane.assessing,
+            pane.action.as_deref(),
+            pane.last_prompt(),
+            max_width.saturating_sub(fixed_width),
+        )
+    };
+    ellipsize_width(&format!("  {state}  {detail}  |  {history}"), max_width)
+}
+
+fn short_thread_id(id: &str) -> String {
+    if id.chars().count() <= 8 {
+        return id.to_string();
+    }
+    id.chars().take(8).collect()
 }
 
 fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
@@ -2452,6 +3020,11 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
             Style::default()
                 .fg(COLOR_SUCCESS)
                 .add_modifier(Modifier::BOLD),
+        )
+    } else if pane.is_turn_running() {
+        (
+            "● 実行中",
+            Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD),
         )
     } else if pane.assessing {
         (
@@ -2487,6 +3060,21 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
         pane.last_prompt(),
         value_width,
     );
+    let command = pane
+        .current_command()
+        .map(|command| ellipsize_width(command, value_width))
+        .unwrap_or_else(|| {
+            if pane.is_turn_running() {
+                "Codex応答中".to_string()
+            } else {
+                "なし".to_string()
+            }
+        });
+    let command_style = if pane.current_command().is_some() || pane.is_turn_running() {
+        Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(COLOR_MUTED)
+    };
     let memory = codex_memory_label(
         pane.last_addness_read_at,
         pane.last_addness_write_at,
@@ -2499,6 +3087,7 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
     } else {
         Style::default().fg(COLOR_MUTED)
     };
+    let history = ellipsize_width(&pane.history_label(), value_width);
 
     let prompt = pane
         .last_prompt()
@@ -2520,8 +3109,16 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
             Span::styled(work, Style::default().fg(Color::White)),
         ]),
         Line::from(vec![
+            Span::styled("コマンド ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(command, command_style),
+        ]),
+        Line::from(vec![
             Span::styled("記憶 ", Style::default().fg(COLOR_MUTED)),
             Span::styled(memory, memory_style),
+        ]),
+        Line::from(vec![
+            Span::styled("履歴 ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(history, Style::default().fg(COLOR_MEMORY)),
         ]),
         Line::from(""),
         Line::from(Span::styled("最後の送信", Style::default().fg(COLOR_MUTED))),
@@ -2532,8 +3129,16 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(COLOR_CODEX))
-                .title(" Codex 現在地 "),
+                .border_style(Style::default().fg(if pane.is_turn_running() {
+                    COLOR_WARN
+                } else {
+                    COLOR_CODEX
+                }))
+                .title(if pane.is_turn_running() {
+                    " Codex 現在地 ● 実行中 "
+                } else {
+                    " Codex 現在地 "
+                }),
         )
         .wrap(ratatui::widgets::Wrap { trim: true });
     frame.render_widget(panel, area);
@@ -2619,11 +3224,24 @@ fn ellipsize_width(text: &str, max_width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivePane, App, codex_work_label, draw_status_bar, ellipsize_width, prompt_preview,
+        ActivePane, App, codex_activity_lines, codex_header_line, codex_log_entry_lines,
+        codex_log_lines, codex_runtime_status, codex_work_label, dim_command_output_lines,
+        draw_status_bar, ellipsize_width, prompt_preview, summarize_tool_display_text,
     };
     use crate::api::ApiClient;
+    use crate::tui::codex_pane::{CODEX_LOG_PREFIX_WIDTH, CodexLogKind, CodexLogLine, CodexPane};
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::style::Modifier;
+    use ratatui::text::Line;
     use ratatui::{Terminal, backend::TestBackend};
     use unicode_width::UnicodeWidthStr;
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
 
     fn render_status_text(app: &App, width: u16) -> String {
         let mut term = Terminal::new(TestBackend::new(width, 3)).unwrap();
@@ -2665,6 +3283,178 @@ mod tests {
     }
 
     #[test]
+    fn codex_log_entry_lines_wraps_assistant_response() {
+        let entry = CodexLogLine {
+            kind: CodexLogKind::Assistant,
+            text: "abcdef".to_string(),
+        };
+
+        let lines = codex_log_entry_lines(&entry, CODEX_LOG_PREFIX_WIDTH + 3);
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(line_text(&lines[0].line), "CODEX| abc");
+        assert_eq!(line_text(&lines[1].line), "     | def");
+    }
+
+    #[test]
+    fn codex_log_entry_lines_marks_failed_tool_and_strips_event_noise() {
+        let entry = CodexLogLine {
+            kind: CodexLogKind::Tool,
+            text: "exec_command_end (exit 1): cargo test\nfailed".to_string(),
+        };
+
+        let lines = codex_log_entry_lines(&entry, 80);
+
+        assert_eq!(line_text(&lines[0].line), "ERR  | cargo test");
+        assert_eq!(
+            line_text(&lines[1].line),
+            "     |   output: 1 lines / 6 chars 省略 — failed"
+        );
+    }
+
+    #[test]
+    fn codex_log_entry_lines_omits_large_tool_output_preview() {
+        let entry = CodexLogLine {
+            kind: CodexLogKind::Tool,
+            text: format!(
+                "exec_command_end (exit 0): curl https://example.test\n{}",
+                "0123456789 ".repeat(40)
+            ),
+        };
+
+        let lines = codex_log_entry_lines(&entry, 240);
+        let rendered = lines
+            .iter()
+            .map(|line| line_text(&line.line))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("OK   | curl https://example.test"));
+        assert!(rendered.contains("output: 1 lines /"));
+        assert!(rendered.contains("chars 省略"));
+        assert!(rendered.contains("..."));
+        assert!(!rendered.contains(&"0123456789 ".repeat(25)));
+    }
+
+    #[test]
+    fn summarize_tool_display_text_highlights_cargo_test_result() {
+        let text = summarize_tool_display_text("cargo test\ntest result: ok. 86 passed; 0 failed;");
+
+        assert_eq!(
+            text,
+            "cargo test\n  tests: test result: ok. 86 passed; 0 failed;"
+        );
+    }
+
+    #[test]
+    fn summarize_tool_display_text_highlights_addness_json_title() {
+        let text = summarize_tool_display_text(
+            r#"addness goal get goal-1 --json
+{"id":"goal-1","title":"AddnessTUI改善"}"#,
+        );
+
+        assert_eq!(
+            text,
+            "addness goal get goal-1 --json\n  addness: goal: AddnessTUI改善"
+        );
+    }
+
+    #[test]
+    fn codex_header_line_shows_filter_and_search_state() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.cycle_log_filter();
+        pane.begin_search();
+        assert!(pane.handle_search_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)));
+
+        let text = line_text(&codex_header_line(&pane, 200));
+
+        assert!(text.contains("filter:Talk"));
+        assert!(text.contains("search:c*"));
+        assert!(text.contains("履歴"));
+    }
+
+    #[test]
+    fn dim_command_output_lines_dims_only_command_output() {
+        let entry = CodexLogLine {
+            kind: CodexLogKind::Tool,
+            text: "exec_command_end (exit 0): cargo test\nok".to_string(),
+        };
+        let mut lines = codex_log_entry_lines(&entry, 80);
+
+        dim_command_output_lines(&mut lines);
+
+        assert!(
+            !lines[0].line.spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::DIM)
+        );
+        assert!(
+            lines[1].line.spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::DIM)
+        );
+    }
+
+    #[test]
+    fn dim_command_output_lines_keeps_evt_readable() {
+        let entry = CodexLogLine {
+            kind: CodexLogKind::Event,
+            text: "waiting for approval".to_string(),
+        };
+        let mut lines = codex_log_entry_lines(&entry, 80);
+
+        dim_command_output_lines(&mut lines);
+
+        assert!(
+            !lines[0].line.spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::DIM)
+        );
+    }
+
+    #[test]
+    fn codex_log_lines_adds_turn_and_tool_separators() {
+        let turn = CodexLogLine {
+            kind: CodexLogKind::Turn,
+            text: "Turn 1".to_string(),
+        };
+        let tool = CodexLogLine {
+            kind: CodexLogKind::Tool,
+            text: "exec_command_begin: cargo test".to_string(),
+        };
+        let lines = codex_log_lines(&[&turn, &tool], 24)
+            .into_iter()
+            .map(|line| line_text(&line.line))
+            .collect::<Vec<_>>();
+
+        assert!(lines.iter().any(|line| line.starts_with("-----+ ")));
+        assert!(lines.iter().any(|line| line.starts_with(".....+ ")));
+    }
+
+    #[test]
+    fn codex_activity_lines_wraps_long_update_rows() {
+        let lines = codex_activity_lines(&["abcdefghijklmnopqrstuvwxyz".to_string()], 10);
+
+        assert!(lines.len() >= 3);
+        assert_eq!(line_text(&lines[0]), "abcdefghij");
+    }
+
+    #[test]
+    fn codex_runtime_status_shows_current_action() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.finished = false;
+        pane.action = Some("ゴール文脈を読込中".to_string());
+
+        let status = codex_runtime_status(&pane, 80);
+
+        assert!(status.contains("READY"));
+        assert!(status.contains("ゴール文脈を読込中"));
+    }
+
+    #[test]
     fn codex_work_label_prefers_action_over_last_prompt() {
         assert_eq!(
             codex_work_label(false, false, Some("ゴールを更新中"), Some("実装して"), 80),
@@ -2688,7 +3478,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_status_bar_prioritizes_last_scroll_diagnostic() {
+    fn codex_status_bar_prioritizes_scroll_diagnostic_without_last_label() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let client = ApiClient::new("t", "http://localhost").unwrap();
         let mut app = App::new(client, rt.handle().clone());
@@ -2698,8 +3488,12 @@ mod tests {
         let text = render_status_text(&app, 80);
 
         assert!(
-            text.contains("last: mouse ScrollUp -> codex 0->3"),
-            "status should expose last scroll diagnostic near the front:\n{text}"
+            text.contains("mouse ScrollUp -> codex 0->3"),
+            "status should expose scroll diagnostic near the front:\n{text}"
+        );
+        assert!(
+            !text.contains("last:"),
+            "status should not show last label:\n{text}"
         );
     }
 }

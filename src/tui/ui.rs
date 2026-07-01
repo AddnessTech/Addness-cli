@@ -2454,8 +2454,8 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
 
     let input_h = if inner.height >= 4 { 2 } else { 1 };
     let header_h = u16::from(inner.height >= 6);
-    let banner_h = if pane.decision_banner().is_some() && inner.height >= 7 {
-        3
+    let banner_h = if pane.decision_banner().is_some() {
+        codex_decision_banner_height(inner.height)
     } else {
         0
     };
@@ -2595,27 +2595,15 @@ fn draw_codex_decision_banner(frame: &mut Frame, area: Rect, pane: &CodexPane) {
         return;
     };
     let (title, color) = match decision.kind {
-        CodexDecisionKind::Approval => (" 確認待ち: 承認 ", COLOR_WARN),
-        CodexDecisionKind::Permission => (" 確認待ち: 権限 ", Color::Red),
-        CodexDecisionKind::Dangerous => (" 確認待ち: 危険操作 ", Color::Red),
-        CodexDecisionKind::YesNo => (" 確認待ち ", COLOR_WARN),
+        CodexDecisionKind::Approval => (" Codex 確認待ち: 承認 ", COLOR_WARN),
+        CodexDecisionKind::Permission => (" Codex 確認待ち: 権限 ", Color::Red),
+        CodexDecisionKind::Dangerous => (" Codex 確認待ち: 危険操作 ", Color::Red),
+        CodexDecisionKind::YesNo => (" Codex 確認待ち ", COLOR_WARN),
     };
-    let width = area.width.saturating_sub(2) as usize;
-    let hint = format!(
-        " {}:{}   {}:{} ",
-        decision.accept_key, decision.accept_label, decision.deny_key, decision.deny_label
-    );
-    let message_width = width.saturating_sub(UnicodeWidthStr::width(hint.as_str()) + 1);
-    let message = ellipsize_width(&decision.message, message_width);
-    let line = Line::from(vec![
-        Span::styled(message, Style::default().fg(Color::White)),
-        Span::styled(
-            hint,
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ),
-    ]);
+    let content_width = area.width.saturating_sub(2) as usize;
+    let lines = codex_decision_banner_lines(decision, content_width, area.height <= 3);
     frame.render_widget(
-        Paragraph::new(vec![line]).block(
+        Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(color))
@@ -2623,6 +2611,115 @@ fn draw_codex_decision_banner(frame: &mut Frame, area: Rect, pane: &CodexPane) {
         ),
         area,
     );
+}
+
+fn codex_decision_banner_height(inner_height: u16) -> u16 {
+    if inner_height >= 8 {
+        4
+    } else if inner_height >= 7 {
+        3
+    } else {
+        0
+    }
+}
+
+fn codex_decision_banner_lines(
+    decision: &super::codex_pane::CodexDecisionBanner,
+    max_width: usize,
+    compact: bool,
+) -> Vec<Line<'static>> {
+    if compact {
+        let choices = format!(
+            "  {}  {}",
+            decision_choice_text(decision, true),
+            decision_choice_text(decision, false)
+        );
+        let message_width = max_width.saturating_sub(UnicodeWidthStr::width(choices.as_str()) + 3);
+        return vec![Line::from(vec![
+            Span::styled(
+                "? ",
+                Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                ellipsize_width(&decision.message, message_width),
+                Style::default().fg(Color::White),
+            ),
+            Span::styled(
+                choices,
+                Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD),
+            ),
+        ])];
+    }
+
+    vec![
+        Line::from(vec![
+            Span::styled(
+                "? ",
+                Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                ellipsize_width(&decision.message, max_width.saturating_sub(2)),
+                Style::default().fg(Color::White),
+            ),
+        ]),
+        codex_decision_choice_line(decision, max_width),
+    ]
+}
+
+fn codex_decision_choice_line(
+    decision: &super::codex_pane::CodexDecisionBanner,
+    max_width: usize,
+) -> Line<'static> {
+    let accept = decision_choice_text(decision, true);
+    let deny = decision_choice_text(decision, false);
+    let hint = ellipsize_width(
+        &format!("  {accept}    {deny}    キーを押すと選択"),
+        max_width,
+    );
+    let accept_len = UnicodeWidthStr::width(accept.as_str());
+    let deny_len = UnicodeWidthStr::width(deny.as_str());
+    let accept_style = Style::default()
+        .fg(Color::Black)
+        .bg(COLOR_SUCCESS)
+        .add_modifier(Modifier::BOLD);
+    let deny_style = Style::default()
+        .fg(Color::White)
+        .bg(if matches!(decision.kind, CodexDecisionKind::YesNo) {
+            COLOR_PANEL
+        } else {
+            Color::Red
+        })
+        .add_modifier(Modifier::BOLD);
+
+    let mut spans = vec![
+        Span::styled("  ", Style::default()),
+        Span::styled(accept, accept_style),
+        Span::styled("    ", Style::default()),
+        Span::styled(deny, deny_style),
+    ];
+    let suffix_start = 2 + accept_len + 4 + deny_len;
+    if UnicodeWidthStr::width(hint.as_str()) > suffix_start {
+        let suffix = hint.chars().skip(suffix_start).collect::<String>();
+        spans.push(Span::styled(suffix, Style::default().fg(COLOR_MUTED)));
+    }
+    Line::from(spans)
+}
+
+fn decision_choice_text(
+    decision: &super::codex_pane::CodexDecisionBanner,
+    is_accept: bool,
+) -> String {
+    let (key, label) = if is_accept {
+        (decision.accept_key, decision.accept_label)
+    } else {
+        (decision.deny_key, decision.deny_label)
+    };
+    let keys = match (&decision.kind, is_accept) {
+        (CodexDecisionKind::YesNo, _) => key.to_ascii_uppercase().to_string(),
+        (_, true) => format!("{}/Y", key.to_ascii_uppercase()),
+        (_, false) => format!("{}/N", key.to_ascii_uppercase()),
+    };
+    format!("[{keys}] {label}")
 }
 
 fn codex_header_line(pane: &CodexPane, max_width: usize) -> Line<'static> {
@@ -2865,7 +2962,15 @@ fn codex_log_prefix(line: &CodexLogLine) -> (&'static str, Style, Style) {
 }
 
 fn codex_tool_prefix(text: &str) -> (&'static str, Style, Style) {
-    if text.starts_with("DIFF ") {
+    if text.starts_with("EDIT ") {
+        (
+            "EDIT | ",
+            Style::default()
+                .fg(COLOR_CODEX)
+                .add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::White),
+        )
+    } else if text.starts_with("DIFF ") {
         (
             "DIFF | ",
             Style::default()
@@ -2993,6 +3098,9 @@ fn wrapped_log_line_count(text: &str, max_width: usize) -> usize {
 
 fn summarize_tool_display_text(text: &str) -> String {
     let normalized = text.replace('\r', "");
+    if let Some(summary) = code_edit_display_text(&normalized) {
+        return summary;
+    }
     let Some((head, tail)) = normalized.split_once('\n') else {
         return normalized;
     };
@@ -3009,6 +3117,84 @@ fn summarize_tool_display_text(text: &str) -> String {
     let char_count = output.chars().count();
     let preview = tool_output_preview(output, CODEX_TOOL_OUTPUT_PREVIEW_CHARS);
     format!("{head}\n  output: {line_count} lines / {char_count} chars 省略 — {preview}")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodeEditChange {
+    action: &'static str,
+    path: String,
+}
+
+fn code_edit_display_text(text: &str) -> Option<String> {
+    if !looks_like_code_edit_display_text(text) {
+        return None;
+    }
+    let changes = code_edit_changes(text);
+    if changes.is_empty() {
+        let first_line = text.lines().next().unwrap_or("code edit").trim();
+        let title = first_line.strip_prefix("EDIT ").unwrap_or(first_line);
+        let title = if title.is_empty() || title.contains("*** Begin Patch") {
+            "code edit"
+        } else {
+            title
+        };
+        return Some(format!("{title}\n  code edit"));
+    }
+
+    let first = changes.first()?;
+    let title = if changes.len() == 1 {
+        format!("{}: {}", first.action, first.path)
+    } else {
+        format!("{} files changed", changes.len())
+    };
+    let mut lines = vec![title];
+    for change in changes.iter().take(3) {
+        lines.push(format!("  {}: {}", change.action, change.path));
+    }
+    let omitted = changes.len().saturating_sub(3);
+    if omitted > 0 {
+        lines.push(format!("  ... +{omitted} more"));
+    }
+    Some(lines.join("\n"))
+}
+
+fn looks_like_code_edit_display_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.starts_with("edit ")
+        || lower.contains("apply_patch")
+        || text.contains("*** Begin Patch")
+        || text.contains("*** Update File:")
+        || text.contains("*** Add File:")
+        || text.contains("*** Delete File:")
+}
+
+fn code_edit_changes(text: &str) -> Vec<CodeEditChange> {
+    let mut changes = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let change = [
+            ("*** Update File: ", "update"),
+            ("*** Add File: ", "add"),
+            ("*** Delete File: ", "delete"),
+            ("*** Move to: ", "move"),
+        ]
+        .into_iter()
+        .find_map(|(prefix, action)| {
+            trimmed.strip_prefix(prefix).map(|path| CodeEditChange {
+                action,
+                path: path.to_string(),
+            })
+        });
+
+        if let Some(change) = change
+            && !changes
+                .iter()
+                .any(|existing: &CodeEditChange| existing == &change)
+        {
+            changes.push(change);
+        }
+    }
+    changes
 }
 
 fn special_tool_summary(head: &str, output: &str) -> Option<String> {
@@ -3406,13 +3592,16 @@ fn ellipsize_width(text: &str, max_width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivePane, App, codex_activity_lines, codex_header_line, codex_log_entry_lines,
-        codex_log_lines, codex_runtime_status, codex_visible_log_lines, codex_work_label,
-        dim_command_output_lines, draw_status_bar, ellipsize_width, prompt_preview,
-        summarize_tool_display_text,
+        ActivePane, App, codex_activity_lines, codex_decision_banner_lines,
+        codex_decision_choice_line, codex_header_line, codex_log_entry_lines, codex_log_lines,
+        codex_runtime_status, codex_visible_log_lines, codex_work_label, dim_command_output_lines,
+        draw_status_bar, ellipsize_width, prompt_preview, summarize_tool_display_text,
     };
     use crate::api::ApiClient;
-    use crate::tui::codex_pane::{CODEX_LOG_PREFIX_WIDTH, CodexLogKind, CodexLogLine, CodexPane};
+    use crate::tui::codex_pane::{
+        CODEX_LOG_PREFIX_WIDTH, CodexDecisionBanner, CodexDecisionKind, CodexLogKind, CodexLogLine,
+        CodexPane,
+    };
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::style::Modifier;
     use ratatui::text::Line;
@@ -3520,6 +3709,19 @@ mod tests {
     }
 
     #[test]
+    fn codex_log_entry_lines_marks_code_edits_like_codex() {
+        let entry = CodexLogLine {
+            kind: CodexLogKind::Tool,
+            text: "EDIT *** Begin Patch\n*** Update File: src/tui/ui.rs\n@@".to_string(),
+        };
+
+        let lines = codex_log_entry_lines(&entry, 80);
+
+        assert_eq!(line_text(&lines[0].line), "EDIT | update: src/tui/ui.rs");
+        assert_eq!(line_text(&lines[1].line), "     |   update: src/tui/ui.rs");
+    }
+
+    #[test]
     fn summarize_tool_display_text_highlights_cargo_test_result() {
         let text = summarize_tool_display_text("cargo test\ntest result: ok. 86 passed; 0 failed;");
 
@@ -3554,6 +3756,44 @@ mod tests {
         assert!(text.contains("filter:Talk"));
         assert!(text.contains("search:c*"));
         assert!(text.contains("履歴"));
+    }
+
+    #[test]
+    fn codex_decision_banner_uses_clear_yes_no_choices() {
+        let decision = CodexDecisionBanner {
+            kind: CodexDecisionKind::YesNo,
+            message: "続行しますか?".to_string(),
+            accept_key: 'y',
+            accept_label: "Yes",
+            deny_key: 'n',
+            deny_label: "No",
+        };
+
+        let lines = codex_decision_banner_lines(&decision, 80, false)
+            .into_iter()
+            .map(|line| line_text(&line))
+            .collect::<Vec<_>>();
+
+        assert_eq!(lines[0], "? 続行しますか?");
+        assert!(lines[1].contains("[Y] Yes"));
+        assert!(lines[1].contains("[N] No"));
+    }
+
+    #[test]
+    fn codex_decision_banner_shows_approval_alias_keys() {
+        let decision = CodexDecisionBanner {
+            kind: CodexDecisionKind::Approval,
+            message: "コマンドを実行しますか?".to_string(),
+            accept_key: 'a',
+            accept_label: "承認",
+            deny_key: 'd',
+            deny_label: "拒否",
+        };
+
+        let text = line_text(&codex_decision_choice_line(&decision, 80));
+
+        assert!(text.contains("[A/Y] 承認"));
+        assert!(text.contains("[D/N] 拒否"));
     }
 
     #[test]

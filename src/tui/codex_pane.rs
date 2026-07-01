@@ -2002,7 +2002,13 @@ fn tool_display(event_type: &str, value: &Value) -> Option<ToolDisplay> {
         });
     };
 
-    let state = tool_state_label(event_type, exit_code.as_deref(), command.as_deref());
+    let is_code_edit = is_code_edit_tool(event_type, &name, command.as_deref(), output.as_deref());
+    let state = tool_state_label(
+        event_type,
+        exit_code.as_deref(),
+        command.as_deref(),
+        is_code_edit,
+    );
     let mut label = format!("{state} {primary}");
     if !display_name.is_empty() && !primary.contains(&display_name) {
         label.push_str(&format!("  [{display_name}]"));
@@ -2036,6 +2042,7 @@ fn tool_state_label(
     event_type: &str,
     exit_code: Option<&str>,
     command: Option<&str>,
+    is_code_edit: bool,
 ) -> &'static str {
     let lower_event = event_type.to_ascii_lowercase();
     let lower_command = command.unwrap_or("").to_ascii_lowercase();
@@ -2047,17 +2054,51 @@ fn tool_state_label(
     }
     if let Some(code) = exit_code {
         if code == "0" {
-            return "OK";
+            return if is_code_edit { "EDIT" } else { "OK" };
         }
         return "FAIL";
     }
     if lower_event.contains("failed") || lower_event.contains("error") {
         return "FAIL";
     }
+    if is_code_edit {
+        return "EDIT";
+    }
     if is_tool_completion_event(event_type) {
         return "OK";
     }
     "RUNNING"
+}
+
+fn is_code_edit_tool(
+    event_type: &str,
+    name: &str,
+    command: Option<&str>,
+    output: Option<&str>,
+) -> bool {
+    let event_type = event_type.to_ascii_lowercase();
+    let name = name.to_ascii_lowercase();
+    if name == "apply_patch"
+        || name.contains("edit")
+        || name.contains("write_file")
+        || name.contains("file_write")
+        || name.contains("update_file")
+    {
+        return true;
+    }
+    [Some(event_type.as_str()), command, output]
+        .into_iter()
+        .flatten()
+        .any(looks_like_code_edit_text)
+}
+
+fn looks_like_code_edit_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("apply_patch")
+        || text.contains("*** Begin Patch")
+        || text.contains("*** Update File:")
+        || text.contains("*** Add File:")
+        || text.contains("*** Delete File:")
 }
 
 fn is_tool_completion_event(event_type: &str) -> bool {
@@ -2864,6 +2905,19 @@ mod tests {
         assert!(line.text.contains("cargo check"));
         assert!(line.text.contains("/repo"));
         assert_eq!(pane.current_command(), Some("cargo check"));
+    }
+
+    #[test]
+    fn apply_patch_renders_as_code_edit_tool() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.handle_stdout_line(
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"apply_patch","arguments":"*** Begin Patch\n*** Update File: src/tui/ui.rs\n@@\n*** End Patch\n"}}"#,
+        );
+
+        let line = pane.log.last().unwrap();
+        assert_eq!(line.kind, CodexLogKind::Tool);
+        assert!(line.text.starts_with("EDIT "));
+        assert!(line.text.contains("*** Update File: src/tui/ui.rs"));
     }
 
     #[test]

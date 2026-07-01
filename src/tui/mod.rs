@@ -1,5 +1,7 @@
 mod app;
+mod codex_memory;
 mod codex_pane;
+mod file_picker;
 mod goal_tree;
 mod ui;
 

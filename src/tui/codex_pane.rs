@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
 use tui_term::vt100;
 
 /// codex 実行ファイルのパスを解決する。
@@ -632,6 +632,23 @@ impl CodexPane {
         let _ = self.writer.flush();
     }
 
+    /// マウスホイール/トラックパッドのスクロールを PTY 内の codex へ転送する。
+    /// column/row は codex 端末内の 0 始まり座標。
+    pub fn input_mouse_wheel(
+        &mut self,
+        kind: MouseEventKind,
+        column: u16,
+        row: u16,
+        modifiers: KeyModifiers,
+    ) -> bool {
+        let Some(bytes) = encode_mouse_wheel(kind, column, row, modifiers) else {
+            return false;
+        };
+        let _ = self.writer.write_all(&bytes);
+        let _ = self.writer.flush();
+        true
+    }
+
     /// TUI 側の操作からシステムプロンプト（F9 再開など）を codex に送信する。
     /// ユーザーの作業依頼ではないので last_prompt は更新しない
     /// （「最後の送信」表示や body 記録の核を定型文で汚さないため）。
@@ -956,6 +973,35 @@ fn encode_key(key: KeyEvent) -> Vec<u8> {
     out
 }
 
+/// crossterm のホイールイベントを xterm SGR mouse mode の入力列へ変換する。
+fn encode_mouse_wheel(
+    kind: MouseEventKind,
+    column: u16,
+    row: u16,
+    modifiers: KeyModifiers,
+) -> Option<Vec<u8>> {
+    let mut cb = match kind {
+        MouseEventKind::ScrollUp => 64,
+        MouseEventKind::ScrollDown => 65,
+        MouseEventKind::ScrollLeft => 66,
+        MouseEventKind::ScrollRight => 67,
+        _ => return None,
+    };
+    if modifiers.contains(KeyModifiers::SHIFT) {
+        cb += 4;
+    }
+    if modifiers.contains(KeyModifiers::ALT) {
+        cb += 8;
+    }
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        cb += 16;
+    }
+
+    let x = column.saturating_add(1);
+    let y = row.saturating_add(1);
+    Some(format!("\x1b[<{cb};{x};{y}M").into_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1003,6 +1049,39 @@ mod tests {
         assert_eq!(
             encode_key(key_mod(KeyCode::Char('x'), KeyModifiers::ALT)),
             vec![0x1b, b'x']
+        );
+    }
+
+    #[test]
+    fn encode_mouse_wheel_uses_sgr_coordinates() {
+        assert_eq!(
+            encode_mouse_wheel(MouseEventKind::ScrollUp, 0, 0, KeyModifiers::NONE),
+            Some(b"\x1b[<64;1;1M".to_vec())
+        );
+        assert_eq!(
+            encode_mouse_wheel(MouseEventKind::ScrollDown, 12, 4, KeyModifiers::NONE),
+            Some(b"\x1b[<65;13;5M".to_vec())
+        );
+    }
+
+    #[test]
+    fn encode_mouse_wheel_preserves_modifiers() {
+        assert_eq!(
+            encode_mouse_wheel(
+                MouseEventKind::ScrollRight,
+                2,
+                3,
+                KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL
+            ),
+            Some(b"\x1b[<95;3;4M".to_vec())
+        );
+    }
+
+    #[test]
+    fn encode_mouse_wheel_ignores_non_wheel_events() {
+        assert_eq!(
+            encode_mouse_wheel(MouseEventKind::Moved, 0, 0, KeyModifiers::NONE),
+            None
         );
     }
 

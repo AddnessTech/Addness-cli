@@ -3,8 +3,9 @@ use chrono::{Local, Utc};
 use ratatui::{
     DefaultTerminal,
     crossterm::event::{
-        self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+        self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
     },
+    layout::Rect,
 };
 use std::{collections::HashMap, io::Write, path::PathBuf, time::Instant};
 use tokio::runtime::Handle;
@@ -914,6 +915,8 @@ pub struct App {
 
     /// 埋め込み codex セッション（起動中のみ Some）
     pub codex: Option<CodexPane>,
+    /// 直近に描画した codex 端末ペインの外枠領域。マウス座標のローカル変換に使う。
+    pub(super) codex_terminal_area: Option<Rect>,
 
     /// codex 実行中、対象ゴールを低頻度・非ブロッキングで再取得するための
     /// バックグラウンドタスク（進行中のみ Some）と、前回リフレッシュ時刻。
@@ -960,6 +963,7 @@ impl App {
             modal_state: None,
             success_message: None,
             codex: None,
+            codex_terminal_area: None,
             codex_refresh: None,
             last_codex_refresh: None,
             last_codex_sync: None,
@@ -1474,7 +1478,7 @@ impl App {
                 self.active_pane = ActivePane::Codex;
                 // 通常UI → codex の構造遷移。前画面の残像を消すため全クリアする。
                 self.needs_full_clear = true;
-                // ホイールスクロール用にマウスキャプチャを有効化（codex 中のみ）。
+                // codex 端末上のトラックパッド/ホイール操作を受け取るため有効化（codex 中のみ）。
                 Self::set_mouse_capture(true);
             }
             Err(e) => {
@@ -1649,6 +1653,7 @@ impl App {
     fn close_codex(&mut self) {
         // 通常画面に戻るのでマウスキャプチャを解除（テキスト選択を戻す）。
         Self::set_mouse_capture(false);
+        self.codex_terminal_area = None;
         // 進行中の非同期作業メモ記録を先に止め、この後の同期終了記録と body を奪い合わせない。
         if let Some(job) = self.codex_body_record_job.take() {
             job.abort();
@@ -2169,6 +2174,53 @@ impl App {
         }
     }
 
+    fn handle_codex_mouse(&mut self, mouse: MouseEvent) {
+        if self.active_pane != ActivePane::Codex || self.modal_state.is_some() {
+            return;
+        }
+        let Some((column, row)) = self.codex_terminal_point(mouse.column, mouse.row) else {
+            return;
+        };
+        let Some(pane) = self.codex.as_mut() else {
+            return;
+        };
+
+        if !pane.finished
+            && pane.scrollback == 0
+            && pane.input_mouse_wheel(mouse.kind, column, row, mouse.modifiers)
+        {
+            return;
+        }
+
+        match mouse.kind {
+            MouseEventKind::ScrollUp => pane.scroll_lines(3),
+            MouseEventKind::ScrollDown => pane.scroll_lines(-3),
+            _ => {}
+        }
+    }
+
+    fn codex_terminal_point(&self, column: u16, row: u16) -> Option<(u16, u16)> {
+        Self::point_in_inner_area(self.codex_terminal_area?, column, row)
+    }
+
+    fn point_in_inner_area(area: Rect, column: u16, row: u16) -> Option<(u16, u16)> {
+        let inner = Rect {
+            x: area.x.saturating_add(1),
+            y: area.y.saturating_add(1),
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(2),
+        };
+        if inner.width == 0 || inner.height == 0 {
+            return None;
+        }
+        let right = inner.x.saturating_add(inner.width);
+        let bottom = inner.y.saturating_add(inner.height);
+        if column < inner.x || row < inner.y || column >= right || row >= bottom {
+            return None;
+        }
+        Some((column - inner.x, row - inner.y))
+    }
+
     /// codex の作業差分（git diff --stat）をプリフィルして、対象ゴールへの
     /// 進捗コメントモーダルを開く（還流: コメント）。
     fn start_codex_reflow_comment(&mut self) {
@@ -2452,19 +2504,9 @@ impl App {
             return Ok(());
         }
 
-        // マウスホイール（トラックパッド）で codex ログをスクロールする。
-        // マウスキャプチャは codex 使用中のみ有効化している。
         if let Event::Mouse(me) = event {
-            if self.active_pane == ActivePane::Codex
-                && self.modal_state.is_none()
-                && let Some(pane) = self.codex.as_mut()
-            {
-                match me.kind {
-                    MouseEventKind::ScrollUp => pane.scroll_lines(3),
-                    MouseEventKind::ScrollDown => pane.scroll_lines(-3),
-                    _ => {}
-                }
-            }
+            // codex 使用中のみ有効なマウスキャプチャを、右側の PTY 端末領域に限定して扱う。
+            self.handle_codex_mouse(me);
             return Ok(());
         }
 
@@ -4442,6 +4484,51 @@ mod picker_interaction_tests {
             app.modal_state,
             Some(ModalState::AddDeliverable { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod codex_mouse_tests {
+    use super::*;
+
+    #[test]
+    fn point_in_inner_area_converts_borderless_terminal_coordinates() {
+        let area = Rect {
+            x: 10,
+            y: 5,
+            width: 20,
+            height: 8,
+        };
+
+        assert_eq!(App::point_in_inner_area(area, 11, 6), Some((0, 0)));
+        assert_eq!(App::point_in_inner_area(area, 28, 11), Some((17, 5)));
+    }
+
+    #[test]
+    fn point_in_inner_area_excludes_borders_and_outside() {
+        let area = Rect {
+            x: 10,
+            y: 5,
+            width: 20,
+            height: 8,
+        };
+
+        assert_eq!(App::point_in_inner_area(area, 10, 6), None);
+        assert_eq!(App::point_in_inner_area(area, 11, 5), None);
+        assert_eq!(App::point_in_inner_area(area, 29, 6), None);
+        assert_eq!(App::point_in_inner_area(area, 11, 12), None);
+    }
+
+    #[test]
+    fn point_in_inner_area_ignores_tiny_rects() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 1,
+        };
+
+        assert_eq!(App::point_in_inner_area(area, 1, 1), None);
     }
 }
 

@@ -90,6 +90,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         // 全幅を「Addnessの進行が見えるペイン + codex本体」に使う。
         draw_codex(frame, main_layout[1], app);
     } else {
+        app.codex_terminal_area = None;
         let content_layout = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(24), Constraint::Min(0)])
@@ -985,6 +986,7 @@ fn draw_help_overlay(frame: &mut Frame) {
         section("codex連携 (o →「codexで作業」)"),
         kv("起動", "選択ゴールの文脈付きでcodexをペイン起動"),
         kv("F9", "Addnessの作業メモ・決定ログから再開"),
+        kv("Trackpad/ホイール", "右側のcodex端末へスクロールを転送"),
         kv("Shift+↑↓", "実行中のcodexログをスクロール"),
         kv(
             "Shift+PgUp/PgDn",
@@ -2348,6 +2350,7 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
 
     // --- codex 端末ペイン ---
     let term_area = chunks[1];
+    app.codex_terminal_area = Some(term_area);
     let rows = term_area.height.saturating_sub(2);
     let cols = term_area.width.saturating_sub(2);
     if let Some(pane) = app.codex.as_mut() {

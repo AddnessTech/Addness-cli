@@ -27,6 +27,7 @@ const COLOR_MUTED: Color = Color::Rgb(112, 122, 138);
 const COLOR_PANEL: Color = Color::Rgb(65, 81, 105);
 const COLOR_INPUT_BG: Color = Color::Rgb(34, 38, 46);
 const CODEX_TOOL_OUTPUT_PREVIEW_CHARS: usize = 160;
+const CODEX_EDIT_DIFF_PREVIEW_LINES: usize = 8;
 
 /// Replace @uuid mentions in text with @member_name
 fn replace_member_mentions(text: &str, members: &HashMap<MemberId, Member>) -> String {
@@ -2871,6 +2872,7 @@ fn codex_log_entry_lines(line: &CodexLogLine, max_width: usize) -> Vec<RenderedC
     let continuation = "     | ";
     let content_width = max_width.saturating_sub(CODEX_LOG_PREFIX_WIDTH).max(1);
     let text = codex_log_display_text(line);
+    let is_edit_tool = matches!(line.kind, CodexLogKind::Tool) && line.text.starts_with("EDIT ");
     let wrapped = wrap_log_text(&text, content_width);
     let mut lines = Vec::with_capacity(wrapped.len().max(1));
     for (idx, part) in wrapped.into_iter().enumerate() {
@@ -2880,16 +2882,45 @@ fn codex_log_entry_lines(line: &CodexLogLine, max_width: usize) -> Vec<RenderedC
         } else {
             Style::default().fg(COLOR_PANEL)
         };
-        let is_command_output = matches!(line.kind, CodexLogKind::Tool) && idx > 0;
+        let is_command_output = matches!(line.kind, CodexLogKind::Tool) && idx > 0 && !is_edit_tool;
+        let part_style = if is_edit_tool {
+            codex_edit_diff_style(&part, text_style)
+        } else {
+            text_style
+        };
         lines.push(RenderedCodexLine {
             is_command_output,
             line: Line::from(vec![
                 Span::styled(prefix_text, style),
-                Span::styled(part, text_style),
+                Span::styled(part, part_style),
             ]),
         });
     }
     lines
+}
+
+fn codex_edit_diff_style(part: &str, fallback: Style) -> Style {
+    let trimmed = part.trim_start();
+    if trimmed.starts_with('+') {
+        Style::default()
+            .fg(COLOR_SUCCESS)
+            .add_modifier(Modifier::BOLD)
+    } else if trimmed.starts_with('-') {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else if trimmed.starts_with("@@") {
+        Style::default().fg(COLOR_MEMORY)
+    } else if trimmed.starts_with("update:")
+        || trimmed.starts_with("add:")
+        || trimmed.starts_with("delete:")
+        || trimmed.starts_with("move:")
+        || trimmed.ends_with("files changed")
+    {
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        fallback
+    }
 }
 
 fn codex_log_prefix(line: &CodexLogLine) -> (&'static str, Style, Style) {
@@ -3076,22 +3107,59 @@ fn summarize_tool_display_text(text: &str) -> String {
     if let Some(summary) = code_edit_display_text(&normalized) {
         return summary;
     }
+    let (state, normalized) = split_tool_state_prefix(&normalized);
     let Some((head, tail)) = normalized.split_once('\n') else {
-        return normalized;
+        return tool_command_tree_head(state, normalized.trim());
     };
     let output = tail.trim();
+    let head_line = tool_command_tree_head(state, head.trim());
     if output.is_empty() {
-        return head.to_string();
+        return head_line;
     }
 
     if let Some(summary) = special_tool_summary(head, output) {
-        return format!("{head}\n  {summary}");
+        return format!("{head_line}\n  └ {summary}");
     }
 
-    let line_count = output.lines().count();
-    let char_count = output.chars().count();
-    let preview = tool_output_preview(output, CODEX_TOOL_OUTPUT_PREVIEW_CHARS);
-    format!("{head}\n  output: {line_count} lines / {char_count} chars 省略 — {preview}")
+    let preview = tool_output_tree_preview(output, CODEX_TOOL_OUTPUT_PREVIEW_CHARS);
+    format!("{head_line}\n  └ {preview}")
+}
+
+fn split_tool_state_prefix(text: &str) -> (Option<&str>, &str) {
+    for state in ["RUNNING", "OK", "FAIL", "DIFF"] {
+        if let Some(rest) = text.strip_prefix(state)
+            && rest.chars().next().is_some_and(char::is_whitespace)
+        {
+            return (Some(state), rest.trim_start());
+        }
+    }
+    (None, text)
+}
+
+fn tool_command_tree_head(state: Option<&str>, command: &str) -> String {
+    let verb = if state == Some("RUNNING") {
+        "Running"
+    } else {
+        "Ran"
+    };
+    format!("• {verb} {command}")
+}
+
+fn tool_output_tree_preview(output: &str, max_chars: usize) -> String {
+    let first = output
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(output)
+        .trim();
+    let mut preview = tool_output_preview(first, max_chars);
+    let omitted = output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    if omitted > 1 {
+        preview.push_str(&format!("  … +{} lines", omitted - 1));
+    }
+    preview
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3123,13 +3191,16 @@ fn code_edit_display_text(text: &str) -> Option<String> {
         format!("{} files changed", changes.len())
     };
     let mut lines = vec![title];
-    for change in changes.iter().take(3) {
-        lines.push(format!("  {}: {}", change.action, change.path));
+    if changes.len() > 1 {
+        for change in changes.iter().take(3) {
+            lines.push(format!("  {}: {}", change.action, change.path));
+        }
+        let omitted = changes.len().saturating_sub(3);
+        if omitted > 0 {
+            lines.push(format!("  ... +{omitted} more"));
+        }
     }
-    let omitted = changes.len().saturating_sub(3);
-    if omitted > 0 {
-        lines.push(format!("  ... +{omitted} more"));
-    }
+    lines.extend(code_edit_diff_preview(text, CODEX_EDIT_DIFF_PREVIEW_LINES));
     Some(lines.join("\n"))
 }
 
@@ -3170,6 +3241,33 @@ fn code_edit_changes(text: &str) -> Vec<CodeEditChange> {
         }
     }
     changes
+}
+
+fn code_edit_diff_preview(text: &str, max_lines: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut omitted = 0usize;
+
+    for line in text.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.starts_with("***") {
+            continue;
+        }
+        let is_diff_line =
+            trimmed.starts_with("@@") || trimmed.starts_with('+') || trimmed.starts_with('-');
+        if !is_diff_line {
+            continue;
+        }
+        if out.len() >= max_lines {
+            omitted += 1;
+            continue;
+        }
+        out.push(ellipsize_width(trimmed, 140));
+    }
+
+    if omitted > 0 {
+        out.push(format!("... +{omitted} diff lines"));
+    }
+    out
 }
 
 fn special_tool_summary(head: &str, output: &str) -> Option<String> {
@@ -3576,7 +3674,7 @@ fn ellipsize_width(text: &str, max_width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivePane, App, codex_activity_lines, codex_decision_banner_lines,
+        ActivePane, App, COLOR_SUCCESS, codex_activity_lines, codex_decision_banner_lines,
         codex_decision_choice_line, codex_header_line, codex_log_entry_lines, codex_log_lines,
         codex_runtime_status, codex_visible_log_lines, codex_work_label, dim_command_output_lines,
         draw_status_bar, ellipsize_width, prompt_preview, summarize_tool_display_text,
@@ -3587,7 +3685,7 @@ mod tests {
         CodexPane,
     };
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use ratatui::style::Modifier;
+    use ratatui::style::{Color, Modifier};
     use ratatui::text::Line;
     use ratatui::{Terminal, backend::TestBackend};
     use unicode_width::UnicodeWidthStr;
@@ -3661,11 +3759,8 @@ mod tests {
 
         let lines = codex_log_entry_lines(&entry, 80);
 
-        assert_eq!(line_text(&lines[0].line), "FAIL | cargo test");
-        assert_eq!(
-            line_text(&lines[1].line),
-            "     |   output: 1 lines / 6 chars 省略 — failed"
-        );
+        assert_eq!(line_text(&lines[0].line), "FAIL | • Ran cargo test");
+        assert_eq!(line_text(&lines[1].line), "     |   └ failed");
     }
 
     #[test]
@@ -3685,9 +3780,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(rendered.contains("OK   | curl https://example.test"));
-        assert!(rendered.contains("output: 1 lines /"));
-        assert!(rendered.contains("chars 省略"));
+        assert!(rendered.contains("OK   | • Ran curl https://example.test"));
+        assert!(rendered.contains("└ 0123456789"));
         assert!(rendered.contains("..."));
         assert!(!rendered.contains(&"0123456789 ".repeat(25)));
     }
@@ -3696,13 +3790,23 @@ mod tests {
     fn codex_log_entry_lines_marks_code_edits_like_codex() {
         let entry = CodexLogLine {
             kind: CodexLogKind::Tool,
-            text: "EDIT *** Begin Patch\n*** Update File: src/tui/ui.rs\n@@".to_string(),
+            text: "EDIT *** Begin Patch\n*** Update File: src/tui/ui.rs\n@@\n-old line\n+new line\n*** End Patch".to_string(),
         };
 
         let lines = codex_log_entry_lines(&entry, 80);
 
         assert_eq!(line_text(&lines[0].line), "EDIT | update: src/tui/ui.rs");
-        assert_eq!(line_text(&lines[1].line), "     |   update: src/tui/ui.rs");
+        assert_eq!(line_text(&lines[1].line), "     | @@");
+        assert_eq!(line_text(&lines[2].line), "     | -old line");
+        assert_eq!(line_text(&lines[3].line), "     | +new line");
+        assert_eq!(lines[2].line.spans[1].style.fg, Some(Color::Red));
+        assert_eq!(lines[3].line.spans[1].style.fg, Some(COLOR_SUCCESS));
+        assert!(
+            !lines[2].line.spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::DIM)
+        );
     }
 
     #[test]
@@ -3711,7 +3815,19 @@ mod tests {
 
         assert_eq!(
             text,
-            "cargo test\n  tests: test result: ok. 86 passed; 0 failed;"
+            "• Ran cargo test\n  └ tests: test result: ok. 86 passed; 0 failed;"
+        );
+    }
+
+    #[test]
+    fn summarize_tool_display_text_uses_codex_like_tree_output() {
+        let text = summarize_tool_display_text(
+            "cargo fmt -- --check\nDiff in /repo/src/tui/ui.rs:3163:\n-old\n+new",
+        );
+
+        assert_eq!(
+            text,
+            "• Ran cargo fmt -- --check\n  └ Diff in /repo/src/tui/ui.rs:3163:  … +2 lines"
         );
     }
 
@@ -3724,7 +3840,7 @@ mod tests {
 
         assert_eq!(
             text,
-            "addness goal get goal-1 --json\n  addness: goal: AddnessTUI改善"
+            "• Ran addness goal get goal-1 --json\n  └ addness: goal: AddnessTUI改善"
         );
     }
 

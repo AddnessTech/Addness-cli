@@ -1,6 +1,6 @@
 use std::io::{self, Write};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use crate::config::{Credentials, Settings};
 
@@ -29,6 +29,13 @@ fn mask_key(key: &str) -> String {
     } else {
         "***".to_string()
     }
+}
+
+fn ensure_non_empty_api_key(api_key: &str) -> Result<()> {
+    if api_key.trim().is_empty() {
+        bail!("API Key cannot be empty. Run `addness login` or enter an API key.");
+    }
+    Ok(())
 }
 
 pub fn handle_configure() -> Result<()> {
@@ -64,6 +71,7 @@ pub fn handle_configure() -> Result<()> {
     } else {
         api_key
     };
+    ensure_non_empty_api_key(&api_key)?;
 
     // API URL
     let api_url = prompt("API URL", existing_creds.api_url())?;
@@ -159,4 +167,20 @@ pub fn handle_logout() -> Result<()> {
     Settings::delete()?;
     println!("Logged out. Credentials and settings removed.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_non_empty_api_key;
+
+    #[test]
+    fn api_key_validation_rejects_blank_values() {
+        assert!(ensure_non_empty_api_key("").is_err());
+        assert!(ensure_non_empty_api_key("   ").is_err());
+    }
+
+    #[test]
+    fn api_key_validation_accepts_non_blank_values() {
+        assert!(ensure_non_empty_api_key("ak_test").is_ok());
+    }
 }

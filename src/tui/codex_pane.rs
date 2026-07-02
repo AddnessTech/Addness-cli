@@ -324,8 +324,11 @@ pub struct CodexPane {
     /// 最初の実依頼の body 自動記録を済み（再試行しない）とするフラグ。
     body_record_done: bool,
     input_state: CodexInputState,
+    queued_prompts: VecDeque<String>,
     /// `codex exec --json` が返した Codex thread id。2ターン目以降の resume に使う。
     thread_id: Option<String>,
+    /// いま実行中のターンに対応するユーザー入力。turn.started の見出しに使う。
+    current_turn_prompt: Option<String>,
     /// Codex の turn 番号。UI上の区切りに使う。
     turn_count: usize,
     collapsed_turns: BTreeSet<usize>,
@@ -446,7 +449,9 @@ impl CodexPane {
             auto_record_attempted: false,
             body_record_done: false,
             input_state: CodexInputState::default(),
+            queued_prompts: VecDeque::new(),
             thread_id: None,
+            current_turn_prompt: None,
             turn_count,
             collapsed_turns,
             log: loaded.log,
@@ -539,7 +544,7 @@ impl CodexPane {
     }
 
     pub fn is_turn_running(&self) -> bool {
-        self.turn_running
+        self.turn_running || self.child.is_some()
     }
 
     pub fn run_state(&self) -> CodexRunState {
@@ -549,7 +554,7 @@ impl CodexPane {
             CodexRunState::Confirming
         } else if self.current_command.is_some() {
             CodexRunState::CommandRunning
-        } else if self.turn_running {
+        } else if self.is_turn_running() {
             CodexRunState::Thinking
         } else {
             CodexRunState::InputWaiting
@@ -591,6 +596,10 @@ impl CodexPane {
 
     pub fn input_line(&self) -> &str {
         &self.input_state.line
+    }
+
+    pub fn queued_prompt_count(&self) -> usize {
+        self.queued_prompts.len()
     }
 
     pub fn filtered_log_lines(&self) -> Vec<&CodexLogLine> {
@@ -941,6 +950,8 @@ impl CodexPane {
                         }
                     }
                     self.turn_finished_by_event = false;
+                    self.current_turn_prompt = None;
+                    self.start_next_queued_turn_if_idle();
                     changed = true;
                 }
                 Ok(None) => {}
@@ -950,9 +961,11 @@ impl CodexPane {
                     self.current_command = None;
                     self.current_command_started_at = None;
                     self.pending_decision = None;
+                    self.current_turn_prompt = None;
                     let message = format!("Codex 状態確認に失敗: {e}");
                     self.push_log(CodexLogKind::Error, message.clone());
                     self.push_terminal_notice("Codex エラー", message);
+                    self.start_next_queued_turn_if_idle();
                     changed = true;
                 }
             }
@@ -1016,7 +1029,9 @@ impl CodexPane {
                 }
                 self.turn_count = self.turn_count.saturating_add(1);
                 let label = self
-                    .last_prompt()
+                    .current_turn_prompt
+                    .as_deref()
+                    .or_else(|| self.last_prompt())
                     .map(compact_turn_prompt)
                     .filter(|prompt| !prompt.is_empty())
                     .map(|prompt| format!("Turn {} - {prompt}", self.turn_count))
@@ -1190,7 +1205,16 @@ impl CodexPane {
             return;
         }
 
-        if self.turn_running {
+        if self.is_turn_running()
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c' | 'C'))
+        {
+            self.kill_current_turn();
+            self.start_next_queued_turn_if_idle();
+            return;
+        }
+
+        if self.pending_decision.is_some() {
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && matches!(key.code, KeyCode::Char('c' | 'C'))
             {
@@ -1209,7 +1233,7 @@ impl CodexPane {
     /// ユーザーの作業依頼ではないので last_prompt は更新しない。
     pub fn submit_system_line(&mut self, line: &str) {
         let submitted = normalize_submitted_line(line);
-        if submitted.is_empty() || self.turn_running || self.finished {
+        if submitted.is_empty() || self.is_turn_running() || self.finished {
             return;
         }
         self.push_log(CodexLogKind::System, format!("Addness: {submitted}"));
@@ -1224,20 +1248,41 @@ impl CodexPane {
         self.input_state.record_submitted(&submitted);
         self.push_log(CodexLogKind::User, submitted.clone());
 
+        if self.is_turn_running() {
+            self.queued_prompts.push_back(submitted);
+            let count = self.queued_prompts.len();
+            self.action = Some(format!("次ターン予約 {count}件"));
+            self.push_log(
+                CodexLogKind::System,
+                format!("Codex 実行中のため次のターンに予約しました（待ち{count}件）"),
+            );
+            return;
+        }
+
+        self.run_submitted_line(submitted);
+    }
+
+    fn run_submitted_line(&mut self, submitted: String) {
         if submitted == "/exit" {
-            self.finished = true;
-            self.pending_decision = None;
-            self.current_command = None;
-            self.current_command_started_at = None;
-            self.push_log(CodexLogKind::System, "Codex セッションを終了します");
+            self.finish_from_exit_command();
             return;
         }
 
         self.start_turn(&submitted);
     }
 
+    fn finish_from_exit_command(&mut self) {
+        self.finished = true;
+        self.queued_prompts.clear();
+        self.pending_decision = None;
+        self.current_command = None;
+        self.current_command_started_at = None;
+        self.current_turn_prompt = None;
+        self.push_log(CodexLogKind::System, "Codex セッションを終了します");
+    }
+
     fn start_turn(&mut self, prompt: &str) {
-        if self.turn_running {
+        if self.is_turn_running() {
             self.push_log(CodexLogKind::System, "前の Codex ターンがまだ実行中です");
             return;
         }
@@ -1249,6 +1294,7 @@ impl CodexPane {
                 self.turn_running = true;
                 self.turn_finished_by_event = false;
                 self.pending_decision = None;
+                self.current_turn_prompt = Some(prompt.to_string());
                 self.scroll_to_live();
             }
             Err(e) => {
@@ -1257,6 +1303,24 @@ impl CodexPane {
                 self.push_terminal_notice("Codex 起動失敗", message);
             }
         }
+    }
+
+    fn start_next_queued_turn_if_idle(&mut self) -> bool {
+        if self.finished || self.is_turn_running() {
+            return false;
+        }
+        let Some(submitted) = self.queued_prompts.pop_front() else {
+            return false;
+        };
+        let remaining = self.queued_prompts.len();
+        self.action = if remaining > 0 {
+            Some(format!("予約入力を実行中 残り{remaining}件"))
+        } else {
+            Some("予約入力を実行中".to_string())
+        };
+        self.push_log(CodexLogKind::System, "予約した入力を実行します");
+        self.run_submitted_line(submitted);
+        true
     }
 
     fn spawn_exec_process(&self, prompt: &str) -> Result<Child> {
@@ -1312,6 +1376,7 @@ impl CodexPane {
         self.current_command_started_at = None;
         self.streaming_assistant_index = None;
         self.pending_decision = None;
+        self.current_turn_prompt = None;
         self.push_log(CodexLogKind::System, "Codex ターンを中断しました");
     }
 
@@ -1351,6 +1416,8 @@ impl CodexPane {
         self.current_command = None;
         self.current_command_started_at = None;
         self.pending_decision = None;
+        self.current_turn_prompt = None;
+        self.queued_prompts.clear();
     }
 
     /// DoD を更新する。内容が変わった場合のみ項目・判定を作り直し `true` を返す。
@@ -2640,6 +2707,51 @@ mod tests {
         state.record_submitted(&submitted);
 
         assert!(state.exit_command_sent);
+    }
+
+    #[test]
+    fn input_during_running_queues_next_turn() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.finished = false;
+        pane.turn_running = true;
+
+        for ch in "j/kも入力".chars() {
+            pane.input(key(KeyCode::Char(ch)));
+        }
+        pane.input(key(KeyCode::Enter));
+
+        assert_eq!(pane.queued_prompt_count(), 1);
+        assert_eq!(pane.input_line(), "");
+        assert_eq!(pane.last_prompt(), Some("j/kも入力"));
+        assert!(
+            pane.log
+                .iter()
+                .any(|line| line.kind == CodexLogKind::User && line.text == "j/kも入力")
+        );
+        assert!(pane.log.iter().any(
+            |line| line.kind == CodexLogKind::System && line.text.contains("次のターンに予約")
+        ));
+    }
+
+    #[test]
+    fn queued_exit_finishes_when_turn_becomes_idle() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.finished = false;
+        pane.turn_running = true;
+
+        for ch in "/exit".chars() {
+            pane.input(key(KeyCode::Char(ch)));
+        }
+        pane.input(key(KeyCode::Enter));
+
+        assert!(!pane.finished);
+        assert_eq!(pane.queued_prompt_count(), 1);
+
+        pane.turn_running = false;
+        assert!(pane.start_next_queued_turn_if_idle());
+
+        assert!(pane.finished);
+        assert_eq!(pane.queued_prompt_count(), 0);
     }
 
     #[test]

@@ -25,6 +25,7 @@ const COLOR_SUCCESS: Color = Color::Rgb(101, 218, 123);
 const COLOR_WARN: Color = Color::Rgb(236, 188, 80);
 const COLOR_MUTED: Color = Color::Rgb(112, 122, 138);
 const COLOR_PANEL: Color = Color::Rgb(65, 81, 105);
+const COLOR_INPUT_BG: Color = Color::Rgb(34, 38, 46);
 const CODEX_TOOL_OUTPUT_PREVIEW_CHARS: usize = 160;
 
 /// Replace @uuid mentions in text with @member_name
@@ -803,7 +804,7 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
         let hint = if finished {
             " [c]コメント  [s]状態  [d]成果物(PR/Release)  [v]DoD判定  Esc/q: 閉じる "
         } else if running {
-            " codex exec --json 実行中  |  Ctrl-C:ターン中断  |  Trackpad/矢印:履歴  |  F12:終了 "
+            " codex exec --json 実行中  |  入力+Enter:次ターン予約  |  Ctrl-C:中断  |  F12:終了 "
         } else {
             " 入力してEnterでcodex exec --json  |  Trackpad/矢印:履歴  |  F9:Addness再開  |  F12:終了 "
         };
@@ -2510,7 +2511,8 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
         if pane.decision_banner().is_some() {
             "  確認待ち: y/n または a/d  Ctrl-C:中断  Ctrl-E:ターン展開".to_string()
         } else {
-            "  Ctrl-C:中断  Ctrl-T:表示  Ctrl-F:検索  Ctrl-L:解除  Ctrl-E:ターン展開".to_string()
+            let input = ellipsize_width(pane.input_line(), input_width.saturating_sub(4));
+            format!("> {input}")
         }
     } else if pane.finished {
         "  Esc/q:戻る  c/s/d/v:還流  Ctrl-T:表示  Ctrl-F:検索  Ctrl-E:ターン展開".to_string()
@@ -2533,7 +2535,10 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
             Line::from(Span::styled(prompt, input_style)),
         ]
     };
-    frame.render_widget(Paragraph::new(input_lines), input_chunk);
+    frame.render_widget(
+        Paragraph::new(input_lines).style(Style::default().bg(COLOR_INPUT_BG)),
+        input_chunk,
+    );
 
     if pane.is_search_editing() && pane.scrollback == 0 {
         let cursor_col = (UnicodeWidthStr::width(search_prefix)
@@ -2545,7 +2550,10 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
             input_chunk.y + 1
         };
         frame.set_cursor_position((input_chunk.x + cursor_col, cursor_row));
-    } else if !pane.is_turn_running() && !pane.finished && pane.scrollback == 0 {
+    } else if !pane.finished
+        && pane.scrollback == 0
+        && !(pane.is_turn_running() && pane.decision_banner().is_some())
+    {
         let cursor_col = (2 + UnicodeWidthStr::width(pane.input_line()))
             .min(input_chunk.width.saturating_sub(1) as usize) as u16;
         let cursor_row = if input_chunk.height <= 1 {
@@ -3290,13 +3298,22 @@ fn codex_runtime_status(pane: &CodexPane, max_width: usize) -> String {
         .saturating_add(UnicodeWidthStr::width(history.as_str()))
         .saturating_add(8);
     let detail = if pane.is_turn_running() {
+        let queued = pane.queued_prompt_count();
+        let input_hint = if queued > 0 {
+            format!(" / 予約{queued}件")
+        } else {
+            " / Enterで次ターン予約".to_string()
+        };
         if let Some(command) = pane.current_command() {
             ellipsize_width(
-                &format!("● 実行中: {command}"),
+                &format!("● 実行中: {command}{input_hint}"),
                 max_width.saturating_sub(fixed_width),
             )
         } else {
-            ellipsize_width("● Codex応答中", max_width.saturating_sub(fixed_width))
+            ellipsize_width(
+                &format!("● Codex応答中{input_hint}"),
+                max_width.saturating_sub(fixed_width),
+            )
         }
     } else {
         codex_work_label(

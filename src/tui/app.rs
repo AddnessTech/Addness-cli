@@ -2383,7 +2383,7 @@ impl App {
                 pane.scroll_to_live();
                 return;
             }
-            if Self::handle_codex_log_scroll(pane, key, true, pane.is_turn_running()) {
+            if Self::handle_codex_log_scroll(pane, key, true, false) {
                 return;
             }
             // 過去ログを見たまま通常入力すると入力位置が見えないので、入力前にライブへ戻す。

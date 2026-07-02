@@ -37,6 +37,10 @@ fn normalize_due_date(input: &str) -> Result<String> {
     Ok(format!("{}T00:00:00Z", date.format("%Y-%m-%d")))
 }
 
+fn should_fetch_child_related(json: bool, include_related: bool) -> bool {
+    json || include_related
+}
+
 #[derive(Subcommand)]
 pub enum GoalCommands {
     /// List goals in the organization tree
@@ -389,7 +393,7 @@ impl GoalNode {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_due_date;
+    use super::{normalize_due_date, should_fetch_child_related};
 
     #[test]
     fn normalize_due_date_accepts_yyyy_mm_dd() {
@@ -413,6 +417,17 @@ mod tests {
         assert!(normalize_due_date("Tomorrow").is_err());
         assert!(normalize_due_date("2026-13-99T99:99:99Z").is_err());
         assert!(normalize_due_date("2026-07-01T12:30:00").is_err());
+    }
+
+    #[test]
+    fn child_related_fetch_preserves_json_compatibility() {
+        assert!(should_fetch_child_related(true, false));
+    }
+
+    #[test]
+    fn child_related_fetch_for_human_output_requires_flag() {
+        assert!(should_fetch_child_related(false, true));
+        assert!(!should_fetch_child_related(false, false));
     }
 }
 
@@ -594,22 +609,20 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
                 .filter(|item| item.id != *id)
                 .collect();
 
-            let children_deliverables = client
-                .get_deliverables_map(
-                    &subtree_items
-                        .iter()
-                        .map(|g| g.id.as_str())
-                        .collect::<Vec<_>>(),
-                )
-                .await;
-            let children_comments = client
-                .get_comments_map(
-                    &subtree_items
-                        .iter()
-                        .map(|g| g.id.as_str())
-                        .collect::<Vec<_>>(),
-                )
-                .await;
+            let subtree_ids = subtree_items
+                .iter()
+                .map(|g| g.id.as_str())
+                .collect::<Vec<_>>();
+            let children_deliverables = if should_fetch_child_related(*json, *with_deliverable) {
+                client.get_deliverables_map(&subtree_ids).await
+            } else {
+                HashMap::new()
+            };
+            let children_comments = if should_fetch_child_related(*json, *with_comment) {
+                client.get_comments_map(&subtree_ids).await
+            } else {
+                HashMap::new()
+            };
 
             // 階層構造を構成
             let goal_tree = GoalNode::build_tree(

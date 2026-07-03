@@ -64,6 +64,10 @@ fn handle_related_fetch_errors(strict: bool, errors: Vec<RelatedFetchError>) -> 
     Ok(())
 }
 
+fn should_fetch_child_related(json: bool, include_related: bool) -> bool {
+    json || include_related
+}
+
 #[derive(Subcommand)]
 pub enum GoalCommands {
     /// List goals in the organization tree
@@ -422,7 +426,10 @@ impl GoalNode {
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_related_fetch_errors, normalize_due_date, related_fetch_error_message};
+    use super::{
+        handle_related_fetch_errors, normalize_due_date, related_fetch_error_message,
+        should_fetch_child_related,
+    };
     use crate::api::RelatedFetchError;
 
     #[test]
@@ -473,6 +480,17 @@ mod tests {
 
         assert!(handle_related_fetch_errors(false, errors.clone()).is_ok());
         assert!(handle_related_fetch_errors(true, errors).is_err());
+    }
+
+    #[test]
+    fn child_related_fetch_preserves_json_compatibility() {
+        assert!(should_fetch_child_related(true, false));
+    }
+
+    #[test]
+    fn child_related_fetch_for_human_output_requires_flag() {
+        assert!(should_fetch_child_related(false, true));
+        assert!(!should_fetch_child_related(false, false));
     }
 }
 
@@ -659,23 +677,32 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
                 .iter()
                 .map(|g| g.id.as_str())
                 .collect::<Vec<_>>();
-            let (children_deliverables, children_comments) = if *strict_related_fetch {
-                let (children_deliverables, deliverable_errors) =
-                    client.get_deliverables_map_with_errors(&subtree_ids).await;
-                let (children_comments, comment_errors) =
-                    client.get_comments_map_with_errors(&subtree_ids).await;
-                let related_errors = deliverable_errors
-                    .into_iter()
-                    .chain(comment_errors)
-                    .collect::<Vec<_>>();
-                handle_related_fetch_errors(true, related_errors)?;
-                (children_deliverables, children_comments)
+
+            let mut related_errors = Vec::new();
+
+            let children_deliverables = if should_fetch_child_related(*json, *with_deliverable) {
+                if *strict_related_fetch {
+                    let (map, errors) = client.get_deliverables_map_with_errors(&subtree_ids).await;
+                    related_errors.extend(errors);
+                    map
+                } else {
+                    client.get_deliverables_map(&subtree_ids).await
+                }
             } else {
-                (
-                    client.get_deliverables_map(&subtree_ids).await,
-                    client.get_comments_map(&subtree_ids).await,
-                )
+                HashMap::new()
             };
+            let children_comments = if should_fetch_child_related(*json, *with_comment) {
+                if *strict_related_fetch {
+                    let (map, errors) = client.get_comments_map_with_errors(&subtree_ids).await;
+                    related_errors.extend(errors);
+                    map
+                } else {
+                    client.get_comments_map(&subtree_ids).await
+                }
+            } else {
+                HashMap::new()
+            };
+            handle_related_fetch_errors(true, related_errors)?;
 
             // 階層構造を構成
             let goal_tree = GoalNode::build_tree(

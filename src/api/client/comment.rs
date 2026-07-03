@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::api::{
     ApiClient, ApiResponse, Comment, CommentDetail, CommentsResponse, CreateCommentRequest,
-    ReactionRequest, UpdateCommentRequest,
+    ReactionRequest, RelatedFetchError, UpdateCommentRequest,
 };
 use anyhow::Result;
 
@@ -144,21 +144,42 @@ impl ApiClient {
 
     /// 各ゴールのコメントを並行取得してマップで返す
     pub async fn get_comments_map(&self, goal_ids: &[&str]) -> HashMap<String, Vec<Comment>> {
+        let (map, errors) = self.get_comments_map_with_errors(goal_ids).await;
+        for error in errors {
+            eprintln!(
+                "Warning: failed to fetch {} for {}: {}",
+                error.kind, error.goal_id, error.message
+            );
+        }
+
+        map
+    }
+
+    /// 各ゴールのコメントを並行取得し、部分失敗を呼び出し側で扱える形で返す。
+    pub async fn get_comments_map_with_errors(
+        &self,
+        goal_ids: &[&str],
+    ) -> (HashMap<String, Vec<Comment>>, Vec<RelatedFetchError>) {
         let futures: Vec<_> = goal_ids.iter().map(|g| self.list_comments(g)).collect();
         let results = futures::future::join_all(futures).await;
 
         let mut map = HashMap::new();
+        let mut errors = Vec::new();
         for (i, result) in results.into_iter().enumerate() {
             match result {
                 Ok(resp) => {
                     map.insert(goal_ids[i].to_string(), resp.comments);
                 }
                 Err(e) => {
-                    eprintln!("Warning: failed to fetch comments for {}: {e}", goal_ids[i]);
+                    errors.push(RelatedFetchError {
+                        kind: "comments",
+                        goal_id: goal_ids[i].to_string(),
+                        message: e.to_string(),
+                    });
                 }
             }
         }
 
-        map
+        (map, errors)
     }
 }

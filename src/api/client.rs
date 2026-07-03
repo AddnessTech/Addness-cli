@@ -40,6 +40,13 @@ pub struct ApiClient {
     org_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelatedFetchError {
+    pub kind: &'static str,
+    pub goal_id: String,
+    pub message: String,
+}
+
 impl ApiClient {
     pub fn new(token: &str, base_url: &str) -> Result<Self> {
         let mut headers = HeaderMap::new();

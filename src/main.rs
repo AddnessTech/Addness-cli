@@ -12,7 +12,7 @@ use crate::config::{Credentials, DEFAULT_API_URL, Settings};
 use api::ApiClient;
 use cli::commands::{
     assignment, comment, configure, deliverable, detect, goal, invitation, kpi, link, login,
-    member, org, skills, summary, update,
+    member, notification, org, skills, summary, today, update,
 };
 
 #[derive(Parser)]
@@ -87,10 +87,20 @@ enum Commands {
         #[command(subcommand)]
         command: member::MemberCommands,
     },
+    /// Send Codex work notifications via goal comments and terminal notices
+    Notification {
+        #[command(subcommand)]
+        command: notification::NotificationCommands,
+    },
     /// Manage invitations and invite links
     Invitation {
         #[command(subcommand)]
         command: invitation::InvitationCommands,
+    },
+    /// Read and write today's todos (today's goals)
+    Today {
+        #[command(subcommand)]
+        command: Option<today::TodayCommands>,
     },
     /// Show progress summary of all goals
     Summary {
@@ -226,9 +236,17 @@ async fn main() -> Result<()> {
             let client = build_client()?;
             member::handle_member(command, &client).await
         }
+        Some(Commands::Notification { command }) => {
+            let client = build_client()?;
+            notification::handle_notification(command, &client).await
+        }
         Some(Commands::Invitation { command }) => {
             let client = build_client()?;
             invitation::handle_invitation(command, &client).await
+        }
+        Some(Commands::Today { command }) => {
+            let client = build_client()?;
+            today::handle_today(command.as_ref(), &client).await
         }
         Some(Commands::Summary { org, depth, json }) => {
             let client = build_client()?;

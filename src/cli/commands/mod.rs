@@ -9,9 +9,11 @@ pub mod kpi;
 pub mod link;
 pub mod login;
 pub mod member;
+pub mod notification;
 pub mod org;
 pub mod skills;
 pub mod summary;
+pub mod today;
 pub mod update;
 
 use anyhow::Result;

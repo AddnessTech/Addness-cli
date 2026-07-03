@@ -7,11 +7,23 @@ use ratatui::{
 };
 
 use std::collections::HashMap;
+use std::time::Instant;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use tui_term::widget::PseudoTerminal;
+
 use super::app::{ActivePane, App, DeliverableFormField, FormField, ModalState};
+use super::codex_pane::CodexPane;
 use super::goal_tree::{CommentView, TreeRow};
 use crate::api::{DeliverableType, GoalStatus, Member, MemberId};
+
+const COLOR_ADDNESS: Color = Color::Rgb(91, 171, 255);
+const COLOR_CODEX: Color = Color::Rgb(207, 140, 255);
+const COLOR_MEMORY: Color = Color::Rgb(84, 214, 190);
+const COLOR_SUCCESS: Color = Color::Rgb(101, 218, 123);
+const COLOR_WARN: Color = Color::Rgb(236, 188, 80);
+const COLOR_MUTED: Color = Color::Rgb(112, 122, 138);
+const COLOR_PANEL: Color = Color::Rgb(65, 81, 105);
 
 /// Replace @uuid mentions in text with @member_name
 fn replace_member_mentions(text: &str, members: &HashMap<MemberId, Member>) -> String {
@@ -71,15 +83,24 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ])
         .split(frame.area());
 
-    draw_title_bar(frame, main_layout[0]);
+    draw_title_bar(frame, main_layout[0], app);
 
-    let content_layout = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(24), Constraint::Min(0)])
-        .split(main_layout[1]);
+    if app.codex.is_some() {
+        // codex 使用中は org/navigation を出さず（切り替えないため）、
+        // 全幅を「Addnessの進行が見えるペイン + codex本体」に使う。
+        draw_codex(frame, main_layout[1], app);
+    } else {
+        app.codex_terminal_area = None;
+        app.codex_contract_area = None;
+        app.codex_activity_area = None;
+        let content_layout = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(24), Constraint::Min(0)])
+            .split(main_layout[1]);
 
-    draw_left_panel(frame, content_layout[0], app);
-    draw_content(frame, content_layout[1], app);
+        draw_left_panel(frame, content_layout[0], app);
+        draw_content(frame, content_layout[1], app);
+    }
     draw_status_bar(frame, main_layout[2], app);
 
     if app.show_org_popup {
@@ -216,23 +237,42 @@ pub fn draw_loading(frame: &mut Frame, tick: u64) {
     frame.render_widget(paragraph, box_area);
 }
 
-fn draw_title_bar(frame: &mut Frame, area: Rect) {
-    let title = Paragraph::new(Line::from(vec![
-        Span::styled(
-            " Addness ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            "- Goal Management TUI",
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]))
-    .block(
+fn draw_title_bar(frame: &mut Frame, area: Rect, app: &App) {
+    // codex 使用中は、参照しているローカルフォルダ（cwd）を出して文脈を明示する。
+    let line = if let Some(pane) = app.codex.as_ref() {
+        Line::from(vec![
+            Span::styled(
+                " codex ",
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("作業フォルダ: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(pane.cwd.as_str(), Style::default().fg(Color::White)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(
+                " Addness ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "- Goal Management TUI",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+    };
+    let border = if app.codex.is_some() {
+        Color::Magenta
+    } else {
+        Color::Cyan
+    };
+    let title = Paragraph::new(line).block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
+            .border_style(Style::default().fg(border))
             .title(format!(" addness v{} ", env!("CARGO_PKG_VERSION"))),
     );
     frame.render_widget(title, area);
@@ -625,12 +665,12 @@ fn render_tree_row(
 
 fn format_status(is_completed: bool, status: Option<&GoalStatus>) -> &'static str {
     if is_completed {
-        "✅ 完了"
+        "完了"
     } else {
         match status {
-            Some(GoalStatus::InProgress) => "⏩ 進行中",
-            Some(GoalStatus::Cancelled) => "⏸ 停止中",
-            _ => "🔵 未着手",
+            Some(GoalStatus::InProgress) => "進行中",
+            Some(GoalStatus::Cancelled) => "停止中",
+            _ => "未着手",
         }
     }
 }
@@ -748,10 +788,49 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     let current_section = app.sidebar_items[app.sidebar_index];
+
+    // codex フォーカス中は通常のキーが codex へ転送されるため、専用のヒントを出す。
+    if app.active_pane == ActivePane::Codex {
+        let finished = app.codex.as_ref().map(|c| c.finished).unwrap_or(true);
+        let hint = if finished {
+            " [c]コメント  [s]状態  [d]成果物(PR/Release)  [v]DoD判定  Esc/q: 閉じる "
+        } else {
+            " 入力はcodexへ転送  |  Trackpad/ホイール: 枠スクロール  |  F9:Addness再開  |  F12:終了 "
+        };
+        let hint = app
+            .codex_last_scroll_input
+            .as_ref()
+            .map(|last| {
+                if finished {
+                    format!(
+                        " last: {last} | [c]コメント [s]状態 [d]成果物 [v]DoD判定 Esc/q:閉じる "
+                    )
+                } else {
+                    format!(
+                        " last: {last} | Trackpad/ホイール:枠スクロール F9:Addness再開 F12:終了 "
+                    )
+                }
+            })
+            .unwrap_or_else(|| hint.to_string());
+        let status = Paragraph::new(Line::from(Span::styled(
+            hint,
+            Style::default().fg(COLOR_CODEX),
+        )))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(COLOR_CODEX))
+                .title(" codex "),
+        );
+        frame.render_widget(status, area);
+        return;
+    }
+
     let pane_label = match app.active_pane {
         ActivePane::OrgSelector => "Org",
         ActivePane::Navigation => "Nav",
         ActivePane::Content => "Content",
+        ActivePane::Codex => "codex",
     };
 
     let mut hints = vec![
@@ -914,12 +993,26 @@ fn draw_help_overlay(frame: &mut Frame) {
         section("アクションメニュー (o) の内容"),
         kv(
             "ゴール上",
-            "完了/再開 / コメント追加 / 成果物追加 / 編集 / 削除",
+            "codexで作業 / 完了・再開 / コメント追加 / 成果物追加 / 編集 / 削除",
         ),
         kv(
             "コメント上",
             "返信 / 解決・未解決 / 編集 / 削除 / リアクション",
         ),
+        blank(),
+        section("codex連携 (o →「codexで作業」)"),
+        kv("起動", "選択ゴールの文脈付きでcodexをペイン起動"),
+        kv("F9", "Addnessの作業メモ・決定ログから再開"),
+        kv(
+            "Trackpad/ホイール",
+            "ポインタ下のcodex/Addness枠をスクロール",
+        ),
+        kv("F12", "実行中のcodexを終了して戻る"),
+        kv(
+            "終了後 c/s/d/v",
+            "還流: コメント / 状態 / 成果物(PR・Release) / DoD判定",
+        ),
+        kv("Esc / q", "codexペインを閉じる"),
         blank(),
         section("モーダル共通"),
         kv("Enter", "確定"),
@@ -1055,35 +1148,21 @@ fn draw_create_goal_modal(frame: &mut Frame, app: &App) {
         ])
         .split(inner);
 
-    // Title field
-    let title_focused = *current_field == FormField::Title;
-    let title_border = if title_focused {
-        Color::Cyan
-    } else {
-        Color::DarkGray
-    };
-    let title_widget = Paragraph::new(title.as_str()).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(title_border))
-            .title(" Title * "),
+    // Title / Description fields（draw_text_field でカーソル・全角幅対応を共通化）
+    draw_text_field(
+        frame,
+        field_layout[0],
+        " Title * ",
+        title,
+        *current_field == FormField::Title,
     );
-    frame.render_widget(title_widget, field_layout[0]);
-
-    // Description field
-    let desc_focused = *current_field == FormField::Description;
-    let desc_border = if desc_focused {
-        Color::Cyan
-    } else {
-        Color::DarkGray
-    };
-    let desc_widget = Paragraph::new(description.as_str()).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(desc_border))
-            .title(" Description "),
+    draw_text_field(
+        frame,
+        field_layout[1],
+        " Description ",
+        description,
+        *current_field == FormField::Description,
     );
-    frame.render_widget(desc_widget, field_layout[1]);
 
     // Parent Goal (read-only)
     let parent_text = parent_goal_title
@@ -1155,35 +1234,21 @@ fn draw_edit_goal_modal(frame: &mut Frame, app: &App) {
         ])
         .split(inner);
 
-    // Title field
-    let title_focused = *current_field == FormField::Title;
-    let title_border = if title_focused {
-        Color::Cyan
-    } else {
-        Color::DarkGray
-    };
-    let title_widget = Paragraph::new(title.as_str()).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(title_border))
-            .title(" Title * "),
+    // Title / Description fields（draw_text_field でカーソル・全角幅対応を共通化）
+    draw_text_field(
+        frame,
+        field_layout[0],
+        " Title * ",
+        title,
+        *current_field == FormField::Title,
     );
-    frame.render_widget(title_widget, field_layout[0]);
-
-    // Description field
-    let desc_focused = *current_field == FormField::Description;
-    let desc_border = if desc_focused {
-        Color::Cyan
-    } else {
-        Color::DarkGray
-    };
-    let desc_widget = Paragraph::new(description.as_str()).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(desc_border))
-            .title(" Description "),
+    draw_text_field(
+        frame,
+        field_layout[1],
+        " Description ",
+        description,
+        *current_field == FormField::Description,
     );
-    frame.render_widget(desc_widget, field_layout[1]);
 
     // Status field - show current status and allowed transitions
     let status_focused = *current_field == FormField::Status;
@@ -1246,7 +1311,7 @@ fn draw_delete_goal_modal(frame: &mut Frame, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Red))
-        .title(" ⚠️  削除の確認 ")
+        .title(" 削除の確認 ")
         .title_bottom(
             Line::from(" ←→/hl: 選択 | Enter: 実行 | Esc: キャンセル ")
                 .style(Style::default().fg(Color::DarkGray)),
@@ -1280,7 +1345,7 @@ fn draw_delete_goal_modal(frame: &mut Frame, app: &App) {
 
     // Warning message
     let warning = Paragraph::new(Line::from(vec![
-        Span::styled("⚠️  ", Style::default().fg(Color::Red)),
+        Span::styled("! ", Style::default().fg(Color::Red)),
         Span::styled(
             "この操作は取り消せません。本当に削除しますか？",
             Style::default().fg(Color::Red),
@@ -1966,6 +2031,21 @@ fn draw_text_field(frame: &mut Frame, area: Rect, title: &str, text: &str, focus
             .title(title.to_string()),
     );
     frame.render_widget(widget, area);
+
+    // フォーカス中は本物の端末カーソルを文末（表示幅基準）へ置く。
+    // これで可視カーソルが出るうえ、日本語入力時に IME の変換ウィンドウが
+    // 正しい位置に出る（全角は 2 セルとして数える）。caret は末尾固定。
+    if focused {
+        let inner_w = area.width.saturating_sub(2);
+        let inner_h = area.height.saturating_sub(2);
+        if inner_w > 0 && inner_h > 0 {
+            let last_line = text.rsplit('\n').next().unwrap_or("");
+            let line_idx = text.matches('\n').count() as u16;
+            let col = (UnicodeWidthStr::width(last_line) as u16).min(inner_w.saturating_sub(1));
+            let row = line_idx.min(inner_h.saturating_sub(1));
+            frame.set_cursor_position((area.x + 1 + col, area.y + 1 + row));
+        }
+    }
 }
 
 fn draw_readonly_field(frame: &mut Frame, area: Rect, title: &str, text: &str, focused: bool) {
@@ -2055,7 +2135,7 @@ fn draw_members(frame: &mut Frame, area: Rect, app: &mut App, border_color: Colo
                 Style::default().fg(Color::White)
             };
 
-            let prefix = if is_current_user { "👤 " } else { "  " };
+            let prefix = if is_current_user { "* " } else { "  " };
             let content = format!("{}{}", prefix, member.name);
 
             ListItem::new(content).style(style)
@@ -2064,4 +2144,562 @@ fn draw_members(frame: &mut Frame, area: Rect, app: &mut App, border_color: Colo
 
     let list = List::new(visible_members);
     frame.render_widget(list, inner_area);
+}
+
+/// codex ペインを契約併置型で描画する。
+/// 左に対象ゴール／DoD（契約）、右に PTY 上で動く codex 本体。
+fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
+    // 左の Addness ペインは固定幅で広めに取り、進行が読み取りやすいようにする。
+    let addness_w = (area.width / 3).clamp(28, 52);
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(addness_w), Constraint::Min(0)])
+        .split(area);
+
+    // 同期の鼓動（スピナー＋最終同期からの経過秒）。可変借用前に App から読む。
+    let sync_label = {
+        const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let s = SPIN[(app.codex_sync_tick as usize) % SPIN.len()];
+        match app.last_codex_sync {
+            Some(t) => format!(" Addness ゴール  {s} 同期{}s前 ", t.elapsed().as_secs()),
+            None => " Addness ゴール  ⟳ 同期待ち ".to_string(),
+        }
+    };
+
+    // --- Addness ペイン（参照中 + ゴール状態 + DoD + 子ゴール + 更新ログ）---
+    // 上段=ゴール/DoD/子ゴール、下段=Addnessの更新ログ。不変借用のまま描いて clone を避ける。
+    if let Some(pane) = app.codex.as_ref() {
+        let now = Instant::now();
+        let recently = |at: Option<Instant>| {
+            at.is_some_and(|t| now.duration_since(t) < std::time::Duration::from_secs(4))
+        };
+
+        let status_panel_h = if chunks[0].height >= 26 { 11 } else { 10 };
+        let panes = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(status_panel_h),
+                Constraint::Min(0),
+                Constraint::Length(8),
+            ])
+            .split(chunks[0]);
+        app.codex_contract_area = Some(panes[1]);
+        app.codex_activity_area = Some(panes[2]);
+
+        draw_codex_status_panel(frame, panes[0], pane);
+
+        let mut lines: Vec<Line> = Vec::new();
+
+        // 「いま参照/書込中」インジケータ（codex の操作をリアルタイム表示）
+        if let Some(action) = &pane.action {
+            lines.push(Line::from(Span::styled(
+                format!("» {action}"),
+                Style::default()
+                    .fg(COLOR_MEMORY)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(""));
+        }
+
+        // ゴール名
+        lines.push(Line::from(Span::styled(
+            pane.goal_title.as_str(),
+            Style::default()
+                .fg(COLOR_ADDNESS)
+                .add_modifier(Modifier::BOLD),
+        )));
+
+        // ステータス（変化直後はハイライト）
+        let status_style = if recently(pane.status_changed_at) {
+            Style::default().fg(Color::Black).bg(COLOR_WARN)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(vec![
+            Span::styled("状態: ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(pane.status_label.as_str(), status_style),
+        ]));
+
+        // DoD 進捗バー
+        if !pane.dod_items.is_empty() {
+            let met = pane.dod_checks.iter().filter(|c| **c == Some(true)).count();
+            let total = pane.dod_items.len();
+            let width = 10usize;
+            let filled = met * width / total.max(1);
+            let bar: String = "▓".repeat(filled) + &"░".repeat(width - filled);
+            lines.push(Line::from(vec![
+                Span::styled("DoD ", Style::default().fg(COLOR_MUTED)),
+                Span::styled(bar, Style::default().fg(COLOR_SUCCESS)),
+                Span::styled(format!(" {met}/{total}"), Style::default().fg(Color::White)),
+            ]));
+        }
+        if let Some(n) = pane.deliverable_count {
+            lines.push(Line::from(vec![
+                Span::styled("成果物: ", Style::default().fg(COLOR_MUTED)),
+                Span::styled(n.to_string(), Style::default().fg(COLOR_MEMORY)),
+                Span::styled(
+                    format!("  Trace {}", pane.trace_links.len()),
+                    Style::default().fg(COLOR_MUTED),
+                ),
+            ]));
+        }
+        lines.push(Line::from(""));
+
+        // DoD チェックリスト（更新直後はヘッダをハイライト）
+        let dod_header_style = if recently(pane.dod_changed_at) {
+            Style::default().fg(Color::Black).bg(COLOR_WARN)
+        } else {
+            Style::default().fg(COLOR_MUTED)
+        };
+        let dod_header = if pane.assessing {
+            "── 完了基準 (DoD) ⟳判定中 ──"
+        } else {
+            "── 完了基準 (DoD) ──"
+        };
+        lines.push(Line::from(Span::styled(dod_header, dod_header_style)));
+        if pane.dod_items.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "（未設定 — codexと決めよう）",
+                Style::default().fg(COLOR_WARN),
+            )));
+        } else {
+            for (i, item) in pane.dod_items.iter().enumerate() {
+                let (mark, style) = match pane.dod_checks.get(i).copied().flatten() {
+                    Some(true) => ("[x]", Style::default().fg(COLOR_SUCCESS)),
+                    Some(false) => ("[ ]", Style::default().fg(Color::Red)),
+                    None => ("[ ]", Style::default().fg(COLOR_MUTED)),
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{mark} "), style),
+                    Span::raw(item.as_str()),
+                ]));
+            }
+        }
+
+        if !pane.trace_links.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "── PR / Release ──",
+                Style::default().fg(COLOR_MUTED),
+            )));
+            for link in &pane.trace_links {
+                lines.push(Line::from(vec![
+                    Span::styled("↗ ", Style::default().fg(COLOR_MEMORY)),
+                    Span::styled(link.as_str(), Style::default().fg(Color::White)),
+                ]));
+            }
+        }
+
+        // 子ゴールのライブリスト（新着は数秒ハイライト）
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "── 子ゴール ({}) ・ コメント {} ──",
+                pane.child_count.unwrap_or(0),
+                pane.comment_count.unwrap_or(0)
+            ),
+            Style::default().fg(COLOR_MUTED),
+        )));
+        if pane.children.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "（まだありません）",
+                Style::default().fg(COLOR_MUTED),
+            )));
+        } else {
+            for child in &pane.children {
+                let is_new = child.new_until.is_some_and(|t| t > now);
+                let title_style = if is_new {
+                    Style::default().fg(Color::Black).bg(COLOR_SUCCESS)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                lines.push(Line::from(vec![
+                    Span::raw(format!("{} ", child.icon)),
+                    Span::styled(child.title.as_str(), title_style),
+                ]));
+            }
+        }
+
+        let contract_inner_h = panes[1].height.saturating_sub(2) as usize;
+        let max_contract_scroll = lines.len().saturating_sub(contract_inner_h.max(1));
+        app.codex_contract_scroll = app.codex_contract_scroll.min(max_contract_scroll);
+        let contract_title = if app.codex_contract_scroll > 0 {
+            format!("{sync_label} ▲スクロール -{} ", app.codex_contract_scroll)
+        } else {
+            sync_label
+        };
+        let contract = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(COLOR_ADDNESS))
+                    .title(contract_title),
+            )
+            .scroll((app.codex_contract_scroll.min(u16::MAX as usize) as u16, 0))
+            .wrap(ratatui::widgets::Wrap { trim: true });
+        frame.render_widget(contract, panes[1]);
+
+        // 下段: Addness の更新ログ（新しいものほど下。最新行は強調）
+        let log_inner_h = panes[2].height.saturating_sub(2) as usize;
+        let mut log_lines: Vec<Line> = if pane.activity.is_empty() {
+            app.codex_activity_scroll = 0;
+            vec![Line::from(Span::styled(
+                "body/DoD/子ゴール/通知の読込・書込がここに出ます",
+                Style::default().fg(COLOR_MUTED),
+            ))]
+        } else {
+            let n = pane.activity.len();
+            let view_h = log_inner_h.max(1);
+            let max_activity_scroll = n.saturating_sub(view_h);
+            app.codex_activity_scroll = app.codex_activity_scroll.min(max_activity_scroll);
+            let end = n.saturating_sub(app.codex_activity_scroll);
+            let start = end.saturating_sub(view_h);
+            pane.activity
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(end.saturating_sub(start))
+                .map(|(i, l)| {
+                    let style = if i + 1 == n {
+                        Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    Line::from(Span::styled(l.as_str(), style))
+                })
+                .collect()
+        };
+        log_lines.truncate(log_inner_h.max(1));
+        let log_title = if app.codex_activity_scroll > 0 {
+            format!(" Addness 更新 ▲スクロール -{} ", app.codex_activity_scroll)
+        } else {
+            " Addness 更新 ".to_string()
+        };
+        let log = Paragraph::new(log_lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(COLOR_PANEL))
+                    .title(log_title),
+            )
+            .wrap(ratatui::widgets::Wrap { trim: true });
+        frame.render_widget(log, panes[2]);
+    }
+
+    // --- codex 端末ペイン ---
+    let term_area = chunks[1];
+    app.codex_terminal_area = Some(term_area);
+    let rows = term_area.height.saturating_sub(2);
+    let cols = term_area.width.saturating_sub(2);
+    if let Some(pane) = app.codex.as_mut() {
+        pane.resize(rows, cols);
+        let (title, color) = if pane.finished {
+            let t = if pane.scrollback > 0 {
+                format!(
+                    " codex 終了 ▲スクロール -{} — ↑↓/PgUp/PgDn/Home/End: ログ  Esc/qで戻る ",
+                    pane.scrollback
+                )
+            } else {
+                " codex 終了 — ↑↓: ログを遡る  [c]コメント [s]状態 [d]成果物 [v]DoD判定  Esc/q: 戻る "
+                    .to_string()
+            };
+            (t, COLOR_SUCCESS)
+        } else if pane.scrollback > 0 {
+            (
+                format!(
+                    " codex 実行中 ▲スクロール -{} — Esc: ライブへ戻る ",
+                    pane.scrollback
+                ),
+                COLOR_WARN,
+            )
+        } else {
+            (
+                " codex 実行中 — Trackpad/ホイール:枠スクロール  F9:Addness再開  F12:終了 "
+                    .to_string(),
+                COLOR_CODEX,
+            )
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(color))
+            .title(title);
+        let screen_view = pane.screen_view();
+        let term = PseudoTerminal::new(&screen_view).block(block);
+        frame.render_widget(term, term_area);
+
+        // 本物の端末カーソルを codex のカーソル位置へ移動する。
+        // tui-term は偽カーソルを描くだけなので、これをやらないと日本語入力時に
+        // IME の変換ウィンドウが正しい位置に出ない（vt100 の桁は全角考慮済み）。
+        // 履歴を遡っている間はカーソルを動かさない（過去位置に飛ぶのを防ぐ）。
+        if let Some((crow, ccol)) = pane.visible_cursor_position()
+            && crow < rows
+            && ccol < cols
+        {
+            // term_area の枠（上・左の罫線）を 1 ずつオフセット。
+            frame.set_cursor_position((term_area.x + 1 + ccol, term_area.y + 1 + crow));
+        }
+    }
+}
+
+fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let value_width = inner_width.saturating_sub(6);
+    let prompt_width = inner_width.saturating_sub(2);
+
+    let (state, state_style) = if pane.finished {
+        (
+            "終了",
+            Style::default()
+                .fg(COLOR_SUCCESS)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if pane.assessing {
+        (
+            "判定中",
+            Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD),
+        )
+    } else if pane.action.is_some() {
+        (
+            "実行中",
+            Style::default()
+                .fg(COLOR_MEMORY)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if pane.last_prompt().is_some() {
+        (
+            "対応中",
+            Style::default()
+                .fg(COLOR_CODEX)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (
+            "待機",
+            Style::default()
+                .fg(COLOR_CODEX)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+    let work = codex_work_label(
+        pane.finished,
+        pane.assessing,
+        pane.action.as_deref(),
+        pane.last_prompt(),
+        value_width,
+    );
+    let memory = codex_memory_label(
+        pane.last_addness_read_at,
+        pane.last_addness_write_at,
+        value_width,
+    );
+    let memory_style = if pane.last_addness_write_at.is_some() {
+        Style::default().fg(COLOR_SUCCESS)
+    } else if pane.last_addness_read_at.is_some() {
+        Style::default().fg(COLOR_MEMORY)
+    } else {
+        Style::default().fg(COLOR_MUTED)
+    };
+
+    let prompt = pane
+        .last_prompt()
+        .map(|p| prompt_preview(p, prompt_width))
+        .unwrap_or_else(|| "（まだありません）".to_string());
+    let prompt_style = if pane.last_prompt().is_some() {
+        Style::default().fg(Color::White)
+    } else {
+        Style::default().fg(COLOR_MUTED)
+    };
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("状態 ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(state, state_style),
+        ]),
+        Line::from(vec![
+            Span::styled("作業 ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(work, Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("記憶 ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(memory, memory_style),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("最後の送信", Style::default().fg(COLOR_MUTED))),
+        Line::from(Span::styled(prompt, prompt_style)),
+    ];
+
+    let panel = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(COLOR_CODEX))
+                .title(" Codex 現在地 "),
+        )
+        .wrap(ratatui::widgets::Wrap { trim: true });
+    frame.render_widget(panel, area);
+}
+
+fn codex_memory_label(
+    last_read_at: Option<Instant>,
+    last_write_at: Option<Instant>,
+    max_width: usize,
+) -> String {
+    let label = if let Some(t) = last_write_at {
+        format!("Addness書込 {}前", elapsed_compact(t))
+    } else if let Some(t) = last_read_at {
+        format!("Addness読込 {}前", elapsed_compact(t))
+    } else {
+        "Addness未読".to_string()
+    };
+    ellipsize_width(&label, max_width)
+}
+
+fn elapsed_compact(t: Instant) -> String {
+    let secs = t.elapsed().as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m", secs / 60)
+    }
+}
+
+fn codex_work_label(
+    finished: bool,
+    assessing: bool,
+    action: Option<&str>,
+    last_prompt: Option<&str>,
+    max_width: usize,
+) -> String {
+    if finished {
+        return ellipsize_width("履歴確認", max_width);
+    }
+    if assessing {
+        return ellipsize_width("DoD自動判定", max_width);
+    }
+    if let Some(action) = action {
+        return ellipsize_width(action, max_width);
+    }
+    if let Some(prompt) = last_prompt {
+        return prompt_preview(&format!("依頼対応: {prompt}"), max_width);
+    }
+    ellipsize_width("入力待ち", max_width)
+}
+
+fn prompt_preview(prompt: &str, max_width: usize) -> String {
+    let normalized = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    ellipsize_width(&normalized, max_width)
+}
+
+fn ellipsize_width(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_string();
+    }
+    if max_width <= 3 {
+        return ".".repeat(max_width);
+    }
+
+    let limit = max_width - 3;
+    let mut out = String::new();
+    let mut width = 0usize;
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width > limit {
+            break;
+        }
+        out.push(ch);
+        width += ch_width;
+    }
+    out.push_str("...");
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ActivePane, App, codex_work_label, draw_status_bar, ellipsize_width, prompt_preview,
+    };
+    use crate::api::ApiClient;
+    use ratatui::{Terminal, backend::TestBackend};
+    use unicode_width::UnicodeWidthStr;
+
+    fn render_status_text(app: &App, width: u16) -> String {
+        let mut term = Terminal::new(TestBackend::new(width, 3)).unwrap();
+        term.draw(|frame| draw_status_bar(frame, frame.area(), app))
+            .unwrap();
+        let buf = term.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                text.push_str(buf[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    #[test]
+    fn prompt_preview_collapses_whitespace() {
+        assert_eq!(
+            prompt_preview("  これを\n\n実行して\tください  ", 80),
+            "これを 実行して ください"
+        );
+    }
+
+    #[test]
+    fn prompt_preview_truncates_to_width() {
+        let preview = prompt_preview("abcdefghijklmnopqrstuvwxyz", 10);
+
+        assert_eq!(preview, "abcdefg...");
+        assert!(UnicodeWidthStr::width(preview.as_str()) <= 10);
+    }
+
+    #[test]
+    fn ellipsize_width_respects_wide_characters() {
+        let preview = ellipsize_width("日本語の長いプロンプト", 9);
+
+        assert!(preview.ends_with("..."));
+        assert!(UnicodeWidthStr::width(preview.as_str()) <= 9);
+    }
+
+    #[test]
+    fn codex_work_label_prefers_action_over_last_prompt() {
+        assert_eq!(
+            codex_work_label(false, false, Some("ゴールを更新中"), Some("実装して"), 80),
+            "ゴールを更新中"
+        );
+    }
+
+    #[test]
+    fn codex_work_label_uses_last_prompt_when_no_action() {
+        let label = codex_work_label(false, false, None, Some("この不具合を直して"), 80);
+
+        assert_eq!(label, "依頼対応: この不具合を直して");
+    }
+
+    #[test]
+    fn codex_work_label_truncates_last_prompt() {
+        let label = codex_work_label(false, false, None, Some("abcdefghijklmnopqrstuvwxyz"), 12);
+
+        assert_eq!(label, "依頼対応:...");
+        assert!(UnicodeWidthStr::width(label.as_str()) <= 12);
+    }
+
+    #[test]
+    fn codex_status_bar_prioritizes_last_scroll_diagnostic() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = ApiClient::new("t", "http://localhost").unwrap();
+        let mut app = App::new(client, rt.handle().clone());
+        app.active_pane = ActivePane::Codex;
+        app.codex_last_scroll_input = Some("mouse ScrollUp -> codex 0->3".to_string());
+
+        let text = render_status_text(&app, 80);
+
+        assert!(
+            text.contains("last: mouse ScrollUp -> codex 0->3"),
+            "status should expose last scroll diagnostic near the front:\n{text}"
+        );
+    }
 }

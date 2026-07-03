@@ -92,10 +92,14 @@ impl Credentials {
 
     /// Return any stored token — used for org-independent endpoints.
     pub fn any_token(&self) -> Option<&str> {
+        if let Some(org) = self.organizations.get(DEFAULT_ORGANIZATION_KEY) {
+            return Some(org.api_key.as_str());
+        }
+
         self.organizations
-            .values()
-            .next()
-            .map(|org| org.api_key.as_str())
+            .iter()
+            .min_by(|(left, _), (right, _)| left.cmp(right))
+            .map(|(_, org)| org.api_key.as_str())
     }
 
     /// Store (or overwrite) a token for the given org.
@@ -197,5 +201,31 @@ impl Credentials {
                 .with_context(|| format!("Failed to delete {}", path.display()))?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Credentials, DEFAULT_ORGANIZATION_KEY};
+
+    #[test]
+    fn any_token_prefers_default_key() {
+        let mut creds = Credentials::new("https://api.example.test".to_string());
+        creds.set_token("org-b".to_string(), "token-b".to_string());
+        creds.set_token(
+            DEFAULT_ORGANIZATION_KEY.to_string(),
+            "token-default".to_string(),
+        );
+
+        assert_eq!(creds.any_token(), Some("token-default"));
+    }
+
+    #[test]
+    fn any_token_uses_lowest_org_id_when_no_default_exists() {
+        let mut creds = Credentials::new("https://api.example.test".to_string());
+        creds.set_token("org-b".to_string(), "token-b".to_string());
+        creds.set_token("org-a".to_string(), "token-a".to_string());
+
+        assert_eq!(creds.any_token(), Some("token-a"));
     }
 }

@@ -2,7 +2,7 @@ use std::process::Command;
 
 use anyhow::{Result, bail};
 
-use crate::update_check::{CDN_VERSION_URL, fetch_latest_version};
+use crate::update_check::{CDN_VERSION_URL, fetch_latest_version, is_update_available};
 
 /// `addness update` — 公式インストーラ経由で最新版へ更新する。
 ///
@@ -15,7 +15,7 @@ pub async fn handle_update(check_only: bool) -> Result<()> {
         bail!("Failed to fetch the latest version from {CDN_VERSION_URL}");
     };
 
-    if latest == current {
+    if !is_update_available(current, &latest) {
         println!("Already up to date (v{current})");
         return Ok(());
     }

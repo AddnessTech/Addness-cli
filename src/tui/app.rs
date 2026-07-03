@@ -7,7 +7,12 @@ use ratatui::{
     },
     layout::Rect,
 };
-use std::{collections::HashMap, io::Write, path::PathBuf, time::Instant};
+use std::{
+    collections::HashMap,
+    io::Write,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
@@ -465,6 +470,19 @@ fn extract_json_object(s: &str) -> Option<String> {
 /// DoD 自動判定がハングした場合に強制終了するまでの上限時間。
 const DOD_ASSESSMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+const CODEX_WHEEL_LINES: isize = 6;
+const CODEX_MOUSE_DRAIN_LIMIT: usize = 64;
+const XTERM_MOUSE_CAPTURE_ON: &[u8] = b"\x1b[?1000h\x1b[?1006h\x1b[?1007h";
+const XTERM_MOUSE_CAPTURE_OFF: &[u8] =
+    b"\x1b[?1007l\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexTerminalScrollRoute {
+    ChildMouse,
+    Scrollback,
+    None,
+}
+
 /// codex ペインのライブ更新で取得する Addness 側のスナップショット。
 struct CodexSnapshot {
     title: String,
@@ -586,6 +604,12 @@ pub struct App {
     pub codex: Option<CodexPane>,
     /// 直近に描画した codex 端末ペインの外枠領域。マウス座標のローカル変換に使う。
     pub(super) codex_terminal_area: Option<Rect>,
+    /// 直近に描画した Codex 左ペインのスクロール対象領域。
+    pub(super) codex_contract_area: Option<Rect>,
+    pub(super) codex_activity_area: Option<Rect>,
+    pub(super) codex_contract_scroll: usize,
+    pub(super) codex_activity_scroll: usize,
+    pub(super) codex_last_scroll_input: Option<String>,
 
     /// codex 実行中、対象ゴールを低頻度・非ブロッキングで再取得するための
     /// バックグラウンドタスク（進行中のみ Some）と、前回リフレッシュ時刻。
@@ -633,6 +657,11 @@ impl App {
             success_message: None,
             codex: None,
             codex_terminal_area: None,
+            codex_contract_area: None,
+            codex_activity_area: None,
+            codex_contract_scroll: 0,
+            codex_activity_scroll: 0,
+            codex_last_scroll_input: None,
             codex_refresh: None,
             last_codex_refresh: None,
             last_codex_sync: None,
@@ -1145,9 +1174,15 @@ impl App {
                 ));
                 self.codex = Some(pane);
                 self.active_pane = ActivePane::Codex;
+                self.codex_terminal_area = None;
+                self.codex_contract_area = None;
+                self.codex_activity_area = None;
+                self.codex_contract_scroll = 0;
+                self.codex_activity_scroll = 0;
+                self.codex_last_scroll_input = None;
                 // 通常UI → codex の構造遷移。前画面の残像を消すため全クリアする。
                 self.needs_full_clear = true;
-                // codex 端末上のトラックパッド/ホイール操作を受け取るため有効化（codex 中のみ）。
+                // codex 画面上のトラックパッド/ホイール操作を受け取るため有効化（codex 中のみ）。
                 Self::set_mouse_capture(true);
             }
             Err(e) => {
@@ -1158,14 +1193,13 @@ impl App {
 
     /// マウスキャプチャの ON/OFF。通常画面ではテキスト選択を壊さないよう OFF にする。
     fn set_mouse_capture(enable: bool) {
-        use ratatui::crossterm::event::{DisableMouseCapture, EnableMouseCapture};
-        use ratatui::crossterm::execute;
         let mut out = std::io::stdout();
         if enable {
-            let _ = execute!(out, EnableMouseCapture);
+            let _ = out.write_all(XTERM_MOUSE_CAPTURE_ON);
         } else {
-            let _ = execute!(out, DisableMouseCapture);
+            let _ = out.write_all(XTERM_MOUSE_CAPTURE_OFF);
         }
+        let _ = out.flush();
     }
 
     /// codex セッションの作業状況を対象ゴールの body に自動記録する。
@@ -1323,6 +1357,11 @@ impl App {
         // 通常画面に戻るのでマウスキャプチャを解除（テキスト選択を戻す）。
         Self::set_mouse_capture(false);
         self.codex_terminal_area = None;
+        self.codex_contract_area = None;
+        self.codex_activity_area = None;
+        self.codex_contract_scroll = 0;
+        self.codex_activity_scroll = 0;
+        self.codex_last_scroll_input = None;
         // 進行中の非同期作業メモ記録を先に止め、この後の同期終了記録と body を奪い合わせない。
         if let Some(job) = self.codex_body_record_job.take() {
             job.abort();
@@ -1688,82 +1727,86 @@ impl App {
 
     /// codex ログのスクロールキーを処理する。
     ///
-    /// codex 実行中は通常キーを codex 側へ渡す必要があるため、Shift 付きの
-    /// ナビゲーションキーだけを横取りする。終了後は codex がキーを処理しないので、
+    /// codex 実行中はキー操作でログを遡らず、trackpad/wheel だけを使う。
+    /// 終了後は codex がキーを処理しないので、
     /// 通常の矢印・PgUp/PgDn・Home/End もログ操作に使える。
     fn handle_codex_log_scroll(pane: &mut CodexPane, key: KeyEvent, allow_plain: bool) -> bool {
-        let shifted = key.modifiers.contains(KeyModifiers::SHIFT);
         let plain = key.modifiers.is_empty();
-        let can_scroll_nav = allow_plain || shifted;
-        let can_scroll_chars = allow_plain && plain;
+        if !allow_plain || !plain {
+            return false;
+        }
         let page = pane.page() as isize;
 
-        if can_scroll_nav {
-            match key.code {
-                KeyCode::Up => {
-                    pane.scroll_lines(1);
-                    return true;
-                }
-                KeyCode::Down => {
-                    pane.scroll_lines(-1);
-                    return true;
-                }
-                KeyCode::PageUp => {
-                    pane.scroll_lines(page);
-                    return true;
-                }
-                KeyCode::PageDown => {
-                    pane.scroll_lines(-page);
-                    return true;
-                }
-                KeyCode::Home => {
-                    pane.scroll_to_top();
-                    return true;
-                }
-                KeyCode::End => {
-                    pane.scroll_to_live();
-                    return true;
-                }
-                _ => {}
+        match key.code {
+            KeyCode::Up => {
+                pane.scroll_lines(1);
+                return true;
             }
-        }
-
-        if can_scroll_chars {
-            match key.code {
-                KeyCode::Char('k') => {
-                    pane.scroll_lines(1);
-                    return true;
-                }
-                KeyCode::Char('j') => {
-                    pane.scroll_lines(-1);
-                    return true;
-                }
-                KeyCode::Char('u') => {
-                    pane.scroll_lines(page);
-                    return true;
-                }
-                KeyCode::Char('d') => {
-                    pane.scroll_lines(-page);
-                    return true;
-                }
-                KeyCode::Char('g') => {
-                    pane.scroll_to_top();
-                    return true;
-                }
-                KeyCode::Char('G') => {
-                    pane.scroll_to_live();
-                    return true;
-                }
-                _ => {}
+            KeyCode::Down => {
+                pane.scroll_lines(-1);
+                return true;
             }
+            KeyCode::PageUp => {
+                pane.scroll_lines(page);
+                return true;
+            }
+            KeyCode::PageDown => {
+                pane.scroll_lines(-page);
+                return true;
+            }
+            KeyCode::Home => {
+                pane.scroll_to_top();
+                return true;
+            }
+            KeyCode::End => {
+                pane.scroll_to_live();
+                return true;
+            }
+            KeyCode::Char('k') => {
+                pane.scroll_lines(1);
+                return true;
+            }
+            KeyCode::Char('j') => {
+                pane.scroll_lines(-1);
+                return true;
+            }
+            KeyCode::Char('u') => {
+                pane.scroll_lines(page);
+                return true;
+            }
+            KeyCode::Char('d') => {
+                pane.scroll_lines(-page);
+                return true;
+            }
+            KeyCode::Char('g') => {
+                pane.scroll_to_top();
+                return true;
+            }
+            KeyCode::Char('G') => {
+                pane.scroll_to_live();
+                return true;
+            }
+            _ => {}
         }
 
         false
     }
 
+    fn is_codex_shift_navigation_key(key: KeyEvent) -> bool {
+        key.modifiers == KeyModifiers::SHIFT
+            && matches!(
+                key.code,
+                KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Home
+                    | KeyCode::End
+            )
+    }
+
     /// codex ペインへのキー入力処理。
-    /// 実行中は F12 で終了、修飾キー付きナビゲーションでログをスクロールし、
-    /// それ以外のキーは codex へ転送する。
+    /// 実行中は F12 で終了、trackpad/wheel でログをスクロールし、それ以外のキーは codex へ転送する。
     /// 終了後は還流バー（c/s/d）で成果を Addness に書き戻し、Esc/q で閉じる。
     fn handle_codex_key(&mut self, key: KeyEvent) {
         let finished = self.codex.as_ref().map(|c| c.finished).unwrap_or(true);
@@ -1816,7 +1859,7 @@ impl App {
             return;
         }
         if let Some(pane) = self.codex.as_mut() {
-            if Self::handle_codex_log_scroll(pane, key, false) {
+            if Self::is_codex_shift_navigation_key(key) {
                 return;
             }
             if pane.scrollback > 0 && key.code == KeyCode::Esc {
@@ -1843,35 +1886,202 @@ impl App {
         }
     }
 
-    fn handle_codex_mouse(&mut self, mouse: MouseEvent) {
-        if self.active_pane != ActivePane::Codex || self.modal_state.is_some() {
-            return;
-        }
-        let Some((column, row)) = self.codex_terminal_point(mouse.column, mouse.row) else {
-            return;
-        };
-        let Some(pane) = self.codex.as_mut() else {
-            return;
-        };
+    fn handle_codex_mouse_batch(&mut self, first: MouseEvent) -> Result<()> {
+        let mut latest_scroll = None;
+        let mut delta = 0;
+        let mut event_count = 0;
+        Self::collect_mouse_scroll(first, &mut latest_scroll, &mut delta, &mut event_count);
 
-        if !pane.finished
-            && pane.scrollback == 0
-            && pane.input_mouse_wheel(mouse.kind, column, row, mouse.modifiers)
-        {
-            return;
+        let mut pending_event = None;
+        for _ in 0..CODEX_MOUSE_DRAIN_LIMIT {
+            if !event::poll(Duration::from_millis(0))? {
+                break;
+            }
+
+            match event::read()? {
+                Event::Mouse(mouse) => {
+                    Self::collect_mouse_scroll(
+                        mouse,
+                        &mut latest_scroll,
+                        &mut delta,
+                        &mut event_count,
+                    );
+                }
+                event => {
+                    pending_event = Some(event);
+                    break;
+                }
+            }
         }
 
-        match mouse.kind {
-            MouseEventKind::ScrollUp => pane.scroll_lines(3),
-            MouseEventKind::ScrollDown => pane.scroll_lines(-3),
-            _ => {}
+        if let Some(mut mouse) = latest_scroll {
+            if delta == 0 {
+                self.codex_last_scroll_input = Some(format!(
+                    "mouse {:?} x{event_count} -> coalesced",
+                    mouse.kind
+                ));
+            } else {
+                mouse.kind = Self::mouse_kind_for_delta(delta);
+                self.handle_codex_mouse_scroll(mouse, delta, event_count);
+            }
+        }
+
+        if let Some(event) = pending_event {
+            self.handle_event(event)?;
+        }
+
+        Ok(())
+    }
+
+    fn collect_mouse_scroll(
+        mouse: MouseEvent,
+        latest_scroll: &mut Option<MouseEvent>,
+        delta: &mut isize,
+        event_count: &mut usize,
+    ) {
+        if let Some(next_delta) = Self::mouse_scroll_delta(mouse.kind) {
+            *latest_scroll = Some(mouse);
+            *delta += next_delta;
+            *event_count += 1;
         }
     }
 
-    fn codex_terminal_point(&self, column: u16, row: u16) -> Option<(u16, u16)> {
-        Self::point_in_inner_area(self.codex_terminal_area?, column, row)
+    fn mouse_kind_for_delta(delta: isize) -> MouseEventKind {
+        if delta >= 0 {
+            MouseEventKind::ScrollUp
+        } else {
+            MouseEventKind::ScrollDown
+        }
     }
 
+    fn handle_codex_mouse_scroll(&mut self, mouse: MouseEvent, delta: isize, event_count: usize) {
+        if Self::point_in_area(self.codex_terminal_area, mouse.column, mouse.row) {
+            let Some(area) = self.codex_terminal_area else {
+                return;
+            };
+            if let Some(pane) = self.codex.as_mut() {
+                let batch = Self::mouse_scroll_batch_label(event_count);
+                let terminal_point =
+                    Self::point_in_inner_area_clamped(area, mouse.column, mouse.row);
+                let before = pane.scrollback;
+                pane.scroll_lines(delta);
+                let after = pane.scrollback;
+                match Self::codex_terminal_scroll_route(
+                    before,
+                    after,
+                    pane.finished,
+                    pane.mouse_reporting_enabled(),
+                    terminal_point,
+                ) {
+                    CodexTerminalScrollRoute::Scrollback => {
+                        self.codex_last_scroll_input = Some(format!(
+                            "mouse {:?}{batch} -> codex {before}->{after}",
+                            mouse.kind
+                        ));
+                        return;
+                    }
+                    CodexTerminalScrollRoute::ChildMouse => {
+                        if let Some((column, row)) = terminal_point {
+                            pane.input_mouse_wheel(mouse.kind, column, row, mouse.modifiers);
+                            self.codex_last_scroll_input = Some(format!(
+                                "mouse {:?}{batch} -> codex {before}->{after} pty-mouse",
+                                mouse.kind
+                            ));
+                            return;
+                        }
+                    }
+                    CodexTerminalScrollRoute::None => {
+                        self.codex_last_scroll_input = Some(format!(
+                            "mouse {:?}{batch} -> codex {before}->{after} no-scroll",
+                            mouse.kind
+                        ));
+                        return;
+                    }
+                }
+            }
+            return;
+        }
+
+        if Self::point_in_area(self.codex_contract_area, mouse.column, mouse.row) {
+            Self::scroll_index(&mut self.codex_contract_scroll, delta);
+            let batch = Self::mouse_scroll_batch_label(event_count);
+            self.codex_last_scroll_input =
+                Some(format!("mouse {:?}{batch} -> Addness", mouse.kind));
+            return;
+        }
+
+        if Self::point_in_area(self.codex_activity_area, mouse.column, mouse.row) {
+            Self::scroll_index(&mut self.codex_activity_scroll, delta);
+            let batch = Self::mouse_scroll_batch_label(event_count);
+            self.codex_last_scroll_input =
+                Some(format!("mouse {:?}{batch} -> Addness更新", mouse.kind));
+            return;
+        }
+
+        self.codex_last_scroll_input = Some(format!(
+            "mouse {:?}{} at {},{} -> outside",
+            mouse.kind,
+            Self::mouse_scroll_batch_label(event_count),
+            mouse.column,
+            mouse.row
+        ));
+    }
+
+    fn mouse_scroll_batch_label(event_count: usize) -> String {
+        if event_count > 1 {
+            format!(" x{event_count}")
+        } else {
+            String::new()
+        }
+    }
+
+    fn mouse_scroll_delta(kind: MouseEventKind) -> Option<isize> {
+        match kind {
+            MouseEventKind::ScrollUp => Some(CODEX_WHEEL_LINES),
+            MouseEventKind::ScrollDown => Some(-CODEX_WHEEL_LINES),
+            MouseEventKind::ScrollLeft => Some(CODEX_WHEEL_LINES),
+            MouseEventKind::ScrollRight => Some(-CODEX_WHEEL_LINES),
+            _ => None,
+        }
+    }
+
+    fn codex_terminal_scroll_route(
+        before: usize,
+        after: usize,
+        finished: bool,
+        mouse_reporting_enabled: bool,
+        terminal_point: Option<(u16, u16)>,
+    ) -> CodexTerminalScrollRoute {
+        if after != before {
+            return CodexTerminalScrollRoute::Scrollback;
+        }
+        if terminal_point.is_none() {
+            return CodexTerminalScrollRoute::None;
+        }
+        if !finished && mouse_reporting_enabled {
+            return CodexTerminalScrollRoute::ChildMouse;
+        }
+        CodexTerminalScrollRoute::None
+    }
+
+    fn scroll_index(offset: &mut usize, delta: isize) {
+        if delta >= 0 {
+            *offset = offset.saturating_add(delta as usize);
+        } else {
+            *offset = offset.saturating_sub((-delta) as usize);
+        }
+    }
+
+    fn point_in_area(area: Option<Rect>, column: u16, row: u16) -> bool {
+        let Some(area) = area else {
+            return false;
+        };
+        let right = area.x.saturating_add(area.width);
+        let bottom = area.y.saturating_add(area.height);
+        column >= area.x && row >= area.y && column < right && row < bottom
+    }
+
+    #[cfg(test)]
     fn point_in_inner_area(area: Rect, column: u16, row: u16) -> Option<(u16, u16)> {
         let inner = Rect {
             x: area.x.saturating_add(1),
@@ -1887,6 +2097,27 @@ impl App {
         if column < inner.x || row < inner.y || column >= right || row >= bottom {
             return None;
         }
+        Some((column - inner.x, row - inner.y))
+    }
+
+    fn point_in_inner_area_clamped(area: Rect, column: u16, row: u16) -> Option<(u16, u16)> {
+        let inner = Rect {
+            x: area.x.saturating_add(1),
+            y: area.y.saturating_add(1),
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(2),
+        };
+        if inner.width == 0 || inner.height == 0 {
+            return None;
+        }
+        if !Self::point_in_area(Some(area), column, row) {
+            return None;
+        }
+
+        let right = inner.x.saturating_add(inner.width).saturating_sub(1);
+        let bottom = inner.y.saturating_add(inner.height).saturating_sub(1);
+        let column = column.clamp(inner.x, right);
+        let row = row.clamp(inner.y, bottom);
         Some((column - inner.x, row - inner.y))
     }
 
@@ -2166,7 +2397,10 @@ impl App {
 
     fn handle_events(&mut self) -> Result<()> {
         let event = event::read()?;
+        self.handle_event(event)
+    }
 
+    fn handle_event(&mut self, event: Event) -> Result<()> {
         // 端末リサイズ時はレイアウトが変わり前サイズの残像が出るため、全クリアを予約する。
         if let Event::Resize(_, _) = event {
             self.needs_full_clear = true;
@@ -2175,7 +2409,7 @@ impl App {
 
         if let Event::Mouse(me) = event {
             // codex 使用中のみ有効なマウスキャプチャを、右側の PTY 端末領域に限定して扱う。
-            self.handle_codex_mouse(me);
+            self.handle_codex_mouse_batch(me)?;
             return Ok(());
         }
 
@@ -4200,6 +4434,218 @@ mod codex_mouse_tests {
         };
 
         assert_eq!(App::point_in_inner_area(area, 1, 1), None);
+    }
+
+    #[test]
+    fn point_in_area_includes_frame_borders() {
+        let area = Rect {
+            x: 10,
+            y: 5,
+            width: 20,
+            height: 8,
+        };
+
+        assert!(App::point_in_area(Some(area), 10, 5));
+        assert!(App::point_in_area(Some(area), 29, 12));
+        assert!(!App::point_in_area(Some(area), 30, 12));
+        assert!(!App::point_in_area(Some(area), 29, 13));
+        assert!(!App::point_in_area(None, 10, 5));
+    }
+
+    #[test]
+    fn point_in_inner_area_clamped_maps_frame_to_nearest_terminal_cell() {
+        let area = Rect {
+            x: 10,
+            y: 5,
+            width: 20,
+            height: 8,
+        };
+
+        assert_eq!(App::point_in_inner_area_clamped(area, 10, 5), Some((0, 0)));
+        assert_eq!(
+            App::point_in_inner_area_clamped(area, 29, 12),
+            Some((17, 5))
+        );
+        assert_eq!(App::point_in_inner_area_clamped(area, 15, 8), Some((4, 2)));
+        assert_eq!(App::point_in_inner_area_clamped(area, 30, 12), None);
+    }
+
+    #[test]
+    fn mouse_scroll_delta_maps_trackpad_wheel_to_history_direction() {
+        assert_eq!(
+            App::mouse_scroll_delta(MouseEventKind::ScrollUp),
+            Some(CODEX_WHEEL_LINES)
+        );
+        assert_eq!(
+            App::mouse_scroll_delta(MouseEventKind::ScrollDown),
+            Some(-CODEX_WHEEL_LINES)
+        );
+        assert_eq!(
+            App::mouse_scroll_delta(MouseEventKind::ScrollLeft),
+            Some(CODEX_WHEEL_LINES)
+        );
+        assert_eq!(
+            App::mouse_scroll_delta(MouseEventKind::ScrollRight),
+            Some(-CODEX_WHEEL_LINES)
+        );
+        assert_eq!(App::mouse_scroll_delta(MouseEventKind::Moved), None);
+    }
+
+    #[test]
+    fn mouse_capture_enables_sgr_without_motion_reporting() {
+        let enable = String::from_utf8(XTERM_MOUSE_CAPTURE_ON.to_vec()).unwrap();
+
+        assert!(enable.contains("\x1b[?1000h"), "normal tracking missing");
+        assert!(enable.contains("\x1b[?1006h"), "SGR mouse mode missing");
+        assert!(
+            !enable.contains("\x1b[?1002h"),
+            "button-event tracking should stay disabled"
+        );
+        assert!(
+            !enable.contains("\x1b[?1003h"),
+            "any-event tracking should stay disabled"
+        );
+
+        let disable = String::from_utf8(XTERM_MOUSE_CAPTURE_OFF.to_vec()).unwrap();
+
+        assert!(
+            disable.contains("\x1b[?1006l"),
+            "SGR mouse mode cleanup missing"
+        );
+        assert!(
+            disable.contains("\x1b[?1000l"),
+            "normal tracking cleanup missing"
+        );
+    }
+
+    #[test]
+    fn scroll_index_saturates_at_zero() {
+        let mut offset = 1;
+        App::scroll_index(&mut offset, 3);
+        assert_eq!(offset, 4);
+
+        App::scroll_index(&mut offset, -10);
+        assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn codex_terminal_scroll_route_prefers_scrollback_then_child_mouse() {
+        assert_eq!(
+            App::codex_terminal_scroll_route(0, 3, false, true, Some((1, 1))),
+            CodexTerminalScrollRoute::Scrollback
+        );
+        assert_eq!(
+            App::codex_terminal_scroll_route(0, 0, false, true, Some((1, 1))),
+            CodexTerminalScrollRoute::ChildMouse
+        );
+        assert_eq!(
+            App::codex_terminal_scroll_route(0, 0, false, false, Some((1, 1))),
+            CodexTerminalScrollRoute::None
+        );
+        assert_eq!(
+            App::codex_terminal_scroll_route(0, 0, true, true, Some((1, 1))),
+            CodexTerminalScrollRoute::None
+        );
+        assert_eq!(
+            App::codex_terminal_scroll_route(0, 0, false, true, None),
+            CodexTerminalScrollRoute::None
+        );
+    }
+
+    #[test]
+    fn handle_codex_mouse_scrolls_real_codex_pane_scrollback() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = ApiClient::new("t", "http://localhost").unwrap();
+        let mut app = App::new(client, rt.handle().clone());
+        let mut output = String::new();
+        for row in 1..=100 {
+            output.push_str(&format!("\x1b[{row};1Hrow {row:03}"));
+        }
+        app.codex = Some(CodexPane::test_with_output(100, 20, 0, &output));
+        app.codex.as_mut().unwrap().resize(4, 20);
+        app.active_pane = ActivePane::Codex;
+        app.codex_terminal_area = Some(Rect {
+            x: 10,
+            y: 5,
+            width: 22,
+            height: 6,
+        });
+
+        app.handle_codex_mouse_scroll(
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 20,
+                row: 8,
+                modifiers: KeyModifiers::NONE,
+            },
+            CODEX_WHEEL_LINES,
+            1,
+        );
+
+        let pane = app.codex.as_ref().unwrap();
+        assert_eq!(pane.scrollback, CODEX_WHEEL_LINES as usize);
+        assert_eq!(
+            app.codex_last_scroll_input.as_deref(),
+            Some("mouse ScrollUp -> codex 0->6")
+        );
+    }
+
+    #[test]
+    fn handle_codex_mouse_scroll_applies_coalesced_trackpad_delta() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = ApiClient::new("t", "http://localhost").unwrap();
+        let mut app = App::new(client, rt.handle().clone());
+        let mut output = String::new();
+        for row in 1..=100 {
+            output.push_str(&format!("\x1b[{row};1Hrow {row:03}"));
+        }
+        app.codex = Some(CodexPane::test_with_output(100, 20, 0, &output));
+        app.codex.as_mut().unwrap().resize(4, 20);
+        app.active_pane = ActivePane::Codex;
+        app.codex_terminal_area = Some(Rect {
+            x: 10,
+            y: 5,
+            width: 22,
+            height: 6,
+        });
+
+        app.handle_codex_mouse_scroll(
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 20,
+                row: 8,
+                modifiers: KeyModifiers::NONE,
+            },
+            CODEX_WHEEL_LINES * 2,
+            2,
+        );
+
+        let pane = app.codex.as_ref().unwrap();
+        assert_eq!(pane.scrollback, (CODEX_WHEEL_LINES * 2) as usize);
+        assert_eq!(
+            app.codex_last_scroll_input.as_deref(),
+            Some("mouse ScrollUp x2 -> codex 0->12")
+        );
+    }
+
+    #[test]
+    fn shifted_codex_navigation_keys_are_swallowed() {
+        assert!(App::is_codex_shift_navigation_key(KeyEvent::new(
+            KeyCode::Up,
+            KeyModifiers::SHIFT,
+        )));
+        assert!(App::is_codex_shift_navigation_key(KeyEvent::new(
+            KeyCode::PageDown,
+            KeyModifiers::SHIFT,
+        )));
+        assert!(!App::is_codex_shift_navigation_key(KeyEvent::new(
+            KeyCode::Up,
+            KeyModifiers::NONE,
+        )));
+        assert!(!App::is_codex_shift_navigation_key(KeyEvent::new(
+            KeyCode::Char('k'),
+            KeyModifiers::SHIFT,
+        )));
     }
 }
 

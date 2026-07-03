@@ -13,7 +13,34 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
-use tui_term::vt100;
+use tui_term::{vt100, widget::Screen};
+
+const CODEX_PTY_EXTRA_SCROLL_ROWS_DEFAULT: u16 = 160;
+const CODEX_PTY_EXTRA_SCROLL_ROWS_MAX: u16 = 1000;
+const CODEX_PTY_EXTRA_SCROLL_ROWS_ENV: &str = "ADDNESS_CODEX_EXTRA_SCROLL_ROWS";
+
+fn pty_extra_scroll_rows() -> u16 {
+    extra_scroll_rows_from_env_value(
+        std::env::var(CODEX_PTY_EXTRA_SCROLL_ROWS_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn extra_scroll_rows_from_env_value(value: Option<&str>) -> u16 {
+    let Some(value) = value else {
+        return CODEX_PTY_EXTRA_SCROLL_ROWS_DEFAULT;
+    };
+    value
+        .trim()
+        .parse::<u16>()
+        .map(|rows| rows.min(CODEX_PTY_EXTRA_SCROLL_ROWS_MAX))
+        .unwrap_or(CODEX_PTY_EXTRA_SCROLL_ROWS_DEFAULT)
+}
+
+fn pty_rows_for_visible(visible_rows: u16) -> u16 {
+    visible_rows.max(1).saturating_add(pty_extra_scroll_rows())
+}
 
 /// codex 実行ファイルのパスを解決する。
 /// 環境変数 `ADDNESS_CODEX_BIN` を最優先で見て、無ければ PATH 上を探す。
@@ -60,6 +87,7 @@ pub struct CodexPane {
     pub finished: bool,
     rows: u16,
     cols: u16,
+    visible_rows: u16,
     /// 還流先となる対象ゴールの ID。
     pub goal_id: String,
     /// 契約ペイン表示用に保持する対象ゴールのタイトルと DoD。
@@ -102,6 +130,36 @@ pub struct CodexPane {
     /// 最初の実依頼の body 自動記録を済み（再試行しない）とするフラグ。
     body_record_done: bool,
     input_state: CodexInputState,
+}
+
+pub struct CodexScreenView<'a> {
+    screen: &'a vt100::Screen,
+    row_offset: u16,
+    hide_cursor: bool,
+}
+
+impl Screen for CodexScreenView<'_> {
+    type C = vt100::Cell;
+
+    fn cell(&self, row: u16, col: u16) -> Option<&Self::C> {
+        self.screen.cell(row.saturating_add(self.row_offset), col)
+    }
+
+    fn hide_cursor(&self) -> bool {
+        self.hide_cursor || self.screen.hide_cursor()
+    }
+
+    fn cursor_position(&self) -> (u16, u16) {
+        let (row, col) = self.screen.cursor_position();
+        if row < self.row_offset {
+            return (u16::MAX, col);
+        }
+        (row - self.row_offset, col)
+    }
+
+    fn cursor_shape(&self) -> tui_term::widget::CursorShape {
+        self.screen.cursor_shape()
+    }
 }
 
 /// 子ゴール 1 件の表示用情報。
@@ -367,7 +425,8 @@ impl CodexPane {
         dod: String,
         status_label: String,
     ) -> Result<Self> {
-        let rows: u16 = 24;
+        let visible_rows: u16 = 24;
+        let rows: u16 = pty_rows_for_visible(visible_rows);
         let cols: u16 = 80;
         // DoD 項目は一度だけ分割し、チェック状態はその件数で初期化する。
         let dod_items = split_dod_items(&dod);
@@ -384,16 +443,8 @@ impl CodexPane {
             .context("PTY の確保に失敗しました")?;
 
         let mut cmd = CommandBuilder::new(codex_bin);
-        // 長い運用ルールはチャットに残さず developer_instructions として渡す。
-        cmd.arg("-c");
-        cmd.arg(codex_config_arg(
-            CodexConfigKey::DeveloperInstructions,
-            addness_tui_developer_instructions(),
-        ));
-        // デフォルトでは初期プロンプトを送らず、ユーザーが即入力できる状態で起動する。
-        // 完全な Addness 読込は developer instructions に従って必要時に遅延実行する。
-        if eager_startup_recall_enabled() {
-            cmd.arg(startup_recall_prompt());
+        for arg in codex_spawn_args(eager_startup_recall_enabled()) {
+            cmd.arg(arg);
         }
         cmd.cwd(cwd);
         // 親プロセスの環境を引き継ぐ（PATH 等を codex のサブプロセスに渡すため）。
@@ -454,6 +505,7 @@ impl CodexPane {
             finished: false,
             rows,
             cols,
+            visible_rows,
             goal_id,
             goal_title,
             cwd: cwd.display().to_string(),
@@ -481,34 +533,133 @@ impl CodexPane {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_with_output(
+        rows: u16,
+        cols: u16,
+        scrollback_len: usize,
+        output: &str,
+    ) -> Self {
+        let rows = rows.max(1);
+        let cols = cols.max(1);
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut child = pair
+            .slave
+            .spawn_command(CommandBuilder::new("true"))
+            .unwrap();
+        let _ = child.wait();
+        drop(pair.slave);
+        let writer = pair.master.take_writer().unwrap();
+        let (_tx, rx) = mpsc::channel::<Vec<u8>>();
+        let mut parser = vt100::Parser::new(rows, cols, scrollback_len);
+        parser.process(output.as_bytes());
+
+        Self {
+            parser,
+            master: pair.master,
+            writer,
+            child,
+            rx,
+            finished: true,
+            rows,
+            cols,
+            visible_rows: rows,
+            goal_id: "test-goal".to_string(),
+            goal_title: "Test goal".to_string(),
+            cwd: std::env::current_dir().unwrap().display().to_string(),
+            status_label: "TEST".to_string(),
+            dod_items: Vec::new(),
+            dod_checks: Vec::new(),
+            assessing: false,
+            child_count: None,
+            comment_count: None,
+            deliverable_count: None,
+            trace_links: Vec::new(),
+            children: Vec::new(),
+            action: None,
+            last_addness_read_at: None,
+            last_addness_write_at: None,
+            status_changed_at: None,
+            dod_changed_at: None,
+            scrollback: 0,
+            activity: Vec::new(),
+            last_terminal_notice_key: None,
+            auto_record_attempted: false,
+            body_record_done: false,
+            input_state: CodexInputState::default(),
+            dod: String::new(),
+        }
+    }
+
     /// ログを delta 行スクロールする（正=過去へ、負=最新へ）。
     pub fn scroll_lines(&mut self, delta: isize) {
+        let max = self.max_view_scrollback();
         let target = (self.scrollback as isize + delta).max(0) as usize;
-        self.parser.screen_mut().set_scrollback(target);
-        self.scrollback = self.parser.screen().scrollback();
+        self.scrollback = target.min(max);
     }
 
     /// 1 ページ分の行数（スクロール量）。
     pub fn page(&self) -> usize {
-        self.rows.saturating_sub(1).max(1) as usize
+        self.visible_rows.saturating_sub(1).max(1) as usize
     }
 
     /// 最古（バッファ先頭）までスクロールする。
     pub fn scroll_to_top(&mut self) {
-        self.parser.screen_mut().set_scrollback(usize::MAX / 2);
-        self.scrollback = self.parser.screen().scrollback();
+        self.scrollback = self.max_view_scrollback();
     }
 
     /// 最新（ライブ）位置へ戻す。
     pub fn scroll_to_live(&mut self) {
-        self.parser.screen_mut().set_scrollback(0);
         self.scrollback = 0;
+    }
+
+    fn max_view_scrollback(&self) -> usize {
+        self.live_row_offset().into()
+    }
+
+    fn row_offset(&self) -> u16 {
+        let live_offset = self.live_row_offset();
+        let scrollback = u16::try_from(self.scrollback).unwrap_or(u16::MAX);
+        live_offset.saturating_sub(scrollback)
+    }
+
+    fn live_row_offset(&self) -> u16 {
+        let last_content_row = self.last_content_row().unwrap_or(0);
+        let (cursor_row, _) = self.parser.screen().cursor_position();
+        let anchor_row = last_content_row.max(cursor_row.min(self.rows.saturating_sub(1)));
+        anchor_row
+            .saturating_add(1)
+            .saturating_sub(self.visible_rows)
+    }
+
+    fn last_content_row(&self) -> Option<u16> {
+        let screen = self.parser.screen();
+        for row in (0..self.rows).rev() {
+            for col in 0..self.cols {
+                if screen.cell(row, col).is_some_and(vt100::Cell::has_contents) {
+                    return Some(row);
+                }
+            }
+        }
+        None
+    }
+
+    fn live_contents(&self) -> String {
+        self.parser.screen().contents()
     }
 
     /// codex の画面（直近の出力）を走査し、最後に実行された addness 操作を
     /// 「いま参照/書込中」ラベルとして self.action に反映する。update() から呼ぶ。
     fn refresh_action(&mut self) {
-        let contents = self.parser.screen().contents();
+        let contents = self.live_contents();
         let lines: Vec<&str> = contents.lines().collect();
         // 画面下部（最近の出力）だけを見て、moved-on したら自然に消えるようにする。
         let start = lines.len().saturating_sub(10);
@@ -581,11 +732,8 @@ impl CodexPane {
 
     /// Codex の画面状態から、ホスト端末へ流すべき通知を 1 件だけ取り出す。
     pub fn take_terminal_notice(&mut self) -> Option<TerminalNotice> {
-        let candidate = terminal_notice_candidate(
-            &self.parser.screen().contents(),
-            self.action.as_deref(),
-            self.finished,
-        );
+        let contents = self.live_contents();
+        let candidate = terminal_notice_candidate(&contents, self.action.as_deref(), self.finished);
         let Some((key, notice)) = candidate else {
             self.last_terminal_notice_key = None;
             return None;
@@ -600,13 +748,17 @@ impl CodexPane {
 
     /// 描画領域に合わせて PTY と vt100 のサイズを更新する（変化時のみ）。
     pub fn resize(&mut self, rows: u16, cols: u16) {
-        let rows = rows.max(1);
+        let visible_rows = rows.max(1);
+        let rows = pty_rows_for_visible(visible_rows);
         let cols = cols.max(1);
-        if rows == self.rows && cols == self.cols {
+        let visible_changed = visible_rows != self.visible_rows;
+        if rows == self.rows && cols == self.cols && !visible_changed {
             return;
         }
         self.rows = rows;
         self.cols = cols;
+        self.visible_rows = visible_rows;
+        self.scrollback = self.scrollback.min(self.max_view_scrollback());
         self.parser.screen_mut().set_size(rows, cols);
         let _ = self.master.resize(PtySize {
             rows,
@@ -617,8 +769,35 @@ impl CodexPane {
     }
 
     /// 描画用の vt100 スクリーン。
+    #[cfg(test)]
     pub fn screen(&self) -> &vt100::Screen {
         self.parser.screen()
+    }
+
+    pub fn screen_view(&self) -> CodexScreenView<'_> {
+        CodexScreenView {
+            screen: self.parser.screen(),
+            row_offset: self.row_offset(),
+            hide_cursor: self.scrollback > 0,
+        }
+    }
+
+    pub fn visible_cursor_position(&self) -> Option<(u16, u16)> {
+        if self.scrollback > 0 || self.parser.screen().hide_cursor() {
+            return None;
+        }
+        let (row, col) = self.parser.screen().cursor_position();
+        let offset = self.row_offset();
+        let visible_row = row.checked_sub(offset)?;
+        (visible_row < self.visible_rows).then_some((visible_row, col))
+    }
+
+    /// 子プロセスの TUI が xterm mouse reporting を有効化しているか。
+    pub fn mouse_reporting_enabled(&self) -> bool {
+        !matches!(
+            self.parser.screen().mouse_protocol_mode(),
+            vt100::MouseProtocolMode::None
+        )
     }
 
     /// キー入力を端末バイト列へ変換して PTY へ書き込む。
@@ -910,8 +1089,34 @@ DoD項目（番号: 内容）:
     )
 }
 
+fn codex_spawn_args(eager_recall: bool) -> Vec<String> {
+    let mut args = vec![
+        // 埋め込み PTY では Codex の会話履歴を Addness 側の scrollback で扱う。
+        // alternate screen のままだと Codex 内部で消えた行をホスト側が遡れない。
+        "--no-alt-screen".to_string(),
+        // 長い運用ルールはチャットに残さず developer_instructions として渡す。
+        "-c".to_string(),
+        codex_config_arg(
+            CodexConfigKey::DeveloperInstructions,
+            addness_tui_developer_instructions(),
+        ),
+    ];
+    // デフォルトでは初期プロンプトを送らず、ユーザーが即入力できる状態で起動する。
+    // 完全な Addness 読込は developer instructions に従って必要時に遅延実行する。
+    if eager_recall {
+        args.push(startup_recall_prompt().to_string());
+    }
+    args
+}
+
 /// crossterm の `KeyEvent` を xterm 互換の端末バイト列へエンコードする。
 fn encode_key(key: KeyEvent) -> Vec<u8> {
+    if key.modifiers == KeyModifiers::SHIFT
+        && let Some(bytes) = encode_shift_navigation_key(key.code)
+    {
+        return bytes;
+    }
+
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
@@ -971,6 +1176,19 @@ fn encode_key(key: KeyEvent) -> Vec<u8> {
         return prefixed;
     }
     out
+}
+
+fn encode_shift_navigation_key(code: KeyCode) -> Option<Vec<u8>> {
+    let suffix = match code {
+        KeyCode::Up => b'A',
+        KeyCode::Down => b'B',
+        KeyCode::Right => b'C',
+        KeyCode::Left => b'D',
+        KeyCode::Home => b'H',
+        KeyCode::End => b'F',
+        _ => return None,
+    };
+    Some(format!("\x1b[1;2{}", suffix as char).into_bytes())
 }
 
 /// crossterm のホイールイベントを xterm SGR mouse mode の入力列へ変換する。
@@ -1042,6 +1260,20 @@ mod tests {
         assert_eq!(encode_key(key(KeyCode::Backspace)), vec![0x7f]);
         assert_eq!(encode_key(key(KeyCode::Up)), b"\x1b[A".to_vec());
         assert_eq!(encode_key(key(KeyCode::Left)), b"\x1b[D".to_vec());
+        assert_eq!(encode_key(key(KeyCode::PageUp)), b"\x1b[5~".to_vec());
+        assert_eq!(encode_key(key(KeyCode::PageDown)), b"\x1b[6~".to_vec());
+    }
+
+    #[test]
+    fn encode_shift_navigation_keys_use_xterm_modified_sequences() {
+        assert_eq!(
+            encode_key(key_mod(KeyCode::Up, KeyModifiers::SHIFT)),
+            b"\x1b[1;2A".to_vec()
+        );
+        assert_eq!(
+            encode_key(key_mod(KeyCode::Down, KeyModifiers::SHIFT)),
+            b"\x1b[1;2B".to_vec()
+        );
     }
 
     #[test]
@@ -1083,6 +1315,182 @@ mod tests {
             encode_mouse_wheel(MouseEventKind::Moved, 0, 0, KeyModifiers::NONE),
             None
         );
+    }
+
+    #[test]
+    fn vt100_scrollback_exposes_previous_lines() {
+        let mut parser = vt100::Parser::new(3, 12, 10);
+        for i in 0..6 {
+            parser.process(format!("line {i}\r\n").as_bytes());
+        }
+
+        let live = parser.screen().contents();
+        parser.screen_mut().set_scrollback(2);
+        let scrolled = parser.screen().contents();
+
+        assert_ne!(live, scrolled);
+        assert!(scrolled.contains("line 2"));
+        assert!(scrolled.contains("line 3"));
+    }
+
+    #[test]
+    fn pseudo_terminal_renders_vt100_scrollback_offset() {
+        use ratatui::{
+            Terminal,
+            backend::TestBackend,
+            widgets::{Block, Borders},
+        };
+        use tui_term::widget::PseudoTerminal;
+
+        fn render(screen: &vt100::Screen) -> String {
+            let mut terminal = Terminal::new(TestBackend::new(22, 6)).unwrap();
+            terminal
+                .draw(|frame| {
+                    let widget =
+                        PseudoTerminal::new(screen).block(Block::default().borders(Borders::ALL));
+                    frame.render_widget(widget, frame.area());
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            let mut text = String::new();
+            for y in 0..buffer.area.height {
+                for x in 0..buffer.area.width {
+                    text.push_str(buffer[(x, y)].symbol());
+                }
+                text.push('\n');
+            }
+            text
+        }
+
+        let mut parser = vt100::Parser::new(4, 20, 10);
+        for i in 0..8 {
+            parser.process(format!("line {i}\r\n").as_bytes());
+        }
+
+        let live = render(parser.screen());
+        parser.screen_mut().set_scrollback(3);
+        let scrolled = render(parser.screen());
+
+        assert_ne!(live, scrolled);
+        assert!(
+            scrolled.contains("line 3") || scrolled.contains("line 4"),
+            "rendered scrollback should show earlier lines:\n{scrolled}"
+        );
+    }
+
+    #[test]
+    fn pseudo_terminal_renders_oversized_pty_view_scrollback() {
+        use ratatui::{
+            Terminal,
+            backend::TestBackend,
+            widgets::{Block, Borders},
+        };
+        use tui_term::widget::PseudoTerminal;
+
+        fn render(pane: &CodexPane) -> String {
+            let mut terminal = Terminal::new(TestBackend::new(22, 6)).unwrap();
+            terminal
+                .draw(|frame| {
+                    let view = pane.screen_view();
+                    let widget =
+                        PseudoTerminal::new(&view).block(Block::default().borders(Borders::ALL));
+                    frame.render_widget(widget, frame.area());
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            let mut text = String::new();
+            for y in 0..buffer.area.height {
+                for x in 0..buffer.area.width {
+                    text.push_str(buffer[(x, y)].symbol());
+                }
+                text.push('\n');
+            }
+            text
+        }
+
+        let mut output = String::new();
+        for row in 1..=10 {
+            output.push_str(&format!("\x1b[{row};1Hrow {row:02}"));
+        }
+        let mut pane = CodexPane::test_with_output(10, 20, 0, &output);
+        pane.visible_rows = 4;
+
+        assert_eq!(pane.screen().scrollback(), 0);
+        let live = render(&pane);
+        assert!(
+            live.contains("row 07") && live.contains("row 10"),
+            "live viewport should show bottom rows without vt100 scrollback:\n{live}"
+        );
+
+        pane.scroll_lines(3);
+        assert_eq!(pane.screen().scrollback(), 0);
+        let scrolled = render(&pane);
+        assert!(
+            scrolled.contains("row 04") && scrolled.contains("row 07"),
+            "scrolled viewport should move up inside the same terminal screen:\n{scrolled}"
+        );
+    }
+
+    #[test]
+    fn scrollback_clamps_to_oversized_pty_view() {
+        let mut output = String::new();
+        for row in 1..=10 {
+            output.push_str(&format!("\x1b[{row};1Hrow {row:02}"));
+        }
+        let mut pane = CodexPane::test_with_output(10, 20, 0, &output);
+        pane.visible_rows = 4;
+
+        pane.scroll_lines(99);
+
+        assert_eq!(pane.scrollback, 6);
+    }
+
+    #[test]
+    fn resize_keeps_extra_scroll_rows_above_visible_viewport() {
+        let mut pane = CodexPane::test_with_output(10, 20, 0, "\x1b[10;1Hbottom");
+
+        pane.resize(7, 20);
+
+        assert_eq!(pane.visible_rows, 7);
+        assert_eq!(pane.rows, 7 + pty_extra_scroll_rows());
+    }
+
+    #[test]
+    fn extra_scroll_rows_default_and_env_value_are_bounded() {
+        assert_eq!(
+            extra_scroll_rows_from_env_value(None),
+            CODEX_PTY_EXTRA_SCROLL_ROWS_DEFAULT
+        );
+        assert_eq!(extra_scroll_rows_from_env_value(Some("320")), 320);
+        assert_eq!(
+            extra_scroll_rows_from_env_value(Some("5000")),
+            CODEX_PTY_EXTRA_SCROLL_ROWS_MAX
+        );
+        assert_eq!(
+            extra_scroll_rows_from_env_value(Some("not-a-number")),
+            CODEX_PTY_EXTRA_SCROLL_ROWS_DEFAULT
+        );
+    }
+
+    #[test]
+    fn vt100_tracks_mouse_reporting_modes_from_child_tui() {
+        let mut parser = vt100::Parser::new(3, 12, 10);
+
+        assert!(matches!(
+            parser.screen().mouse_protocol_mode(),
+            vt100::MouseProtocolMode::None
+        ));
+
+        parser.process(b"\x1b[?1006h\x1b[?1002h");
+
+        assert!(matches!(
+            parser.screen().mouse_protocol_encoding(),
+            vt100::MouseProtocolEncoding::Sgr
+        ));
+        assert!(matches!(
+            parser.screen().mouse_protocol_mode(),
+            vt100::MouseProtocolMode::ButtonMotion
+        ));
     }
 
     #[test]
@@ -1284,6 +1692,28 @@ mod tests {
         assert_eq!(
             arg,
             "developer_instructions=\"quote: \\\" / path: C:\\\\tmp\\nnext\\tline\""
+        );
+    }
+
+    #[test]
+    fn codex_spawn_args_use_inline_codex_with_developer_instructions() {
+        let args = codex_spawn_args(false);
+
+        assert_eq!(args.first().map(String::as_str), Some("--no-alt-screen"));
+        assert!(
+            args.iter()
+                .any(|arg| arg.starts_with("developer_instructions="))
+        );
+        assert!(!args.iter().any(|arg| arg == startup_recall_prompt()));
+    }
+
+    #[test]
+    fn codex_spawn_args_can_append_eager_startup_recall_prompt() {
+        let args = codex_spawn_args(true);
+
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some(startup_recall_prompt())
         );
     }
 }

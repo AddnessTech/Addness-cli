@@ -91,6 +91,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_codex(frame, main_layout[1], app);
     } else {
         app.codex_terminal_area = None;
+        app.codex_contract_area = None;
+        app.codex_activity_area = None;
         let content_layout = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(24), Constraint::Min(0)])
@@ -793,8 +795,23 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
         let hint = if finished {
             " [c]コメント  [s]状態  [d]成果物(PR/Release)  [v]DoD判定  Esc/q: 閉じる "
         } else {
-            " 入力はcodexへ転送  |  F9:Addnessから再開  |  Shift+↑↓/PgUp/PgDn: ログ  |  F12: 終了 "
+            " 入力はcodexへ転送  |  Trackpad/ホイール: 枠スクロール  |  F9:Addness再開  |  F12:終了 "
         };
+        let hint = app
+            .codex_last_scroll_input
+            .as_ref()
+            .map(|last| {
+                if finished {
+                    format!(
+                        " last: {last} | [c]コメント [s]状態 [d]成果物 [v]DoD判定 Esc/q:閉じる "
+                    )
+                } else {
+                    format!(
+                        " last: {last} | Trackpad/ホイール:枠スクロール F9:Addness再開 F12:終了 "
+                    )
+                }
+            })
+            .unwrap_or_else(|| hint.to_string());
         let status = Paragraph::new(Line::from(Span::styled(
             hint,
             Style::default().fg(COLOR_CODEX),
@@ -986,11 +1003,9 @@ fn draw_help_overlay(frame: &mut Frame) {
         section("codex連携 (o →「codexで作業」)"),
         kv("起動", "選択ゴールの文脈付きでcodexをペイン起動"),
         kv("F9", "Addnessの作業メモ・決定ログから再開"),
-        kv("Trackpad/ホイール", "右側のcodex端末へスクロールを転送"),
-        kv("Shift+↑↓", "実行中のcodexログをスクロール"),
         kv(
-            "Shift+PgUp/PgDn",
-            "実行中のcodexログをページ単位でスクロール",
+            "Trackpad/ホイール",
+            "ポインタ下のcodex/Addness枠をスクロール",
         ),
         kv("F12", "実行中のcodexを終了して戻る"),
         kv(
@@ -2168,6 +2183,8 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
                 Constraint::Length(8),
             ])
             .split(chunks[0]);
+        app.codex_contract_area = Some(panes[1]);
+        app.codex_activity_area = Some(panes[2]);
 
         draw_codex_status_panel(frame, panes[0], pane);
 
@@ -2303,29 +2320,45 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
             }
         }
 
+        let contract_inner_h = panes[1].height.saturating_sub(2) as usize;
+        let max_contract_scroll = lines.len().saturating_sub(contract_inner_h.max(1));
+        app.codex_contract_scroll = app.codex_contract_scroll.min(max_contract_scroll);
+        let contract_title = if app.codex_contract_scroll > 0 {
+            format!("{sync_label} ▲スクロール -{} ", app.codex_contract_scroll)
+        } else {
+            sync_label
+        };
         let contract = Paragraph::new(lines)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(COLOR_ADDNESS))
-                    .title(sync_label),
+                    .title(contract_title),
             )
+            .scroll((app.codex_contract_scroll.min(u16::MAX as usize) as u16, 0))
             .wrap(ratatui::widgets::Wrap { trim: true });
         frame.render_widget(contract, panes[1]);
 
         // 下段: Addness の更新ログ（新しいものほど下。最新行は強調）
         let log_inner_h = panes[2].height.saturating_sub(2) as usize;
         let mut log_lines: Vec<Line> = if pane.activity.is_empty() {
+            app.codex_activity_scroll = 0;
             vec![Line::from(Span::styled(
                 "body/DoD/子ゴール/通知の読込・書込がここに出ます",
                 Style::default().fg(COLOR_MUTED),
             ))]
         } else {
             let n = pane.activity.len();
+            let view_h = log_inner_h.max(1);
+            let max_activity_scroll = n.saturating_sub(view_h);
+            app.codex_activity_scroll = app.codex_activity_scroll.min(max_activity_scroll);
+            let end = n.saturating_sub(app.codex_activity_scroll);
+            let start = end.saturating_sub(view_h);
             pane.activity
                 .iter()
                 .enumerate()
-                .skip(n.saturating_sub(log_inner_h.max(1)))
+                .skip(start)
+                .take(end.saturating_sub(start))
                 .map(|(i, l)| {
                     let style = if i + 1 == n {
                         Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD)
@@ -2337,12 +2370,17 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
                 .collect()
         };
         log_lines.truncate(log_inner_h.max(1));
+        let log_title = if app.codex_activity_scroll > 0 {
+            format!(" Addness 更新 ▲スクロール -{} ", app.codex_activity_scroll)
+        } else {
+            " Addness 更新 ".to_string()
+        };
         let log = Paragraph::new(log_lines)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(COLOR_PANEL))
-                    .title(" Addness 更新 "),
+                    .title(log_title),
             )
             .wrap(ratatui::widgets::Wrap { trim: true });
         frame.render_widget(log, panes[2]);
@@ -2358,7 +2396,7 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
         let (title, color) = if pane.finished {
             let t = if pane.scrollback > 0 {
                 format!(
-                    " codex 終了 ▲履歴 -{} — ↑↓/PgUp/PgDn/Home/End: ログ  Esc/qで戻る ",
+                    " codex 終了 ▲スクロール -{} — ↑↓/PgUp/PgDn/Home/End: ログ  Esc/qで戻る ",
                     pane.scrollback
                 )
             } else {
@@ -2369,14 +2407,15 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
         } else if pane.scrollback > 0 {
             (
                 format!(
-                    " codex 実行中 ▲履歴 -{} — Shift+↓/End or Esc: ライブへ戻る ",
+                    " codex 実行中 ▲スクロール -{} — Esc: ライブへ戻る ",
                     pane.scrollback
                 ),
                 COLOR_WARN,
             )
         } else {
             (
-                " codex 実行中 — F9:Addness再開  Shift+↑↓/PgUp/PgDn:ログ  F12:終了 ".to_string(),
+                " codex 実行中 — Trackpad/ホイール:枠スクロール  F9:Addness再開  F12:終了 "
+                    .to_string(),
                 COLOR_CODEX,
             )
         };
@@ -2384,20 +2423,20 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(color))
             .title(title);
-        let term = PseudoTerminal::new(pane.screen()).block(block);
+        let screen_view = pane.screen_view();
+        let term = PseudoTerminal::new(&screen_view).block(block);
         frame.render_widget(term, term_area);
 
         // 本物の端末カーソルを codex のカーソル位置へ移動する。
         // tui-term は偽カーソルを描くだけなので、これをやらないと日本語入力時に
         // IME の変換ウィンドウが正しい位置に出ない（vt100 の桁は全角考慮済み）。
         // 履歴を遡っている間はカーソルを動かさない（過去位置に飛ぶのを防ぐ）。
-        let screen = pane.screen();
-        if pane.scrollback == 0 && !screen.hide_cursor() {
-            let (crow, ccol) = screen.cursor_position();
-            if crow < rows && ccol < cols {
-                // term_area の枠（上・左の罫線）を 1 ずつオフセット。
-                frame.set_cursor_position((term_area.x + 1 + ccol, term_area.y + 1 + crow));
-            }
+        if let Some((crow, ccol)) = pane.visible_cursor_position()
+            && crow < rows
+            && ccol < cols
+        {
+            // term_area の枠（上・左の罫線）を 1 ずつオフセット。
+            frame.set_cursor_position((term_area.x + 1 + ccol, term_area.y + 1 + crow));
         }
     }
 }
@@ -2579,8 +2618,27 @@ fn ellipsize_width(text: &str, max_width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{codex_work_label, ellipsize_width, prompt_preview};
+    use super::{
+        ActivePane, App, codex_work_label, draw_status_bar, ellipsize_width, prompt_preview,
+    };
+    use crate::api::ApiClient;
+    use ratatui::{Terminal, backend::TestBackend};
     use unicode_width::UnicodeWidthStr;
+
+    fn render_status_text(app: &App, width: u16) -> String {
+        let mut term = Terminal::new(TestBackend::new(width, 3)).unwrap();
+        term.draw(|frame| draw_status_bar(frame, frame.area(), app))
+            .unwrap();
+        let buf = term.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                text.push_str(buf[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        text
+    }
 
     #[test]
     fn prompt_preview_collapses_whitespace() {
@@ -2627,5 +2685,21 @@ mod tests {
 
         assert_eq!(label, "依頼対応:...");
         assert!(UnicodeWidthStr::width(label.as_str()) <= 12);
+    }
+
+    #[test]
+    fn codex_status_bar_prioritizes_last_scroll_diagnostic() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = ApiClient::new("t", "http://localhost").unwrap();
+        let mut app = App::new(client, rt.handle().clone());
+        app.active_pane = ActivePane::Codex;
+        app.codex_last_scroll_input = Some("mouse ScrollUp -> codex 0->3".to_string());
+
+        let text = render_status_text(&app, 80);
+
+        assert!(
+            text.contains("last: mouse ScrollUp -> codex 0->3"),
+            "status should expose last scroll diagnostic near the front:\n{text}"
+        );
     }
 }

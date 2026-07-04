@@ -2509,8 +2509,16 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
     }
 
     let input_h = if inner.height >= 4 { 2 } else { 1 };
+    let decision_banner_h = if pane.decision_banner().is_some() {
+        codex_decision_banner_height(inner.height)
+    } else {
+        0
+    };
     let header_h = u16::from(inner.height >= 6);
     let mut constraints = Vec::new();
+    if decision_banner_h > 0 {
+        constraints.push(Constraint::Length(decision_banner_h));
+    }
     if header_h > 0 {
         constraints.push(Constraint::Length(header_h));
     }
@@ -2521,6 +2529,13 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
         .constraints(constraints)
         .split(inner);
     let mut chunk_index = 0usize;
+    let decision_banner_chunk = if decision_banner_h > 0 {
+        let chunk = chunks[chunk_index];
+        chunk_index += 1;
+        Some(chunk)
+    } else {
+        None
+    };
     let header_chunk = if header_h > 0 {
         let chunk = chunks[chunk_index];
         chunk_index += 1;
@@ -2530,6 +2545,12 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
     };
     let history_chunk = chunks[chunk_index];
     let input_chunk = chunks[chunk_index + 1];
+
+    if let (Some(decision_banner_chunk), Some(decision)) =
+        (decision_banner_chunk, pane.decision_banner())
+    {
+        draw_codex_decision_banner(frame, decision_banner_chunk, decision);
+    }
 
     if let Some(header_chunk) = header_chunk {
         frame.render_widget(
@@ -2581,7 +2602,12 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
             Style::default().fg(COLOR_TEXT),
         ))]
     } else if let Some(decision) = pane.decision_banner() {
-        codex_decision_input_lines(decision, input_width, input_chunk.height)
+        codex_decision_input_lines(
+            decision,
+            input_width,
+            input_chunk.height,
+            decision_banner_chunk.is_some(),
+        )
     } else {
         let prompt = if pane.finished {
             "  Esc/q:戻る  c/s/d/v:還流  Alt-e/e/Ctrl-1..9:turn".to_string()
@@ -2633,19 +2659,110 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
     }
 }
 
+fn draw_codex_decision_banner(
+    frame: &mut Frame,
+    area: Rect,
+    decision: &super::codex_pane::CodexDecisionBanner,
+) {
+    let color = codex_decision_color(&decision.kind);
+    let title = format!(
+        " Codex 確認待ち: {} ",
+        codex_decision_kind_label(&decision.kind)
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(color))
+        .title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    frame.render_widget(
+        Paragraph::new(codex_decision_banner_lines(
+            decision,
+            inner.width as usize,
+            inner.height,
+        )),
+        inner,
+    );
+}
+
+fn codex_decision_banner_height(inner_height: u16) -> u16 {
+    if inner_height >= 10 {
+        4
+    } else if inner_height >= 7 {
+        3
+    } else {
+        0
+    }
+}
+
+fn codex_decision_banner_lines(
+    decision: &super::codex_pane::CodexDecisionBanner,
+    max_width: usize,
+    max_lines: u16,
+) -> Vec<Line<'static>> {
+    let color = codex_decision_color(&decision.kind);
+    let subject = codex_decision_subject_label(&decision.kind);
+    let subject_prefix = format!("  {subject}: ");
+
+    if max_lines <= 1 {
+        let text = format!(
+            "{subject_prefix}{}  | {}",
+            decision.message,
+            decision_choice_summary(decision)
+        );
+        return vec![Line::from(Span::styled(
+            ellipsize_width(&text, max_width),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ))];
+    }
+
+    let subject_width = UnicodeWidthStr::width(subject_prefix.as_str());
+    vec![
+        Line::from(vec![
+            Span::styled(
+                subject_prefix,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                ellipsize_width(&decision.message, max_width.saturating_sub(subject_width)),
+                Style::default().fg(COLOR_TEXT_STRONG),
+            ),
+        ]),
+        codex_decision_choice_line(decision, max_width),
+    ]
+}
+
 fn codex_decision_input_lines(
     decision: &super::codex_pane::CodexDecisionBanner,
     max_width: usize,
     input_height: u16,
+    message_visible_above: bool,
 ) -> Vec<Line<'static>> {
     let color = codex_decision_color(&decision.kind);
-    let label = match decision.kind {
-        CodexDecisionKind::Approval => "確認待ち: 承認 ",
-        CodexDecisionKind::Permission => "確認待ち: 権限 ",
-        CodexDecisionKind::Dangerous => "確認待ち: 危険操作 ",
-        CodexDecisionKind::YesNo => "確認待ち ",
-    };
+    let label = codex_decision_input_label(&decision.kind);
     let label_width = UnicodeWidthStr::width(label);
+
+    if message_visible_above {
+        if input_height <= 1 {
+            let text = format!("{label}  {}", decision_choice_summary(decision));
+            return vec![Line::from(Span::styled(
+                ellipsize_width(&text, max_width),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ))];
+        }
+
+        return vec![
+            Line::from(Span::styled(
+                label.trim_end().to_string(),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )),
+            codex_decision_choice_line(decision, max_width),
+        ];
+    }
 
     if input_height <= 1 {
         let mut choices = format!(
@@ -2690,6 +2807,33 @@ fn codex_decision_input_lines(
     ]
 }
 
+fn codex_decision_input_label(kind: &CodexDecisionKind) -> &'static str {
+    match kind {
+        CodexDecisionKind::Approval => "確認待ち: 承認 ",
+        CodexDecisionKind::Permission => "確認待ち: 権限 ",
+        CodexDecisionKind::Dangerous => "確認待ち: 危険操作 ",
+        CodexDecisionKind::YesNo => "確認待ち ",
+    }
+}
+
+fn codex_decision_kind_label(kind: &CodexDecisionKind) -> &'static str {
+    match kind {
+        CodexDecisionKind::Approval => "承認",
+        CodexDecisionKind::Permission => "権限",
+        CodexDecisionKind::Dangerous => "危険操作",
+        CodexDecisionKind::YesNo => "確認",
+    }
+}
+
+fn codex_decision_subject_label(kind: &CodexDecisionKind) -> &'static str {
+    match kind {
+        CodexDecisionKind::Approval => "実行予定",
+        CodexDecisionKind::Permission => "権限要求",
+        CodexDecisionKind::Dangerous => "危険操作",
+        CodexDecisionKind::YesNo => "確認内容",
+    }
+}
+
 fn codex_decision_color(kind: &CodexDecisionKind) -> Color {
     match kind {
         CodexDecisionKind::Permission | CodexDecisionKind::Dangerous => COLOR_DANGER,
@@ -2709,7 +2853,7 @@ fn codex_decision_title_hint(decision: &super::codex_pane::CodexDecisionBanner) 
             }
         }
     };
-    format!(" codex exec 確認待ち — 入力欄で {keys} ")
+    format!(" codex exec 確認待ち — 上部で内容確認 / {keys} ")
 }
 
 fn codex_decision_choice_line(
@@ -2765,6 +2909,17 @@ fn codex_decision_choice_line(
         spans.push(Span::styled(suffix, Style::default().fg(COLOR_MUTED)));
     }
     Line::from(spans)
+}
+
+fn decision_choice_summary(decision: &super::codex_pane::CodexDecisionBanner) -> String {
+    let mut choices = vec![
+        decision_choice_text(decision, true),
+        decision_choice_text(decision, false),
+    ];
+    if let Some(always) = decision_always_choice_text(decision) {
+        choices.push(always);
+    }
+    choices.join("    ")
 }
 
 fn decision_choice_text(
@@ -3753,10 +3908,11 @@ fn ellipsize_width(text: &str, max_width: usize) -> String {
 mod tests {
     use super::{
         ActivePane, App, COLOR_DANGER, COLOR_EVENT, COLOR_SUCCESS, COLOR_WARN,
-        codex_activity_lines, codex_decision_choice_line, codex_decision_input_lines,
-        codex_decision_title_hint, codex_header_line, codex_log_entry_lines, codex_log_lines,
-        codex_runtime_status, codex_visible_log_lines, codex_work_label, dim_command_output_lines,
-        draw_status_bar, ellipsize_width, prompt_preview, summarize_tool_display_text,
+        codex_activity_lines, codex_decision_banner_lines, codex_decision_choice_line,
+        codex_decision_input_lines, codex_decision_title_hint, codex_header_line,
+        codex_log_entry_lines, codex_log_lines, codex_runtime_status, codex_visible_log_lines,
+        codex_work_label, dim_command_output_lines, draw_status_bar, ellipsize_width,
+        prompt_preview, summarize_tool_display_text,
     };
     use crate::api::ApiClient;
     use crate::tui::codex_pane::{
@@ -3963,7 +4119,7 @@ mod tests {
             deny_label: "No",
         };
 
-        let lines = codex_decision_input_lines(&decision, 80, 2)
+        let lines = codex_decision_input_lines(&decision, 80, 2, false)
             .into_iter()
             .map(|line| line_text(&line))
             .collect::<Vec<_>>();
@@ -3975,21 +4131,26 @@ mod tests {
     }
 
     #[test]
-    fn codex_decision_banner_shows_approval_alias_keys() {
+    fn codex_decision_banner_lines_show_command_and_choices() {
         let decision = CodexDecisionBanner {
             kind: CodexDecisionKind::Approval,
-            message: "コマンドを実行しますか?".to_string(),
+            message: "cargo test --workspace".to_string(),
             accept_key: 'a',
             accept_label: "承認",
             deny_key: 'd',
             deny_label: "拒否",
         };
 
-        let text = line_text(&codex_decision_choice_line(&decision, 80));
+        let rendered = codex_decision_banner_lines(&decision, 80, 2)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
 
-        assert!(text.contains("[A/Y] 承認"));
-        assert!(text.contains("[D/N] 拒否"));
-        assert!(text.contains("[L] 常に許可"));
+        assert!(rendered.contains("実行予定: cargo test --workspace"));
+        assert!(rendered.contains("[A/Y] 承認"));
+        assert!(rendered.contains("[D/N] 拒否"));
+        assert!(rendered.contains("[L] 常に許可"));
     }
 
     #[test]
@@ -4014,10 +4175,11 @@ mod tests {
         assert!(codex_decision_title_hint(&approval).contains("l:常に許可"));
         assert!(!codex_decision_title_hint(&yes_no).contains("常に許可"));
         assert!(codex_decision_title_hint(&yes_no).contains("y/n"));
+        assert!(codex_decision_title_hint(&approval).contains("上部で内容確認"));
     }
 
     #[test]
-    fn codex_decision_input_lines_show_prompt_at_input_area() {
+    fn codex_decision_input_lines_keep_prompt_when_no_top_banner() {
         let decision = CodexDecisionBanner {
             kind: CodexDecisionKind::Approval,
             message: "Run cargo test?".to_string(),
@@ -4027,9 +4189,29 @@ mod tests {
             deny_label: "拒否",
         };
 
-        let lines = codex_decision_input_lines(&decision, 80, 2);
+        let lines = codex_decision_input_lines(&decision, 80, 2, false);
 
         assert_eq!(line_text(&lines[0]), "確認待ち: 承認 Run cargo test?");
+        assert!(line_text(&lines[1]).contains("[A/Y] 承認"));
+        assert!(line_text(&lines[1]).contains("[D/N] 拒否"));
+        assert!(line_text(&lines[1]).contains("[L] 常に許可"));
+    }
+
+    #[test]
+    fn codex_decision_input_lines_use_choices_when_top_banner_is_visible() {
+        let decision = CodexDecisionBanner {
+            kind: CodexDecisionKind::Approval,
+            message: "Run cargo test?".to_string(),
+            accept_key: 'a',
+            accept_label: "承認",
+            deny_key: 'd',
+            deny_label: "拒否",
+        };
+
+        let lines = codex_decision_input_lines(&decision, 80, 2, true);
+
+        assert_eq!(line_text(&lines[0]), "確認待ち: 承認");
+        assert!(!line_text(&lines[0]).contains("Run cargo test"));
         assert!(line_text(&lines[1]).contains("[A/Y] 承認"));
         assert!(line_text(&lines[1]).contains("[D/N] 拒否"));
         assert!(line_text(&lines[1]).contains("[L] 常に許可"));
@@ -4046,7 +4228,7 @@ mod tests {
             deny_label: "拒否",
         };
 
-        let lines = codex_decision_input_lines(&decision, 80, 1);
+        let lines = codex_decision_input_lines(&decision, 80, 1, true);
         let text = line_text(&lines[0]);
 
         assert!(text.contains("確認待ち: 権限"));

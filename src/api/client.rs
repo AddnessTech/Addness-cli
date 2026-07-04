@@ -12,17 +12,82 @@ pub use comment::ListCommentsParams;
 pub use org::CreateOrganizationParams;
 
 use anyhow::{Context, Result};
-use reqwest::Client;
-use reqwest::StatusCode;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
+use reqwest::{Client, RequestBuilder, Response, StatusCode, Url};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
+
+const API_RESOLVE_ENV: &str = "ADDNESS_API_RESOLVE";
+const REQUEST_SEND_ATTEMPTS: usize = 3;
 
 #[derive(Clone)]
 pub struct ApiClient {
     client: Client,
     base_url: String,
     org_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelatedFetchError {
+    pub kind: &'static str,
+    pub goal_id: String,
+    pub message: String,
+}
+
+fn dns_override_for_base_url(base_url: &str) -> Result<Option<(String, Vec<SocketAddr>)>> {
+    let override_value = match std::env::var(API_RESOLVE_ENV) {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => return Ok(None),
+    };
+    let url = Url::parse(base_url).context("Invalid API URL")?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("Invalid API URL: missing host"))?;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| anyhow::anyhow!("Invalid API URL: missing port"))?;
+    let addrs = parse_dns_override_addrs(&override_value, host, port)?;
+    if addrs.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((host.to_string(), addrs)))
+}
+
+fn parse_dns_override_addrs(raw: &str, host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+    let mut addrs = Vec::new();
+    for entry in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let addr_text = match entry.split_once('=') {
+            Some((entry_host, value)) if entry_host.trim() == host => value.trim(),
+            Some(_) => continue,
+            None => entry,
+        };
+        addrs.push(parse_dns_override_addr(addr_text, port)?);
+    }
+    Ok(addrs)
+}
+
+fn parse_dns_override_addr(raw: &str, port: u16) -> Result<SocketAddr> {
+    if let Ok(addr) = raw.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    let ip = raw
+        .parse::<IpAddr>()
+        .with_context(|| format!("Invalid {API_RESOLVE_ENV} address: {raw}"))?;
+    Ok(SocketAddr::new(ip, port))
+}
+
+fn send_failure_context(url: &str, attempts: usize) -> String {
+    format!(
+        "Failed to send request to {url} after {attempts} attempt(s). \
+         If this is a DNS error in a restricted environment, set \
+         {API_RESOLVE_ENV}=<host>=<ip> to temporarily bypass local name resolution."
+    )
 }
 
 impl ApiClient {
@@ -34,9 +99,15 @@ impl ApiClient {
             HeaderValue::from_str(&auth_value).context("Invalid token format")?,
         );
 
-        let client = Client::builder()
+        let mut client_builder = Client::builder()
             .default_headers(headers)
-            .user_agent(format!("addness-cli/{}", env!("CARGO_PKG_VERSION")))
+            .user_agent(format!("addness-cli/{}", env!("CARGO_PKG_VERSION")));
+
+        if let Some((host, addrs)) = dns_override_for_base_url(base_url)? {
+            client_builder = client_builder.resolve_to_addrs(&host, &addrs);
+        }
+
+        let client = client_builder
             .build()
             .context("Failed to create HTTP client")?;
 
@@ -181,16 +252,54 @@ impl ApiClient {
         }
     }
 
+    async fn send_request(req: RequestBuilder, url: &str) -> Result<Response> {
+        let retryable_req = req.try_clone();
+        let mut first_req = Some(req);
+
+        for attempt in 1..=REQUEST_SEND_ATTEMPTS {
+            let current_req = if attempt == 1 {
+                first_req
+                    .take()
+                    .expect("request builder should be available for first send")
+            } else if let Some(retryable_req) = &retryable_req {
+                retryable_req
+                    .try_clone()
+                    .expect("request builder clone should remain cloneable")
+            } else {
+                break;
+            };
+
+            match current_req.send().await {
+                Ok(response) => return Ok(response),
+                Err(err)
+                    if Self::should_retry_send_error(&err, attempt, retryable_req.is_some()) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(150 * attempt as u64)).await;
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| send_failure_context(url, attempt));
+                }
+            }
+        }
+
+        anyhow::bail!("{}", send_failure_context(url, REQUEST_SEND_ATTEMPTS))
+    }
+
+    fn should_retry_send_error(
+        err: &reqwest::Error,
+        attempt: usize,
+        request_cloneable: bool,
+    ) -> bool {
+        request_cloneable
+            && attempt < REQUEST_SEND_ATTEMPTS
+            && (err.is_connect() || err.is_timeout())
+    }
+
     /// x-organization-id ヘッダーなしでGETリクエストを発行する。
     /// 組織に依存しないエンドポイント（org list等）で使用。
     pub(super) async fn get_without_org<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
         let url = format!("{}{}", self.base_url, path);
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| format!("Failed to send request to {url}"))?;
+        let response = Self::send_request(self.client.get(&url), &url).await?;
 
         let status = response.status();
         if !status.is_success() {
@@ -220,10 +329,7 @@ impl ApiClient {
             );
         }
 
-        let response = req
-            .send()
-            .await
-            .with_context(|| format!("Failed to send request to {url}"))?;
+        let response = Self::send_request(req, &url).await?;
 
         let status = response.status();
         if !status.is_success() {
@@ -252,10 +358,7 @@ impl ApiClient {
             );
         }
 
-        let response = req
-            .send()
-            .await
-            .with_context(|| format!("Failed to send request to {url}"))?;
+        let response = Self::send_request(req, &url).await?;
 
         let status = response.status();
         if !status.is_success() {
@@ -277,13 +380,7 @@ impl ApiClient {
         body: &B,
     ) -> Result<T> {
         let url = format!("{}{}", self.base_url, path);
-        let response = self
-            .client
-            .post(&url)
-            .json(body)
-            .send()
-            .await
-            .with_context(|| format!("Failed to send request to {url}"))?;
+        let response = Self::send_request(self.client.post(&url).json(body), &url).await?;
 
         let status = response.status();
         if !status.is_success() {
@@ -309,10 +406,7 @@ impl ApiClient {
             );
         }
 
-        let response = req
-            .send()
-            .await
-            .with_context(|| format!("Failed to send request to {url}"))?;
+        let response = Self::send_request(req, &url).await?;
 
         let status = response.status();
         if !status.is_success() {
@@ -338,10 +432,7 @@ impl ApiClient {
             );
         }
 
-        let response = req
-            .send()
-            .await
-            .with_context(|| format!("Failed to send request to {url}"))?;
+        let response = Self::send_request(req, &url).await?;
 
         let status = response.status();
         if !status.is_success() {
@@ -367,10 +458,7 @@ impl ApiClient {
             );
         }
 
-        let response = req
-            .send()
-            .await
-            .with_context(|| format!("Failed to send request to {url}"))?;
+        let response = Self::send_request(req, &url).await?;
 
         let status = response.status();
         if !status.is_success() {
@@ -392,10 +480,7 @@ impl ApiClient {
             );
         }
 
-        let response = req
-            .send()
-            .await
-            .with_context(|| format!("Failed to send request to {url}"))?;
+        let response = Self::send_request(req, &url).await?;
 
         let status = response.status();
         if !status.is_success() {
@@ -421,10 +506,7 @@ impl ApiClient {
             );
         }
 
-        let response = req
-            .send()
-            .await
-            .with_context(|| format!("Failed to send request to {url}"))?;
+        let response = Self::send_request(req, &url).await?;
 
         let status = response.status();
         if !status.is_success() {
@@ -454,10 +536,7 @@ impl ApiClient {
             );
         }
 
-        let response = req
-            .send()
-            .await
-            .with_context(|| format!("Failed to send request to {url}"))?;
+        let response = Self::send_request(req, &url).await?;
 
         let status = response.status();
         if !status.is_success() {
@@ -483,10 +562,7 @@ impl ApiClient {
             );
         }
 
-        let response = req
-            .send()
-            .await
-            .with_context(|| format!("Failed to send request to {url}"))?;
+        let response = Self::send_request(req, &url).await?;
 
         let status = response.status();
         if !status.is_success() {
@@ -508,10 +584,7 @@ impl ApiClient {
             );
         }
 
-        let response = req
-            .send()
-            .await
-            .with_context(|| format!("Failed to send request to {url}"))?;
+        let response = Self::send_request(req, &url).await?;
 
         let status = response.status();
         if !status.is_success() {
@@ -533,10 +606,7 @@ impl ApiClient {
             );
         }
 
-        let response = req
-            .send()
-            .await
-            .with_context(|| format!("Failed to send request to {url}"))?;
+        let response = Self::send_request(req, &url).await?;
 
         let status = response.status();
         if !status.is_success() {
@@ -558,10 +628,7 @@ impl ApiClient {
             );
         }
 
-        let response = req
-            .send()
-            .await
-            .with_context(|| format!("Failed to send request to {url}"))?;
+        let response = Self::send_request(req, &url).await?;
 
         let status = response.status();
         if !status.is_success() {
@@ -569,5 +636,53 @@ impl ApiClient {
             return Err(Self::api_error(status, &body));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{API_RESOLVE_ENV, parse_dns_override_addrs, send_failure_context};
+    use std::net::SocketAddr;
+
+    #[test]
+    fn dns_override_accepts_plain_ip_for_base_host() {
+        let addrs = parse_dns_override_addrs("54.248.80.181", "vt.api.addness.com", 443).unwrap();
+
+        assert_eq!(
+            addrs,
+            vec!["54.248.80.181:443".parse::<SocketAddr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn dns_override_filters_host_mapping() {
+        let addrs = parse_dns_override_addrs(
+            "other.example=10.0.0.1,vt.api.addness.com=54.248.80.181:8443",
+            "vt.api.addness.com",
+            443,
+        )
+        .unwrap();
+
+        assert_eq!(
+            addrs,
+            vec!["54.248.80.181:8443".parse::<SocketAddr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn dns_override_rejects_invalid_address() {
+        let err = parse_dns_override_addrs("not-an-ip", "vt.api.addness.com", 443)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("Invalid ADDNESS_API_RESOLVE address"));
+    }
+
+    #[test]
+    fn send_failure_context_mentions_dns_override_env() {
+        let context = send_failure_context("https://vt.api.addness.com/api/v2/objectives", 3);
+
+        assert!(context.contains(API_RESOLVE_ENV));
+        assert!(context.contains("after 3 attempt"));
     }
 }

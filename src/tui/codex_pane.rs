@@ -141,6 +141,7 @@ enum CodexProcessEvent {
 #[serde(tag = "record", rename_all = "snake_case")]
 enum CodexSessionRecord {
     Log { kind: CodexLogKind, text: String },
+    UpdateTurn { turn: usize, text: String },
     AssistantDelta { text: String },
     RawEvent { stream: String, line: String },
 }
@@ -174,6 +175,14 @@ pub struct ChildGoal {
 pub struct TerminalNotice {
     pub title: String,
     pub message: String,
+}
+
+/// 初回ユーザー依頼から作る Codex タスク子ゴールの入力情報。
+pub struct PendingCodexTaskGoal {
+    pub parent_goal_id: String,
+    pub parent_goal_title: String,
+    pub prompt: String,
+    pub cwd: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,6 +288,9 @@ pub struct CodexPane {
     cols: u16,
     /// 還流先となる対象ゴールの ID。
     pub goal_id: String,
+    /// codex 起動元として選択された親ゴール。初回依頼から子ゴールを作った後も保持する。
+    pub parent_goal_id: String,
+    pub parent_goal_title: String,
     /// 契約ペイン表示用に保持する対象ゴールのタイトルと DoD。
     pub goal_title: String,
     pub dod: String,
@@ -325,6 +337,9 @@ pub struct CodexPane {
     body_record_done: bool,
     input_state: CodexInputState,
     queued_prompts: VecDeque<String>,
+    /// 初回実依頼から子ゴールを作るまで保留しているユーザー入力。
+    pending_task_prompt: Option<String>,
+    task_goal_creation_started: bool,
     /// `codex exec --json` が返した Codex thread id。2ターン目以降の resume に使う。
     thread_id: Option<String>,
     /// いま実行中のターンに対応するユーザー入力。turn.started の見出しに使う。
@@ -422,6 +437,8 @@ impl CodexPane {
             turn_running: false,
             rows: 24,
             cols: 80,
+            parent_goal_id: goal_id.clone(),
+            parent_goal_title: goal_title.clone(),
             goal_id,
             goal_title,
             cwd: cwd.display().to_string(),
@@ -450,6 +467,8 @@ impl CodexPane {
             body_record_done: false,
             input_state: CodexInputState::default(),
             queued_prompts: VecDeque::new(),
+            pending_task_prompt: None,
+            task_goal_creation_started: false,
             thread_id: None,
             current_turn_prompt: None,
             turn_count,
@@ -554,7 +573,7 @@ impl CodexPane {
             CodexRunState::Confirming
         } else if self.current_command.is_some() {
             CodexRunState::CommandRunning
-        } else if self.is_turn_running() {
+        } else if self.task_goal_creation_started || self.is_turn_running() {
             CodexRunState::Thinking
         } else {
             CodexRunState::InputWaiting
@@ -604,11 +623,7 @@ impl CodexPane {
 
     pub fn filtered_log_lines(&self) -> Vec<&CodexLogLine> {
         let query = self.normalized_search_query();
-        let collapse_turns = query.is_empty()
-            && matches!(
-                self.log_filter,
-                CodexLogFilter::All | CodexLogFilter::Conversation
-            );
+        let collapse_turns = self.turns_are_collapsible_in_current_view();
         let mut current_collapsed_turn = None;
         let mut visible = Vec::new();
         for line in &self.log {
@@ -630,11 +645,48 @@ impl CodexPane {
         visible
     }
 
+    pub fn toggle_visible_turn_collapsed(&mut self) -> bool {
+        if !self.turns_are_collapsible_in_current_view() {
+            return false;
+        }
+        let target = if self.scrollback == 0 {
+            self.latest_completed_turn()
+        } else {
+            self.turn_at_viewport_start()
+                .filter(|turn| self.can_toggle_turn(*turn))
+                .or_else(|| self.latest_completed_turn())
+        };
+        let Some(turn) = target else {
+            return false;
+        };
+        self.toggle_turn_collapsed_by_number(turn)
+    }
+
+    pub fn toggle_turn_collapsed_by_number(&mut self, turn: usize) -> bool {
+        if !self.turns_are_collapsible_in_current_view() {
+            return false;
+        }
+        if !self.can_toggle_turn(turn) {
+            return false;
+        }
+        self.toggle_turn_collapsed(turn);
+        self.scroll_to_turn_header(turn);
+        true
+    }
+
     pub fn toggle_old_turns_collapsed(&mut self) {
         if self.collapsed_turns.is_empty() {
             self.collapse_completed_turns();
         } else {
             self.collapsed_turns.clear();
+        }
+        self.invalidate_rendered_history_metrics();
+        self.scrollback = self.scrollback.min(self.max_view_scrollback());
+    }
+
+    fn toggle_turn_collapsed(&mut self, turn: usize) {
+        if !self.collapsed_turns.remove(&turn) {
+            self.collapsed_turns.insert(turn);
         }
         self.invalidate_rendered_history_metrics();
         self.scrollback = self.scrollback.min(self.max_view_scrollback());
@@ -650,6 +702,77 @@ impl CodexPane {
         for turn in 1..keep_open {
             self.collapsed_turns.insert(turn);
         }
+    }
+
+    fn turns_are_collapsible_in_current_view(&self) -> bool {
+        self.search_query.trim().is_empty()
+            && matches!(
+                self.log_filter,
+                CodexLogFilter::All | CodexLogFilter::Conversation
+            )
+    }
+
+    fn turn_at_viewport_start(&self) -> Option<usize> {
+        let lines = self.filtered_log_lines();
+        let total_lines = lines
+            .iter()
+            .map(|line| rendered_log_line_height(&line.text, self.cols as usize))
+            .sum::<usize>();
+        let max_scrollback = self
+            .rendered_history_max_scrollback
+            .unwrap_or_else(|| total_lines.saturating_sub(self.log_viewport_height()));
+        let viewport_top = max_scrollback.saturating_sub(self.scrollback);
+        let mut active_turn = None;
+        let mut line_top = 0usize;
+        let mut viewport_reached = false;
+
+        for line in lines {
+            if line.kind == CodexLogKind::Turn {
+                active_turn = turn_number_from_label(&line.text);
+                if viewport_reached {
+                    return active_turn;
+                }
+            }
+            let line_bottom =
+                line_top.saturating_add(rendered_log_line_height(&line.text, self.cols as usize));
+            if viewport_top < line_bottom {
+                if active_turn.is_some() {
+                    return active_turn;
+                }
+                viewport_reached = true;
+            }
+            line_top = line_bottom;
+        }
+
+        active_turn
+    }
+
+    fn scroll_to_turn_header(&mut self, turn: usize) {
+        let mut line_top = 0usize;
+        for line in self.filtered_log_lines() {
+            if line.kind == CodexLogKind::Turn && turn_number_from_label(&line.text) == Some(turn) {
+                let max = self.max_view_scrollback();
+                self.scrollback = max.saturating_sub(line_top);
+                return;
+            }
+            line_top =
+                line_top.saturating_add(rendered_log_line_height(&line.text, self.cols as usize));
+        }
+        self.scrollback = self.scrollback.min(self.max_view_scrollback());
+    }
+
+    fn latest_completed_turn(&self) -> Option<usize> {
+        if self.turn_count == 0 {
+            return None;
+        }
+        if self.turn_running {
+            return self.turn_count.checked_sub(1).filter(|turn| *turn > 0);
+        }
+        Some(self.turn_count)
+    }
+
+    fn can_toggle_turn(&self, turn: usize) -> bool {
+        turn > 0 && turn <= self.turn_count && !(self.turn_running && turn == self.turn_count)
     }
 
     pub fn work_summary(&self) -> CodexWorkSummary {
@@ -782,10 +905,8 @@ impl CodexPane {
         if let Some(max) = self.rendered_history_max_scrollback {
             return max;
         }
-        let query = self.normalized_search_query();
-        self.log
+        self.filtered_log_lines()
             .iter()
-            .filter(|line| self.log_line_visible(line, &query))
             .map(|line| rendered_log_line_height(&line.text, self.cols as usize))
             .sum::<usize>()
             .saturating_sub(self.log_viewport_height())
@@ -860,6 +981,18 @@ impl CodexPane {
             .push(CodexLogLine::new(CodexLogKind::Assistant, text));
         self.trim_in_memory_log();
         self.streaming_assistant_index = Some(self.log.len().saturating_sub(1));
+    }
+
+    fn refresh_current_turn_title(&mut self) {
+        let turn = self.turn_count;
+        let Some(title) = summarize_turn_title(&self.log, turn) else {
+            return;
+        };
+        let label = format!("Turn {turn} - {title}");
+        if update_turn_log_line(&mut self.log, turn, label.clone()) {
+            self.invalidate_rendered_history_metrics();
+            self.persist_session_record(CodexSessionRecord::UpdateTurn { turn, text: label });
+        }
     }
 
     fn trim_in_memory_log(&mut self) {
@@ -941,11 +1074,13 @@ impl CodexPane {
                     self.pending_decision = None;
                     if !self.turn_finished_by_event {
                         if status.success() {
+                            self.refresh_current_turn_title();
                             self.push_log(CodexLogKind::System, "Codex ターンが完了しました");
                             self.push_terminal_notice("Codex 完了", "Codex の出力が完了しました");
                         } else {
                             let message = format!("Codex ターンが失敗しました: {status}");
                             self.push_log(CodexLogKind::Error, message.clone());
+                            self.refresh_current_turn_title();
                             self.push_terminal_notice("Codex 失敗", message);
                         }
                     }
@@ -1045,6 +1180,7 @@ impl CodexPane {
                 self.current_command_started_at = None;
                 self.streaming_assistant_index = None;
                 self.pending_decision = None;
+                self.refresh_current_turn_title();
                 self.push_log(CodexLogKind::System, "Codex ターンが完了しました");
                 self.push_terminal_notice("Codex 完了", "Codex の出力が完了しました");
             }
@@ -1059,6 +1195,7 @@ impl CodexPane {
                     .or_else(|| first_text_field(&value))
                     .unwrap_or_else(|| "Codex ターンが失敗しました".to_string());
                 self.push_log(CodexLogKind::Error, message.clone());
+                self.refresh_current_turn_title();
                 self.push_terminal_notice("Codex 失敗", message);
             }
             "error" => {
@@ -1245,6 +1382,37 @@ impl CodexPane {
         if submitted.is_empty() {
             return;
         }
+
+        if self.pending_task_prompt.is_some() {
+            self.queued_prompts.push_back(submitted);
+            let count = self.queued_prompts.len();
+            self.action = Some(format!("次ターン予約 {count}件"));
+            self.push_log(
+                CodexLogKind::System,
+                format!("子ゴール作成中のため次のターンに予約しました（待ち{count}件）"),
+            );
+            return;
+        }
+
+        if self.is_turn_running() {
+            self.record_and_run_user_line(submitted);
+            return;
+        }
+
+        if self.should_create_task_goal_for_first_prompt(&submitted) {
+            self.pending_task_prompt = Some(submitted);
+            self.action = Some("子ゴール作成中".to_string());
+            self.push_log(
+                CodexLogKind::System,
+                "最初の依頼をまとめる子ゴールを作成しています",
+            );
+            return;
+        }
+
+        self.record_and_run_user_line(submitted);
+    }
+
+    fn record_and_run_user_line(&mut self, submitted: String) {
         self.input_state.record_submitted(&submitted);
         self.push_log(CodexLogKind::User, submitted.clone());
 
@@ -1260,6 +1428,14 @@ impl CodexPane {
         }
 
         self.run_submitted_line(submitted);
+    }
+
+    fn should_create_task_goal_for_first_prompt(&self, submitted: &str) -> bool {
+        self.thread_id.is_none()
+            && self.input_state.last_prompt.is_none()
+            && !self.task_goal_creation_started
+            && self.goal_id == self.parent_goal_id
+            && submitted != "/exit"
     }
 
     fn run_submitted_line(&mut self, submitted: String) {
@@ -1338,6 +1514,10 @@ impl CodexPane {
         cmd.env("ADDNESS_GOAL_TITLE", &self.goal_title);
         cmd.env("ADDNESS_GOAL_STATUS", &self.status_label);
         cmd.env("ADDNESS_GOAL_DOD", &self.dod);
+        cmd.env("ADDNESS_TASK_GOAL_ID", &self.goal_id);
+        cmd.env("ADDNESS_TASK_GOAL_TITLE", &self.goal_title);
+        cmd.env("ADDNESS_PARENT_GOAL_ID", &self.parent_goal_id);
+        cmd.env("ADDNESS_PARENT_GOAL_TITLE", &self.parent_goal_title);
         cmd.env("ADDNESS_BIN", &self.addness_bin);
 
         let mut child = cmd.spawn().context("codex exec の起動に失敗しました")?;
@@ -1393,7 +1573,10 @@ impl CodexPane {
     /// 最初の実依頼を一度だけ body へ自動記録する。記録済み（or 失敗済み）なら None。
     /// 失敗しても再試行はせず、終了/中断時の記録に委ねる（best-effort）。
     pub fn prompt_needs_body_record(&self) -> Option<&str> {
-        if self.body_record_done {
+        if self.body_record_done
+            || self.pending_task_prompt.is_some()
+            || self.task_goal_creation_started
+        {
             return None;
         }
         self.last_prompt()
@@ -1402,6 +1585,60 @@ impl CodexPane {
     /// 最初の実依頼の自動記録を済み（再試行しない）として扱う。
     pub fn mark_body_recorded_prompt(&mut self) {
         self.body_record_done = true;
+    }
+
+    /// 初回ユーザー依頼を子ゴール作成ジョブへ渡す。ジョブ開始中は再度取り出さない。
+    pub fn take_pending_task_goal(&mut self) -> Option<PendingCodexTaskGoal> {
+        if self.task_goal_creation_started {
+            return None;
+        }
+        let prompt = self.pending_task_prompt.clone()?;
+        self.task_goal_creation_started = true;
+        self.action = Some("子ゴール作成中".to_string());
+        Some(PendingCodexTaskGoal {
+            parent_goal_id: self.parent_goal_id.clone(),
+            parent_goal_title: self.parent_goal_title.clone(),
+            prompt,
+            cwd: self.cwd.clone(),
+        })
+    }
+
+    /// 作成した子ゴールを以後の Codex 作業対象にして、保留していた初回依頼を実行する。
+    pub fn start_pending_prompt_with_task_goal(
+        &mut self,
+        goal_id: String,
+        goal_title: String,
+        dod: String,
+        status_label: String,
+        message: String,
+    ) {
+        let Some(prompt) = self.pending_task_prompt.take() else {
+            self.task_goal_creation_started = false;
+            return;
+        };
+        self.goal_id = goal_id;
+        self.goal_title = goal_title;
+        self.status_label = status_label;
+        self.set_dod(dod);
+        self.session_log_path = codex_session_log_path(&self.goal_id);
+        self.session_record_count = 0;
+        self.loaded_history_count = 0;
+        self.task_goal_creation_started = false;
+        self.action = Some("子ゴールに文脈を切替".to_string());
+        self.push_log(CodexLogKind::System, message);
+        self.record_and_run_user_line(prompt);
+    }
+
+    /// 子ゴール作成に失敗した場合は親ゴールのまま、保留していた依頼を止めずに実行する。
+    pub fn start_pending_prompt_without_task_goal(&mut self, message: String) {
+        let Some(prompt) = self.pending_task_prompt.take() else {
+            self.task_goal_creation_started = false;
+            return;
+        };
+        self.task_goal_creation_started = false;
+        self.action = Some("親ゴールで実行".to_string());
+        self.push_log(CodexLogKind::Error, message);
+        self.record_and_run_user_line(prompt);
     }
 
     /// codex プロセスを終了させる（ペインを閉じる時に呼ぶ）。
@@ -1418,6 +1655,8 @@ impl CodexPane {
         self.pending_decision = None;
         self.current_turn_prompt = None;
         self.queued_prompts.clear();
+        self.pending_task_prompt = None;
+        self.task_goal_creation_started = false;
     }
 
     /// DoD を更新する。内容が変わった場合のみ項目・判定を作り直し `true` を返す。
@@ -1764,6 +2003,9 @@ fn load_codex_session(path: &Path) -> Result<LoadedCodexSession> {
         };
         match record {
             CodexSessionRecord::Log { kind, text } => log.push(CodexLogLine::new(kind, text)),
+            CodexSessionRecord::UpdateTurn { turn, text } => {
+                update_turn_log_line(&mut log, turn, text);
+            }
             CodexSessionRecord::AssistantDelta { text } => {
                 if let Some(last) = log.last_mut()
                     && last.kind == CodexLogKind::Assistant
@@ -1876,6 +2118,138 @@ fn turn_number_from_label(label: &str) -> Option<usize> {
         .take_while(|ch| ch.is_ascii_digit())
         .collect::<String>();
     digits.parse().ok()
+}
+
+fn update_turn_log_line(log: &mut [CodexLogLine], turn: usize, text: String) -> bool {
+    let Some(line) = log.iter_mut().find(|line| {
+        line.kind == CodexLogKind::Turn && turn_number_from_label(&line.text) == Some(turn)
+    }) else {
+        return false;
+    };
+    if line.text == text {
+        return false;
+    }
+    line.text = text;
+    true
+}
+
+fn summarize_turn_title(log: &[CodexLogLine], turn: usize) -> Option<String> {
+    let (start, end) = turn_log_bounds(log, turn)?;
+    let lines = &log[start + 1..end];
+    summarize_turn_assistant_title(lines).or_else(|| summarize_turn_tool_title(lines))
+}
+
+fn turn_log_bounds(log: &[CodexLogLine], turn: usize) -> Option<(usize, usize)> {
+    let start = log.iter().position(|line| {
+        line.kind == CodexLogKind::Turn && turn_number_from_label(&line.text) == Some(turn)
+    })?;
+    let end = log[start + 1..]
+        .iter()
+        .position(|line| line.kind == CodexLogKind::Turn)
+        .map(|offset| start + 1 + offset)
+        .unwrap_or(log.len());
+    Some((start, end))
+}
+
+fn summarize_turn_assistant_title(lines: &[CodexLogLine]) -> Option<String> {
+    lines
+        .iter()
+        .rev()
+        .filter(|line| line.kind == CodexLogKind::Assistant)
+        .flat_map(|line| line.text.lines())
+        .filter_map(clean_assistant_title_line)
+        .next()
+}
+
+fn clean_assistant_title_line(line: &str) -> Option<String> {
+    let title = line
+        .trim()
+        .trim_start_matches(['#', '-', '*', '•', ' '])
+        .trim();
+    if title.is_empty() || title.starts_with("```") {
+        return None;
+    }
+    if matches!(
+        title,
+        "対応しました"
+            | "対応しました。"
+            | "実装しました"
+            | "実装しました。"
+            | "完了しました"
+            | "完了しました。"
+    ) {
+        return None;
+    }
+    Some(compact_turn_prompt(title))
+}
+
+fn summarize_turn_tool_title(lines: &[CodexLogLine]) -> Option<String> {
+    lines
+        .iter()
+        .rev()
+        .filter(|line| line.kind == CodexLogKind::Tool)
+        .filter_map(|line| summarize_turn_tool_line(&line.text))
+        .next()
+}
+
+fn summarize_turn_tool_line(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("*** update file:")
+        || lower.contains("*** add file:")
+        || lower.contains("*** delete file:")
+        || lower.contains("apply_patch")
+        || lower.starts_with("edit ")
+    {
+        return Some(
+            extract_code_edit_path(text)
+                .map(|path| format!("コード編集: {path}"))
+                .unwrap_or_else(|| "コード編集".to_string()),
+        );
+    }
+    for (needle, label) in [
+        ("cargo fmt", "フォーマット確認"),
+        ("cargo test", "テスト実行"),
+        ("cargo clippy", "clippy確認"),
+        ("cargo build", "ビルド確認"),
+        ("git diff", "差分確認"),
+        ("git status", "差分確認"),
+        (" goal get ", "Addnessゴール確認"),
+        (" goal update ", "Addnessゴール更新"),
+        (" notification send ", "Addness通知送信"),
+        (" deliverable ", "成果物更新"),
+    ] {
+        if lower.contains(needle) {
+            return Some(label.to_string());
+        }
+    }
+    let first = text.lines().next()?.trim();
+    let first = strip_turn_tool_state(first);
+    (!first.is_empty()).then(|| compact_turn_prompt(&compact_tool_text(first)))
+}
+
+fn strip_turn_tool_state(text: &str) -> &str {
+    for state in ["RUNNING", "EDIT", "DIFF", "FAIL", "OK"] {
+        if let Some(rest) = text.strip_prefix(state)
+            && rest.chars().next().is_some_and(char::is_whitespace)
+        {
+            return rest.trim_start();
+        }
+    }
+    text
+}
+
+fn extract_code_edit_path(text: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let trimmed = line.trim();
+        [
+            "*** Update File: ",
+            "*** Add File: ",
+            "*** Delete File: ",
+            "*** Move to: ",
+        ]
+        .into_iter()
+        .find_map(|prefix| trimmed.strip_prefix(prefix).map(str::to_string))
+    })
 }
 
 fn summarize_implemented_work(log: &[CodexLogLine]) -> Vec<String> {
@@ -2518,10 +2892,12 @@ fn addness_tui_developer_instructions() -> &'static str {
 軽い挨拶や単純な表示確認には、TUIから渡された軽量コンテキストだけで即応して構いません。
 
 軽量コンテキスト:
-- ADDNESS_GOAL_ID: 対象ゴールID
-- ADDNESS_GOAL_TITLE: 対象ゴール名
+- ADDNESS_GOAL_ID: 作業対象ゴールID（通常はTUIが初回依頼から作成した子ゴール）
+- ADDNESS_GOAL_TITLE: 作業対象ゴール名
 - ADDNESS_GOAL_STATUS: 対象ゴールの現在状態
 - ADDNESS_GOAL_DOD: 対象ゴールのDoD/完了基準
+- ADDNESS_PARENT_GOAL_ID: TUIでcodexを起動した親ゴールID（ある場合）
+- ADDNESS_PARENT_GOAL_TITLE: TUIでcodexを起動した親ゴール名（ある場合）
 
 最初の依頼が「何をするかの相談」「方針検討」「実装」「調査」「レビュー」「PR/リリース」など
 プロジェクト固有の判断を含む場合は、返答や作業に入る前に Addness CLI で対象ゴールを想起してください。
@@ -2543,6 +2919,8 @@ Codexが普段memoryに保存したくなるプロジェクト固有の情報（
 
 書き込み時:
 - 起動しただけでは Addness に書き込まない。
+- TUIが初回依頼から作成した子ゴールが `ADDNESS_GOAL_ID` に渡されている場合、通常の作業メモ・決定・PR/成果物はその子ゴールへ集約する。親ゴールを参照したい時だけ `ADDNESS_PARENT_GOAL_ID` を読む。
+- 子ゴールの追加作成、body/DoD/コメント/成果物リンクなどのコンテキスト書き込みは、サブエージェント機能が使える場合、最も軽量/低コストの記録専用サブエージェントに委任する。メインエージェントは実装判断と検証に集中し、委任入力は「対象ゴールID」「現在body」「追加したい要約」「更新フィールド」に絞る。
 - Addnessに書き込むのは、作業を始めた時、方針を決めた時、重要な発見や制約が分かった時、実装のまとまりが進んだ時、次にやることが変わった時、完了/中断/引き継ぎ前。
 - `## Codex自動メモ(機械)`（`<!-- addness:codex:auto-record:start -->` / `<!-- addness:codex:auto-record:end -->` で囲まれた領域）はTUIが自動更新するので読むだけにし、編集しない。あなたが所有・更新するのは `## Codex作業メモ`（判断・方針・次の手を散文で）/`## Codex決定ログ`/`## PR/Release Traceability`。
 - body更新前に必ず現bodyを読み、手書きメモや上記の自動メモを消さず、自分の専用ブロックだけを作成・更新する。長文や引用が多い場合は `goal update --body-file` を使う。
@@ -2553,7 +2931,6 @@ Codexが普段memoryに保存したくなるプロジェクト固有の情報（
 - tag/releaseを作成したら `"$ADDNESS_BIN" deliverable add --goal "$ADDNESS_GOAL_ID" --link-url "<release-or-tag-url>" --name "Release <version>" --json` で紐づけ、body の `## PR/Release Traceability` にPR・tag・release URL・CI結果を残す。
 - ユーザーに通知したい時（作業完了、確認依頼、ブロック中など）は `"$ADDNESS_BIN" notification send --kind done --body "<通知内容>" --json` のように送る。これは対象ゴールへの通知用コメントを作り、同時にTUIが動いている端末へ通知する。完了は `--kind done`、確認依頼は `--kind review`、ブロック中は `--kind blocked`。必要なら `--mention <ORG_MEMBER_ID>` を付ける。
 - 実装速度を落とさないため、Addness更新は節目でまとめる。毎コマンド・毎小変更の記録はしない。
-- サブエージェント機能が使える場合、Addness更新は最も小さい/低コストの記録専用サブエージェントに委任する。委任する内容は「現在body」「追加したい作業メモ」「更新すべき構造化フィールド」だけに絞る。
 - サブエージェントが使えない場合だけ、メインエージェントが短い差分で body/DoD/子ゴールを更新する。
 - DoDが不十分なら、足りない観点を短く整理してユーザーに確認し、合意できたら `"$ADDNESS_BIN" goal update "$ADDNESS_GOAL_ID" --description "..." --json` で更新する。
 - 子ゴール分解が不十分なら、作業に必要な粒度へ子ゴールを作成または更新する。
@@ -2734,6 +3111,67 @@ mod tests {
     }
 
     #[test]
+    fn first_user_input_waits_for_task_goal_creation() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.finished = false;
+
+        for ch in "実装して".chars() {
+            pane.input(key(KeyCode::Char(ch)));
+        }
+        pane.input(key(KeyCode::Enter));
+
+        assert_eq!(pane.pending_task_prompt.as_deref(), Some("実装して"));
+        assert_eq!(pane.last_prompt(), None);
+        assert!(!pane.is_turn_running());
+        assert!(pane.prompt_needs_body_record().is_none());
+
+        let pending = pane.take_pending_task_goal().unwrap();
+        assert_eq!(pending.parent_goal_id, "test-goal");
+        assert_eq!(pending.parent_goal_title, "Test goal");
+        assert_eq!(pending.prompt, "実装して");
+    }
+
+    #[test]
+    fn applying_task_goal_switches_target_before_running_prompt() {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let mut pane = CodexPane::spawn_inner(CodexPaneSpawnOptions {
+            codex_bin: Path::new("/definitely/missing/codex"),
+            cwd: &cwd,
+            addness_bin: "addness",
+            goal_id: "parent-goal".to_string(),
+            goal_title: "Parent goal".to_string(),
+            dod: String::new(),
+            status_label: "TEST".to_string(),
+            session_log_path: None,
+        })
+        .unwrap();
+
+        for ch in "調査して".chars() {
+            pane.input(key(KeyCode::Char(ch)));
+        }
+        pane.input(key(KeyCode::Enter));
+        assert!(pane.take_pending_task_goal().is_some());
+
+        pane.start_pending_prompt_with_task_goal(
+            "child-goal".to_string(),
+            "Child goal".to_string(),
+            "子ゴールDoD".to_string(),
+            "未着手".to_string(),
+            "子ゴールへ切替".to_string(),
+        );
+
+        assert_eq!(pane.goal_id, "child-goal");
+        assert_eq!(pane.goal_title, "Child goal");
+        assert_eq!(pane.parent_goal_id, "parent-goal");
+        assert_eq!(pane.last_prompt(), Some("調査して"));
+        assert!(
+            pane.log
+                .iter()
+                .any(|line| line.kind == CodexLogKind::User && line.text == "調査して")
+        );
+    }
+
+    #[test]
     fn queued_exit_finishes_when_turn_becomes_idle() {
         let mut pane = CodexPane::test_with_output(8, 20, 0, "");
         pane.finished = false;
@@ -2799,6 +3237,46 @@ mod tests {
     }
 
     #[test]
+    fn turn_completed_updates_title_from_assistant_summary() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.input_state.last_prompt = Some("最初に送った依頼".to_string());
+
+        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
+        pane.push_log(
+            CodexLogKind::Assistant,
+            "対応しました。\n確認待ち表示を入力欄に移動しました。",
+        );
+        pane.handle_stdout_line(r#"{"type":"turn.completed"}"#);
+
+        let turn = pane
+            .log
+            .iter()
+            .find(|line| line.kind == CodexLogKind::Turn)
+            .unwrap();
+        assert_eq!(turn.text, "Turn 1 - 確認待ち表示を入力欄に移動しました。");
+    }
+
+    #[test]
+    fn turn_completed_updates_title_from_tool_summary_without_assistant() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.input_state.last_prompt = Some("最初に送った依頼".to_string());
+
+        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
+        pane.push_log(
+            CodexLogKind::Tool,
+            "OK cargo test (exit 0)\ntest result: ok. 123 passed; 0 failed;",
+        );
+        pane.handle_stdout_line(r#"{"type":"turn.completed"}"#);
+
+        let turn = pane
+            .log
+            .iter()
+            .find(|line| line.kind == CodexLogKind::Turn)
+            .unwrap();
+        assert_eq!(turn.text, "Turn 1 - テスト実行");
+    }
+
+    #[test]
     fn run_state_tracks_command_and_confirmation() {
         let mut pane = CodexPane::test_with_output(8, 20, 0, "");
         assert_eq!(pane.run_state(), CodexRunState::Completed);
@@ -2839,7 +3317,7 @@ mod tests {
             .iter()
             .map(|line| line.text.as_str())
             .collect::<Vec<_>>();
-        assert!(collapsed.contains(&"Turn 1"));
+        assert!(collapsed.iter().any(|text| text.starts_with("Turn 1")));
         assert!(!collapsed.contains(&"old response"));
         assert!(collapsed.contains(&"new response"));
 
@@ -2850,6 +3328,139 @@ mod tests {
             .map(|line| line.text.as_str())
             .collect::<Vec<_>>();
         assert!(expanded.contains(&"old response"));
+    }
+
+    #[test]
+    fn visible_turn_can_be_toggled_individually() {
+        let mut pane = CodexPane::test_with_output(5, 80, 0, "");
+        pane.finished = false;
+        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
+        pane.push_log(CodexLogKind::Assistant, "first response");
+        pane.handle_stdout_line(r#"{"type":"turn.completed"}"#);
+        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
+        pane.push_log(CodexLogKind::Assistant, "second response");
+        pane.handle_stdout_line(r#"{"type":"turn.completed"}"#);
+        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
+        pane.push_log(CodexLogKind::Assistant, "third response");
+
+        pane.scroll_to_top();
+        assert!(pane.toggle_visible_turn_collapsed());
+        let expanded = pane
+            .filtered_log_lines()
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(expanded.contains(&"first response"));
+        assert!(!expanded.contains(&"second response"));
+        assert!(expanded.contains(&"third response"));
+
+        pane.scroll_to_top();
+        assert!(pane.toggle_visible_turn_collapsed());
+        let collapsed = pane
+            .filtered_log_lines()
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(!collapsed.contains(&"first response"));
+        assert!(!collapsed.contains(&"second response"));
+        assert!(collapsed.contains(&"third response"));
+
+        assert!(pane.toggle_visible_turn_collapsed());
+        let reopened = pane
+            .filtered_log_lines()
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(reopened.contains(&"first response"));
+        assert!(!reopened.contains(&"second response"));
+        assert!(reopened.contains(&"third response"));
+    }
+
+    #[test]
+    fn live_position_toggles_latest_completed_turn_repeatedly() {
+        let mut pane = CodexPane::test_with_output(30, 80, 0, "");
+        pane.finished = false;
+        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
+        pane.push_log(CodexLogKind::Assistant, "first response");
+        pane.handle_stdout_line(r#"{"type":"turn.completed"}"#);
+        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
+        pane.push_log(CodexLogKind::Assistant, "second response");
+        pane.handle_stdout_line(r#"{"type":"turn.completed"}"#);
+        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
+        pane.push_log(CodexLogKind::Assistant, "third response");
+        pane.handle_stdout_line(r#"{"type":"turn.completed"}"#);
+        pane.scroll_to_live();
+
+        assert_eq!(pane.scrollback, 0);
+        assert!(pane.toggle_visible_turn_collapsed());
+        let collapsed = pane
+            .filtered_log_lines()
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(collapsed.iter().any(|text| text.starts_with("Turn 3")));
+        assert!(!collapsed.contains(&"third response"));
+
+        assert!(pane.toggle_visible_turn_collapsed());
+        let expanded = pane
+            .filtered_log_lines()
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(expanded.contains(&"third response"));
+    }
+
+    #[test]
+    fn numbered_turn_can_be_toggled_directly() {
+        let mut pane = CodexPane::test_with_output(5, 80, 0, "");
+        pane.finished = false;
+        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
+        pane.push_log(CodexLogKind::Assistant, "first response");
+        pane.handle_stdout_line(r#"{"type":"turn.completed"}"#);
+        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
+        pane.push_log(CodexLogKind::Assistant, "second response");
+        pane.handle_stdout_line(r#"{"type":"turn.completed"}"#);
+        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
+        pane.push_log(CodexLogKind::Assistant, "third response");
+
+        assert!(pane.toggle_turn_collapsed_by_number(2));
+        let expanded = pane
+            .filtered_log_lines()
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(!expanded.contains(&"first response"));
+        assert!(expanded.contains(&"second response"));
+        assert!(expanded.contains(&"third response"));
+
+        assert!(pane.toggle_turn_collapsed_by_number(2));
+        let collapsed = pane
+            .filtered_log_lines()
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(!collapsed.contains(&"first response"));
+        assert!(!collapsed.contains(&"second response"));
+        assert!(collapsed.contains(&"third response"));
+    }
+
+    #[test]
+    fn numbered_turn_does_not_toggle_running_current_turn() {
+        let mut pane = CodexPane::test_with_output(5, 80, 0, "");
+        pane.finished = false;
+        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
+        pane.push_log(CodexLogKind::Assistant, "first response");
+        pane.handle_stdout_line(r#"{"type":"turn.completed"}"#);
+        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
+        pane.push_log(CodexLogKind::Assistant, "running response");
+
+        assert!(!pane.toggle_turn_collapsed_by_number(2));
+        let visible = pane
+            .filtered_log_lines()
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(visible.contains(&"running response"));
     }
 
     #[test]
@@ -2976,6 +3587,38 @@ mod tests {
         );
         assert!(pane.history_label().contains("保存中"));
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn session_history_restores_updated_turn_title() {
+        let path = std::env::temp_dir().join(format!(
+            "addness-codex-turn-title-{}-{}.jsonl",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        append_codex_session_record(
+            &path,
+            &CodexSessionRecord::Log {
+                kind: CodexLogKind::Turn,
+                text: "Turn 1 - 最初の依頼".to_string(),
+            },
+        )
+        .unwrap();
+        append_codex_session_record(
+            &path,
+            &CodexSessionRecord::UpdateTurn {
+                turn: 1,
+                text: "Turn 1 - 確認待ち表示を入力欄に移動".to_string(),
+            },
+        )
+        .unwrap();
+
+        let loaded = load_codex_session(&path).unwrap();
+
+        assert_eq!(loaded.log[0].text, "Turn 1 - 確認待ち表示を入力欄に移動");
         let _ = std::fs::remove_file(path);
     }
 
@@ -3154,5 +3797,14 @@ mod tests {
 
         assert!(prompt.contains("0: A"));
         assert!(prompt.contains("1: B"));
+    }
+
+    #[test]
+    fn developer_instructions_delegate_addness_writes_to_lightweight_subagent() {
+        let instructions = addness_tui_developer_instructions();
+
+        assert!(instructions.contains("最も軽量/低コストの記録専用サブエージェント"));
+        assert!(instructions.contains("子ゴールの追加作成"));
+        assert!(instructions.contains("ADDNESS_PARENT_GOAL_ID"));
     }
 }

@@ -22,7 +22,7 @@ use crate::api::{
 };
 use crate::dbg_log;
 
-use super::codex_pane::{self, CodexPane, CodexWorkSummary, TerminalNotice};
+use super::codex_pane::{self, CodexPane, CodexWorkSummary, PendingCodexTaskGoal, TerminalNotice};
 use super::goal_tree::{GoalTree, TreeRow};
 use super::ui;
 
@@ -618,6 +618,76 @@ async fn fetch_deferred_initial_data(
     }
 }
 
+async fn create_codex_task_goal(
+    mut client: ApiClient,
+    org_id: String,
+    seed: PendingCodexTaskGoal,
+) -> CodexTaskGoalOutcome {
+    let prompt = seed.prompt.clone();
+    let result = async {
+        client.set_org_id(Some(org_id.clone()));
+        let dod = codex_task_goal_dod();
+        let req = CreateGoalRequest {
+            organization_id: org_id,
+            title: codex_task_goal_title(&seed.prompt),
+            parent_objective_id: Some(seed.parent_goal_id.clone()),
+            description: Some(dod.clone()),
+        };
+        let goal = client
+            .create_goal(&req)
+            .await
+            .map_err(|e| format!("子ゴール作成に失敗: {e}"))?
+            .data;
+        let goal_id = goal.id;
+        let title = goal.title;
+        let status_label =
+            GoalDisplayStatus::from_goal_state(goal.status.as_ref(), goal.is_completed)
+                .to_emoji_string();
+        let dod = goal.description.unwrap_or(dod);
+        let cwd = seed.cwd.clone();
+        let prompt_for_record = seed.prompt.clone();
+        let record = tokio::task::spawn_blocking(move || {
+            codex_work_memo(
+                &cwd,
+                "子ゴール作成/依頼受付",
+                Some(&prompt_for_record),
+                None,
+            )
+        })
+        .await
+        .unwrap_or_default();
+        let body = codex_task_goal_initial_body(
+            &seed.parent_goal_id,
+            &seed.parent_goal_title,
+            &seed.cwd,
+            &seed.prompt,
+            &record,
+        );
+        let req = UpdateGoalRequest {
+            status: None,
+            completed_at: None,
+            title: None,
+            description: None,
+            body: Some(body),
+            due_date: None,
+        };
+        let message = match client.update_goal(&goal_id, &req).await {
+            Ok(_) => format!("子ゴール作成: {title}"),
+            Err(e) => format!("子ゴール作成: {title}（body初期記録失敗: {e}）"),
+        };
+        Ok(CodexTaskGoal {
+            id: goal_id,
+            title,
+            dod,
+            status_label,
+            message,
+        })
+    }
+    .await;
+
+    CodexTaskGoalOutcome { prompt, result }
+}
+
 /// codex exec が出力した JSON 文字列から DoD 判定結果を取り出す。
 /// `{ "results": [ { "index": <int>, "met": <bool> } ] }` を期待する。
 fn parse_dod_results(content: &str, item_count: usize) -> Option<Vec<(usize, bool)>> {
@@ -795,6 +865,52 @@ fn codex_work_memo(
     )
 }
 
+fn codex_task_goal_title(prompt: &str) -> String {
+    let normalized = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    let preview = truncate_chars(&normalized, 48);
+    if preview.is_empty() {
+        "Codexタスク".to_string()
+    } else {
+        format!("Codex: {preview}")
+    }
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let mut out = text.chars().take(max_chars).collect::<String>();
+    if text.chars().count() > max_chars {
+        out.push_str("...");
+    }
+    out
+}
+
+fn codex_task_goal_dod() -> String {
+    "このCodexタスクの依頼内容・作業フォルダ/ブランチ・判断・実装内容・検証結果・残課題が、この子ゴールのbodyにまとまっている。Codexセッションはこの子ゴールを作業対象としてAddnessを読み書きしている。".to_string()
+}
+
+fn codex_task_goal_initial_body(
+    parent_goal_id: &str,
+    parent_goal_title: &str,
+    cwd: &str,
+    prompt: &str,
+    record: &str,
+) -> String {
+    let initial_note = format!(
+        "## Codex作業メモ\n\
+         - 親ゴール: {parent_goal_title} (`{parent_goal_id}`)\n\
+         - 初回依頼: {}\n\
+         - 作業フォルダ: {cwd}\n\
+         - 方針: この子ゴールに今回のCodex作業コンテキストを集約する。",
+        prompt.split_whitespace().collect::<Vec<_>>().join(" ")
+    )
+    .replace("\n         ", "\n");
+    let mut body = initial_note;
+    if let Some(auto_body) = codex_body_update_request(None, record).body {
+        body.push_str("\n\n");
+        body.push_str(&auto_body);
+    }
+    body
+}
+
 fn ensure_codex_block(existing: String, start: &str, end: &str, block_body: &str) -> String {
     // codex が body を書き直して不可視マーカーを落としても、見出し（`## ...`）が
     // 残っていれば既存とみなし、空ブロックを重複追加しない。
@@ -929,6 +1045,19 @@ struct CodexBodyRecordOutcome {
     message: String,
 }
 
+struct CodexTaskGoal {
+    id: String,
+    title: String,
+    dod: String,
+    status_label: String,
+    message: String,
+}
+
+struct CodexTaskGoalOutcome {
+    prompt: String,
+    result: Result<CodexTaskGoal, String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CodexBodyRecordResult {
     Written,
@@ -1052,6 +1181,8 @@ pub struct App {
 
     /// DoD 自動判定（codex exec）の実行中ジョブ。
     codex_dod_job: Option<DodJob>,
+    /// 初回依頼をまとめる子ゴール作成ジョブ。
+    codex_task_goal_job: Option<JoinHandle<CodexTaskGoalOutcome>>,
     /// 最初の実依頼など、節目の Codex 作業メモを body に非同期記録するジョブ。
     codex_body_record_job: Option<JoinHandle<CodexBodyRecordOutcome>>,
     /// 初回表示後にメンバー・ルートゴール詳細を埋める遅延ロードジョブ。
@@ -1098,6 +1229,7 @@ impl App {
             pending_codex_tree_reload: false,
             needs_full_clear: false,
             codex_dod_job: None,
+            codex_task_goal_job: None,
             codex_body_record_job: None,
             deferred_initial_load: None,
         }
@@ -1706,6 +1838,80 @@ impl App {
         }
     }
 
+    fn maybe_start_codex_task_goal_creation(&mut self) -> bool {
+        if self.codex_task_goal_job.is_some() {
+            return false;
+        }
+        let Some(seed) = self
+            .codex
+            .as_mut()
+            .and_then(CodexPane::take_pending_task_goal)
+        else {
+            return false;
+        };
+        let Some(org_id) = self.current_org_id().map(str::to_string) else {
+            if let Some(pane) = self.codex.as_mut() {
+                pane.start_pending_prompt_without_task_goal(
+                    "組織IDが未選択のため、子ゴールを作らず親ゴールでCodexを開始します".to_string(),
+                );
+            }
+            return true;
+        };
+
+        let client = self.client.clone();
+        self.codex_task_goal_job =
+            Some(self.rt.spawn(create_codex_task_goal(client, org_id, seed)));
+        if let Some(pane) = self.codex.as_mut() {
+            let now = Local::now().format("%H:%M");
+            pane.push_activity(format!("{now} 初回依頼の子ゴール作成を予約"));
+        }
+        true
+    }
+
+    fn poll_codex_task_goal_job(&mut self) -> bool {
+        let Some(handle) = self.codex_task_goal_job.as_ref() else {
+            return false;
+        };
+        if !handle.is_finished() {
+            return false;
+        }
+        let handle = self.codex_task_goal_job.take().unwrap();
+        let outcome = self
+            .rt
+            .block_on(handle)
+            .unwrap_or_else(|e| CodexTaskGoalOutcome {
+                prompt: String::new(),
+                result: Err(format!("子ゴール作成ジョブに失敗: {e}")),
+            });
+        let Some(pane) = self.codex.as_mut() else {
+            return true;
+        };
+        let now = Local::now().format("%H:%M");
+        match outcome.result {
+            Ok(task_goal) => {
+                pane.last_addness_write_at = Some(Instant::now());
+                pane.push_activity(format!("{now} {}", task_goal.message));
+                pane.start_pending_prompt_with_task_goal(
+                    task_goal.id,
+                    task_goal.title,
+                    task_goal.dod,
+                    task_goal.status_label,
+                    "今回の作業用子ゴールを作成し、Codexの作業対象に切り替えました".to_string(),
+                );
+            }
+            Err(message) => {
+                pane.push_activity(format!("{now} 子ゴール作成に失敗"));
+                let fallback = if outcome.prompt.is_empty() {
+                    message
+                } else {
+                    format!("{message}。親ゴールのままCodexを開始します")
+                };
+                pane.start_pending_prompt_without_task_goal(fallback);
+            }
+        }
+        true
+    }
+
     fn maybe_start_codex_prompt_body_record(&mut self) -> bool {
         if self.codex_body_record_job.is_some() {
             return false;
@@ -1846,6 +2052,9 @@ impl App {
         self.codex_activity_scroll = 0;
         self.codex_last_scroll_input = None;
         // 進行中の非同期作業メモ記録を先に止め、この後の同期終了記録と body を奪い合わせない。
+        if let Some(job) = self.codex_task_goal_job.take() {
+            job.abort();
+        }
         if let Some(job) = self.codex_body_record_job.take() {
             job.abort();
         }
@@ -1896,6 +2105,8 @@ impl App {
             emit_terminal_notification(&notice);
             changed = true;
         }
+        changed |= self.maybe_start_codex_task_goal_creation();
+        changed |= self.poll_codex_task_goal_job();
         changed |= self.maybe_start_codex_prompt_body_record();
         changed |= self.poll_codex_body_record_job();
         changed |= self.maybe_record_finished_codex_session();
@@ -2303,6 +2514,10 @@ impl App {
             if pane.handle_decision_key(key) {
                 return;
             }
+            if key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('e' | 'E')) {
+                pane.toggle_visible_turn_collapsed();
+                return;
+            }
             if key.modifiers.contains(KeyModifiers::CONTROL) {
                 match key.code {
                     KeyCode::Char('t' | 'T') => {
@@ -2318,6 +2533,28 @@ impl App {
                         return;
                     }
                     KeyCode::Char('e' | 'E') => {
+                        pane.toggle_old_turns_collapsed();
+                        return;
+                    }
+                    KeyCode::Char(ch) if ('1'..='9').contains(&ch) => {
+                        let turn = ch.to_digit(10).unwrap_or_default() as usize;
+                        pane.toggle_turn_collapsed_by_number(turn);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            if pane.decision_banner().is_none()
+                && (pane.scrollback > 0 || pane.finished)
+                && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+            {
+                match key.code {
+                    KeyCode::Char('e') => {
+                        if pane.toggle_visible_turn_collapsed() {
+                            return;
+                        }
+                    }
+                    KeyCode::Char('E') => {
                         pane.toggle_old_turns_collapsed();
                         return;
                     }
@@ -2901,6 +3138,28 @@ impl App {
                 return Ok(());
             }
 
+            if self.active_pane == ActivePane::Codex
+                && self.modal_state.is_none()
+                && Self::is_ctrl_help_key(key)
+            {
+                self.show_help = !self.show_help;
+                return Ok(());
+            }
+            if Self::is_ctrl_help_key(key) {
+                return Ok(());
+            }
+
+            if self.show_help {
+                // ヘルプ表示中は閉じる操作のみ受け付ける。
+                if matches!(
+                    key.code,
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')
+                ) {
+                    self.show_help = false;
+                }
+                return Ok(());
+            }
+
             // codex ペインにフォーカス中はキーを codex へ転送する。
             // ただし還流モーダルが開いている間はモーダル入力を優先する。
             if self.active_pane == ActivePane::Codex && self.modal_state.is_none() {
@@ -2912,15 +3171,7 @@ impl App {
             self.error_message = None;
             self.success_message = None;
 
-            if self.show_help {
-                // ヘルプ表示中は閉じる操作のみ受け付ける。
-                if matches!(
-                    key.code,
-                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')
-                ) {
-                    self.show_help = false;
-                }
-            } else if self.modal_state.is_some() {
+            if self.modal_state.is_some() {
                 self.handle_modal_input(key);
             } else if self.show_org_popup {
                 self.handle_org_popup(key.code);
@@ -2929,6 +3180,14 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    fn is_ctrl_help_key(key: KeyEvent) -> bool {
+        key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(
+                key.code,
+                KeyCode::Char('?') | KeyCode::Char('/') | KeyCode::Backspace
+            )
     }
 
     fn handle_org_popup(&mut self, code: KeyCode) {
@@ -5188,6 +5447,103 @@ mod codex_mouse_tests {
             KeyCode::Char('k'),
             KeyModifiers::SHIFT,
         )));
+    }
+
+    #[test]
+    fn ctrl_help_key_matches_common_terminal_encodings() {
+        assert!(App::is_ctrl_help_key(KeyEvent::new(
+            KeyCode::Char('?'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(App::is_ctrl_help_key(KeyEvent::new(
+            KeyCode::Char('/'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(App::is_ctrl_help_key(KeyEvent::new(
+            KeyCode::Backspace,
+            KeyModifiers::CONTROL,
+        )));
+        assert!(!App::is_ctrl_help_key(KeyEvent::new(
+            KeyCode::Char('?'),
+            KeyModifiers::NONE,
+        )));
+        assert!(!App::is_ctrl_help_key(KeyEvent::new(
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+        )));
+    }
+
+    #[test]
+    fn ctrl_help_opens_help_before_codex_key_forwarding() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = ApiClient::new("t", "http://localhost").unwrap();
+        let mut app = App::new(client, rt.handle().clone());
+        app.codex = Some(CodexPane::test_with_output(20, 20, 0, ""));
+        app.active_pane = ActivePane::Codex;
+
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('?'),
+            KeyModifiers::CONTROL,
+        )))
+        .unwrap();
+
+        assert!(app.show_help);
+    }
+
+    #[test]
+    fn ctrl_help_is_codex_pane_only() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = ApiClient::new("t", "http://localhost").unwrap();
+        let mut app = App::new(client, rt.handle().clone());
+        app.active_pane = ActivePane::Content;
+
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('?'),
+            KeyModifiers::CONTROL,
+        )))
+        .unwrap();
+
+        assert!(!app.show_help);
+    }
+}
+
+#[cfg(test)]
+mod codex_task_goal_tests {
+    use super::{
+        CODEX_AUTO_RECORD_START, codex_task_goal_dod, codex_task_goal_initial_body,
+        codex_task_goal_title,
+    };
+
+    #[test]
+    fn codex_task_goal_title_uses_prompt_preview() {
+        assert_eq!(codex_task_goal_title("  実装して  "), "Codex: 実装して");
+        let title = codex_task_goal_title("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ");
+        assert!(title.starts_with("Codex: abcdefghijklmnopqrstuvwxyz"));
+        assert!(title.ends_with("..."));
+    }
+
+    #[test]
+    fn codex_task_goal_initial_body_keeps_parent_and_auto_record_context() {
+        let body = codex_task_goal_initial_body(
+            "parent-1",
+            "親ゴール",
+            "/repo",
+            "TUIで子ゴールを作って",
+            "## Codex自動メモ(機械)\n- セッション: 子ゴール作成/依頼受付",
+        );
+
+        assert!(body.contains("親ゴール: 親ゴール (`parent-1`)"));
+        assert!(body.contains("初回依頼: TUIで子ゴールを作って"));
+        assert!(body.contains(CODEX_AUTO_RECORD_START));
+        assert!(body.contains("## Codex決定ログ"));
+        assert!(body.contains("## PR/Release Traceability"));
+    }
+
+    #[test]
+    fn codex_task_goal_dod_describes_goal_scoped_context() {
+        let dod = codex_task_goal_dod();
+        assert!(dod.contains("子ゴールのbody"));
+        assert!(dod.contains("作業対象"));
     }
 }
 

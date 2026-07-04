@@ -24,6 +24,7 @@ const COLOR_MEMORY: Color = Color::Rgb(84, 214, 190);
 const COLOR_SUCCESS: Color = Color::Rgb(101, 218, 123);
 const COLOR_WARN: Color = Color::Rgb(236, 188, 80);
 const COLOR_MUTED: Color = Color::Rgb(112, 122, 138);
+const COLOR_EVENT: Color = Color::Rgb(224, 230, 238);
 const COLOR_PANEL: Color = Color::Rgb(65, 81, 105);
 const COLOR_INPUT_BG: Color = Color::Rgb(34, 38, 46);
 const CODEX_TOOL_OUTPUT_PREVIEW_CHARS: usize = 160;
@@ -135,7 +136,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     // Help overlay sits above everything else.
     if app.show_help {
-        draw_help_overlay(frame);
+        if app.codex.is_some() {
+            draw_codex_help_overlay(frame);
+        } else {
+            draw_help_overlay(frame);
+        }
     }
 }
 
@@ -1032,6 +1037,73 @@ fn draw_help_overlay(frame: &mut Frame) {
         .title(" Keybindings ")
         .title_bottom(
             Line::from(" ? / Esc / q: Close ").style(Style::default().fg(Color::DarkGray)),
+        );
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_codex_help_overlay(frame: &mut Frame) {
+    let section = |title: &str| {
+        Line::from(Span::styled(
+            title.to_string(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    let kv = |key: &str, desc: &str| {
+        Line::from(vec![
+            Span::styled(
+                format!("  {key:<18}"),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(desc.to_string(), Style::default().fg(Color::White)),
+        ])
+    };
+    let blank = || Line::from("");
+
+    let lines: Vec<Line> = vec![
+        section("Codex in Addness"),
+        kv("Ctrl+?", "この操作一覧を表示 / 閉じる"),
+        kv("入力 + Enter", "Codexへ依頼を送信（初回は子ゴールを作成）"),
+        kv("入力中 Enter", "実行中なら次ターンに予約"),
+        kv("Ctrl-C", "実行中のCodexターンを中断"),
+        kv("F9", "Addnessの作業メモ・決定ログから再開"),
+        kv("F12", "Codexペインを終了して戻る"),
+        blank(),
+        section("履歴 / 検索"),
+        kv(
+            "Trackpad/ホイール",
+            "ポインタ下のCodex履歴 / Addness枠をスクロール",
+        ),
+        kv("↑↓ / PgUp/PgDn", "Codex履歴をスクロール"),
+        kv("Home / End", "履歴先頭 / 最新へ移動"),
+        kv("Ctrl-T", "履歴表示を All / Talk / Tools / Errors で切替"),
+        kv("Ctrl-F", "履歴検索を開始"),
+        kv("Ctrl-L", "検索解除"),
+        blank(),
+        section("turn開閉"),
+        kv("Alt-e", "最新または表示中のturnを開閉"),
+        kv("e / E", "表示中turnを開閉 / 古いturnを一括開閉"),
+        kv("Ctrl-E", "古いturnを一括開閉"),
+        kv("Ctrl-1..9", "指定番号のturnを直接開閉"),
+        blank(),
+        section("終了後の還流"),
+        kv("c / s / d / v", "コメント / 状態 / 成果物 / DoD判定"),
+        kv("Esc / q", "Codexペインを閉じる"),
+    ];
+
+    let height = (lines.len() as u16 + 2).min(frame.area().height);
+    let area = centered_rect(72, height, frame.area());
+    clear_modal_area(frame, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Codex in Addness ")
+        .title_bottom(
+            Line::from(" Ctrl+? / Esc / q: Close ").style(Style::default().fg(Color::DarkGray)),
         );
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
@@ -2382,7 +2454,7 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
             (t, COLOR_SUCCESS)
         } else if pane.decision_banner().is_some() {
             (
-                " codex exec 確認待ち — 上部バナーで y/n または a/d  Esc:ライブへ戻る ".to_string(),
+                " codex exec 確認待ち — 入力欄で y/n または a/d ".to_string(),
                 COLOR_WARN,
             )
         } else if pane.is_turn_running() {
@@ -2423,15 +2495,7 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
 
     let input_h = if inner.height >= 4 { 2 } else { 1 };
     let header_h = u16::from(inner.height >= 6);
-    let banner_h = if pane.decision_banner().is_some() {
-        codex_decision_banner_height(inner.height)
-    } else {
-        0
-    };
     let mut constraints = Vec::new();
-    if banner_h > 0 {
-        constraints.push(Constraint::Length(banner_h));
-    }
     if header_h > 0 {
         constraints.push(Constraint::Length(header_h));
     }
@@ -2442,13 +2506,6 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
         .constraints(constraints)
         .split(inner);
     let mut chunk_index = 0usize;
-    let banner_chunk = if banner_h > 0 {
-        let chunk = chunks[chunk_index];
-        chunk_index += 1;
-        Some(chunk)
-    } else {
-        None
-    };
     let header_chunk = if header_h > 0 {
         let chunk = chunks[chunk_index];
         chunk_index += 1;
@@ -2458,10 +2515,6 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
     };
     let history_chunk = chunks[chunk_index];
     let input_chunk = chunks[chunk_index + 1];
-
-    if let Some(banner_chunk) = banner_chunk {
-        draw_codex_decision_banner(frame, banner_chunk, pane);
-    }
 
     if let Some(header_chunk) = header_chunk {
         frame.render_widget(
@@ -2500,41 +2553,40 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
     let status_width = input_chunk.width as usize;
     let status = codex_runtime_status(pane, status_width);
     let search_prefix = "  search: ";
-    let prompt = if pane.is_search_editing() {
-        format!(
+    let input_lines = if pane.is_search_editing() {
+        let prompt = format!(
             "{search_prefix}{}",
             ellipsize_width(
                 pane.search_query(),
                 input_width.saturating_sub(search_prefix.len())
             )
-        )
-    } else if pane.is_turn_running() {
-        if pane.decision_banner().is_some() {
-            "  確認待ち: y/n または a/d  Ctrl-C:中断  Ctrl-E:ターン展開".to_string()
+        );
+        vec![Line::from(Span::styled(
+            prompt,
+            Style::default().fg(COLOR_MEMORY),
+        ))]
+    } else if let Some(decision) = pane.decision_banner() {
+        codex_decision_input_lines(decision, input_width, input_chunk.height)
+    } else {
+        let prompt = if pane.finished {
+            "  Esc/q:戻る  c/s/d/v:還流  Alt-e/e/Ctrl-1..9:turn".to_string()
         } else {
             let input = ellipsize_width(pane.input_line(), input_width.saturating_sub(4));
             format!("> {input}")
+        };
+        let input_style = if pane.is_turn_running() {
+            Style::default().fg(COLOR_WARN)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        if input_chunk.height <= 1 {
+            vec![Line::from(Span::styled(prompt, input_style))]
+        } else {
+            vec![
+                Line::from(Span::styled(status, Style::default().fg(COLOR_MUTED))),
+                Line::from(Span::styled(prompt, input_style)),
+            ]
         }
-    } else if pane.finished {
-        "  Esc/q:戻る  c/s/d/v:還流  Ctrl-T:表示  Ctrl-F:検索  Ctrl-E:ターン展開".to_string()
-    } else {
-        let input = ellipsize_width(pane.input_line(), input_width.saturating_sub(4));
-        format!("> {input}")
-    };
-    let input_style = if pane.is_search_editing() {
-        Style::default().fg(COLOR_MEMORY)
-    } else if pane.is_turn_running() {
-        Style::default().fg(COLOR_WARN)
-    } else {
-        Style::default().fg(Color::White)
-    };
-    let input_lines = if input_chunk.height <= 1 {
-        vec![Line::from(Span::styled(prompt, input_style))]
-    } else {
-        vec![
-            Line::from(Span::styled(status, Style::default().fg(COLOR_MUTED))),
-            Line::from(Span::styled(prompt, input_style)),
-        ]
     };
     frame.render_widget(
         Paragraph::new(input_lines).style(Style::default().bg(COLOR_INPUT_BG)),
@@ -2566,55 +2618,32 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
     }
 }
 
-fn draw_codex_decision_banner(frame: &mut Frame, area: Rect, pane: &CodexPane) {
-    let Some(decision) = pane.decision_banner() else {
-        return;
-    };
-    let (title, color) = match decision.kind {
-        CodexDecisionKind::Approval => (" Codex 確認待ち: 承認 ", COLOR_WARN),
-        CodexDecisionKind::Permission => (" Codex 確認待ち: 権限 ", Color::Red),
-        CodexDecisionKind::Dangerous => (" Codex 確認待ち: 危険操作 ", Color::Red),
-        CodexDecisionKind::YesNo => (" Codex 確認待ち ", COLOR_WARN),
-    };
-    let content_width = area.width.saturating_sub(2) as usize;
-    let lines = codex_decision_banner_lines(decision, content_width, area.height <= 3);
-    frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(color))
-                .title(title),
-        ),
-        area,
-    );
-}
-
-fn codex_decision_banner_height(inner_height: u16) -> u16 {
-    if inner_height >= 8 {
-        4
-    } else if inner_height >= 7 {
-        3
-    } else {
-        0
-    }
-}
-
-fn codex_decision_banner_lines(
+fn codex_decision_input_lines(
     decision: &super::codex_pane::CodexDecisionBanner,
     max_width: usize,
-    compact: bool,
+    input_height: u16,
 ) -> Vec<Line<'static>> {
-    if compact {
+    let color = codex_decision_color(&decision.kind);
+    let label = match decision.kind {
+        CodexDecisionKind::Approval => "確認待ち: 承認 ",
+        CodexDecisionKind::Permission => "確認待ち: 権限 ",
+        CodexDecisionKind::Dangerous => "確認待ち: 危険操作 ",
+        CodexDecisionKind::YesNo => "確認待ち ",
+    };
+    let label_width = UnicodeWidthStr::width(label);
+
+    if input_height <= 1 {
         let choices = format!(
             "  {}  {}",
             decision_choice_text(decision, true),
             decision_choice_text(decision, false)
         );
-        let message_width = max_width.saturating_sub(UnicodeWidthStr::width(choices.as_str()) + 3);
+        let choices_width = UnicodeWidthStr::width(choices.as_str());
+        let message_width = max_width.saturating_sub(label_width + choices_width);
         return vec![Line::from(vec![
             Span::styled(
-                "? ",
-                Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD),
+                label,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 ellipsize_width(&decision.message, message_width),
@@ -2622,7 +2651,7 @@ fn codex_decision_banner_lines(
             ),
             Span::styled(
                 choices,
-                Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
         ])];
     }
@@ -2630,16 +2659,23 @@ fn codex_decision_banner_lines(
     vec![
         Line::from(vec![
             Span::styled(
-                "? ",
-                Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD),
+                label,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                ellipsize_width(&decision.message, max_width.saturating_sub(2)),
+                ellipsize_width(&decision.message, max_width.saturating_sub(label_width)),
                 Style::default().fg(Color::White),
             ),
         ]),
         codex_decision_choice_line(decision, max_width),
     ]
+}
+
+fn codex_decision_color(kind: &CodexDecisionKind) -> Color {
+    match kind {
+        CodexDecisionKind::Permission | CodexDecisionKind::Dangerous => Color::Red,
+        CodexDecisionKind::Approval | CodexDecisionKind::YesNo => COLOR_WARN,
+    }
 }
 
 fn codex_decision_choice_line(
@@ -2717,7 +2753,7 @@ fn codex_header_line(pane: &CodexPane, max_width: usize) -> Line<'static> {
         .map(short_thread_id)
         .unwrap_or_else(|| "new".to_string());
     let text = format!(
-        " {state} {} | Turn {} | fold:{} | filter:{} | {search} | thread:{thread} | {} | Ctrl-T/F/L/E",
+        " {state} {} | Turn {} | fold:{} | filter:{} | {search} | thread:{thread} | {} | Ctrl-T/F/L e/E C-1..9",
         run_state.label(),
         pane.turn_count(),
         pane.collapsed_turn_count(),
@@ -2888,15 +2924,36 @@ fn codex_log_entry_lines(line: &CodexLogLine, max_width: usize) -> Vec<RenderedC
         } else {
             text_style
         };
+        let mut spans = vec![Span::styled(prefix_text, style)];
+        spans.extend(codex_log_content_spans(
+            line.kind,
+            part,
+            part_style,
+            prefix_style,
+        ));
         lines.push(RenderedCodexLine {
             is_command_output,
-            line: Line::from(vec![
-                Span::styled(prefix_text, style),
-                Span::styled(part, part_style),
-            ]),
+            line: Line::from(spans),
         });
     }
     lines
+}
+
+fn codex_log_content_spans(
+    kind: CodexLogKind,
+    part: String,
+    text_style: Style,
+    marker_style: Style,
+) -> Vec<Span<'static>> {
+    if kind == CodexLogKind::Tool
+        && let Some(rest) = part.strip_prefix("• ")
+    {
+        return vec![
+            Span::styled("•", marker_style),
+            Span::styled(format!(" {rest}"), text_style),
+        ];
+    }
+    vec![Span::styled(part, text_style)]
 }
 
 fn codex_edit_diff_style(part: &str, fallback: Style) -> Style {
@@ -2961,8 +3018,10 @@ fn codex_log_prefix(line: &CodexLogLine) -> (&'static str, Style, Style) {
         ),
         CodexLogKind::Event => (
             "EVT  | ",
-            Style::default().fg(COLOR_WARN),
-            Style::default().fg(COLOR_WARN),
+            Style::default()
+                .fg(COLOR_EVENT)
+                .add_modifier(Modifier::BOLD),
+            Style::default().fg(COLOR_EVENT),
         ),
     }
 }
@@ -3674,10 +3733,11 @@ fn ellipsize_width(text: &str, max_width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivePane, App, COLOR_SUCCESS, codex_activity_lines, codex_decision_banner_lines,
-        codex_decision_choice_line, codex_header_line, codex_log_entry_lines, codex_log_lines,
-        codex_runtime_status, codex_visible_log_lines, codex_work_label, dim_command_output_lines,
-        draw_status_bar, ellipsize_width, prompt_preview, summarize_tool_display_text,
+        ActivePane, App, COLOR_EVENT, COLOR_SUCCESS, COLOR_WARN, codex_activity_lines,
+        codex_decision_choice_line, codex_decision_input_lines, codex_header_line,
+        codex_log_entry_lines, codex_log_lines, codex_runtime_status, codex_visible_log_lines,
+        codex_work_label, dim_command_output_lines, draw_status_bar, ellipsize_width,
+        prompt_preview, summarize_tool_display_text,
     };
     use crate::api::ApiClient;
     use crate::tui::codex_pane::{
@@ -3761,6 +3821,27 @@ mod tests {
 
         assert_eq!(line_text(&lines[0].line), "FAIL | • Ran cargo test");
         assert_eq!(line_text(&lines[1].line), "     |   └ failed");
+        assert_eq!(lines[0].line.spans[1].content.as_ref(), "•");
+        assert_eq!(lines[0].line.spans[1].style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn codex_log_entry_lines_colors_tool_bullet_by_state() {
+        let running = CodexLogLine {
+            kind: CodexLogKind::Tool,
+            text: "RUNNING cargo test".to_string(),
+        };
+        let running_lines = codex_log_entry_lines(&running, 80);
+        assert_eq!(running_lines[0].line.spans[1].content.as_ref(), "•");
+        assert_eq!(running_lines[0].line.spans[1].style.fg, Some(COLOR_WARN));
+
+        let ok = CodexLogLine {
+            kind: CodexLogKind::Tool,
+            text: "exec_command_end (exit 0): cargo test\nok".to_string(),
+        };
+        let ok_lines = codex_log_entry_lines(&ok, 80);
+        assert_eq!(ok_lines[0].line.spans[1].content.as_ref(), "•");
+        assert_eq!(ok_lines[0].line.spans[1].style.fg, Some(COLOR_SUCCESS));
     }
 
     #[test]
@@ -3859,7 +3940,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_decision_banner_uses_clear_yes_no_choices() {
+    fn codex_decision_input_lines_use_clear_yes_no_choices() {
         let decision = CodexDecisionBanner {
             kind: CodexDecisionKind::YesNo,
             message: "続行しますか?".to_string(),
@@ -3869,12 +3950,12 @@ mod tests {
             deny_label: "No",
         };
 
-        let lines = codex_decision_banner_lines(&decision, 80, false)
+        let lines = codex_decision_input_lines(&decision, 80, 2)
             .into_iter()
             .map(|line| line_text(&line))
             .collect::<Vec<_>>();
 
-        assert_eq!(lines[0], "? 続行しますか?");
+        assert_eq!(lines[0], "確認待ち 続行しますか?");
         assert!(lines[1].contains("[Y] Yes"));
         assert!(lines[1].contains("[N] No"));
     }
@@ -3894,6 +3975,44 @@ mod tests {
 
         assert!(text.contains("[A/Y] 承認"));
         assert!(text.contains("[D/N] 拒否"));
+    }
+
+    #[test]
+    fn codex_decision_input_lines_show_prompt_at_input_area() {
+        let decision = CodexDecisionBanner {
+            kind: CodexDecisionKind::Approval,
+            message: "Run cargo test?".to_string(),
+            accept_key: 'a',
+            accept_label: "承認",
+            deny_key: 'd',
+            deny_label: "拒否",
+        };
+
+        let lines = codex_decision_input_lines(&decision, 80, 2);
+
+        assert_eq!(line_text(&lines[0]), "確認待ち: 承認 Run cargo test?");
+        assert!(line_text(&lines[1]).contains("[A/Y] 承認"));
+        assert!(line_text(&lines[1]).contains("[D/N] 拒否"));
+    }
+
+    #[test]
+    fn compact_codex_decision_input_line_keeps_choices() {
+        let decision = CodexDecisionBanner {
+            kind: CodexDecisionKind::Permission,
+            message: "Need filesystem permission".to_string(),
+            accept_key: 'a',
+            accept_label: "許可",
+            deny_key: 'd',
+            deny_label: "拒否",
+        };
+
+        let lines = codex_decision_input_lines(&decision, 80, 1);
+        let text = line_text(&lines[0]);
+
+        assert!(text.contains("確認待ち: 権限"));
+        assert!(text.contains("[A/Y] 許可"));
+        assert!(text.contains("[D/N] 拒否"));
+        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Red));
     }
 
     #[test]
@@ -3936,6 +4055,22 @@ mod tests {
                 .add_modifier
                 .contains(Modifier::DIM)
         );
+    }
+
+    #[test]
+    fn event_log_lines_do_not_use_warn_yellow() {
+        let entry = CodexLogLine {
+            kind: CodexLogKind::Event,
+            text: "waiting for approval".to_string(),
+        };
+        let lines = codex_log_entry_lines(&entry, 80);
+        let spans = &lines[0].line.spans;
+
+        assert_ne!(spans[0].style.fg, Some(COLOR_WARN));
+        assert_ne!(spans[1].style.fg, Some(COLOR_WARN));
+        assert_eq!(spans[0].style.fg, Some(COLOR_EVENT));
+        assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(spans[1].style.fg, Some(COLOR_EVENT));
     }
 
     #[test]

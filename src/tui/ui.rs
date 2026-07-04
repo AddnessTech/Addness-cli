@@ -18,16 +18,19 @@ use super::codex_pane::{
 use super::goal_tree::{CommentView, TreeRow};
 use crate::api::{DeliverableType, GoalStatus, Member, MemberId};
 
-const COLOR_ADDNESS: Color = Color::Rgb(91, 171, 255);
-const COLOR_CODEX: Color = Color::Rgb(207, 140, 255);
-const COLOR_MEMORY: Color = Color::Rgb(84, 214, 190);
-const COLOR_SUCCESS: Color = Color::Rgb(101, 218, 123);
-const COLOR_WARN: Color = Color::Rgb(236, 188, 80);
-const COLOR_MUTED: Color = Color::Rgb(112, 122, 138);
-const COLOR_EVENT: Color = Color::Rgb(224, 230, 238);
-const COLOR_PANEL: Color = Color::Rgb(65, 81, 105);
-const COLOR_INPUT_BG: Color = Color::Rgb(34, 38, 46);
-const CODEX_TOOL_OUTPUT_PREVIEW_CHARS: usize = 160;
+const COLOR_TEXT: Color = Color::Rgb(220, 224, 230);
+const COLOR_TEXT_STRONG: Color = Color::Rgb(236, 238, 242);
+const COLOR_ADDNESS: Color = Color::Rgb(128, 154, 181);
+const COLOR_CODEX: Color = Color::Rgb(178, 181, 190);
+const COLOR_MEMORY: Color = Color::Rgb(139, 161, 154);
+const COLOR_SUCCESS: Color = Color::Rgb(137, 169, 143);
+const COLOR_WARN: Color = Color::Rgb(202, 164, 91);
+const COLOR_DANGER: Color = Color::Rgb(208, 112, 112);
+const COLOR_MUTED: Color = Color::Rgb(112, 122, 134);
+const COLOR_EVENT: Color = Color::Rgb(142, 150, 160);
+const COLOR_PANEL: Color = Color::Rgb(76, 84, 96);
+const COLOR_INPUT_BG: Color = Color::Rgb(27, 30, 36);
+const CODEX_TOOL_COMMAND_PREVIEW_WIDTH: usize = 96;
 const CODEX_EDIT_DIFF_PREVIEW_LINES: usize = 8;
 
 /// Replace @uuid mentions in text with @member_name
@@ -2264,9 +2267,7 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
         if let Some(action) = &pane.action {
             lines.push(Line::from(Span::styled(
                 format!("» {action}"),
-                Style::default()
-                    .fg(COLOR_MEMORY)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD),
             )));
             lines.push(Line::from(""));
         }
@@ -2283,7 +2284,7 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
         let status_style = if recently(pane.status_changed_at) {
             Style::default().fg(Color::Black).bg(COLOR_WARN)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(COLOR_TEXT)
         };
         lines.push(Line::from(vec![
             Span::styled("状態: ", Style::default().fg(COLOR_MUTED)),
@@ -2300,7 +2301,7 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
             lines.push(Line::from(vec![
                 Span::styled("DoD ", Style::default().fg(COLOR_MUTED)),
                 Span::styled(bar, Style::default().fg(COLOR_SUCCESS)),
-                Span::styled(format!(" {met}/{total}"), Style::default().fg(Color::White)),
+                Span::styled(format!(" {met}/{total}"), Style::default().fg(COLOR_TEXT)),
             ]));
         }
         if let Some(n) = pane.deliverable_count {
@@ -2336,7 +2337,7 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
             for (i, item) in pane.dod_items.iter().enumerate() {
                 let (mark, style) = match pane.dod_checks.get(i).copied().flatten() {
                     Some(true) => ("[x]", Style::default().fg(COLOR_SUCCESS)),
-                    Some(false) => ("[ ]", Style::default().fg(Color::Red)),
+                    Some(false) => ("[ ]", Style::default().fg(COLOR_MUTED)),
                     None => ("[ ]", Style::default().fg(COLOR_MUTED)),
                 };
                 lines.push(Line::from(vec![
@@ -2354,8 +2355,8 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
             )));
             for link in &pane.trace_links {
                 lines.push(Line::from(vec![
-                    Span::styled("↗ ", Style::default().fg(COLOR_MEMORY)),
-                    Span::styled(link.as_str(), Style::default().fg(Color::White)),
+                    Span::styled("↗ ", Style::default().fg(COLOR_MUTED)),
+                    Span::styled(link.as_str(), Style::default().fg(COLOR_TEXT)),
                 ]));
             }
         }
@@ -2379,13 +2380,30 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
             for child in &pane.children {
                 let is_new = child.new_until.is_some_and(|t| t > now);
                 let title_style = if is_new {
-                    Style::default().fg(Color::Black).bg(COLOR_SUCCESS)
+                    Style::default().fg(Color::Black).bg(COLOR_WARN)
+                } else if child.is_completed {
+                    Style::default()
+                        .fg(COLOR_MUTED)
+                        .add_modifier(Modifier::CROSSED_OUT)
                 } else {
-                    Style::default().fg(Color::White)
+                    Style::default().fg(COLOR_TEXT)
+                };
+                let marker_style = if child.is_completed {
+                    Style::default().fg(COLOR_SUCCESS)
+                } else {
+                    Style::default().fg(COLOR_MUTED)
+                };
+                let status_style = if child.is_completed {
+                    Style::default().fg(COLOR_SUCCESS)
+                } else if child.status_label == "進行中" {
+                    Style::default().fg(COLOR_WARN)
+                } else {
+                    Style::default().fg(COLOR_MUTED)
                 };
                 lines.push(Line::from(vec![
-                    Span::raw(format!("{} ", child.icon)),
+                    Span::styled(format!("{} ", child.icon), marker_style),
                     Span::styled(child.title.as_str(), title_style),
+                    Span::styled(format!("  {}", child.status_label), status_style),
                 ]));
             }
         }
@@ -2400,7 +2418,7 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(COLOR_ADDNESS))
+                    .border_style(Style::default().fg(COLOR_PANEL))
                     .title(contract_title),
             )
             .scroll((app.codex_contract_scroll.min(u16::MAX as usize) as u16, 0))
@@ -2451,22 +2469,19 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
                 " codex exec 終了 — ↑↓: ログ  [c]コメント [s]状態 [d]成果物 [v]DoD判定  Esc/q: 戻る "
                     .to_string()
             };
-            (t, COLOR_SUCCESS)
-        } else if pane.decision_banner().is_some() {
-            (
-                " codex exec 確認待ち — 入力欄で y/n または a/d ".to_string(),
-                COLOR_WARN,
-            )
+            (t, COLOR_PANEL)
+        } else if let Some(decision) = pane.decision_banner() {
+            (codex_decision_title_hint(decision), COLOR_WARN)
         } else if pane.is_turn_running() {
             (
                 " codex exec --json 実行中 — JSONLをAddnessで表示  Ctrl-C:ターン中断  F12:終了 "
                     .to_string(),
-                COLOR_CODEX,
+                COLOR_WARN,
             )
         } else if pane.scrollback > 0 {
             (
                 " codex exec --json — Esc: ライブへ戻る ".to_string(),
-                COLOR_WARN,
+                COLOR_PANEL,
             )
         } else {
             let thread = pane
@@ -2475,7 +2490,7 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
                 .unwrap_or_default();
             (
                 format!(" codex exec --json 入力待ち{thread}  F9:Addness再開  F12:終了 "),
-                COLOR_CODEX,
+                COLOR_PANEL,
             )
         };
         let block = Block::default()
@@ -2563,7 +2578,7 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
         );
         vec![Line::from(Span::styled(
             prompt,
-            Style::default().fg(COLOR_MEMORY),
+            Style::default().fg(COLOR_TEXT),
         ))]
     } else if let Some(decision) = pane.decision_banner() {
         codex_decision_input_lines(decision, input_width, input_chunk.height)
@@ -2577,7 +2592,7 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
         let input_style = if pane.is_turn_running() {
             Style::default().fg(COLOR_WARN)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(COLOR_TEXT)
         };
         if input_chunk.height <= 1 {
             vec![Line::from(Span::styled(prompt, input_style))]
@@ -2633,11 +2648,15 @@ fn codex_decision_input_lines(
     let label_width = UnicodeWidthStr::width(label);
 
     if input_height <= 1 {
-        let choices = format!(
+        let mut choices = format!(
             "  {}  {}",
             decision_choice_text(decision, true),
             decision_choice_text(decision, false)
         );
+        if let Some(always) = decision_always_choice_text(decision) {
+            choices.push_str("  ");
+            choices.push_str(&always);
+        }
         let choices_width = UnicodeWidthStr::width(choices.as_str());
         let message_width = max_width.saturating_sub(label_width + choices_width);
         return vec![Line::from(vec![
@@ -2647,7 +2666,7 @@ fn codex_decision_input_lines(
             ),
             Span::styled(
                 ellipsize_width(&decision.message, message_width),
-                Style::default().fg(Color::White),
+                Style::default().fg(COLOR_TEXT),
             ),
             Span::styled(
                 choices,
@@ -2664,7 +2683,7 @@ fn codex_decision_input_lines(
             ),
             Span::styled(
                 ellipsize_width(&decision.message, max_width.saturating_sub(label_width)),
-                Style::default().fg(Color::White),
+                Style::default().fg(COLOR_TEXT),
             ),
         ]),
         codex_decision_choice_line(decision, max_width),
@@ -2673,9 +2692,24 @@ fn codex_decision_input_lines(
 
 fn codex_decision_color(kind: &CodexDecisionKind) -> Color {
     match kind {
-        CodexDecisionKind::Permission | CodexDecisionKind::Dangerous => Color::Red,
+        CodexDecisionKind::Permission | CodexDecisionKind::Dangerous => COLOR_DANGER,
         CodexDecisionKind::Approval | CodexDecisionKind::YesNo => COLOR_WARN,
     }
+}
+
+fn codex_decision_title_hint(decision: &super::codex_pane::CodexDecisionBanner) -> String {
+    let keys = match decision.kind {
+        CodexDecisionKind::YesNo => "y/n",
+        CodexDecisionKind::Dangerous => "a/y または d/n",
+        CodexDecisionKind::Approval | CodexDecisionKind::Permission => {
+            if decision.always_choice().is_some() {
+                "a/y・d/n・l:常に許可"
+            } else {
+                "a/y または d/n"
+            }
+        }
+    };
+    format!(" codex exec 確認待ち — 入力欄で {keys} ")
 }
 
 fn codex_decision_choice_line(
@@ -2684,23 +2718,34 @@ fn codex_decision_choice_line(
 ) -> Line<'static> {
     let accept = decision_choice_text(decision, true);
     let deny = decision_choice_text(decision, false);
-    let hint = ellipsize_width(
-        &format!("  {accept}    {deny}    キーを押すと選択"),
-        max_width,
-    );
+    let always = decision_always_choice_text(decision);
+    let hint_text = if let Some(always) = always.as_deref() {
+        format!("  {accept}    {deny}    {always}    キーを押すと選択")
+    } else {
+        format!("  {accept}    {deny}    キーを押すと選択")
+    };
+    let hint = ellipsize_width(&hint_text, max_width);
     let accept_len = UnicodeWidthStr::width(accept.as_str());
     let deny_len = UnicodeWidthStr::width(deny.as_str());
+    let always_len = always
+        .as_deref()
+        .map(UnicodeWidthStr::width)
+        .unwrap_or_default();
     let accept_style = Style::default()
         .fg(Color::Black)
         .bg(COLOR_SUCCESS)
         .add_modifier(Modifier::BOLD);
     let deny_style = Style::default()
-        .fg(Color::White)
+        .fg(COLOR_TEXT_STRONG)
         .bg(if matches!(decision.kind, CodexDecisionKind::YesNo) {
             COLOR_PANEL
         } else {
-            Color::Red
+            COLOR_DANGER
         })
+        .add_modifier(Modifier::BOLD);
+    let always_style = Style::default()
+        .fg(COLOR_WARN)
+        .bg(COLOR_PANEL)
         .add_modifier(Modifier::BOLD);
 
     let mut spans = vec![
@@ -2709,7 +2754,12 @@ fn codex_decision_choice_line(
         Span::styled("    ", Style::default()),
         Span::styled(deny, deny_style),
     ];
-    let suffix_start = 2 + accept_len + 4 + deny_len;
+    let mut suffix_start = 2 + accept_len + 4 + deny_len;
+    if let Some(always) = always {
+        spans.push(Span::styled("    ", Style::default()));
+        spans.push(Span::styled(always, always_style));
+        suffix_start += 4 + always_len;
+    }
     if UnicodeWidthStr::width(hint.as_str()) > suffix_start {
         let suffix = hint.chars().skip(suffix_start).collect::<String>();
         spans.push(Span::styled(suffix, Style::default().fg(COLOR_MUTED)));
@@ -2732,6 +2782,14 @@ fn decision_choice_text(
         (_, false) => format!("{}/N", key.to_ascii_uppercase()),
     };
     format!("[{keys}] {label}")
+}
+
+fn decision_always_choice_text(
+    decision: &super::codex_pane::CodexDecisionBanner,
+) -> Option<String> {
+    decision
+        .always_choice()
+        .map(|(key, label)| format!("[{}] {label}", key.to_ascii_uppercase()))
 }
 
 fn codex_header_line(pane: &CodexPane, max_width: usize) -> Line<'static> {
@@ -2804,7 +2862,7 @@ fn codex_activity_lines(activity: &[String], width: usize) -> Vec<Line<'static>>
         let style = if idx == last_index {
             Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(COLOR_TEXT)
         };
         for part in wrap_log_text(text, width) {
             out.push(Line::from(Span::styled(part, style)));
@@ -2884,7 +2942,7 @@ fn codex_log_line_rendered_count(line: &CodexLogLine, max_width: usize) -> usize
 
 fn codex_separator_line(kind: CodexLogKind, max_width: usize) -> RenderedCodexLine {
     let (head, fill, color) = match kind {
-        CodexLogKind::Turn => ("-----+ ", '-', COLOR_CODEX),
+        CodexLogKind::Turn => ("-----+ ", '-', COLOR_PANEL),
         CodexLogKind::Tool => (".....+ ", '.', COLOR_PANEL),
         _ => ("     | ", '-', COLOR_PANEL),
     };
@@ -2963,9 +3021,11 @@ fn codex_edit_diff_style(part: &str, fallback: Style) -> Style {
             .fg(COLOR_SUCCESS)
             .add_modifier(Modifier::BOLD)
     } else if trimmed.starts_with('-') {
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(COLOR_DANGER)
+            .add_modifier(Modifier::BOLD)
     } else if trimmed.starts_with("@@") {
-        Style::default().fg(COLOR_MEMORY)
+        Style::default().fg(COLOR_MUTED)
     } else if trimmed.starts_with("update:")
         || trimmed.starts_with("add:")
         || trimmed.starts_with("delete:")
@@ -2973,7 +3033,7 @@ fn codex_edit_diff_style(part: &str, fallback: Style) -> Style {
         || trimmed.ends_with("files changed")
     {
         Style::default()
-            .fg(Color::White)
+            .fg(COLOR_TEXT_STRONG)
             .add_modifier(Modifier::BOLD)
     } else {
         fallback
@@ -2987,14 +3047,14 @@ fn codex_log_prefix(line: &CodexLogLine) -> (&'static str, Style, Style) {
             Style::default()
                 .fg(COLOR_ADDNESS)
                 .add_modifier(Modifier::BOLD),
-            Style::default().fg(Color::White),
+            Style::default().fg(COLOR_TEXT),
         ),
         CodexLogKind::Assistant => (
             "CODEX| ",
             Style::default()
-                .fg(Color::White)
+                .fg(COLOR_TEXT_STRONG)
                 .add_modifier(Modifier::BOLD),
-            Style::default().fg(Color::White),
+            Style::default().fg(COLOR_TEXT),
         ),
         CodexLogKind::Tool => codex_tool_prefix(&line.text),
         CodexLogKind::Turn => (
@@ -3002,9 +3062,7 @@ fn codex_log_prefix(line: &CodexLogLine) -> (&'static str, Style, Style) {
             Style::default()
                 .fg(COLOR_CODEX)
                 .add_modifier(Modifier::BOLD),
-            Style::default()
-                .fg(COLOR_CODEX)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD),
         ),
         CodexLogKind::System => (
             "INFO | ",
@@ -3013,14 +3071,14 @@ fn codex_log_prefix(line: &CodexLogLine) -> (&'static str, Style, Style) {
         ),
         CodexLogKind::Error => (
             "ERR! | ",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            Style::default().fg(Color::Red),
+            Style::default()
+                .fg(COLOR_DANGER)
+                .add_modifier(Modifier::BOLD),
+            Style::default().fg(COLOR_DANGER),
         ),
         CodexLogKind::Event => (
-            "EVT  | ",
-            Style::default()
-                .fg(COLOR_EVENT)
-                .add_modifier(Modifier::BOLD),
+            "INFO | ",
+            Style::default().fg(COLOR_EVENT),
             Style::default().fg(COLOR_EVENT),
         ),
     }
@@ -3033,21 +3091,23 @@ fn codex_tool_prefix(text: &str) -> (&'static str, Style, Style) {
             Style::default()
                 .fg(COLOR_CODEX)
                 .add_modifier(Modifier::BOLD),
-            Style::default().fg(Color::White),
+            Style::default().fg(COLOR_TEXT),
         )
     } else if text.starts_with("DIFF ") {
         (
             "DIFF | ",
             Style::default()
-                .fg(COLOR_MEMORY)
+                .fg(COLOR_MUTED)
                 .add_modifier(Modifier::BOLD),
-            Style::default().fg(Color::White),
+            Style::default().fg(COLOR_TEXT),
         )
     } else if text.starts_with("FAIL ") || text.contains("exit ") && !text.contains("exit 0") {
         (
             "FAIL | ",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            Style::default().fg(Color::Red),
+            Style::default()
+                .fg(COLOR_DANGER)
+                .add_modifier(Modifier::BOLD),
+            Style::default().fg(COLOR_DANGER),
         )
     } else if text.starts_with("OK ") || text.contains("exit 0") {
         (
@@ -3055,27 +3115,25 @@ fn codex_tool_prefix(text: &str) -> (&'static str, Style, Style) {
             Style::default()
                 .fg(COLOR_SUCCESS)
                 .add_modifier(Modifier::BOLD),
-            Style::default().fg(Color::White),
+            Style::default().fg(COLOR_TEXT),
         )
     } else if text.contains("output_delta") || text.contains('\n') {
         (
             "OUT  | ",
-            Style::default().fg(COLOR_MEMORY),
-            Style::default().fg(Color::White),
+            Style::default().fg(COLOR_MUTED),
+            Style::default().fg(COLOR_TEXT),
         )
     } else if text.starts_with("RUNNING ") {
         (
             "RUN  | ",
             Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD),
-            Style::default().fg(Color::White),
+            Style::default().fg(COLOR_TEXT),
         )
     } else {
         (
             "RUN  | ",
-            Style::default()
-                .fg(COLOR_MEMORY)
-                .add_modifier(Modifier::BOLD),
-            Style::default().fg(Color::White),
+            Style::default().fg(COLOR_MUTED),
+            Style::default().fg(COLOR_TEXT),
         )
     }
 }
@@ -3180,7 +3238,7 @@ fn summarize_tool_display_text(text: &str) -> String {
         return format!("{head_line}\n  └ {summary}");
     }
 
-    let preview = tool_output_tree_preview(output, CODEX_TOOL_OUTPUT_PREVIEW_CHARS);
+    let preview = tool_output_tree_preview(output);
     format!("{head_line}\n  └ {preview}")
 }
 
@@ -3201,24 +3259,37 @@ fn tool_command_tree_head(state: Option<&str>, command: &str) -> String {
     } else {
         "Ran"
     };
+    let command = ellipsize_width(command, CODEX_TOOL_COMMAND_PREVIEW_WIDTH);
     format!("• {verb} {command}")
 }
 
-fn tool_output_tree_preview(output: &str, max_chars: usize) -> String {
-    let first = output
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or(output)
-        .trim();
-    let mut preview = tool_output_preview(first, max_chars);
-    let omitted = output
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .count();
-    if omitted > 1 {
-        preview.push_str(&format!("  … +{} lines", omitted - 1));
+fn tool_output_tree_preview(output: &str) -> String {
+    match non_empty_line_count(output) {
+        0 => "output: empty".to_string(),
+        1 => "output: 1 line".to_string(),
+        n => format!("output: {n} lines"),
     }
-    preview
+}
+
+fn non_empty_line_count(text: &str) -> usize {
+    text.lines().filter(|line| !line.trim().is_empty()).count()
+}
+
+fn compact_command_result(kind: &str, output: &str) -> Option<String> {
+    let lower = output.to_ascii_lowercase();
+    if output.lines().any(|line| line.contains("Finished ")) || lower.trim() == "ok" {
+        return Some(format!("{kind}: ok"));
+    }
+    if output
+        .lines()
+        .any(|line| line.contains("test result:") && line.to_ascii_lowercase().contains(" ok."))
+    {
+        return Some(format!("{kind}: ok"));
+    }
+    if lower.contains("fail") || lower.contains("error") {
+        return Some(format!("{kind}: failed"));
+    }
+    None
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3333,39 +3404,22 @@ fn special_tool_summary(head: &str, output: &str) -> Option<String> {
     let lower = head.to_ascii_lowercase();
 
     if lower.contains("cargo test") {
-        if let Some(line) = output.lines().find(|line| line.contains("test result:")) {
-            return Some(format!("tests: {}", compact_summary_line(line)));
-        }
-        if lower.contains("exit 0") {
-            return Some("tests: ok".to_string());
-        }
+        return compact_command_result("tests", output);
     }
 
     if lower.contains("cargo clippy") {
-        if let Some(line) = output.lines().rev().find(|line| line.contains("Finished ")) {
-            return Some(format!("clippy: {}", compact_summary_line(line)));
-        }
-        if lower.contains("exit 0") {
-            return Some("clippy: ok".to_string());
-        }
+        return compact_command_result("clippy", output);
     }
 
     if lower.contains("cargo build") {
-        if let Some(line) = output.lines().rev().find(|line| line.contains("Finished ")) {
-            return Some(format!("build: {}", compact_summary_line(line)));
-        }
-        if lower.contains("exit 0") {
-            return Some("build: ok".to_string());
-        }
+        return compact_command_result("build", output);
     }
 
     if lower.contains("git diff") || lower.contains("git status") {
-        if let Some(line) = output.lines().rev().find(|line| line.contains("changed")) {
-            return Some(format!("diff: {}", compact_summary_line(line)));
-        }
         if output.trim().is_empty() {
             return Some("git: no output".to_string());
         }
+        return Some(format!("git: {} lines", non_empty_line_count(output)));
     }
 
     if looks_like_addness_command(head)
@@ -3390,48 +3444,14 @@ fn looks_like_addness_command(head: &str) -> bool {
 
 fn json_output_summary(output: &str) -> Option<String> {
     let value = serde_json::from_str::<Value>(output.trim()).ok()?;
-    if let Some(title) = json_title(&value) {
-        return Some(format!("goal: {}", compact_summary_line(title)));
+    if value.get("goal").is_some() || value.get("title").is_some() {
+        return Some("goal".to_string());
     }
     match value {
         Value::Array(items) => Some(format!("json array {} items", items.len())),
         Value::Object(map) => Some(format!("json object {} keys", map.len())),
         _ => Some("json value".to_string()),
     }
-}
-
-fn json_title(value: &Value) -> Option<&str> {
-    value
-        .get("title")
-        .and_then(Value::as_str)
-        .or_else(|| value.get("name").and_then(Value::as_str))
-        .or_else(|| {
-            value
-                .get("goal")
-                .and_then(|goal| goal.get("title"))
-                .and_then(Value::as_str)
-        })
-        .or_else(|| {
-            value
-                .get("data")
-                .and_then(|data| data.get("title"))
-                .and_then(Value::as_str)
-        })
-}
-
-fn compact_summary_line(text: &str) -> String {
-    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    ellipsize_width(&normalized, 140)
-}
-
-fn tool_output_preview(text: &str, max_chars: usize) -> String {
-    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.chars().count() <= max_chars {
-        return collapsed;
-    }
-    let mut preview = collapsed.chars().take(max_chars).collect::<String>();
-    preview.push_str("...");
-    preview
 }
 
 fn dim_command_output_lines(lines: &mut [RenderedCodexLine]) {
@@ -3498,19 +3518,19 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
 
     let run_state = pane.run_state();
     let state_style = match run_state {
-        super::codex_pane::CodexRunState::Completed => Style::default()
-            .fg(COLOR_SUCCESS)
-            .add_modifier(Modifier::BOLD),
+        super::codex_pane::CodexRunState::Completed => {
+            Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD)
+        }
         super::codex_pane::CodexRunState::Confirming => {
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD)
         }
         super::codex_pane::CodexRunState::CommandRunning
         | super::codex_pane::CodexRunState::Thinking => {
             Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD)
         }
-        super::codex_pane::CodexRunState::InputWaiting => Style::default()
-            .fg(COLOR_CODEX)
-            .add_modifier(Modifier::BOLD),
+        super::codex_pane::CodexRunState::InputWaiting => {
+            Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD)
+        }
     };
     let work = if let Some(decision) = pane.decision_banner() {
         ellipsize_width(&format!("確認: {}", decision.message), value_width)
@@ -3551,13 +3571,12 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
         pane.last_addness_write_label.as_deref(),
         value_width,
     );
-    let memory_style = if pane.last_addness_write_at.is_some() {
-        Style::default().fg(COLOR_SUCCESS)
-    } else if pane.last_addness_read_at.is_some() {
-        Style::default().fg(COLOR_MEMORY)
-    } else {
-        Style::default().fg(COLOR_MUTED)
-    };
+    let memory_style =
+        if pane.last_addness_write_at.is_some() || pane.last_addness_read_at.is_some() {
+            Style::default().fg(COLOR_ADDNESS)
+        } else {
+            Style::default().fg(COLOR_MUTED)
+        };
     let history = ellipsize_width(
         &format!(
             "{} / 折畳{}",
@@ -3571,7 +3590,7 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
         .map(|p| prompt_preview(p, prompt_width))
         .unwrap_or_else(|| "（まだありません）".to_string());
     let assistant_style = if pane.last_assistant_text().is_some() {
-        Style::default().fg(Color::White)
+        Style::default().fg(COLOR_TEXT)
     } else {
         Style::default().fg(COLOR_MUTED)
     };
@@ -3581,7 +3600,7 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
         .map(|p| prompt_preview(p, prompt_width))
         .unwrap_or_else(|| "（まだありません）".to_string());
     let prompt_style = if pane.last_prompt().is_some() {
-        Style::default().fg(Color::White)
+        Style::default().fg(COLOR_TEXT)
     } else {
         Style::default().fg(COLOR_MUTED)
     };
@@ -3597,7 +3616,7 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
         ]),
         Line::from(vec![
             Span::styled("作業 ", Style::default().fg(COLOR_MUTED)),
-            Span::styled(work, Style::default().fg(Color::White)),
+            Span::styled(work, Style::default().fg(COLOR_TEXT)),
         ]),
         Line::from(vec![
             Span::styled("コマンド ", Style::default().fg(COLOR_MUTED)),
@@ -3609,7 +3628,7 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
         ]),
         Line::from(vec![
             Span::styled("履歴 ", Style::default().fg(COLOR_MUTED)),
-            Span::styled(history, Style::default().fg(COLOR_MEMORY)),
+            Span::styled(history, Style::default().fg(COLOR_MUTED)),
         ]),
         Line::from(vec![
             Span::styled("Codex ", Style::default().fg(COLOR_MUTED)),
@@ -3624,13 +3643,13 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(if pane.is_turn_running() {
-                    COLOR_WARN
-                } else if pane.decision_banner().is_some() {
-                    Color::Red
-                } else {
-                    COLOR_CODEX
-                }))
+                .border_style(Style::default().fg(
+                    if pane.is_turn_running() || pane.decision_banner().is_some() {
+                        COLOR_WARN
+                    } else {
+                        COLOR_PANEL
+                    },
+                ))
                 .title(if pane.decision_banner().is_some() {
                     " Codex 作業ダッシュボード ▲確認待ち "
                 } else if pane.is_turn_running() {
@@ -3733,8 +3752,9 @@ fn ellipsize_width(text: &str, max_width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivePane, App, COLOR_SUCCESS, codex_activity_lines, codex_decision_banner_lines,
-        codex_decision_choice_line, codex_header_line, codex_log_entry_lines, codex_log_lines,
+        ActivePane, App, COLOR_DANGER, COLOR_EVENT, COLOR_SUCCESS, COLOR_WARN,
+        codex_activity_lines, codex_decision_choice_line, codex_decision_input_lines,
+        codex_decision_title_hint, codex_header_line, codex_log_entry_lines, codex_log_lines,
         codex_runtime_status, codex_visible_log_lines, codex_work_label, dim_command_output_lines,
         draw_status_bar, ellipsize_width, prompt_preview, summarize_tool_display_text,
     };
@@ -3744,7 +3764,7 @@ mod tests {
         CodexPane,
     };
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use ratatui::style::{Color, Modifier};
+    use ratatui::style::Modifier;
     use ratatui::text::Line;
     use ratatui::{Terminal, backend::TestBackend};
     use unicode_width::UnicodeWidthStr;
@@ -3819,7 +3839,28 @@ mod tests {
         let lines = codex_log_entry_lines(&entry, 80);
 
         assert_eq!(line_text(&lines[0].line), "FAIL | • Ran cargo test");
-        assert_eq!(line_text(&lines[1].line), "     |   └ failed");
+        assert_eq!(line_text(&lines[1].line), "     |   └ tests: failed");
+        assert_eq!(lines[0].line.spans[1].content.as_ref(), "•");
+        assert_eq!(lines[0].line.spans[1].style.fg, Some(COLOR_DANGER));
+    }
+
+    #[test]
+    fn codex_log_entry_lines_colors_tool_bullet_by_state() {
+        let running = CodexLogLine {
+            kind: CodexLogKind::Tool,
+            text: "RUNNING cargo test".to_string(),
+        };
+        let running_lines = codex_log_entry_lines(&running, 80);
+        assert_eq!(running_lines[0].line.spans[1].content.as_ref(), "•");
+        assert_eq!(running_lines[0].line.spans[1].style.fg, Some(COLOR_WARN));
+
+        let ok = CodexLogLine {
+            kind: CodexLogKind::Tool,
+            text: "exec_command_end (exit 0): cargo test\nok".to_string(),
+        };
+        let ok_lines = codex_log_entry_lines(&ok, 80);
+        assert_eq!(ok_lines[0].line.spans[1].content.as_ref(), "•");
+        assert_eq!(ok_lines[0].line.spans[1].style.fg, Some(COLOR_SUCCESS));
     }
 
     #[test]
@@ -3840,8 +3881,8 @@ mod tests {
             .join("\n");
 
         assert!(rendered.contains("OK   | • Ran curl https://example.test"));
-        assert!(rendered.contains("└ 0123456789"));
-        assert!(rendered.contains("..."));
+        assert!(rendered.contains("└ output: 1 line"));
+        assert!(!rendered.contains("└ 0123456789"));
         assert!(!rendered.contains(&"0123456789 ".repeat(25)));
     }
 
@@ -3858,7 +3899,7 @@ mod tests {
         assert_eq!(line_text(&lines[1].line), "     | @@");
         assert_eq!(line_text(&lines[2].line), "     | -old line");
         assert_eq!(line_text(&lines[3].line), "     | +new line");
-        assert_eq!(lines[2].line.spans[1].style.fg, Some(Color::Red));
+        assert_eq!(lines[2].line.spans[1].style.fg, Some(COLOR_DANGER));
         assert_eq!(lines[3].line.spans[1].style.fg, Some(COLOR_SUCCESS));
         assert!(
             !lines[2].line.spans[1]
@@ -3872,10 +3913,7 @@ mod tests {
     fn summarize_tool_display_text_highlights_cargo_test_result() {
         let text = summarize_tool_display_text("cargo test\ntest result: ok. 86 passed; 0 failed;");
 
-        assert_eq!(
-            text,
-            "• Ran cargo test\n  └ tests: test result: ok. 86 passed; 0 failed;"
-        );
+        assert_eq!(text, "• Ran cargo test\n  └ tests: ok");
     }
 
     #[test]
@@ -3884,10 +3922,7 @@ mod tests {
             "cargo fmt -- --check\nDiff in /repo/src/tui/ui.rs:3163:\n-old\n+new",
         );
 
-        assert_eq!(
-            text,
-            "• Ran cargo fmt -- --check\n  └ Diff in /repo/src/tui/ui.rs:3163:  … +2 lines"
-        );
+        assert_eq!(text, "• Ran cargo fmt -- --check\n  └ output: 3 lines");
     }
 
     #[test]
@@ -3899,7 +3934,7 @@ mod tests {
 
         assert_eq!(
             text,
-            "• Ran addness goal get goal-1 --json\n  └ addness: goal: AddnessTUI改善"
+            "• Ran addness goal get goal-1 --json\n  └ addness: goal"
         );
     }
 
@@ -3918,7 +3953,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_decision_banner_uses_clear_yes_no_choices() {
+    fn codex_decision_input_lines_use_clear_yes_no_choices() {
         let decision = CodexDecisionBanner {
             kind: CodexDecisionKind::YesNo,
             message: "続行しますか?".to_string(),
@@ -3928,14 +3963,15 @@ mod tests {
             deny_label: "No",
         };
 
-        let lines = codex_decision_banner_lines(&decision, 80, false)
+        let lines = codex_decision_input_lines(&decision, 80, 2)
             .into_iter()
             .map(|line| line_text(&line))
             .collect::<Vec<_>>();
 
-        assert_eq!(lines[0], "? 続行しますか?");
+        assert_eq!(lines[0], "確認待ち 続行しますか?");
         assert!(lines[1].contains("[Y] Yes"));
         assert!(lines[1].contains("[N] No"));
+        assert!(!lines[1].contains("常に許可"));
     }
 
     #[test]
@@ -3953,6 +3989,89 @@ mod tests {
 
         assert!(text.contains("[A/Y] 承認"));
         assert!(text.contains("[D/N] 拒否"));
+        assert!(text.contains("[L] 常に許可"));
+    }
+
+    #[test]
+    fn codex_decision_title_hint_mentions_always_allow_only_when_available() {
+        let approval = CodexDecisionBanner {
+            kind: CodexDecisionKind::Approval,
+            message: "コマンドを実行しますか?".to_string(),
+            accept_key: 'a',
+            accept_label: "承認",
+            deny_key: 'd',
+            deny_label: "拒否",
+        };
+        let yes_no = CodexDecisionBanner {
+            kind: CodexDecisionKind::YesNo,
+            message: "続行しますか?".to_string(),
+            accept_key: 'y',
+            accept_label: "Yes",
+            deny_key: 'n',
+            deny_label: "No",
+        };
+
+        assert!(codex_decision_title_hint(&approval).contains("l:常に許可"));
+        assert!(!codex_decision_title_hint(&yes_no).contains("常に許可"));
+        assert!(codex_decision_title_hint(&yes_no).contains("y/n"));
+    }
+
+    #[test]
+    fn codex_decision_input_lines_show_prompt_at_input_area() {
+        let decision = CodexDecisionBanner {
+            kind: CodexDecisionKind::Approval,
+            message: "Run cargo test?".to_string(),
+            accept_key: 'a',
+            accept_label: "承認",
+            deny_key: 'd',
+            deny_label: "拒否",
+        };
+
+        let lines = codex_decision_input_lines(&decision, 80, 2);
+
+        assert_eq!(line_text(&lines[0]), "確認待ち: 承認 Run cargo test?");
+        assert!(line_text(&lines[1]).contains("[A/Y] 承認"));
+        assert!(line_text(&lines[1]).contains("[D/N] 拒否"));
+        assert!(line_text(&lines[1]).contains("[L] 常に許可"));
+    }
+
+    #[test]
+    fn compact_codex_decision_input_line_keeps_choices() {
+        let decision = CodexDecisionBanner {
+            kind: CodexDecisionKind::Permission,
+            message: "Need filesystem permission".to_string(),
+            accept_key: 'a',
+            accept_label: "許可",
+            deny_key: 'd',
+            deny_label: "拒否",
+        };
+
+        let lines = codex_decision_input_lines(&decision, 80, 1);
+        let text = line_text(&lines[0]);
+
+        assert!(text.contains("確認待ち: 権限"));
+        assert!(text.contains("[A/Y] 許可"));
+        assert!(text.contains("[D/N] 拒否"));
+        assert!(text.contains("[L] 常に許可"));
+        assert_eq!(lines[0].spans[0].style.fg, Some(COLOR_DANGER));
+    }
+
+    #[test]
+    fn dangerous_codex_decision_omits_always_allow_choice() {
+        let decision = CodexDecisionBanner {
+            kind: CodexDecisionKind::Dangerous,
+            message: "delete files?".to_string(),
+            accept_key: 'a',
+            accept_label: "許可",
+            deny_key: 'd',
+            deny_label: "拒否",
+        };
+
+        let text = line_text(&codex_decision_choice_line(&decision, 80));
+
+        assert!(text.contains("[A/Y] 許可"));
+        assert!(text.contains("[D/N] 拒否"));
+        assert!(!text.contains("常に許可"));
     }
 
     #[test]
@@ -3995,6 +4114,23 @@ mod tests {
                 .add_modifier
                 .contains(Modifier::DIM)
         );
+    }
+
+    #[test]
+    fn event_log_lines_do_not_use_warn_yellow() {
+        let entry = CodexLogLine {
+            kind: CodexLogKind::Event,
+            text: "waiting for approval".to_string(),
+        };
+        let lines = codex_log_entry_lines(&entry, 80);
+        let spans = &lines[0].line.spans;
+
+        assert!(line_text(&lines[0].line).starts_with("INFO | "));
+        assert_ne!(spans[0].style.fg, Some(COLOR_WARN));
+        assert_ne!(spans[1].style.fg, Some(COLOR_WARN));
+        assert_eq!(spans[0].style.fg, Some(COLOR_EVENT));
+        assert!(!spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(spans[1].style.fg, Some(COLOR_EVENT));
     }
 
     #[test]

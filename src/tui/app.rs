@@ -23,7 +23,9 @@ use crate::api::{
 use crate::dbg_log;
 
 use super::codex_memory::{codex_body_update_request, codex_trace_link_label, codex_work_memo};
-use super::codex_pane::{self, CodexPane, CodexWorkSummary, PendingCodexTaskGoal, TerminalNotice};
+use super::codex_pane::{
+    self, ChildGoalUpdate, CodexPane, CodexWorkSummary, PendingCodexTaskGoal, TerminalNotice,
+};
 pub(super) use super::file_picker::PICKER_VISIBLE_ROWS;
 use super::file_picker::{
     FileEntry, FilePickerReturn, complete_path, initial_picker_dir, read_dir_entries,
@@ -639,8 +641,8 @@ struct CodexSnapshot {
     comment_count: Option<usize>,
     deliverable_count: Option<usize>,
     trace_links: Vec<String>,
-    /// 子ゴール一覧（id, タイトル, 状態アイコン）。None=取得失敗。
-    children: Option<Vec<(String, String, &'static str)>>,
+    /// 子ゴール一覧。None=取得失敗。
+    children: Option<Vec<ChildGoalUpdate>>,
 }
 
 /// 実行中の DoD 自動判定（codex exec）ジョブ。
@@ -1901,7 +1903,7 @@ impl App {
             // 子ゴール／コメントの取得は失敗しても本体があれば続行する。
             let (goal_res, children_res, comments_res, deliverables_res) = tokio::join!(
                 client.get_goal(&goal_id),
-                client.get_goal_children(&goal_id, 50, 0),
+                client.get_goal_children_with_completed(&goal_id, 50, 0),
                 client.list_comments(&goal_id),
                 client.get_goal_deliverables(&goal_id),
             );
@@ -1914,10 +1916,15 @@ impl App {
                     .children
                     .into_iter()
                     .map(|c| {
-                        let icon =
-                            GoalDisplayStatus::from_goal_state(c.status.as_ref(), c.is_completed)
-                                .icon();
-                        (c.id, c.title, icon)
+                        let status =
+                            GoalDisplayStatus::from_goal_state(c.status.as_ref(), c.is_completed);
+                        ChildGoalUpdate {
+                            id: c.id,
+                            title: c.title,
+                            icon: status.icon(),
+                            status_label: status.to_emoji_string(),
+                            is_completed: status == GoalDisplayStatus::Completed,
+                        }
                     })
                     .collect::<Vec<_>>()
             });

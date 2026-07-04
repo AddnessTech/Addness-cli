@@ -167,8 +167,19 @@ pub struct ChildGoal {
     pub id: String,
     pub title: String,
     pub icon: &'static str,
+    pub status_label: String,
+    pub is_completed: bool,
     /// 新着ハイライトの有効期限（None=通常表示）。
     pub new_until: Option<Instant>,
+}
+
+/// Addness 側から取得した子ゴール更新情報。
+pub struct ChildGoalUpdate {
+    pub id: String,
+    pub title: String,
+    pub icon: &'static str,
+    pub status_label: String,
+    pub is_completed: bool,
 }
 
 /// ホスト側 TUI が端末へ通知すべき Codex イベント。
@@ -261,6 +272,28 @@ impl CodexDecisionBanner {
                 deny_key: 'n',
                 deny_label: "No",
             },
+        }
+    }
+
+    pub fn always_choice(&self) -> Option<(char, &'static str)> {
+        match self.kind {
+            CodexDecisionKind::Approval | CodexDecisionKind::Permission => Some(('l', "常に許可")),
+            CodexDecisionKind::Dangerous | CodexDecisionKind::YesNo => None,
+        }
+    }
+
+    fn response_label_for_key(&self, ch: char) -> Option<&'static str> {
+        if ch == self.accept_key || ch == 'y' {
+            Some(self.accept_label)
+        } else if ch == self.deny_key || ch == 'n' {
+            Some(self.deny_label)
+        } else if self
+            .always_choice()
+            .is_some_and(|(key, _)| ch == key.to_ascii_lowercase())
+        {
+            self.always_choice().map(|(_, label)| label)
+        } else {
+            None
         }
     }
 }
@@ -794,13 +827,7 @@ impl CodexPane {
             return false;
         };
         let ch = ch.to_ascii_lowercase();
-        let response = if ch == decision.accept_key || ch == 'y' {
-            Some(decision.accept_label)
-        } else if ch == decision.deny_key || ch == 'n' {
-            Some(decision.deny_label)
-        } else {
-            None
-        };
+        let response = decision.response_label_for_key(ch);
         let Some(response) = response else {
             return false;
         };
@@ -1033,20 +1060,22 @@ impl CodexPane {
 
     /// 子ゴールのライブリストを差し替える。新規 ID は一定時間ハイライトする。
     /// 初回（既存が空）の取得では全件を新着扱いしない。
-    pub fn update_children(&mut self, incoming: Vec<(String, String, &'static str)>) {
+    pub fn update_children(&mut self, incoming: Vec<ChildGoalUpdate>) {
         let had_any = !self.children.is_empty();
         let old_ids: std::collections::HashSet<String> =
             self.children.iter().map(|c| c.id.clone()).collect();
         let new_until = Instant::now() + std::time::Duration::from_secs(4);
         self.children = incoming
             .into_iter()
-            .map(|(id, title, icon)| {
-                let is_new = had_any && !old_ids.contains(&id);
+            .map(|child| {
+                let is_new = had_any && !old_ids.contains(&child.id);
                 ChildGoal {
                     new_until: is_new.then_some(new_until),
-                    id,
-                    title,
-                    icon,
+                    id: child.id,
+                    title: child.title,
+                    icon: child.icon,
+                    status_label: child.status_label,
+                    is_completed: child.is_completed,
                 }
             })
             .collect();
@@ -1117,7 +1146,7 @@ impl CodexPane {
         self.persist_raw_event("stdout", trimmed);
         match serde_json::from_str::<Value>(trimmed) {
             Ok(value) => self.handle_json_event(value),
-            Err(_) => self.push_log(CodexLogKind::Event, trimmed.to_string()),
+            Err(_) => self.push_log(CodexLogKind::Event, format!("Codex 出力: {trimmed}")),
         }
     }
 
@@ -1134,7 +1163,7 @@ impl CodexPane {
         if let Some(decision) = decision_banner("stderr", Some(trimmed)) {
             self.set_pending_decision(decision);
         }
-        self.push_log(CodexLogKind::Event, trimmed.to_string());
+        self.push_log(CodexLogKind::Event, format!("Codex 通知: {trimmed}"));
     }
 
     fn handle_json_event(&mut self, value: Value) {
@@ -1235,7 +1264,7 @@ impl CodexPane {
         if event_type.contains("message") || event_type.contains("output_text") {
             let text = first_text_field(value).unwrap_or_default();
             if text.is_empty() {
-                self.push_log(CodexLogKind::Event, event_type.to_string());
+                return;
             } else if event_type.contains("delta") {
                 self.append_assistant_delta(&text);
             } else {
@@ -1250,7 +1279,9 @@ impl CodexPane {
             || event_type.contains("function")
             || event_type.contains("mcp")
         {
-            let text = first_text_field(value).unwrap_or_else(|| event_type.to_string());
+            let Some(text) = first_text_field(value).filter(|text| !text.is_empty()) else {
+                return;
+            };
             if is_tool_completion_event(event_type) {
                 self.current_command = None;
                 self.current_command_started_at = None;
@@ -1259,18 +1290,23 @@ impl CodexPane {
                 self.current_command_started_at = Some(Instant::now());
             }
             self.refresh_action_from_text(&text);
-            self.push_log(CodexLogKind::Tool, format!("{event_type}: {text}"));
+            self.push_log(
+                CodexLogKind::Tool,
+                format!("{} {text}", generic_tool_state_label(event_type)),
+            );
             return;
         }
 
         if let Some(text) = first_text_field(value)
             && !text.is_empty()
         {
-            self.push_log(CodexLogKind::Event, format!("{event_type}: {text}"));
+            self.push_log(CodexLogKind::Event, text);
             return;
         }
 
-        self.push_log(CodexLogKind::Event, event_type.to_string());
+        if let Some(label) = generic_event_label(event_type) {
+            self.push_log(CodexLogKind::Event, label.to_string());
+        }
     }
 
     fn refresh_action_from_text(&mut self, text: &str) {
@@ -2411,35 +2447,11 @@ fn tool_display(event_type: &str, value: &Value) -> Option<ToolDisplay> {
     }
 
     let name = tool_name(value).unwrap_or_else(|| event_type.to_string());
-    let display_name = tool_display_name(event_type, &name);
     let command = command_text(value).map(|text| compact_tool_text(&text));
     let output = tool_output_text(value).map(|text| compact_tool_text(&text));
     let exit_code = scalar_field_text(value, &["exit_code", "exitCode"]);
-    let duration = scalar_field_text(value, &["duration", "duration_ms", "durationMs"]);
-    let cwd = scalar_field_text(value, &["cwd", "workdir", "working_directory", "codex_cwd"]);
 
-    let mut attrs = Vec::new();
-    if let Some(exit_code) = exit_code.as_deref() {
-        attrs.push(format!("exit {exit_code}"));
-    }
-    if let Some(duration) = duration.as_deref() {
-        attrs.push(format!("duration {duration}"));
-    }
-
-    let suffix = if attrs.is_empty() {
-        String::new()
-    } else {
-        format!(" ({})", attrs.join(", "))
-    };
-
-    let Some(primary) = command.as_deref().or(output.as_deref()) else {
-        return Some(ToolDisplay {
-            label: format!("{display_name}{suffix}"),
-            action_text: None,
-            command_text: None,
-            output_text: None,
-        });
-    };
+    let primary = command.as_deref().or(output.as_deref())?;
 
     let is_code_edit = is_code_edit_tool(event_type, &name, command.as_deref(), output.as_deref());
     let state = tool_state_label(
@@ -2449,18 +2461,6 @@ fn tool_display(event_type: &str, value: &Value) -> Option<ToolDisplay> {
         is_code_edit,
     );
     let mut label = format!("{state} {primary}");
-    if !display_name.is_empty() && !primary.contains(&display_name) {
-        label.push_str(&format!("  [{display_name}]"));
-    }
-    if !suffix.is_empty() {
-        label.push_str(&suffix);
-    }
-    if let Some(cwd) = cwd.as_deref()
-        && !cwd.is_empty()
-        && command.is_some()
-    {
-        label.push_str(&format!("  [cwd: {cwd}]"));
-    }
     if let (Some(command), Some(output)) = (command.as_deref(), output.as_deref())
         && !output.is_empty()
         && output != command
@@ -2549,11 +2549,25 @@ fn is_tool_completion_event(event_type: &str) -> bool {
         || event_type.contains("result")
 }
 
-fn tool_display_name(event_type: &str, name: &str) -> String {
-    if event_type == "response_item" || event_type == "event" || event_type == name {
-        name.to_string()
+fn generic_tool_state_label(event_type: &str) -> &'static str {
+    let lower = event_type.to_ascii_lowercase();
+    if lower.contains("failed") || lower.contains("error") {
+        "FAIL"
+    } else if is_tool_completion_event(event_type) {
+        "OK"
     } else {
-        format!("{event_type}/{name}")
+        "RUNNING"
+    }
+}
+
+fn generic_event_label(event_type: &str) -> Option<&'static str> {
+    let lower = event_type.to_ascii_lowercase();
+    if lower.contains("approval") || lower.contains("confirm") {
+        Some("確認待ち")
+    } else if lower.contains("failed") || lower.contains("error") {
+        Some("Codex エラー")
+    } else {
+        None
     }
 }
 
@@ -3200,6 +3214,29 @@ mod tests {
     }
 
     #[test]
+    fn decision_key_accepts_always_allow_choice() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.finished = false;
+        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
+        pane.handle_stdout_line(
+            r#"{"type":"permission_requested","message":"Need filesystem permission"}"#,
+        );
+
+        let banner = pane.decision_banner().unwrap();
+        assert_eq!(banner.always_choice(), Some(('l', "常に許可")));
+
+        assert!(pane.handle_decision_key(key(KeyCode::Char('l'))));
+
+        assert!(pane.decision_banner().is_none());
+        assert_eq!(pane.action.as_deref(), Some("確認応答: 常に許可"));
+        assert!(
+            pane.activity
+                .iter()
+                .any(|line| line.contains("確認待ちに 常に許可 で応答"))
+        );
+    }
+
+    #[test]
     fn old_turns_are_collapsed_until_toggled_open() {
         let mut pane = CodexPane::test_with_output(8, 80, 0, "");
         pane.finished = false;
@@ -3214,7 +3251,7 @@ mod tests {
             .iter()
             .map(|line| line.text.as_str())
             .collect::<Vec<_>>();
-        assert!(collapsed.contains(&"Turn 1"));
+        assert!(collapsed.iter().any(|text| text.starts_with("Turn 1")));
         assert!(!collapsed.contains(&"old response"));
         assert!(collapsed.contains(&"new response"));
 
@@ -3363,9 +3400,9 @@ mod tests {
 
         let line = pane.log.last().unwrap();
         assert_eq!(line.kind, CodexLogKind::Tool);
-        assert!(line.text.contains("exec_command"));
+        assert!(!line.text.contains("exec_command"));
         assert!(line.text.contains("cargo test"));
-        assert!(line.text.contains("/repo"));
+        assert!(!line.text.contains("/repo"));
     }
 
     #[test]
@@ -3388,9 +3425,9 @@ mod tests {
 
         let line = pane.log.last().unwrap();
         assert_eq!(line.kind, CodexLogKind::Tool);
-        assert!(line.text.contains("exec_command_begin"));
+        assert!(!line.text.contains("exec_command_begin"));
         assert!(line.text.contains("cargo check"));
-        assert!(line.text.contains("/repo"));
+        assert!(!line.text.contains("/repo"));
         assert_eq!(pane.current_command(), Some("cargo check"));
     }
 
@@ -3416,11 +3453,47 @@ mod tests {
 
         let line = pane.log.last().unwrap();
         assert_eq!(line.kind, CodexLogKind::Tool);
-        assert!(line.text.contains("exec_command_end"));
-        assert!(line.text.contains("exit 0"));
+        assert!(!line.text.contains("exec_command_end"));
+        assert!(!line.text.contains("exit 0"));
         assert!(line.text.contains("cargo check"));
         assert!(line.text.contains("Finished dev profile"));
         assert_eq!(pane.current_command(), None);
+    }
+
+    #[test]
+    fn internal_item_completed_event_is_not_logged() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.handle_stdout_line(r#"{"type":"item.completed"}"#);
+
+        assert!(pane.log.is_empty());
+    }
+
+    #[test]
+    fn generic_text_event_hides_internal_event_type() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.handle_stdout_line(r#"{"type":"item.completed","message":"処理を完了しました"}"#);
+
+        let line = pane.log.last().unwrap();
+        assert_eq!(line.kind, CodexLogKind::Event);
+        assert_eq!(line.text, "処理を完了しました");
+    }
+
+    #[test]
+    fn update_children_preserves_completed_status() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+
+        pane.update_children(vec![ChildGoalUpdate {
+            id: "goal-1".to_string(),
+            title: "完了済みの子ゴール".to_string(),
+            icon: "[x]",
+            status_label: "完了".to_string(),
+            is_completed: true,
+        }]);
+
+        assert_eq!(pane.children.len(), 1);
+        assert_eq!(pane.children[0].icon, "[x]");
+        assert_eq!(pane.children[0].status_label, "完了");
+        assert!(pane.children[0].is_completed);
     }
 
     #[test]

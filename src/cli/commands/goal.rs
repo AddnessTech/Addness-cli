@@ -4,7 +4,7 @@ use clap::Subcommand;
 
 use crate::api::{
     ApiClient, ApiResponse, Comment, CreateGoalRequest, Deliverable, DeliverableType, Goal,
-    GoalStatus, GoalTreeData, GoalTreeItem, UpdateGoalRequest,
+    GoalStatus, GoalTreeData, GoalTreeItem, RelatedFetchError, UpdateGoalRequest,
 };
 use crate::cli::commands::org::resolve_org_id;
 use crate::cli::output::{
@@ -35,6 +35,37 @@ fn normalize_due_date(input: &str) -> Result<String> {
     let date = NaiveDate::parse_from_str(input, "%Y-%m-%d")
         .map_err(|_| anyhow::anyhow!("--due-date must be YYYY-MM-DD or RFC3339"))?;
     Ok(format!("{}T00:00:00Z", date.format("%Y-%m-%d")))
+}
+
+fn related_fetch_error_message(errors: &[RelatedFetchError]) -> String {
+    let details = errors
+        .iter()
+        .map(|error| format!("{} for {}: {}", error.kind, error.goal_id, error.message))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("Failed to fetch related goal data:\n{details}")
+}
+
+fn handle_related_fetch_errors(strict: bool, errors: Vec<RelatedFetchError>) -> Result<()> {
+    if errors.is_empty() {
+        return Ok(());
+    }
+
+    if strict {
+        bail!("{}", related_fetch_error_message(&errors));
+    }
+
+    for error in errors {
+        eprintln!(
+            "Warning: failed to fetch {} for {}: {}",
+            error.kind, error.goal_id, error.message
+        );
+    }
+    Ok(())
+}
+
+fn should_fetch_child_related(json: bool, include_related: bool) -> bool {
+    json || include_related
 }
 
 #[derive(Subcommand)]
@@ -70,6 +101,9 @@ pub enum GoalCommands {
         /// With comments information
         #[arg(long)]
         with_comment: bool,
+        /// Fail when child deliverables/comments cannot be fetched
+        #[arg(long)]
+        strict_related_fetch: bool,
     },
     /// List children of a goal
     Children {
@@ -103,6 +137,9 @@ pub enum GoalCommands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+        /// Fail when sibling deliverables cannot be fetched
+        #[arg(long)]
+        strict_related_fetch: bool,
     },
     /// Search goals by keyword
     Search {
@@ -389,7 +426,11 @@ impl GoalNode {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_due_date;
+    use super::{
+        handle_related_fetch_errors, normalize_due_date, related_fetch_error_message,
+        should_fetch_child_related,
+    };
+    use crate::api::RelatedFetchError;
 
     #[test]
     fn normalize_due_date_accepts_yyyy_mm_dd() {
@@ -413,6 +454,43 @@ mod tests {
         assert!(normalize_due_date("Tomorrow").is_err());
         assert!(normalize_due_date("2026-13-99T99:99:99Z").is_err());
         assert!(normalize_due_date("2026-07-01T12:30:00").is_err());
+    }
+
+    #[test]
+    fn related_fetch_error_message_lists_each_failure() {
+        let errors = vec![RelatedFetchError {
+            kind: "deliverables",
+            goal_id: "goal-1".to_string(),
+            message: "network error".to_string(),
+        }];
+
+        assert_eq!(
+            related_fetch_error_message(&errors),
+            "Failed to fetch related goal data:\ndeliverables for goal-1: network error"
+        );
+    }
+
+    #[test]
+    fn related_fetch_errors_only_fail_in_strict_mode() {
+        let errors = vec![RelatedFetchError {
+            kind: "comments",
+            goal_id: "goal-2".to_string(),
+            message: "forbidden".to_string(),
+        }];
+
+        assert!(handle_related_fetch_errors(false, errors.clone()).is_ok());
+        assert!(handle_related_fetch_errors(true, errors).is_err());
+    }
+
+    #[test]
+    fn child_related_fetch_preserves_json_compatibility() {
+        assert!(should_fetch_child_related(true, false));
+    }
+
+    #[test]
+    fn child_related_fetch_for_human_output_requires_flag() {
+        assert!(should_fetch_child_related(false, true));
+        assert!(!should_fetch_child_related(false, false));
     }
 }
 
@@ -571,6 +649,7 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
             json,
             with_deliverable,
             with_comment,
+            strict_related_fetch,
         } => {
             // id で指定されたゴール自身の情報を取得
             let resp: ApiResponse<Goal> = client.get_goal(id).await?;
@@ -594,22 +673,36 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
                 .filter(|item| item.id != *id)
                 .collect();
 
-            let children_deliverables = client
-                .get_deliverables_map(
-                    &subtree_items
-                        .iter()
-                        .map(|g| g.id.as_str())
-                        .collect::<Vec<_>>(),
-                )
-                .await;
-            let children_comments = client
-                .get_comments_map(
-                    &subtree_items
-                        .iter()
-                        .map(|g| g.id.as_str())
-                        .collect::<Vec<_>>(),
-                )
-                .await;
+            let subtree_ids = subtree_items
+                .iter()
+                .map(|g| g.id.as_str())
+                .collect::<Vec<_>>();
+
+            let mut related_errors = Vec::new();
+
+            let children_deliverables = if should_fetch_child_related(*json, *with_deliverable) {
+                if *strict_related_fetch {
+                    let (map, errors) = client.get_deliverables_map_with_errors(&subtree_ids).await;
+                    related_errors.extend(errors);
+                    map
+                } else {
+                    client.get_deliverables_map(&subtree_ids).await
+                }
+            } else {
+                HashMap::new()
+            };
+            let children_comments = if should_fetch_child_related(*json, *with_comment) {
+                if *strict_related_fetch {
+                    let (map, errors) = client.get_comments_map_with_errors(&subtree_ids).await;
+                    related_errors.extend(errors);
+                    map
+                } else {
+                    client.get_comments_map(&subtree_ids).await
+                }
+            } else {
+                HashMap::new()
+            };
+            handle_related_fetch_errors(true, related_errors)?;
 
             // 階層構造を構成
             let goal_tree = GoalNode::build_tree(
@@ -656,7 +749,12 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
             }
             Ok(())
         }
-        GoalCommands::Siblings { id, limit, json } => {
+        GoalCommands::Siblings {
+            id,
+            limit,
+            json,
+            strict_related_fetch,
+        } => {
             // 1. 対象ゴールの詳細を取得して親IDを得る
             let goal_resp: ApiResponse<Goal> = client.get_goal(id).await?;
             let parent_id = match &goal_resp.data.parent_id {
@@ -689,9 +787,15 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
                 return Ok(());
             }
 
-            let deliverables_map = client
-                .get_deliverables_map(&siblings.iter().map(|g| g.id.as_str()).collect::<Vec<_>>())
-                .await;
+            let sibling_ids = siblings.iter().map(|g| g.id.as_str()).collect::<Vec<_>>();
+            let deliverables_map = if *strict_related_fetch {
+                let (deliverables_map, deliverable_errors) =
+                    client.get_deliverables_map_with_errors(&sibling_ids).await;
+                handle_related_fetch_errors(true, deliverable_errors)?;
+                deliverables_map
+            } else {
+                client.get_deliverables_map(&sibling_ids).await
+            };
 
             if *json {
                 print_goals_with_deliverables_json(&siblings, &deliverables_map)?;

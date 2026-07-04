@@ -135,6 +135,161 @@ enum Commands {
     },
 }
 
+impl Cli {
+    fn should_check_for_update(&self) -> bool {
+        match &self.command {
+            Some(Commands::Completions { .. }) => false,
+            Some(command) => !command_outputs_json(command),
+            None => true,
+        }
+    }
+}
+
+fn command_outputs_json(command: &Commands) -> bool {
+    match command {
+        Commands::Status { json }
+        | Commands::Summary { json, .. }
+        | Commands::DetectGoal { json } => *json,
+        Commands::Org { command } => org_outputs_json(command),
+        Commands::Goal { command } => goal_outputs_json(command),
+        Commands::Comment { command } => comment_outputs_json(command),
+        Commands::Link { command } => link_outputs_json(command),
+        Commands::Deliverable { command } => deliverable_outputs_json(command),
+        Commands::Assignment { command } => assignment_outputs_json(command),
+        Commands::Kpi { command } => kpi_outputs_json(command),
+        Commands::Member { command } => member_outputs_json(command),
+        Commands::Notification { command } => notification_outputs_json(command),
+        Commands::Invitation { command } => invitation_outputs_json(command),
+        Commands::Today { command } => command.as_ref().is_some_and(today_outputs_json),
+        Commands::Login { .. }
+        | Commands::Configure
+        | Commands::Logout
+        | Commands::Update { .. }
+        | Commands::Skills
+        | Commands::Completions { .. } => false,
+    }
+}
+
+fn org_outputs_json(command: &org::OrgCommands) -> bool {
+    match command {
+        org::OrgCommands::List { json }
+        | org::OrgCommands::Current { json }
+        | org::OrgCommands::Create { json, .. }
+        | org::OrgCommands::Update { json, .. }
+        | org::OrgCommands::SetContext { json, .. } => *json,
+        org::OrgCommands::Switch { .. } | org::OrgCommands::Rm { .. } => false,
+    }
+}
+
+fn goal_outputs_json(command: &goal::GoalCommands) -> bool {
+    match command {
+        goal::GoalCommands::List { json, .. }
+        | goal::GoalCommands::Get { json, .. }
+        | goal::GoalCommands::Children { json, .. }
+        | goal::GoalCommands::Tree { json, .. }
+        | goal::GoalCommands::Siblings { json, .. }
+        | goal::GoalCommands::Search { json, .. }
+        | goal::GoalCommands::Create { json, .. }
+        | goal::GoalCommands::Update { json, .. }
+        | goal::GoalCommands::Delete { json, .. }
+        | goal::GoalCommands::Archive { json, .. }
+        | goal::GoalCommands::Unarchive { json, .. }
+        | goal::GoalCommands::Restore { json, .. }
+        | goal::GoalCommands::Duplicate { json, .. }
+        | goal::GoalCommands::Move { json, .. } => *json,
+        goal::GoalCommands::Share { command } => match command {
+            goal::ShareCommands::Create { json, .. } => *json,
+            goal::ShareCommands::Revoke { .. } => false,
+        },
+        goal::GoalCommands::Alias { command } => match command {
+            goal::AliasCommands::Add { json, .. } => *json,
+            goal::AliasCommands::Rm { .. } | goal::AliasCommands::Reorder { .. } => false,
+        },
+    }
+}
+
+fn comment_outputs_json(command: &comment::CommentCommands) -> bool {
+    match command {
+        comment::CommentCommands::List { json, .. }
+        | comment::CommentCommands::Get { json, .. }
+        | comment::CommentCommands::Create { json, .. }
+        | comment::CommentCommands::Update { json, .. }
+        | comment::CommentCommands::Resolve { json, .. }
+        | comment::CommentCommands::Unresolve { json, .. } => *json,
+        comment::CommentCommands::Delete { .. }
+        | comment::CommentCommands::React { .. }
+        | comment::CommentCommands::Attachment { .. } => false,
+    }
+}
+
+fn link_outputs_json(command: &link::LinkCommands) -> bool {
+    match command {
+        link::LinkCommands::Pr { json, .. } | link::LinkCommands::Progress { json, .. } => *json,
+    }
+}
+
+fn deliverable_outputs_json(command: &deliverable::DeliverableCommands) -> bool {
+    match command {
+        deliverable::DeliverableCommands::Add { json, .. }
+        | deliverable::DeliverableCommands::List { json, .. }
+        | deliverable::DeliverableCommands::Update { json, .. }
+        | deliverable::DeliverableCommands::Rename { json, .. }
+        | deliverable::DeliverableCommands::Move { json, .. }
+        | deliverable::DeliverableCommands::BatchMove { json, .. } => *json,
+        deliverable::DeliverableCommands::Rm { .. }
+        | deliverable::DeliverableCommands::BatchRm { .. } => false,
+    }
+}
+
+fn assignment_outputs_json(command: &assignment::AssignmentCommands) -> bool {
+    match command {
+        assignment::AssignmentCommands::Add { json, .. }
+        | assignment::AssignmentCommands::Update { json, .. }
+        | assignment::AssignmentCommands::Transfer { json, .. } => *json,
+        assignment::AssignmentCommands::Rm { .. } => false,
+    }
+}
+
+fn kpi_outputs_json(command: &kpi::KpiCommands) -> bool {
+    match command {
+        kpi::KpiCommands::Add { json, .. } | kpi::KpiCommands::Update { json, .. } => *json,
+        kpi::KpiCommands::Rm { .. } => false,
+    }
+}
+
+fn member_outputs_json(command: &member::MemberCommands) -> bool {
+    matches!(command, member::MemberCommands::List { json: true, .. })
+}
+
+fn notification_outputs_json(command: &notification::NotificationCommands) -> bool {
+    match command {
+        notification::NotificationCommands::Send { json, .. } => *json,
+    }
+}
+
+fn invitation_outputs_json(command: &invitation::InvitationCommands) -> bool {
+    match command {
+        invitation::InvitationCommands::Create { json, .. }
+        | invitation::InvitationCommands::Resend { json, .. }
+        | invitation::InvitationCommands::Accept { json, .. } => *json,
+        invitation::InvitationCommands::Link { command } => match command {
+            invitation::InviteLinkCommands::Create { json, .. } => *json,
+            invitation::InviteLinkCommands::Deactivate { .. } => false,
+        },
+        invitation::InvitationCommands::Revoke { .. } => false,
+    }
+}
+
+fn today_outputs_json(command: &today::TodayCommands) -> bool {
+    match command {
+        today::TodayCommands::List { json, .. }
+        | today::TodayCommands::Add { json, .. }
+        | today::TodayCommands::Done { json, .. }
+        | today::TodayCommands::Reopen { json, .. }
+        | today::TodayCommands::Status { json, .. } => *json,
+    }
+}
+
 fn build_client() -> Result<ApiClient> {
     let creds = Credentials::load()?;
     let settings = Settings::load()?;
@@ -190,7 +345,9 @@ fn build_client_for_org_commands() -> Result<ApiClient> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let update_handle = tokio::spawn(update_check::check_for_update());
+    let update_handle = cli
+        .should_check_for_update()
+        .then(|| tokio::spawn(update_check::check_for_update()));
 
     let result = match &cli.command {
         None => {
@@ -266,7 +423,67 @@ async fn main() -> Result<()> {
         }
     };
 
-    let _ = update_handle.await;
+    if let Some(handle) = update_handle {
+        let _ = handle.await;
+    }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_check_runs_for_tui_and_human_commands() {
+        assert!(Cli { command: None }.should_check_for_update());
+        assert!(
+            Cli {
+                command: Some(Commands::Status { json: false })
+            }
+            .should_check_for_update()
+        );
+        assert!(
+            Cli {
+                command: Some(Commands::Today { command: None })
+            }
+            .should_check_for_update()
+        );
+    }
+
+    #[test]
+    fn update_check_skips_json_commands() {
+        assert!(
+            !Cli {
+                command: Some(Commands::Status { json: true })
+            }
+            .should_check_for_update()
+        );
+        assert!(
+            !Cli {
+                command: Some(Commands::Goal {
+                    command: goal::GoalCommands::List {
+                        org: None,
+                        depth: 3,
+                        assigned_to: None,
+                        status: None,
+                        json: true,
+                    }
+                })
+            }
+            .should_check_for_update()
+        );
+    }
+
+    #[test]
+    fn update_check_skips_completions() {
+        assert!(
+            !Cli {
+                command: Some(Commands::Completions {
+                    shell: clap_complete::Shell::Bash,
+                })
+            }
+            .should_check_for_update()
+        );
+    }
 }

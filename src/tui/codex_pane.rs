@@ -6,7 +6,7 @@
 //! 2 ターン目以降は `codex exec resume <thread_id> --json` で同じ Codex セッションを
 //! 継続する。
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -176,6 +176,93 @@ pub struct TerminalNotice {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexRunState {
+    InputWaiting,
+    Thinking,
+    CommandRunning,
+    Confirming,
+    Completed,
+}
+
+impl CodexRunState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::InputWaiting => "入力待ち",
+            Self::Thinking => "考え中",
+            Self::CommandRunning => "コマンド実行中",
+            Self::Confirming => "確認待ち",
+            Self::Completed => "完了",
+        }
+    }
+
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::InputWaiting => "READY",
+            Self::Thinking => "THINK",
+            Self::CommandRunning => "RUN",
+            Self::Confirming => "WAIT",
+            Self::Completed => "DONE",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodexDecisionKind {
+    Approval,
+    Permission,
+    Dangerous,
+    YesNo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexDecisionBanner {
+    pub kind: CodexDecisionKind,
+    pub message: String,
+    pub accept_key: char,
+    pub accept_label: &'static str,
+    pub deny_key: char,
+    pub deny_label: &'static str,
+}
+
+impl CodexDecisionBanner {
+    fn new(kind: CodexDecisionKind, message: String) -> Self {
+        match kind {
+            CodexDecisionKind::Approval => Self {
+                kind,
+                message,
+                accept_key: 'a',
+                accept_label: "承認",
+                deny_key: 'd',
+                deny_label: "拒否",
+            },
+            CodexDecisionKind::Permission | CodexDecisionKind::Dangerous => Self {
+                kind,
+                message,
+                accept_key: 'a',
+                accept_label: "許可",
+                deny_key: 'd',
+                deny_label: "拒否",
+            },
+            CodexDecisionKind::YesNo => Self {
+                kind,
+                message,
+                accept_key: 'y',
+                accept_label: "Yes",
+                deny_key: 'n',
+                deny_label: "No",
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CodexWorkSummary {
+    pub implemented: Vec<String>,
+    pub checks: Vec<String>,
+    pub remaining: Vec<String>,
+}
+
 /// 埋め込み codex セッションの状態。
 pub struct CodexPane {
     codex_bin: PathBuf,
@@ -217,9 +304,12 @@ pub struct CodexPane {
     pub action: Option<String>,
     /// codex が現在実行中として報告したコマンド。
     current_command: Option<String>,
+    current_command_started_at: Option<Instant>,
     /// Addness をメモリとして使っているかを左ペインで示すための最終読込/書込時刻。
     pub last_addness_read_at: Option<Instant>,
     pub last_addness_write_at: Option<Instant>,
+    pub last_addness_read_label: Option<String>,
+    pub last_addness_write_label: Option<String>,
     /// ステータス・DoD が変化した時刻（変化行を数秒ハイライトするのに使う）。
     pub status_changed_at: Option<Instant>,
     pub dod_changed_at: Option<Instant>,
@@ -234,10 +324,14 @@ pub struct CodexPane {
     /// 最初の実依頼の body 自動記録を済み（再試行しない）とするフラグ。
     body_record_done: bool,
     input_state: CodexInputState,
+    queued_prompts: VecDeque<String>,
     /// `codex exec --json` が返した Codex thread id。2ターン目以降の resume に使う。
     thread_id: Option<String>,
+    /// いま実行中のターンに対応するユーザー入力。turn.started の見出しに使う。
+    current_turn_prompt: Option<String>,
     /// Codex の turn 番号。UI上の区切りに使う。
     turn_count: usize,
+    collapsed_turns: BTreeSet<usize>,
     /// Addness 側で保持する会話・イベント履歴。
     log: Vec<CodexLogLine>,
     /// Addness 側で永続化する codex exec JSONL/UI 履歴。
@@ -258,6 +352,7 @@ pub struct CodexPane {
     search_query: String,
     /// 検索入力中か。
     search_editing: bool,
+    pending_decision: Option<CodexDecisionBanner>,
 }
 
 impl CodexPane {
@@ -315,6 +410,7 @@ impl CodexPane {
             .iter()
             .filter(|line| line.kind == CodexLogKind::Turn)
             .count();
+        let collapsed_turns = (1..turn_count).collect::<BTreeSet<_>>();
 
         let mut pane = Self {
             codex_bin: codex_bin.to_path_buf(),
@@ -340,8 +436,11 @@ impl CodexPane {
             children: Vec::new(),
             action: None,
             current_command: None,
+            current_command_started_at: None,
             last_addness_read_at: None,
             last_addness_write_at: None,
+            last_addness_read_label: None,
+            last_addness_write_label: None,
             status_changed_at: None,
             dod_changed_at: None,
             scrollback: 0,
@@ -350,8 +449,11 @@ impl CodexPane {
             auto_record_attempted: false,
             body_record_done: false,
             input_state: CodexInputState::default(),
+            queued_prompts: VecDeque::new(),
             thread_id: None,
+            current_turn_prompt: None,
             turn_count,
+            collapsed_turns,
             log: loaded.log,
             session_log_path,
             session_record_count: loaded.record_count,
@@ -362,6 +464,7 @@ impl CodexPane {
             log_filter: CodexLogFilter::All,
             search_query: String::new(),
             search_editing: false,
+            pending_decision: None,
             dod,
         };
         if pane.loaded_history_count > 0 {
@@ -409,6 +512,8 @@ impl CodexPane {
         pane.log_filter = CodexLogFilter::All;
         pane.search_query.clear();
         pane.search_editing = false;
+        pane.collapsed_turns.clear();
+        pane.pending_decision = None;
         for line in output.lines() {
             pane.push_log(CodexLogKind::Assistant, line.to_string());
         }
@@ -439,27 +544,148 @@ impl CodexPane {
     }
 
     pub fn is_turn_running(&self) -> bool {
-        self.turn_running
+        self.turn_running || self.child.is_some()
+    }
+
+    pub fn run_state(&self) -> CodexRunState {
+        if self.finished {
+            CodexRunState::Completed
+        } else if self.pending_decision.is_some() {
+            CodexRunState::Confirming
+        } else if self.current_command.is_some() {
+            CodexRunState::CommandRunning
+        } else if self.is_turn_running() {
+            CodexRunState::Thinking
+        } else {
+            CodexRunState::InputWaiting
+        }
     }
 
     pub fn current_command(&self) -> Option<&str> {
         self.current_command.as_deref()
     }
 
+    pub fn current_command_elapsed_secs(&self) -> Option<u64> {
+        self.current_command_started_at
+            .map(|t| t.elapsed().as_secs())
+    }
+
     pub fn thread_id(&self) -> Option<&str> {
         self.thread_id.as_deref()
+    }
+
+    pub fn turn_count(&self) -> usize {
+        self.turn_count
+    }
+
+    pub fn collapsed_turn_count(&self) -> usize {
+        self.collapsed_turns.len()
+    }
+
+    pub fn decision_banner(&self) -> Option<&CodexDecisionBanner> {
+        self.pending_decision.as_ref()
+    }
+
+    pub fn last_assistant_text(&self) -> Option<&str> {
+        self.log
+            .iter()
+            .rev()
+            .find(|line| line.kind == CodexLogKind::Assistant)
+            .map(|line| line.text.as_str())
     }
 
     pub fn input_line(&self) -> &str {
         &self.input_state.line
     }
 
+    pub fn queued_prompt_count(&self) -> usize {
+        self.queued_prompts.len()
+    }
+
     pub fn filtered_log_lines(&self) -> Vec<&CodexLogLine> {
         let query = self.normalized_search_query();
-        self.log
-            .iter()
-            .filter(|line| self.log_line_visible(line, &query))
-            .collect()
+        let collapse_turns = query.is_empty()
+            && matches!(
+                self.log_filter,
+                CodexLogFilter::All | CodexLogFilter::Conversation
+            );
+        let mut current_collapsed_turn = None;
+        let mut visible = Vec::new();
+        for line in &self.log {
+            if line.kind == CodexLogKind::Turn {
+                current_collapsed_turn = turn_number_from_label(&line.text)
+                    .filter(|n| collapse_turns && self.collapsed_turns.contains(n));
+                if self.log_line_visible(line, &query) {
+                    visible.push(line);
+                }
+                continue;
+            }
+            if current_collapsed_turn.is_some() {
+                continue;
+            }
+            if self.log_line_visible(line, &query) {
+                visible.push(line);
+            }
+        }
+        visible
+    }
+
+    pub fn toggle_old_turns_collapsed(&mut self) {
+        if self.collapsed_turns.is_empty() {
+            self.collapse_completed_turns();
+        } else {
+            self.collapsed_turns.clear();
+        }
+        self.invalidate_rendered_history_metrics();
+        self.scrollback = self.scrollback.min(self.max_view_scrollback());
+    }
+
+    fn collapse_completed_turns(&mut self) {
+        self.collapsed_turns.clear();
+        let keep_open = if self.turn_running {
+            self.turn_count
+        } else {
+            self.turn_count.saturating_add(1)
+        };
+        for turn in 1..keep_open {
+            self.collapsed_turns.insert(turn);
+        }
+    }
+
+    pub fn work_summary(&self) -> CodexWorkSummary {
+        CodexWorkSummary {
+            implemented: summarize_implemented_work(&self.log),
+            checks: summarize_checks(&self.log),
+            remaining: summarize_remaining_work(&self.log),
+        }
+    }
+
+    pub fn handle_decision_key(&mut self, key: KeyEvent) -> bool {
+        let Some(decision) = self.pending_decision.clone() else {
+            return false;
+        };
+        if !key.modifiers.is_empty() {
+            return false;
+        }
+        let KeyCode::Char(ch) = key.code else {
+            return false;
+        };
+        let ch = ch.to_ascii_lowercase();
+        let response = if ch == decision.accept_key || ch == 'y' {
+            Some(decision.accept_label)
+        } else if ch == decision.deny_key || ch == 'n' {
+            Some(decision.deny_label)
+        } else {
+            None
+        };
+        let Some(response) = response else {
+            return false;
+        };
+        self.pending_decision = None;
+        self.action = Some(format!("確認応答: {response}"));
+        self.push_activity(format!("確認待ちに {response} で応答"));
+        self.push_terminal_notice("Codex 確認応答", format!("{response} を選択しました"));
+        true
     }
 
     pub fn log_filter_label(&self) -> &'static str {
@@ -710,7 +936,9 @@ impl CodexPane {
                     self.child = None;
                     self.turn_running = false;
                     self.current_command = None;
+                    self.current_command_started_at = None;
                     self.streaming_assistant_index = None;
+                    self.pending_decision = None;
                     if !self.turn_finished_by_event {
                         if status.success() {
                             self.push_log(CodexLogKind::System, "Codex ターンが完了しました");
@@ -722,6 +950,8 @@ impl CodexPane {
                         }
                     }
                     self.turn_finished_by_event = false;
+                    self.current_turn_prompt = None;
+                    self.start_next_queued_turn_if_idle();
                     changed = true;
                 }
                 Ok(None) => {}
@@ -729,9 +959,13 @@ impl CodexPane {
                     self.child = None;
                     self.turn_running = false;
                     self.current_command = None;
+                    self.current_command_started_at = None;
+                    self.pending_decision = None;
+                    self.current_turn_prompt = None;
                     let message = format!("Codex 状態確認に失敗: {e}");
                     self.push_log(CodexLogKind::Error, message.clone());
                     self.push_terminal_notice("Codex エラー", message);
+                    self.start_next_queued_turn_if_idle();
                     changed = true;
                 }
             }
@@ -762,8 +996,8 @@ impl CodexPane {
             return;
         }
         self.persist_raw_event("stderr", trimmed);
-        if let Some(notice) = decision_terminal_notice("stderr", Some(trimmed)) {
-            self.push_terminal_notice(notice.title, notice.message);
+        if let Some(decision) = decision_banner("stderr", Some(trimmed)) {
+            self.set_pending_decision(decision);
         }
         self.push_log(CodexLogKind::Event, trimmed.to_string());
     }
@@ -788,9 +1022,16 @@ impl CodexPane {
                 self.turn_running = true;
                 self.turn_finished_by_event = false;
                 self.current_command = None;
+                self.current_command_started_at = None;
+                self.pending_decision = None;
+                if self.turn_count > 0 {
+                    self.collapsed_turns.insert(self.turn_count);
+                }
                 self.turn_count = self.turn_count.saturating_add(1);
                 let label = self
-                    .last_prompt()
+                    .current_turn_prompt
+                    .as_deref()
+                    .or_else(|| self.last_prompt())
                     .map(compact_turn_prompt)
                     .filter(|prompt| !prompt.is_empty())
                     .map(|prompt| format!("Turn {} - {prompt}", self.turn_count))
@@ -801,7 +1042,9 @@ impl CodexPane {
                 self.turn_running = false;
                 self.turn_finished_by_event = true;
                 self.current_command = None;
+                self.current_command_started_at = None;
                 self.streaming_assistant_index = None;
+                self.pending_decision = None;
                 self.push_log(CodexLogKind::System, "Codex ターンが完了しました");
                 self.push_terminal_notice("Codex 完了", "Codex の出力が完了しました");
             }
@@ -809,7 +1052,9 @@ impl CodexPane {
                 self.turn_running = false;
                 self.turn_finished_by_event = true;
                 self.current_command = None;
+                self.current_command_started_at = None;
                 self.streaming_assistant_index = None;
+                self.pending_decision = None;
                 let message = nested_error_message(&value)
                     .or_else(|| first_text_field(&value))
                     .unwrap_or_else(|| "Codex ターンが失敗しました".to_string());
@@ -828,23 +1073,24 @@ impl CodexPane {
     }
 
     fn handle_generic_json_event(&mut self, event_type: &str, value: &Value) {
-        if let Some(notice) =
-            decision_terminal_notice(event_type, first_text_field(value).as_deref())
-        {
-            self.push_terminal_notice(notice.title, notice.message);
+        if let Some(decision) = decision_banner(event_type, first_text_field(value).as_deref()) {
+            self.set_pending_decision(decision);
         }
 
         if let Some(display) = tool_display(event_type, value) {
             if let Some(command) = display.command_text.as_deref() {
                 if is_tool_completion_event(event_type) {
                     self.current_command = None;
+                    self.current_command_started_at = None;
                 } else {
                     self.current_command = Some(compact_tool_text(command));
+                    self.current_command_started_at = Some(Instant::now());
                 }
             }
             if let Some(action_text) = display.action_text.as_deref() {
                 self.refresh_action_from_text(action_text);
             }
+            self.record_addness_tool_activity(&display);
             self.push_log(CodexLogKind::Tool, display.label);
             return;
         }
@@ -870,8 +1116,10 @@ impl CodexPane {
             let text = first_text_field(value).unwrap_or_else(|| event_type.to_string());
             if is_tool_completion_event(event_type) {
                 self.current_command = None;
+                self.current_command_started_at = None;
             } else {
                 self.current_command = Some(compact_tool_text(&text));
+                self.current_command_started_at = Some(Instant::now());
             }
             self.refresh_action_from_text(&text);
             self.push_log(CodexLogKind::Tool, format!("{event_type}: {text}"));
@@ -892,11 +1140,38 @@ impl CodexPane {
         if let Some(rest) = addness_command_rest(text) {
             let (label, kind) = action_label(rest);
             match kind {
-                AddnessActionKind::Read => self.last_addness_read_at = Some(Instant::now()),
-                AddnessActionKind::Write => self.last_addness_write_at = Some(Instant::now()),
+                AddnessActionKind::Read => {
+                    self.last_addness_read_at = Some(Instant::now());
+                    self.last_addness_read_label = Some(label.clone());
+                }
+                AddnessActionKind::Write => {
+                    self.last_addness_write_at = Some(Instant::now());
+                    self.last_addness_write_label = Some(label.clone());
+                }
             }
             self.action = Some(label);
         }
+    }
+
+    fn set_pending_decision(&mut self, decision: CodexDecisionBanner) {
+        let message = decision.message.clone();
+        self.pending_decision = Some(decision);
+        self.push_terminal_notice("Codex 確認待ち", message);
+    }
+
+    fn record_addness_tool_activity(&mut self, display: &ToolDisplay) {
+        let Some(command) = display.command_text.as_deref() else {
+            return;
+        };
+        if addness_command_rest(command).is_none() && !looks_like_addness_command_text(command) {
+            return;
+        }
+        let Some(activity) = addness_activity_summary(command, display.output_text.as_deref())
+        else {
+            return;
+        };
+        let now = chrono::Local::now().format("%H:%M");
+        self.push_activity(format!("{now} {activity}"));
     }
 
     /// Codex の画面状態から、ホスト端末へ流すべき通知を 1 件だけ取り出す。
@@ -930,7 +1205,16 @@ impl CodexPane {
             return;
         }
 
-        if self.turn_running {
+        if self.is_turn_running()
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c' | 'C'))
+        {
+            self.kill_current_turn();
+            self.start_next_queued_turn_if_idle();
+            return;
+        }
+
+        if self.pending_decision.is_some() {
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && matches!(key.code, KeyCode::Char('c' | 'C'))
             {
@@ -949,7 +1233,7 @@ impl CodexPane {
     /// ユーザーの作業依頼ではないので last_prompt は更新しない。
     pub fn submit_system_line(&mut self, line: &str) {
         let submitted = normalize_submitted_line(line);
-        if submitted.is_empty() || self.turn_running || self.finished {
+        if submitted.is_empty() || self.is_turn_running() || self.finished {
             return;
         }
         self.push_log(CodexLogKind::System, format!("Addness: {submitted}"));
@@ -964,17 +1248,41 @@ impl CodexPane {
         self.input_state.record_submitted(&submitted);
         self.push_log(CodexLogKind::User, submitted.clone());
 
+        if self.is_turn_running() {
+            self.queued_prompts.push_back(submitted);
+            let count = self.queued_prompts.len();
+            self.action = Some(format!("次ターン予約 {count}件"));
+            self.push_log(
+                CodexLogKind::System,
+                format!("Codex 実行中のため次のターンに予約しました（待ち{count}件）"),
+            );
+            return;
+        }
+
+        self.run_submitted_line(submitted);
+    }
+
+    fn run_submitted_line(&mut self, submitted: String) {
         if submitted == "/exit" {
-            self.finished = true;
-            self.push_log(CodexLogKind::System, "Codex セッションを終了します");
+            self.finish_from_exit_command();
             return;
         }
 
         self.start_turn(&submitted);
     }
 
+    fn finish_from_exit_command(&mut self) {
+        self.finished = true;
+        self.queued_prompts.clear();
+        self.pending_decision = None;
+        self.current_command = None;
+        self.current_command_started_at = None;
+        self.current_turn_prompt = None;
+        self.push_log(CodexLogKind::System, "Codex セッションを終了します");
+    }
+
     fn start_turn(&mut self, prompt: &str) {
-        if self.turn_running {
+        if self.is_turn_running() {
             self.push_log(CodexLogKind::System, "前の Codex ターンがまだ実行中です");
             return;
         }
@@ -985,6 +1293,8 @@ impl CodexPane {
                 self.child = Some(child);
                 self.turn_running = true;
                 self.turn_finished_by_event = false;
+                self.pending_decision = None;
+                self.current_turn_prompt = Some(prompt.to_string());
                 self.scroll_to_live();
             }
             Err(e) => {
@@ -993,6 +1303,24 @@ impl CodexPane {
                 self.push_terminal_notice("Codex 起動失敗", message);
             }
         }
+    }
+
+    fn start_next_queued_turn_if_idle(&mut self) -> bool {
+        if self.finished || self.is_turn_running() {
+            return false;
+        }
+        let Some(submitted) = self.queued_prompts.pop_front() else {
+            return false;
+        };
+        let remaining = self.queued_prompts.len();
+        self.action = if remaining > 0 {
+            Some(format!("予約入力を実行中 残り{remaining}件"))
+        } else {
+            Some("予約入力を実行中".to_string())
+        };
+        self.push_log(CodexLogKind::System, "予約した入力を実行します");
+        self.run_submitted_line(submitted);
+        true
     }
 
     fn spawn_exec_process(&self, prompt: &str) -> Result<Child> {
@@ -1045,7 +1373,10 @@ impl CodexPane {
         self.child = None;
         self.turn_running = false;
         self.current_command = None;
+        self.current_command_started_at = None;
         self.streaming_assistant_index = None;
+        self.pending_decision = None;
+        self.current_turn_prompt = None;
         self.push_log(CodexLogKind::System, "Codex ターンを中断しました");
     }
 
@@ -1082,6 +1413,11 @@ impl CodexPane {
         }
         self.child = None;
         self.turn_running = false;
+        self.current_command = None;
+        self.current_command_started_at = None;
+        self.pending_decision = None;
+        self.current_turn_prompt = None;
+        self.queued_prompts.clear();
     }
 
     /// DoD を更新する。内容が変わった場合のみ項目・判定を作り直し `true` を返す。
@@ -1207,6 +1543,82 @@ fn rest_has_flag(rest: &str, flag: &str) -> bool {
     let with_eq = format!("{flag}=");
     rest.split_whitespace()
         .any(|part| part == flag || part.starts_with(&with_eq))
+}
+
+fn addness_activity_summary(command: &str, output: Option<&str>) -> Option<String> {
+    let rest = addness_command_rest(command).unwrap_or(command);
+    let mut parts = rest.split_whitespace();
+    let first = parts.next().unwrap_or("");
+    let second = parts.next().unwrap_or("");
+    let json_summary = output.and_then(addness_json_output_summary);
+
+    let kind = match (first, second) {
+        ("goal", "update") if rest_has_flag(rest, "--body") => "body変更",
+        ("goal", "update") if rest_has_flag(rest, "--description") => "DoD変更",
+        ("goal", "update") if rest_has_flag(rest, "--status") => "ステータス変更",
+        ("goal", "update") if rest_has_flag(rest, "--title") => "タイトル変更",
+        ("goal", "create") => "子ゴール追加",
+        ("comment", "create") => "コメント追加",
+        ("link", "progress") => "進捗リンク追加",
+        ("link", "pr") => "PRリンク追加",
+        ("deliverable", _) => "成果物変更",
+        ("goal", "get" | "list" | "children" | "tree" | "search" | "siblings") => "ゴール読込",
+        ("comment", _) => "コメント読込",
+        ("status" | "summary", _) => "状態読込",
+        _ => {
+            if looks_like_addness_command_text(command) {
+                "Addness操作"
+            } else {
+                return None;
+            }
+        }
+    };
+
+    let detail = json_summary
+        .map(|summary| format!(": {summary}"))
+        .unwrap_or_default();
+    Some(format!("Addness {kind}{detail}"))
+}
+
+fn looks_like_addness_command_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("addness")
+        || lower.contains("$addness_bin")
+        || lower.contains(" goal ")
+        || lower.contains(" comment ")
+        || lower.contains(" deliverable ")
+        || lower.contains(" link ")
+}
+
+fn addness_json_output_summary(output: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(output.trim()).ok()?;
+    if let Some(title) = addness_json_title(&value) {
+        return Some(compact_tool_text(title));
+    }
+    match value {
+        Value::Array(items) => Some(format!("{}件", items.len())),
+        Value::Object(map) => Some(format!("{}キー", map.len())),
+        _ => Some("JSON".to_string()),
+    }
+}
+
+fn addness_json_title(value: &Value) -> Option<&str> {
+    value
+        .get("title")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("name").and_then(Value::as_str))
+        .or_else(|| {
+            value
+                .get("goal")
+                .and_then(|goal| goal.get("title"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            value
+                .get("data")
+                .and_then(|data| data.get("title"))
+                .and_then(Value::as_str)
+        })
 }
 
 fn rest_has_any_flag(rest: &str, flags: &[&str]) -> bool {
@@ -1457,6 +1869,74 @@ fn compact_turn_prompt(prompt: &str) -> String {
     out
 }
 
+fn turn_number_from_label(label: &str) -> Option<usize> {
+    let rest = label.strip_prefix("Turn ")?;
+    let digits = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    digits.parse().ok()
+}
+
+fn summarize_implemented_work(log: &[CodexLogLine]) -> Vec<String> {
+    log.iter()
+        .rev()
+        .filter(|line| line.kind == CodexLogKind::Assistant)
+        .flat_map(|line| line.text.lines())
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .filter(|line| !line.starts_with("```"))
+        .take(3)
+        .map(compact_tool_text)
+        .collect()
+}
+
+fn summarize_checks(log: &[CodexLogLine]) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in log.iter().filter(|line| line.kind == CodexLogKind::Tool) {
+        let lower = line.text.to_ascii_lowercase();
+        if !(lower.contains("cargo fmt")
+            || lower.contains("cargo clippy")
+            || lower.contains("cargo test")
+            || lower.contains("cargo build")
+            || lower.contains("git diff"))
+        {
+            continue;
+        }
+        let summary = line
+            .text
+            .lines()
+            .find(|text| {
+                text.contains("test result:")
+                    || text.contains("Finished ")
+                    || text.contains("files changed")
+            })
+            .or_else(|| line.text.lines().find(|text| text.contains("exit ")))
+            .unwrap_or_else(|| line.text.lines().next().unwrap_or(""));
+        let summary = compact_tool_text(summary);
+        if !summary.is_empty() && !out.iter().any(|seen| seen == &summary) {
+            out.push(summary);
+        }
+    }
+    out
+}
+
+fn summarize_remaining_work(log: &[CodexLogLine]) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in log.iter().rev() {
+        if matches!(line.kind, CodexLogKind::Error) {
+            out.push(compact_tool_text(&line.text));
+        }
+        if out.len() >= 3 {
+            break;
+        }
+    }
+    if out.is_empty() {
+        out.push("未記録".to_string());
+    }
+    out
+}
+
 fn string_at_any(value: &Value, keys: &[&str]) -> Option<String> {
     keys.iter()
         .find_map(|key| value.get(*key).and_then(Value::as_str))
@@ -1475,7 +1955,7 @@ fn nested_error_message(value: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-fn decision_terminal_notice(event_type: &str, text: Option<&str>) -> Option<TerminalNotice> {
+fn decision_banner(event_type: &str, text: Option<&str>) -> Option<CodexDecisionBanner> {
     let event_lower = event_type.to_ascii_lowercase();
     let event_requests_decision = [
         "approval",
@@ -1495,6 +1975,34 @@ fn decision_terminal_notice(event_type: &str, text: Option<&str>) -> Option<Term
         .filter(|text| !text.is_empty())
         .unwrap_or_else(|| event_type.to_string());
     let text_lower = message.to_lowercase();
+    let kind = if [
+        "danger",
+        "dangerous",
+        "destructive",
+        "rm ",
+        "delete",
+        "reset --hard",
+        "force",
+        "破壊",
+        "危険",
+    ]
+    .iter()
+    .any(|needle| text_lower.contains(needle))
+    {
+        CodexDecisionKind::Dangerous
+    } else if ["permission", "forbidden", "403", "権限", "許可"]
+        .iter()
+        .any(|needle| text_lower.contains(needle) || event_lower.contains(needle))
+    {
+        CodexDecisionKind::Permission
+    } else if ["approval", "approve", "承認"]
+        .iter()
+        .any(|needle| text_lower.contains(needle) || event_lower.contains(needle))
+    {
+        CodexDecisionKind::Approval
+    } else {
+        CodexDecisionKind::YesNo
+    };
     let text_requests_decision = [
         "yes/no",
         "y/n",
@@ -1513,10 +2021,8 @@ fn decision_terminal_notice(event_type: &str, text: Option<&str>) -> Option<Term
     .iter()
     .any(|needle| text_lower.contains(needle));
 
-    (event_requests_decision || text_requests_decision).then_some(TerminalNotice {
-        title: "Codex 確認待ち".to_string(),
-        message,
-    })
+    (event_requests_decision || text_requests_decision)
+        .then_some(CodexDecisionBanner::new(kind, message))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1524,6 +2030,7 @@ struct ToolDisplay {
     label: String,
     action_text: Option<String>,
     command_text: Option<String>,
+    output_text: Option<String>,
 }
 
 fn tool_display(event_type: &str, value: &Value) -> Option<ToolDisplay> {
@@ -1540,10 +2047,10 @@ fn tool_display(event_type: &str, value: &Value) -> Option<ToolDisplay> {
     let cwd = scalar_field_text(value, &["cwd", "workdir", "working_directory", "codex_cwd"]);
 
     let mut attrs = Vec::new();
-    if let Some(exit_code) = exit_code {
+    if let Some(exit_code) = exit_code.as_deref() {
         attrs.push(format!("exit {exit_code}"));
     }
-    if let Some(duration) = duration {
+    if let Some(duration) = duration.as_deref() {
         attrs.push(format!("duration {duration}"));
     }
 
@@ -1558,11 +2065,25 @@ fn tool_display(event_type: &str, value: &Value) -> Option<ToolDisplay> {
             label: format!("{display_name}{suffix}"),
             action_text: None,
             command_text: None,
+            output_text: None,
         });
     };
 
-    let mut label = format!("{display_name}{suffix}: {primary}");
-    if let Some(cwd) = cwd
+    let is_code_edit = is_code_edit_tool(event_type, &name, command.as_deref(), output.as_deref());
+    let state = tool_state_label(
+        event_type,
+        exit_code.as_deref(),
+        command.as_deref(),
+        is_code_edit,
+    );
+    let mut label = format!("{state} {primary}");
+    if !display_name.is_empty() && !primary.contains(&display_name) {
+        label.push_str(&format!("  [{display_name}]"));
+    }
+    if !suffix.is_empty() {
+        label.push_str(&suffix);
+    }
+    if let Some(cwd) = cwd.as_deref()
         && !cwd.is_empty()
         && command.is_some()
     {
@@ -1580,7 +2101,71 @@ fn tool_display(event_type: &str, value: &Value) -> Option<ToolDisplay> {
         label,
         action_text: command.clone(),
         command_text: command,
+        output_text: output,
     })
+}
+
+fn tool_state_label(
+    event_type: &str,
+    exit_code: Option<&str>,
+    command: Option<&str>,
+    is_code_edit: bool,
+) -> &'static str {
+    let lower_event = event_type.to_ascii_lowercase();
+    let lower_command = command.unwrap_or("").to_ascii_lowercase();
+    if lower_event.contains("begin") || lower_event.contains("start") {
+        return "RUNNING";
+    }
+    if lower_command.contains("git diff") || lower_command.contains("git status") {
+        return "DIFF";
+    }
+    if let Some(code) = exit_code {
+        if code == "0" {
+            return if is_code_edit { "EDIT" } else { "OK" };
+        }
+        return "FAIL";
+    }
+    if lower_event.contains("failed") || lower_event.contains("error") {
+        return "FAIL";
+    }
+    if is_code_edit {
+        return "EDIT";
+    }
+    if is_tool_completion_event(event_type) {
+        return "OK";
+    }
+    "RUNNING"
+}
+
+fn is_code_edit_tool(
+    event_type: &str,
+    name: &str,
+    command: Option<&str>,
+    output: Option<&str>,
+) -> bool {
+    let event_type = event_type.to_ascii_lowercase();
+    let name = name.to_ascii_lowercase();
+    if name == "apply_patch"
+        || name.contains("edit")
+        || name.contains("write_file")
+        || name.contains("file_write")
+        || name.contains("update_file")
+    {
+        return true;
+    }
+    [Some(event_type.as_str()), command, output]
+        .into_iter()
+        .flatten()
+        .any(looks_like_code_edit_text)
+}
+
+fn looks_like_code_edit_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("apply_patch")
+        || text.contains("*** Begin Patch")
+        || text.contains("*** Update File:")
+        || text.contains("*** Add File:")
+        || text.contains("*** Delete File:")
 }
 
 fn is_tool_completion_event(event_type: &str) -> bool {
@@ -2125,6 +2710,51 @@ mod tests {
     }
 
     #[test]
+    fn input_during_running_queues_next_turn() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.finished = false;
+        pane.turn_running = true;
+
+        for ch in "j/kも入力".chars() {
+            pane.input(key(KeyCode::Char(ch)));
+        }
+        pane.input(key(KeyCode::Enter));
+
+        assert_eq!(pane.queued_prompt_count(), 1);
+        assert_eq!(pane.input_line(), "");
+        assert_eq!(pane.last_prompt(), Some("j/kも入力"));
+        assert!(
+            pane.log
+                .iter()
+                .any(|line| line.kind == CodexLogKind::User && line.text == "j/kも入力")
+        );
+        assert!(pane.log.iter().any(
+            |line| line.kind == CodexLogKind::System && line.text.contains("次のターンに予約")
+        ));
+    }
+
+    #[test]
+    fn queued_exit_finishes_when_turn_becomes_idle() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.finished = false;
+        pane.turn_running = true;
+
+        for ch in "/exit".chars() {
+            pane.input(key(KeyCode::Char(ch)));
+        }
+        pane.input(key(KeyCode::Enter));
+
+        assert!(!pane.finished);
+        assert_eq!(pane.queued_prompt_count(), 1);
+
+        pane.turn_running = false;
+        assert!(pane.start_next_queued_turn_if_idle());
+
+        assert!(pane.finished);
+        assert_eq!(pane.queued_prompt_count(), 0);
+    }
+
+    #[test]
     fn scrollback_clamps_to_log_history() {
         let mut pane = CodexPane::test_with_output(8, 20, 0, "1\n2\n3\n4\n5\n6\n7\n8\n9\n10");
         pane.resize(6, 20);
@@ -2166,6 +2796,60 @@ mod tests {
         assert_eq!(line.kind, CodexLogKind::Turn);
         assert_eq!(line.text, "Turn 1 - 実装を進めて ください");
         assert!(pane.is_turn_running());
+    }
+
+    #[test]
+    fn run_state_tracks_command_and_confirmation() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        assert_eq!(pane.run_state(), CodexRunState::Completed);
+        pane.finished = false;
+        assert_eq!(pane.run_state(), CodexRunState::InputWaiting);
+
+        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
+        assert_eq!(pane.run_state(), CodexRunState::Thinking);
+
+        pane.handle_stdout_line(
+            r#"{"type":"exec_command_begin","parsed_cmd":"cargo test","codex_cwd":"/repo"}"#,
+        );
+        assert_eq!(pane.run_state(), CodexRunState::CommandRunning);
+        assert_eq!(pane.current_command(), Some("cargo test"));
+
+        pane.handle_stdout_line(r#"{"type":"approval_requested","message":"Run command? y/n"}"#);
+        let banner = pane.decision_banner().unwrap();
+        assert_eq!(pane.run_state(), CodexRunState::Confirming);
+        assert_eq!(banner.kind, CodexDecisionKind::Approval);
+
+        assert!(pane.handle_decision_key(key(KeyCode::Char('a'))));
+        assert!(pane.decision_banner().is_none());
+        assert_eq!(pane.run_state(), CodexRunState::CommandRunning);
+    }
+
+    #[test]
+    fn old_turns_are_collapsed_until_toggled_open() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.finished = false;
+        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
+        pane.push_log(CodexLogKind::Assistant, "old response");
+        pane.handle_stdout_line(r#"{"type":"turn.completed"}"#);
+        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
+        pane.push_log(CodexLogKind::Assistant, "new response");
+
+        let collapsed = pane
+            .filtered_log_lines()
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(collapsed.contains(&"Turn 1"));
+        assert!(!collapsed.contains(&"old response"));
+        assert!(collapsed.contains(&"new response"));
+
+        pane.toggle_old_turns_collapsed();
+        let expanded = pane
+            .filtered_log_lines()
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(expanded.contains(&"old response"));
     }
 
     #[test]
@@ -2336,6 +3020,19 @@ mod tests {
     }
 
     #[test]
+    fn apply_patch_renders_as_code_edit_tool() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.handle_stdout_line(
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"apply_patch","arguments":"*** Begin Patch\n*** Update File: src/tui/ui.rs\n@@\n*** End Patch\n"}}"#,
+        );
+
+        let line = pane.log.last().unwrap();
+        assert_eq!(line.kind, CodexLogKind::Tool);
+        assert!(line.text.starts_with("EDIT "));
+        assert!(line.text.contains("*** Update File: src/tui/ui.rs"));
+    }
+
+    #[test]
     fn exec_command_end_renders_exit_code_and_output() {
         let mut pane = CodexPane::test_with_output(8, 20, 0, "");
         pane.handle_stdout_line(
@@ -2362,6 +3059,50 @@ mod tests {
         pane.handle_stdout_line(r#"{"type":"turn.completed"}"#);
 
         assert_eq!(pane.current_command(), None);
+    }
+
+    #[test]
+    fn addness_tool_activity_summarizes_semantic_change() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.handle_stdout_line(
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"$ADDNESS_BIN goal update goal-1 --body memo --json\",\"workdir\":\"/repo\"}"},"formatted_output":"{\"title\":\"重要ゴール\"}"}"#,
+        );
+
+        assert!(pane.last_addness_write_at.is_some());
+        assert!(
+            pane.activity
+                .iter()
+                .any(|line| line.contains("Addness body変更: 重要ゴール"))
+        );
+    }
+
+    #[test]
+    fn work_summary_extracts_assistant_checks_and_errors() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.push_log(
+            CodexLogKind::Assistant,
+            "UIを改善しました\nテストを追加しました",
+        );
+        pane.push_log(
+            CodexLogKind::Tool,
+            "OK cargo test (exit 0)\ntest result: ok. 99 passed; 0 failed;",
+        );
+        pane.push_log(CodexLogKind::Error, "残課題: なし");
+
+        let summary = pane.work_summary();
+        assert!(
+            summary
+                .implemented
+                .iter()
+                .any(|line| line.contains("UIを改善"))
+        );
+        assert!(
+            summary
+                .checks
+                .iter()
+                .any(|line| line.contains("test result: ok"))
+        );
+        assert!(summary.remaining.iter().any(|line| line.contains("残課題")));
     }
 
     #[test]

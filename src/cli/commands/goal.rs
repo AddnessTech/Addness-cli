@@ -1,22 +1,71 @@
 use anyhow::{Result, bail};
+use chrono::NaiveDate;
 use clap::Subcommand;
 
 use crate::api::{
     ApiClient, ApiResponse, Comment, CreateGoalRequest, Deliverable, DeliverableType, Goal,
-    GoalStatus, GoalTreeData, GoalTreeItem, UpdateGoalRequest,
+    GoalStatus, GoalTreeData, GoalTreeItem, RelatedFetchError, UpdateGoalRequest,
 };
 use crate::cli::commands::org::resolve_org_id;
 use crate::cli::output::{
     print_children_table, print_goals_table, print_search_results, resolve_status,
 };
 
-fn read_text_arg(inline: Option<&String>, file: Option<&String>) -> Result<Option<String>> {
+fn read_text_arg(
+    inline: Option<&String>,
+    file: Option<&String>,
+    inline_flag: &str,
+    file_flag: &str,
+) -> Result<Option<String>> {
     match (inline, file) {
         (Some(s), None) => Ok(Some(s.clone())),
         (None, Some(p)) => Ok(Some(std::fs::read_to_string(p)?)),
-        (Some(_), Some(_)) => bail!("Specify only one of --description or --description-file"),
+        (Some(_), Some(_)) => bail!("Specify only one of {inline_flag} or {file_flag}"),
         (None, None) => Ok(None),
     }
+}
+
+fn normalize_due_date(input: &str) -> Result<String> {
+    if input.contains('T') {
+        // RFC3339 として実際にパースして妥当性を検証する（不正値を素通しさせない）。
+        chrono::DateTime::parse_from_rfc3339(input)
+            .map_err(|_| anyhow::anyhow!("--due-date must be YYYY-MM-DD or RFC3339"))?;
+        return Ok(input.to_string());
+    }
+    let date = NaiveDate::parse_from_str(input, "%Y-%m-%d")
+        .map_err(|_| anyhow::anyhow!("--due-date must be YYYY-MM-DD or RFC3339"))?;
+    Ok(format!("{}T00:00:00Z", date.format("%Y-%m-%d")))
+}
+
+fn related_fetch_error_message(errors: &[RelatedFetchError]) -> String {
+    let details = errors
+        .iter()
+        .map(|error| format!("{} for {}: {}", error.kind, error.goal_id, error.message))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("Failed to fetch related goal data:\n{details}")
+}
+
+fn handle_related_fetch_errors(strict: bool, errors: Vec<RelatedFetchError>) -> Result<()> {
+    if errors.is_empty() {
+        return Ok(());
+    }
+
+    if strict {
+        bail!("{}", related_fetch_error_message(&errors));
+    }
+
+    for error in errors {
+        eprintln!(
+            "Warning: failed to fetch {} for {}: {}",
+            error.kind, error.goal_id, error.message
+        );
+    }
+    Ok(())
+}
+
+fn should_fetch_child_related(json: bool, include_related: bool) -> bool {
+    json || include_related
 }
 
 #[derive(Subcommand)]
@@ -52,6 +101,9 @@ pub enum GoalCommands {
         /// With comments information
         #[arg(long)]
         with_comment: bool,
+        /// Fail when child deliverables/comments cannot be fetched
+        #[arg(long)]
+        strict_related_fetch: bool,
     },
     /// List children of a goal
     Children {
@@ -85,6 +137,9 @@ pub enum GoalCommands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+        /// Fail when sibling deliverables cannot be fetched
+        #[arg(long)]
+        strict_related_fetch: bool,
     },
     /// Search goals by keyword
     Search {
@@ -112,7 +167,7 @@ pub enum GoalCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Update a goal's status, title, or description
+    /// Update a goal's status, title, definition of done, body, or due date
     Update {
         /// Goal ID
         id: String,
@@ -128,6 +183,18 @@ pub enum GoalCommands {
         /// Description from a file path (alternative to --description)
         #[arg(long)]
         description_file: Option<String>,
+        /// Body/current state - replaces the current value
+        #[arg(long)]
+        body: Option<String>,
+        /// Body/current state from a file path (alternative to --body)
+        #[arg(long)]
+        body_file: Option<String>,
+        /// Due date/current deadline (YYYY-MM-DD or RFC3339) - replaces the current value
+        #[arg(long, conflicts_with = "clear_due_date", value_name = "DATE")]
+        due_date: Option<String>,
+        /// Clear the current due date
+        #[arg(long, conflicts_with = "due_date")]
+        clear_due_date: bool,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -357,6 +424,76 @@ impl GoalNode {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{
+        handle_related_fetch_errors, normalize_due_date, related_fetch_error_message,
+        should_fetch_child_related,
+    };
+    use crate::api::RelatedFetchError;
+
+    #[test]
+    fn normalize_due_date_accepts_yyyy_mm_dd() {
+        assert_eq!(
+            normalize_due_date("2026-07-01").unwrap(),
+            "2026-07-01T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn normalize_due_date_keeps_rfc3339() {
+        assert_eq!(
+            normalize_due_date("2026-07-01T12:30:00Z").unwrap(),
+            "2026-07-01T12:30:00Z"
+        );
+    }
+
+    #[test]
+    fn normalize_due_date_rejects_invalid_input() {
+        // 'T' を含むだけの不正な値は素通しせず、エラーにする。
+        assert!(normalize_due_date("Tomorrow").is_err());
+        assert!(normalize_due_date("2026-13-99T99:99:99Z").is_err());
+        assert!(normalize_due_date("2026-07-01T12:30:00").is_err());
+    }
+
+    #[test]
+    fn related_fetch_error_message_lists_each_failure() {
+        let errors = vec![RelatedFetchError {
+            kind: "deliverables",
+            goal_id: "goal-1".to_string(),
+            message: "network error".to_string(),
+        }];
+
+        assert_eq!(
+            related_fetch_error_message(&errors),
+            "Failed to fetch related goal data:\ndeliverables for goal-1: network error"
+        );
+    }
+
+    #[test]
+    fn related_fetch_errors_only_fail_in_strict_mode() {
+        let errors = vec![RelatedFetchError {
+            kind: "comments",
+            goal_id: "goal-2".to_string(),
+            message: "forbidden".to_string(),
+        }];
+
+        assert!(handle_related_fetch_errors(false, errors.clone()).is_ok());
+        assert!(handle_related_fetch_errors(true, errors).is_err());
+    }
+
+    #[test]
+    fn child_related_fetch_preserves_json_compatibility() {
+        assert!(should_fetch_child_related(true, false));
+    }
+
+    #[test]
+    fn child_related_fetch_for_human_output_requires_flag() {
+        assert!(should_fetch_child_related(false, true));
+        assert!(!should_fetch_child_related(false, false));
+    }
+}
+
 use crate::api::GoalChildItem;
 use colored::Colorize;
 use std::collections::HashMap;
@@ -512,6 +649,7 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
             json,
             with_deliverable,
             with_comment,
+            strict_related_fetch,
         } => {
             // id で指定されたゴール自身の情報を取得
             let resp: ApiResponse<Goal> = client.get_goal(id).await?;
@@ -535,22 +673,36 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
                 .filter(|item| item.id != *id)
                 .collect();
 
-            let children_deliverables = client
-                .get_deliverables_map(
-                    &subtree_items
-                        .iter()
-                        .map(|g| g.id.as_str())
-                        .collect::<Vec<_>>(),
-                )
-                .await;
-            let children_comments = client
-                .get_comments_map(
-                    &subtree_items
-                        .iter()
-                        .map(|g| g.id.as_str())
-                        .collect::<Vec<_>>(),
-                )
-                .await;
+            let subtree_ids = subtree_items
+                .iter()
+                .map(|g| g.id.as_str())
+                .collect::<Vec<_>>();
+
+            let mut related_errors = Vec::new();
+
+            let children_deliverables = if should_fetch_child_related(*json, *with_deliverable) {
+                if *strict_related_fetch {
+                    let (map, errors) = client.get_deliverables_map_with_errors(&subtree_ids).await;
+                    related_errors.extend(errors);
+                    map
+                } else {
+                    client.get_deliverables_map(&subtree_ids).await
+                }
+            } else {
+                HashMap::new()
+            };
+            let children_comments = if should_fetch_child_related(*json, *with_comment) {
+                if *strict_related_fetch {
+                    let (map, errors) = client.get_comments_map_with_errors(&subtree_ids).await;
+                    related_errors.extend(errors);
+                    map
+                } else {
+                    client.get_comments_map(&subtree_ids).await
+                }
+            } else {
+                HashMap::new()
+            };
+            handle_related_fetch_errors(true, related_errors)?;
 
             // 階層構造を構成
             let goal_tree = GoalNode::build_tree(
@@ -597,7 +749,12 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
             }
             Ok(())
         }
-        GoalCommands::Siblings { id, limit, json } => {
+        GoalCommands::Siblings {
+            id,
+            limit,
+            json,
+            strict_related_fetch,
+        } => {
             // 1. 対象ゴールの詳細を取得して親IDを得る
             let goal_resp: ApiResponse<Goal> = client.get_goal(id).await?;
             let parent_id = match &goal_resp.data.parent_id {
@@ -630,9 +787,15 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
                 return Ok(());
             }
 
-            let deliverables_map = client
-                .get_deliverables_map(&siblings.iter().map(|g| g.id.as_str()).collect::<Vec<_>>())
-                .await;
+            let sibling_ids = siblings.iter().map(|g| g.id.as_str()).collect::<Vec<_>>();
+            let deliverables_map = if *strict_related_fetch {
+                let (deliverables_map, deliverable_errors) =
+                    client.get_deliverables_map_with_errors(&sibling_ids).await;
+                handle_related_fetch_errors(true, deliverable_errors)?;
+                deliverables_map
+            } else {
+                client.get_deliverables_map(&sibling_ids).await
+            };
 
             if *json {
                 print_goals_with_deliverables_json(&siblings, &deliverables_map)?;
@@ -706,6 +869,10 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
             title,
             description,
             description_file,
+            body,
+            body_file,
+            due_date,
+            clear_due_date,
             json,
         } => {
             let (completed_at, goal_status) = if let Some(s) = status {
@@ -714,13 +881,30 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
                 (None, None)
             };
 
-            let desc = read_text_arg(description.as_ref(), description_file.as_ref())?;
+            let desc = read_text_arg(
+                description.as_ref(),
+                description_file.as_ref(),
+                "--description",
+                "--description-file",
+            )?;
+            let body_text =
+                read_text_arg(body.as_ref(), body_file.as_ref(), "--body", "--body-file")?;
+            let due_date = if *clear_due_date {
+                Some(None)
+            } else {
+                due_date
+                    .as_ref()
+                    .map(|d| normalize_due_date(d).map(Some))
+                    .transpose()?
+            };
 
             let mut req = UpdateGoalRequest {
                 status: goal_status,
                 completed_at,
                 title: None,
                 description: desc,
+                body: body_text,
+                due_date,
             };
 
             if let Some(t) = title {
@@ -731,8 +915,12 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
                 && req.completed_at.is_none()
                 && req.title.is_none()
                 && req.description.is_none()
+                && req.body.is_none()
+                && req.due_date.is_none()
             {
-                bail!("Nothing to update. Specify --status, --title, or --description.");
+                bail!(
+                    "Nothing to update. Specify --status, --title, --description, --body, or --due-date."
+                );
             }
 
             let resp: ApiResponse<Goal> = client.update_goal(id, &req).await?;

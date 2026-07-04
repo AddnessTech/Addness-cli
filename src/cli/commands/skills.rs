@@ -10,6 +10,22 @@ Addnessは「AIと一緒に人生を進める新しいOS」です。
 Addness CLIはターミナルからAddnessのゴール管理機能を操作するためのコマンドラインツールです。
 すべてのデータ取得コマンドは `--json` フラグでJSON出力に対応しており、スクリプトやAIエージェントとの連携に適しています。
 
+## Addnessの構造原理（理想 − 現在 = アクション）
+
+ゴールは「理想の状態」と「現在の状態」のギャップを構造的に埋める仕組みです。
+
+- **完了基準(DoD / `--description`)** = 理想の状態を記述する
+- **説明(body)** = 現在の状態を記述する
+- **子ゴール** = 理想と現在の差分を埋めるアクションとして分解したもの
+
+この構造を再帰的に適用し、各階層で差分をアクションへ落として実行することで理想を達成します。
+AIエージェントとして作業する際は、まずDoD（理想）を確認し、曖昧なら具体化してから差分を子ゴールへ分解してください。
+
+補足:
+- ゴールはタイトル名で呼び、IDは補助情報として扱ってください。
+- ステータス `CANCELLED` は「中止」ではなく「一時停止」を意味します。親がCANCELLEDでも配下を勝手に動かさないでください。
+- タスク・進捗・決定の真実源はAddnessです。ローカルメモではなくゴール／コメントに記録してください。
+
 ## 認証
 
 ```bash
@@ -84,6 +100,11 @@ addness goal search <KEYWORD> --json
 addness goal update <GOAL_ID> --status IN_PROGRESS
 addness goal update <GOAL_ID> --status COMPLETED
 addness goal update <GOAL_ID> --title "新しいタイトル"
+addness goal update <GOAL_ID> --description "完了基準"
+addness goal update <GOAL_ID> --body "現在の状態"
+addness goal update <GOAL_ID> --body-file ./status.md
+addness goal update <GOAL_ID> --due-date 2026-07-01
+addness goal update <GOAL_ID> --clear-due-date
 addness goal update <GOAL_ID> --status NOT_STARTED --title "タイトル変更" --json
 ```
 
@@ -108,6 +129,12 @@ addness comment create --goal <GOAL_ID> --body-file ./comment.md
 printf "確認お願いします" | addness comment create --goal <GOAL_ID> --body -
 addness comment create --goal <GOAL_ID> --parent <COMMENT_ID> --body "返信です"
 
+# 作業完了・確認依頼・ブロック通知を送る（対象ゴールへの通知用コメント + 端末通知）
+addness notification send --goal <GOAL_ID> --kind done --body "作業が完了しました"
+addness notification send --goal <GOAL_ID> --kind review --body "確認お願いします" --json
+printf "完了しました" | addness notification send --goal <GOAL_ID> --kind done --body -
+addness notification send --goal <GOAL_ID> --kind review --body "確認お願いします" --mention <ORG_MEMBER_ID>
+
 # コメント編集・削除・解決
 addness comment update <COMMENT_ID> --body "更新後の本文"
 addness comment delete <COMMENT_ID> --force
@@ -131,10 +158,33 @@ addness link pr --goal <GOAL_ID> --url <PR_URL> --name "PR #42: 機能追加"
 addness link pr --goal <GOAL_ID> --url <PR_URL> --comment "実装完了"
 addness link pr --goal <GOAL_ID> --url <PR_URL> --json
 
+# 成果物を追加
+addness deliverable add --goal <GOAL_ID> --link-url https://example.com --name "参考リンク"
+
 # 進捗を記録（コメント + オプションでステータス更新）
 addness link progress --goal <GOAL_ID> --message "設計レビュー完了"
 addness link progress --goal <GOAL_ID> --message "実装完了" --status COMPLETED
 addness link progress --goal <GOAL_ID> --message "着手開始" --status IN_PROGRESS --json
+```
+
+## 今日のtodo（今日のゴール）
+
+その日に取り組むゴールを「今日のtodo」として読み書きします。
+
+```bash
+# 今日のtodoを一覧（サブコマンド省略時のデフォルト）
+addness today
+addness today list --json
+addness today list --date 2026-06-29 --json
+
+# 今日のtodoとしてゴールを追加（--parent 省略でルートゴール）
+addness today add --title "設計レビューを終える"
+addness today add --title "サブタスク" --parent <PARENT_GOAL_ID> --description "完了基準"
+
+# 完了 / 再オープン / ステータス変更
+addness today done <GOAL_ID>
+addness today reopen <GOAL_ID>
+addness today status <GOAL_ID> IN_PROGRESS
 ```
 
 ## 進捗サマリー
@@ -165,10 +215,18 @@ addness detect-goal --json
 2. ゴールが検出された場合、`addness goal get <ID> --json --with-deliverable --with-comment` で詳細を確認してから作業を開始してください。
 3. ゴールが検出されない場合、`addness goal list --json --depth 3` で全体を確認し、関連するゴールを特定してください。
 
+### DoD（完了基準）の確認と具体化
+- 取り組む前に、対象ゴールのDoD（`--description` の内容）が十分かを確認してください。
+- 曖昧・不十分なら、人間に質問して具体化し、`addness goal update <ID> --description "..."`（または `--description-file`）で書き戻してください。勝手に確定しないでください。
+- 作業環境・現在地・未完了点・次にやることは、コメントではなく `addness goal update <ID> --body "..."`（または `--body-file`）で現状欄に集約してください。
+- 理想と現在の差分を埋めるアクションは、子ゴールとして `addness goal create --title "..." --parent <ID>` で分解してください。
+
 ### 作業中
 - データ取得時は必ず `--json` フラグを使用してください。構造化データとして処理できます。
 - 最初に `addness status --json` で認証状態を確認してください。
 - 組織が未設定の場合は `addness org list --json` で一覧を取得し、`addness org switch <ID>` で設定してください。
+- 決定や進捗は `addness comment create --goal <ID> --body "..."` に記録してください。コメント末尾にはAIであることが分かる署名（例: 「Codexより」）を付け、人間のコメントと区別してください。
+- ユーザーへ作業完了通知を送りたい場合は `addness notification send --goal <ID> --kind done --body "..."` を使ってください。確認依頼は `--kind review`、ブロック中は `--kind blocked` です。対象ゴールへ通知用コメントを残し、同時に端末へ BEL/OSC 通知を送ります。TUI codex セッションでは `ADDNESS_GOAL_ID` があるため `--goal` を省略できます。
 
 ### 作業完了時
 - 作業完了時は `addness link progress --goal <ID> --message "内容" --status COMPLETED` で進捗を記録してください。

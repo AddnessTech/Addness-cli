@@ -104,6 +104,8 @@ pub async fn handle_today(cmd: Option<&TodayCommands>, client: &ApiClient) -> Re
                 completed_at: Some(Some(chrono::Utc::now().to_rfc3339())),
                 title: None,
                 description: None,
+                body: None,
+                due_date: None,
             };
             update_and_report(id, &req, "Completed", *json, client).await
         }
@@ -113,6 +115,8 @@ pub async fn handle_today(cmd: Option<&TodayCommands>, client: &ApiClient) -> Re
                 completed_at: Some(None),
                 title: None,
                 description: None,
+                body: None,
+                due_date: None,
             };
             update_and_report(id, &req, "Reopened", *json, client).await
         }
@@ -123,6 +127,8 @@ pub async fn handle_today(cmd: Option<&TodayCommands>, client: &ApiClient) -> Re
                 completed_at,
                 title: None,
                 description: None,
+                body: None,
+                due_date: None,
             };
             update_and_report(id, &req, "Updated", *json, client).await
         }

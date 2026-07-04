@@ -76,6 +76,10 @@ fn timestamp() -> i64 {
         .as_secs() as i64
 }
 
+fn is_callback_path(path: &str) -> bool {
+    path == "/callback"
+}
+
 pub async fn handle_login(api_url: &str, frontend_url: Option<&str>) -> Result<()> {
     // 現在選択中のorgを取得（あれば）
     let current_org_id = Settings::load()
@@ -326,7 +330,7 @@ async fn wait_for_callback(listener: tokio::net::TcpListener) -> Result<(String,
     let service = service_fn(move |req: Request<Incoming>| {
         let tx = tx.lock().unwrap().take();
         async move {
-            if !req.uri().path().starts_with("/callback") {
+            if !is_callback_path(req.uri().path()) {
                 return Ok::<_, Infallible>(
                     Response::builder()
                         .status(StatusCode::NOT_FOUND)
@@ -373,4 +377,16 @@ async fn wait_for_callback(listener: tokio::net::TcpListener) -> Result<(String,
     }
 
     Ok((handoff_id, state))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_callback_path;
+
+    #[test]
+    fn callback_path_must_match_exactly() {
+        assert!(is_callback_path("/callback"));
+        assert!(!is_callback_path("/callback-extra"));
+        assert!(!is_callback_path("/callback/extra"));
+    }
 }

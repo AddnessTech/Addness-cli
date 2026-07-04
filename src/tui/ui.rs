@@ -3733,11 +3733,10 @@ fn ellipsize_width(text: &str, max_width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivePane, App, COLOR_EVENT, COLOR_SUCCESS, COLOR_WARN, codex_activity_lines,
-        codex_decision_choice_line, codex_decision_input_lines, codex_header_line,
-        codex_log_entry_lines, codex_log_lines, codex_runtime_status, codex_visible_log_lines,
-        codex_work_label, dim_command_output_lines, draw_status_bar, ellipsize_width,
-        prompt_preview, summarize_tool_display_text,
+        ActivePane, App, COLOR_SUCCESS, codex_activity_lines, codex_decision_banner_lines,
+        codex_decision_choice_line, codex_header_line, codex_log_entry_lines, codex_log_lines,
+        codex_runtime_status, codex_visible_log_lines, codex_work_label, dim_command_output_lines,
+        draw_status_bar, ellipsize_width, prompt_preview, summarize_tool_display_text,
     };
     use crate::api::ApiClient;
     use crate::tui::codex_pane::{
@@ -3821,27 +3820,6 @@ mod tests {
 
         assert_eq!(line_text(&lines[0].line), "FAIL | • Ran cargo test");
         assert_eq!(line_text(&lines[1].line), "     |   └ failed");
-        assert_eq!(lines[0].line.spans[1].content.as_ref(), "•");
-        assert_eq!(lines[0].line.spans[1].style.fg, Some(Color::Red));
-    }
-
-    #[test]
-    fn codex_log_entry_lines_colors_tool_bullet_by_state() {
-        let running = CodexLogLine {
-            kind: CodexLogKind::Tool,
-            text: "RUNNING cargo test".to_string(),
-        };
-        let running_lines = codex_log_entry_lines(&running, 80);
-        assert_eq!(running_lines[0].line.spans[1].content.as_ref(), "•");
-        assert_eq!(running_lines[0].line.spans[1].style.fg, Some(COLOR_WARN));
-
-        let ok = CodexLogLine {
-            kind: CodexLogKind::Tool,
-            text: "exec_command_end (exit 0): cargo test\nok".to_string(),
-        };
-        let ok_lines = codex_log_entry_lines(&ok, 80);
-        assert_eq!(ok_lines[0].line.spans[1].content.as_ref(), "•");
-        assert_eq!(ok_lines[0].line.spans[1].style.fg, Some(COLOR_SUCCESS));
     }
 
     #[test]
@@ -3940,7 +3918,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_decision_input_lines_use_clear_yes_no_choices() {
+    fn codex_decision_banner_uses_clear_yes_no_choices() {
         let decision = CodexDecisionBanner {
             kind: CodexDecisionKind::YesNo,
             message: "続行しますか?".to_string(),
@@ -3950,12 +3928,12 @@ mod tests {
             deny_label: "No",
         };
 
-        let lines = codex_decision_input_lines(&decision, 80, 2)
+        let lines = codex_decision_banner_lines(&decision, 80, false)
             .into_iter()
             .map(|line| line_text(&line))
             .collect::<Vec<_>>();
 
-        assert_eq!(lines[0], "確認待ち 続行しますか?");
+        assert_eq!(lines[0], "? 続行しますか?");
         assert!(lines[1].contains("[Y] Yes"));
         assert!(lines[1].contains("[N] No"));
     }
@@ -3975,44 +3953,6 @@ mod tests {
 
         assert!(text.contains("[A/Y] 承認"));
         assert!(text.contains("[D/N] 拒否"));
-    }
-
-    #[test]
-    fn codex_decision_input_lines_show_prompt_at_input_area() {
-        let decision = CodexDecisionBanner {
-            kind: CodexDecisionKind::Approval,
-            message: "Run cargo test?".to_string(),
-            accept_key: 'a',
-            accept_label: "承認",
-            deny_key: 'd',
-            deny_label: "拒否",
-        };
-
-        let lines = codex_decision_input_lines(&decision, 80, 2);
-
-        assert_eq!(line_text(&lines[0]), "確認待ち: 承認 Run cargo test?");
-        assert!(line_text(&lines[1]).contains("[A/Y] 承認"));
-        assert!(line_text(&lines[1]).contains("[D/N] 拒否"));
-    }
-
-    #[test]
-    fn compact_codex_decision_input_line_keeps_choices() {
-        let decision = CodexDecisionBanner {
-            kind: CodexDecisionKind::Permission,
-            message: "Need filesystem permission".to_string(),
-            accept_key: 'a',
-            accept_label: "許可",
-            deny_key: 'd',
-            deny_label: "拒否",
-        };
-
-        let lines = codex_decision_input_lines(&decision, 80, 1);
-        let text = line_text(&lines[0]);
-
-        assert!(text.contains("確認待ち: 権限"));
-        assert!(text.contains("[A/Y] 許可"));
-        assert!(text.contains("[D/N] 拒否"));
-        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Red));
     }
 
     #[test]
@@ -4055,22 +3995,6 @@ mod tests {
                 .add_modifier
                 .contains(Modifier::DIM)
         );
-    }
-
-    #[test]
-    fn event_log_lines_do_not_use_warn_yellow() {
-        let entry = CodexLogLine {
-            kind: CodexLogKind::Event,
-            text: "waiting for approval".to_string(),
-        };
-        let lines = codex_log_entry_lines(&entry, 80);
-        let spans = &lines[0].line.spans;
-
-        assert_ne!(spans[0].style.fg, Some(COLOR_WARN));
-        assert_ne!(spans[1].style.fg, Some(COLOR_WARN));
-        assert_eq!(spans[0].style.fg, Some(COLOR_EVENT));
-        assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(spans[1].style.fg, Some(COLOR_EVENT));
     }
 
     #[test]

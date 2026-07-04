@@ -22,7 +22,12 @@ use crate::api::{
 };
 use crate::dbg_log;
 
+use super::codex_memory::{codex_body_update_request, codex_trace_link_label, codex_work_memo};
 use super::codex_pane::{self, CodexPane, CodexWorkSummary, PendingCodexTaskGoal, TerminalNotice};
+pub(super) use super::file_picker::PICKER_VISIBLE_ROWS;
+use super::file_picker::{
+    FileEntry, FilePickerReturn, complete_path, initial_picker_dir, read_dir_entries,
+};
 use super::goal_tree::{GoalTree, TreeRow};
 use super::ui;
 
@@ -205,169 +210,6 @@ impl GoalDisplayStatus {
             _ => GoalDisplayStatus::NotStarted,
         }
     }
-}
-
-/// ファイラーで選んだパスを書き戻す先のモーダル状態。
-/// キャンセル時は元の値で、ファイル選択時は選んだパスで復元する。
-#[derive(Debug, Clone)]
-pub enum FilePickerReturn {
-    AddDeliverable {
-        goal_id: String,
-        goal_title: String,
-        kind: DeliverableKind,
-        name: String,
-        value: String,
-    },
-    UpdateDeliverable {
-        goal_id: String,
-        deliverable_id: String,
-        deliverable_name: String,
-        content_file: String,
-    },
-}
-
-/// ファイラーの1エントリ。
-#[derive(Debug, Clone)]
-pub struct FileEntry {
-    pub name: String,
-    pub is_dir: bool,
-}
-
-/// ファイラーで一度に表示する行数（スクロール計算と描画で共有）。
-pub(super) const PICKER_VISIBLE_ROWS: usize = 12;
-
-/// 先頭の `~` をホームディレクトリに展開する。
-fn expand_tilde(input: &str) -> String {
-    if let Some(rest) = input.strip_prefix('~')
-        && (rest.is_empty() || rest.starts_with('/'))
-        && let Some(home) = dirs::home_dir()
-    {
-        return format!("{}{}", home.display(), rest);
-    }
-    input.to_string()
-}
-
-/// パス入力をファイルシステムから補完する（共通接頭辞まで）。
-/// 補完候補が無ければ None。候補が1つでディレクトリなら末尾に `/` を付ける。
-fn complete_path(input: &str) -> Option<String> {
-    let expanded = expand_tilde(input);
-    let path = std::path::Path::new(&expanded);
-
-    let (dir, prefix) = if expanded.ends_with('/') {
-        (PathBuf::from(expanded.trim_end_matches('/')), String::new())
-    } else {
-        let parent = path.parent().map(|p| p.to_path_buf());
-        let dir = match parent {
-            Some(p) if p.as_os_str().is_empty() => PathBuf::from("."),
-            Some(p) => p,
-            None => PathBuf::from("."),
-        };
-        let prefix = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
-        (dir, prefix)
-    };
-
-    let mut names: Vec<(String, bool)> = std::fs::read_dir(&dir)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let name = e.file_name().into_string().ok()?;
-            if name.starts_with(&prefix) {
-                Some((name, e.path().is_dir()))
-            } else {
-                None
-            }
-        })
-        .collect();
-    if names.is_empty() {
-        return None;
-    }
-    names.sort();
-
-    let lcp = longest_common_prefix(names.iter().map(|(n, _)| n.as_str()));
-    let single_dir = names.len() == 1 && names[0].1;
-
-    // 入力にディレクトリ区切りが無い場合は元の見た目（カレント相対）を保つ。
-    let mut result = if expanded.contains('/') {
-        let mut p = dir.join(&lcp).to_string_lossy().into_owned();
-        if expanded.ends_with('/') && lcp.is_empty() {
-            p = dir.to_string_lossy().into_owned();
-        }
-        p
-    } else {
-        lcp
-    };
-    if single_dir {
-        result.push('/');
-    }
-    Some(result)
-}
-
-/// 文字列群の最長共通接頭辞。
-fn longest_common_prefix<'a>(mut iter: impl Iterator<Item = &'a str>) -> String {
-    let Some(first) = iter.next() else {
-        return String::new();
-    };
-    let mut prefix: Vec<char> = first.chars().collect();
-    for s in iter {
-        let common = prefix
-            .iter()
-            .zip(s.chars())
-            .take_while(|(a, b)| **a == *b)
-            .count();
-        prefix.truncate(common);
-        if prefix.is_empty() {
-            break;
-        }
-    }
-    prefix.into_iter().collect()
-}
-
-/// ファイラーの初期ディレクトリを現在の入力値から決める。
-fn initial_picker_dir(current: &str) -> PathBuf {
-    let trimmed = current.trim();
-    if !trimmed.is_empty() {
-        let expanded = expand_tilde(trimmed);
-        let p = PathBuf::from(&expanded);
-        if p.is_dir() {
-            return p;
-        }
-        if let Some(parent) = p.parent()
-            && parent.is_dir()
-            && !parent.as_os_str().is_empty()
-        {
-            return parent.to_path_buf();
-        }
-    }
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
-}
-
-/// ディレクトリの中身を読み、ディレクトリ→ファイルの順、各々名前順で返す。
-/// 隠しファイル（.始まり）は除外する。
-fn read_dir_entries(dir: &std::path::Path) -> Vec<FileEntry> {
-    let mut entries: Vec<FileEntry> = match std::fs::read_dir(dir) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok())
-            .filter_map(|e| {
-                let name = e.file_name().into_string().ok()?;
-                if name.starts_with('.') {
-                    return None;
-                }
-                let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                Some(FileEntry { name, is_dir })
-            })
-            .collect(),
-        Err(_) => Vec::new(),
-    };
-    entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
-        (true, false) => std::cmp::Ordering::Less,
-        (false, true) => std::cmp::Ordering::Greater,
-        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-    });
-    entries
 }
 
 /// コメント本文を一覧表示・タイトル用に短く切り詰める（改行は空白化）。
@@ -722,12 +564,6 @@ fn extract_json_object(s: &str) -> Option<String> {
 /// DoD 自動判定がハングした場合に強制終了するまでの上限時間。
 const DOD_ASSESSMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-const CODEX_AUTO_RECORD_START: &str = "<!-- addness:codex:auto-record:start -->";
-const CODEX_AUTO_RECORD_END: &str = "<!-- addness:codex:auto-record:end -->";
-const CODEX_DECISION_LOG_START: &str = "<!-- addness:codex:decision-log:start -->";
-const CODEX_DECISION_LOG_END: &str = "<!-- addness:codex:decision-log:end -->";
-const CODEX_TRACEABILITY_START: &str = "<!-- addness:codex:traceability:start -->";
-const CODEX_TRACEABILITY_END: &str = "<!-- addness:codex:traceability:end -->";
 const CODEX_WHEEL_LINES: isize = 6;
 const CODEX_MOUSE_DRAIN_LIMIT: usize = 64;
 const XTERM_MOUSE_CAPTURE_ON: &[u8] = b"\x1b[?1000h\x1b[?1006h\x1b[?1007h";
@@ -738,131 +574,6 @@ const XTERM_MOUSE_CAPTURE_OFF: &[u8] =
 enum CodexTerminalScrollRoute {
     Scrollback,
     None,
-}
-
-fn git_status_short(cwd: &str) -> String {
-    let output = std::process::Command::new("git")
-        .args(["status", "--short"])
-        .current_dir(cwd)
-        .output();
-    match output {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-        _ => String::new(),
-    }
-}
-
-fn git_branch_name(cwd: &str) -> String {
-    let output = std::process::Command::new("git")
-        .args(["branch", "--show-current"])
-        .current_dir(cwd)
-        .output();
-    match output {
-        Ok(o) if o.status.success() => {
-            let branch = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if branch.is_empty() {
-                "(detached)".to_string()
-            } else {
-                branch
-            }
-        }
-        _ => "(unknown)".to_string(),
-    }
-}
-
-fn git_changed_files(cwd: &str) -> Vec<String> {
-    let output = std::process::Command::new("git")
-        .args(["diff", "--name-only", "HEAD"])
-        .current_dir(cwd)
-        .output();
-    match output {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .take(12)
-            .map(str::to_string)
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-fn markdown_list(items: &[String], empty: &str) -> String {
-    if items.is_empty() {
-        return format!("- {empty}");
-    }
-    items
-        .iter()
-        .map(|item| format!("- {item}"))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn codex_summary_markdown(summary: Option<&CodexWorkSummary>, touched_files: &[String]) -> String {
-    let Some(summary) = summary else {
-        return String::new();
-    };
-    format!(
-        "\n\n### 作業終了サマリ\n\
-         実装したこと:\n\
-         {}\n\n\
-         触ったファイル:\n\
-         {}\n\n\
-         通したチェック:\n\
-         {}\n\n\
-         残課題:\n\
-         {}",
-        markdown_list(&summary.implemented, "未記録"),
-        markdown_list(touched_files, "差分なし"),
-        markdown_list(&summary.checks, "未記録"),
-        markdown_list(&summary.remaining, "未記録").replace("- 未記録", "- なし/未記録")
-    )
-}
-
-fn codex_work_memo(
-    cwd: &str,
-    session_state: &str,
-    last_prompt: Option<&str>,
-    summary: Option<&CodexWorkSummary>,
-) -> String {
-    let cwd_path = PathBuf::from(cwd);
-    let diff = codex_pane::git_diff_stat(&cwd_path);
-    let status = git_status_short(cwd);
-    let branch = git_branch_name(cwd);
-    let touched_files = git_changed_files(cwd);
-    let diff_text = if diff.trim().is_empty() {
-        "差分なし".to_string()
-    } else {
-        diff
-    };
-    let status_text = if status.trim().is_empty() {
-        "差分なし".to_string()
-    } else {
-        status
-    };
-    let prompt_text = last_prompt
-        .map(|p| p.split_whitespace().collect::<Vec<_>>().join(" "))
-        .filter(|p| !p.is_empty())
-        .unwrap_or_else(|| "未記録".to_string());
-    let summary_text = codex_summary_markdown(summary, &touched_files);
-
-    format!(
-        "## Codex自動メモ(機械)\n\
-         - 更新: {}\n\
-         - セッション: {session_state}\n\
-         - 最後の依頼: {prompt_text}\n\
-         - 作業フォルダ: {cwd}\n\
-         - ブランチ: {branch}\n\
-         - 現在地: プロジェクト固有の判断・決定・次の手は `## Codex作業メモ` / `## Codex決定ログ` / `## PR/Release Traceability` へ集約する（この機械メモは自動更新なので編集不要）\n\
-         - git status:\n\
-         ```text\n\
-         {status_text}\n\
-         ```\n\
-         - git diff --stat HEAD:\n\
-         ```text\n\
-         {diff_text}\n\
-         ```{summary_text}",
-        Local::now().format("%Y-%m-%d %H:%M")
-    )
 }
 
 fn codex_task_goal_title(prompt: &str) -> String {
@@ -909,103 +620,6 @@ fn codex_task_goal_initial_body(
         body.push_str(&auto_body);
     }
     body
-}
-
-fn ensure_codex_block(existing: String, start: &str, end: &str, block_body: &str) -> String {
-    // codex が body を書き直して不可視マーカーを落としても、見出し（`## ...`）が
-    // 残っていれば既存とみなし、空ブロックを重複追加しない。
-    let heading = block_body.lines().next().unwrap_or("").trim();
-    let has_markers = existing.contains(start) && existing.contains(end);
-    let has_heading = !heading.is_empty() && existing.contains(heading);
-    if has_markers || has_heading {
-        existing
-    } else if existing.trim().is_empty() {
-        format!("{start}\n{block_body}\n{end}")
-    } else {
-        format!("{}\n\n{start}\n{block_body}\n{end}", existing.trim_end())
-    }
-}
-
-fn ensure_codex_memory_sections(body: String) -> String {
-    let decision_log = "## Codex決定ログ\n\
-        - （決定が出たら `YYYY-MM-DD HH:MM - 決定: ... / 理由: ... / 影響: ...` の形で追記）"
-        .replace("\n        ", "\n");
-    let traceability = "## PR/Release Traceability\n\
-        - PR: 未登録\n\
-        - tag/release: 未登録\n\
-        - CI: 未記録"
-        .replace("\n        ", "\n");
-    let body = ensure_codex_block(
-        body,
-        CODEX_DECISION_LOG_START,
-        CODEX_DECISION_LOG_END,
-        &decision_log,
-    );
-    ensure_codex_block(
-        body,
-        CODEX_TRACEABILITY_START,
-        CODEX_TRACEABILITY_END,
-        &traceability,
-    )
-}
-
-/// codex 作業メモを既存 body へ統合した body 更新リクエストを作る。
-/// 同期・非同期どちらの記録経路もこれを使い、body 合成ロジックを一本化する。
-fn codex_body_update_request(existing_body: Option<&str>, record: &str) -> UpdateGoalRequest {
-    let body = ensure_codex_memory_sections(upsert_codex_auto_record(existing_body, record));
-    UpdateGoalRequest {
-        status: None,
-        completed_at: None,
-        title: None,
-        description: None,
-        body: Some(body),
-        due_date: None,
-    }
-}
-
-fn upsert_codex_auto_record(existing: Option<&str>, record: &str) -> String {
-    let existing = existing.unwrap_or("").trim();
-    let block = format!("{CODEX_AUTO_RECORD_START}\n{record}\n{CODEX_AUTO_RECORD_END}");
-
-    if let (Some(start), Some(end)) = (
-        existing.find(CODEX_AUTO_RECORD_START),
-        existing.find(CODEX_AUTO_RECORD_END),
-    ) {
-        let end = end + CODEX_AUTO_RECORD_END.len();
-        let mut next = String::new();
-        next.push_str(existing[..start].trim_end());
-        if !next.is_empty() {
-            next.push_str("\n\n");
-        }
-        next.push_str(&block);
-        let tail = existing[end..].trim_start();
-        if !tail.is_empty() {
-            next.push_str("\n\n");
-            next.push_str(tail);
-        }
-        next
-    } else if existing.is_empty() {
-        block
-    } else {
-        format!("{existing}\n\n{block}")
-    }
-}
-
-fn codex_trace_link_label(name: &str, url: Option<&str>) -> Option<String> {
-    // URL のパス構造で判定する。`release`/`tag` のベア部分一致は
-    // `staging`（s-tag-ing）や `press release` を誤検知するため使わない。
-    let haystack = format!("{name} {}", url.unwrap_or("")).to_lowercase();
-    let kind = if haystack.contains("/pull/") {
-        "PR"
-    } else if haystack.contains("/releases")
-        || haystack.contains("/tag/")
-        || haystack.contains("/tags/")
-    {
-        "Release"
-    } else {
-        return None;
-    };
-    Some(format!("{kind}: {name}"))
 }
 
 fn is_permission_denied_error_text(text: &str) -> bool {
@@ -4849,7 +4463,9 @@ impl App {
 
 #[cfg(test)]
 mod path_tests {
-    use super::{complete_path, expand_tilde, longest_common_prefix, read_dir_entries};
+    use super::super::file_picker::{
+        complete_path, expand_tilde, longest_common_prefix, read_dir_entries,
+    };
     use std::fs;
     use std::path::PathBuf;
 
@@ -5448,113 +5064,16 @@ mod codex_mouse_tests {
             KeyModifiers::SHIFT,
         )));
     }
-
-    #[test]
-    fn ctrl_help_key_matches_common_terminal_encodings() {
-        assert!(App::is_ctrl_help_key(KeyEvent::new(
-            KeyCode::Char('?'),
-            KeyModifiers::CONTROL,
-        )));
-        assert!(App::is_ctrl_help_key(KeyEvent::new(
-            KeyCode::Char('/'),
-            KeyModifiers::CONTROL,
-        )));
-        assert!(App::is_ctrl_help_key(KeyEvent::new(
-            KeyCode::Backspace,
-            KeyModifiers::CONTROL,
-        )));
-        assert!(!App::is_ctrl_help_key(KeyEvent::new(
-            KeyCode::Char('?'),
-            KeyModifiers::NONE,
-        )));
-        assert!(!App::is_ctrl_help_key(KeyEvent::new(
-            KeyCode::Backspace,
-            KeyModifiers::NONE,
-        )));
-    }
-
-    #[test]
-    fn ctrl_help_opens_help_before_codex_key_forwarding() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let client = ApiClient::new("t", "http://localhost").unwrap();
-        let mut app = App::new(client, rt.handle().clone());
-        app.codex = Some(CodexPane::test_with_output(20, 20, 0, ""));
-        app.active_pane = ActivePane::Codex;
-
-        app.handle_event(Event::Key(KeyEvent::new(
-            KeyCode::Char('?'),
-            KeyModifiers::CONTROL,
-        )))
-        .unwrap();
-
-        assert!(app.show_help);
-    }
-
-    #[test]
-    fn ctrl_help_is_codex_pane_only() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let client = ApiClient::new("t", "http://localhost").unwrap();
-        let mut app = App::new(client, rt.handle().clone());
-        app.active_pane = ActivePane::Content;
-
-        app.handle_event(Event::Key(KeyEvent::new(
-            KeyCode::Char('?'),
-            KeyModifiers::CONTROL,
-        )))
-        .unwrap();
-
-        assert!(!app.show_help);
-    }
-}
-
-#[cfg(test)]
-mod codex_task_goal_tests {
-    use super::{
-        CODEX_AUTO_RECORD_START, codex_task_goal_dod, codex_task_goal_initial_body,
-        codex_task_goal_title,
-    };
-
-    #[test]
-    fn codex_task_goal_title_uses_prompt_preview() {
-        assert_eq!(codex_task_goal_title("  実装して  "), "Codex: 実装して");
-        let title = codex_task_goal_title("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ");
-        assert!(title.starts_with("Codex: abcdefghijklmnopqrstuvwxyz"));
-        assert!(title.ends_with("..."));
-    }
-
-    #[test]
-    fn codex_task_goal_initial_body_keeps_parent_and_auto_record_context() {
-        let body = codex_task_goal_initial_body(
-            "parent-1",
-            "親ゴール",
-            "/repo",
-            "TUIで子ゴールを作って",
-            "## Codex自動メモ(機械)\n- セッション: 子ゴール作成/依頼受付",
-        );
-
-        assert!(body.contains("親ゴール: 親ゴール (`parent-1`)"));
-        assert!(body.contains("初回依頼: TUIで子ゴールを作って"));
-        assert!(body.contains(CODEX_AUTO_RECORD_START));
-        assert!(body.contains("## Codex決定ログ"));
-        assert!(body.contains("## PR/Release Traceability"));
-    }
-
-    #[test]
-    fn codex_task_goal_dod_describes_goal_scoped_context() {
-        let dod = codex_task_goal_dod();
-        assert!(dod.contains("子ゴールのbody"));
-        assert!(dod.contains("作業対象"));
-    }
 }
 
 #[cfg(test)]
 mod dod_tests {
-    use super::{
+    use super::super::codex_memory::{
         CODEX_DECISION_LOG_END, CODEX_DECISION_LOG_START, CODEX_TRACEABILITY_END,
         CODEX_TRACEABILITY_START, codex_trace_link_label, ensure_codex_memory_sections,
-        extract_json_object, is_permission_denied_error_text, parse_dod_results,
         upsert_codex_auto_record,
     };
+    use super::{extract_json_object, is_permission_denied_error_text, parse_dod_results};
 
     #[test]
     fn extract_json_object_strips_surrounding_text() {

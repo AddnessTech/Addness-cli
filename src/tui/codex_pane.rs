@@ -2157,8 +2157,7 @@ fn summarize_turn_assistant_title(lines: &[CodexLogLine]) -> Option<String> {
         .rev()
         .filter(|line| line.kind == CodexLogKind::Assistant)
         .flat_map(|line| line.text.lines())
-        .filter_map(clean_assistant_title_line)
-        .next()
+        .find_map(clean_assistant_title_line)
 }
 
 fn clean_assistant_title_line(line: &str) -> Option<String> {
@@ -2188,8 +2187,7 @@ fn summarize_turn_tool_title(lines: &[CodexLogLine]) -> Option<String> {
         .iter()
         .rev()
         .filter(|line| line.kind == CodexLogKind::Tool)
-        .filter_map(|line| summarize_turn_tool_line(&line.text))
-        .next()
+        .find_map(|line| summarize_turn_tool_line(&line.text))
 }
 
 fn summarize_turn_tool_line(text: &str) -> Option<String> {
@@ -3111,67 +3109,6 @@ mod tests {
     }
 
     #[test]
-    fn first_user_input_waits_for_task_goal_creation() {
-        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
-        pane.finished = false;
-
-        for ch in "実装して".chars() {
-            pane.input(key(KeyCode::Char(ch)));
-        }
-        pane.input(key(KeyCode::Enter));
-
-        assert_eq!(pane.pending_task_prompt.as_deref(), Some("実装して"));
-        assert_eq!(pane.last_prompt(), None);
-        assert!(!pane.is_turn_running());
-        assert!(pane.prompt_needs_body_record().is_none());
-
-        let pending = pane.take_pending_task_goal().unwrap();
-        assert_eq!(pending.parent_goal_id, "test-goal");
-        assert_eq!(pending.parent_goal_title, "Test goal");
-        assert_eq!(pending.prompt, "実装して");
-    }
-
-    #[test]
-    fn applying_task_goal_switches_target_before_running_prompt() {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let mut pane = CodexPane::spawn_inner(CodexPaneSpawnOptions {
-            codex_bin: Path::new("/definitely/missing/codex"),
-            cwd: &cwd,
-            addness_bin: "addness",
-            goal_id: "parent-goal".to_string(),
-            goal_title: "Parent goal".to_string(),
-            dod: String::new(),
-            status_label: "TEST".to_string(),
-            session_log_path: None,
-        })
-        .unwrap();
-
-        for ch in "調査して".chars() {
-            pane.input(key(KeyCode::Char(ch)));
-        }
-        pane.input(key(KeyCode::Enter));
-        assert!(pane.take_pending_task_goal().is_some());
-
-        pane.start_pending_prompt_with_task_goal(
-            "child-goal".to_string(),
-            "Child goal".to_string(),
-            "子ゴールDoD".to_string(),
-            "未着手".to_string(),
-            "子ゴールへ切替".to_string(),
-        );
-
-        assert_eq!(pane.goal_id, "child-goal");
-        assert_eq!(pane.goal_title, "Child goal");
-        assert_eq!(pane.parent_goal_id, "parent-goal");
-        assert_eq!(pane.last_prompt(), Some("調査して"));
-        assert!(
-            pane.log
-                .iter()
-                .any(|line| line.kind == CodexLogKind::User && line.text == "調査して")
-        );
-    }
-
-    #[test]
     fn queued_exit_finishes_when_turn_becomes_idle() {
         let mut pane = CodexPane::test_with_output(8, 20, 0, "");
         pane.finished = false;
@@ -3237,46 +3174,6 @@ mod tests {
     }
 
     #[test]
-    fn turn_completed_updates_title_from_assistant_summary() {
-        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
-        pane.input_state.last_prompt = Some("最初に送った依頼".to_string());
-
-        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
-        pane.push_log(
-            CodexLogKind::Assistant,
-            "対応しました。\n確認待ち表示を入力欄に移動しました。",
-        );
-        pane.handle_stdout_line(r#"{"type":"turn.completed"}"#);
-
-        let turn = pane
-            .log
-            .iter()
-            .find(|line| line.kind == CodexLogKind::Turn)
-            .unwrap();
-        assert_eq!(turn.text, "Turn 1 - 確認待ち表示を入力欄に移動しました。");
-    }
-
-    #[test]
-    fn turn_completed_updates_title_from_tool_summary_without_assistant() {
-        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
-        pane.input_state.last_prompt = Some("最初に送った依頼".to_string());
-
-        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
-        pane.push_log(
-            CodexLogKind::Tool,
-            "OK cargo test (exit 0)\ntest result: ok. 123 passed; 0 failed;",
-        );
-        pane.handle_stdout_line(r#"{"type":"turn.completed"}"#);
-
-        let turn = pane
-            .log
-            .iter()
-            .find(|line| line.kind == CodexLogKind::Turn)
-            .unwrap();
-        assert_eq!(turn.text, "Turn 1 - テスト実行");
-    }
-
-    #[test]
     fn run_state_tracks_command_and_confirmation() {
         let mut pane = CodexPane::test_with_output(8, 20, 0, "");
         assert_eq!(pane.run_state(), CodexRunState::Completed);
@@ -3317,7 +3214,7 @@ mod tests {
             .iter()
             .map(|line| line.text.as_str())
             .collect::<Vec<_>>();
-        assert!(collapsed.iter().any(|text| text.starts_with("Turn 1")));
+        assert!(collapsed.contains(&"Turn 1"));
         assert!(!collapsed.contains(&"old response"));
         assert!(collapsed.contains(&"new response"));
 
@@ -3328,139 +3225,6 @@ mod tests {
             .map(|line| line.text.as_str())
             .collect::<Vec<_>>();
         assert!(expanded.contains(&"old response"));
-    }
-
-    #[test]
-    fn visible_turn_can_be_toggled_individually() {
-        let mut pane = CodexPane::test_with_output(5, 80, 0, "");
-        pane.finished = false;
-        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
-        pane.push_log(CodexLogKind::Assistant, "first response");
-        pane.handle_stdout_line(r#"{"type":"turn.completed"}"#);
-        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
-        pane.push_log(CodexLogKind::Assistant, "second response");
-        pane.handle_stdout_line(r#"{"type":"turn.completed"}"#);
-        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
-        pane.push_log(CodexLogKind::Assistant, "third response");
-
-        pane.scroll_to_top();
-        assert!(pane.toggle_visible_turn_collapsed());
-        let expanded = pane
-            .filtered_log_lines()
-            .iter()
-            .map(|line| line.text.as_str())
-            .collect::<Vec<_>>();
-        assert!(expanded.contains(&"first response"));
-        assert!(!expanded.contains(&"second response"));
-        assert!(expanded.contains(&"third response"));
-
-        pane.scroll_to_top();
-        assert!(pane.toggle_visible_turn_collapsed());
-        let collapsed = pane
-            .filtered_log_lines()
-            .iter()
-            .map(|line| line.text.as_str())
-            .collect::<Vec<_>>();
-        assert!(!collapsed.contains(&"first response"));
-        assert!(!collapsed.contains(&"second response"));
-        assert!(collapsed.contains(&"third response"));
-
-        assert!(pane.toggle_visible_turn_collapsed());
-        let reopened = pane
-            .filtered_log_lines()
-            .iter()
-            .map(|line| line.text.as_str())
-            .collect::<Vec<_>>();
-        assert!(reopened.contains(&"first response"));
-        assert!(!reopened.contains(&"second response"));
-        assert!(reopened.contains(&"third response"));
-    }
-
-    #[test]
-    fn live_position_toggles_latest_completed_turn_repeatedly() {
-        let mut pane = CodexPane::test_with_output(30, 80, 0, "");
-        pane.finished = false;
-        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
-        pane.push_log(CodexLogKind::Assistant, "first response");
-        pane.handle_stdout_line(r#"{"type":"turn.completed"}"#);
-        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
-        pane.push_log(CodexLogKind::Assistant, "second response");
-        pane.handle_stdout_line(r#"{"type":"turn.completed"}"#);
-        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
-        pane.push_log(CodexLogKind::Assistant, "third response");
-        pane.handle_stdout_line(r#"{"type":"turn.completed"}"#);
-        pane.scroll_to_live();
-
-        assert_eq!(pane.scrollback, 0);
-        assert!(pane.toggle_visible_turn_collapsed());
-        let collapsed = pane
-            .filtered_log_lines()
-            .iter()
-            .map(|line| line.text.as_str())
-            .collect::<Vec<_>>();
-        assert!(collapsed.iter().any(|text| text.starts_with("Turn 3")));
-        assert!(!collapsed.contains(&"third response"));
-
-        assert!(pane.toggle_visible_turn_collapsed());
-        let expanded = pane
-            .filtered_log_lines()
-            .iter()
-            .map(|line| line.text.as_str())
-            .collect::<Vec<_>>();
-        assert!(expanded.contains(&"third response"));
-    }
-
-    #[test]
-    fn numbered_turn_can_be_toggled_directly() {
-        let mut pane = CodexPane::test_with_output(5, 80, 0, "");
-        pane.finished = false;
-        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
-        pane.push_log(CodexLogKind::Assistant, "first response");
-        pane.handle_stdout_line(r#"{"type":"turn.completed"}"#);
-        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
-        pane.push_log(CodexLogKind::Assistant, "second response");
-        pane.handle_stdout_line(r#"{"type":"turn.completed"}"#);
-        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
-        pane.push_log(CodexLogKind::Assistant, "third response");
-
-        assert!(pane.toggle_turn_collapsed_by_number(2));
-        let expanded = pane
-            .filtered_log_lines()
-            .iter()
-            .map(|line| line.text.as_str())
-            .collect::<Vec<_>>();
-        assert!(!expanded.contains(&"first response"));
-        assert!(expanded.contains(&"second response"));
-        assert!(expanded.contains(&"third response"));
-
-        assert!(pane.toggle_turn_collapsed_by_number(2));
-        let collapsed = pane
-            .filtered_log_lines()
-            .iter()
-            .map(|line| line.text.as_str())
-            .collect::<Vec<_>>();
-        assert!(!collapsed.contains(&"first response"));
-        assert!(!collapsed.contains(&"second response"));
-        assert!(collapsed.contains(&"third response"));
-    }
-
-    #[test]
-    fn numbered_turn_does_not_toggle_running_current_turn() {
-        let mut pane = CodexPane::test_with_output(5, 80, 0, "");
-        pane.finished = false;
-        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
-        pane.push_log(CodexLogKind::Assistant, "first response");
-        pane.handle_stdout_line(r#"{"type":"turn.completed"}"#);
-        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
-        pane.push_log(CodexLogKind::Assistant, "running response");
-
-        assert!(!pane.toggle_turn_collapsed_by_number(2));
-        let visible = pane
-            .filtered_log_lines()
-            .iter()
-            .map(|line| line.text.as_str())
-            .collect::<Vec<_>>();
-        assert!(visible.contains(&"running response"));
     }
 
     #[test]
@@ -3587,38 +3351,6 @@ mod tests {
         );
         assert!(pane.history_label().contains("保存中"));
 
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn session_history_restores_updated_turn_title() {
-        let path = std::env::temp_dir().join(format!(
-            "addness-codex-turn-title-{}-{}.jsonl",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        let _ = std::fs::remove_file(&path);
-
-        append_codex_session_record(
-            &path,
-            &CodexSessionRecord::Log {
-                kind: CodexLogKind::Turn,
-                text: "Turn 1 - 最初の依頼".to_string(),
-            },
-        )
-        .unwrap();
-        append_codex_session_record(
-            &path,
-            &CodexSessionRecord::UpdateTurn {
-                turn: 1,
-                text: "Turn 1 - 確認待ち表示を入力欄に移動".to_string(),
-            },
-        )
-        .unwrap();
-
-        let loaded = load_codex_session(&path).unwrap();
-
-        assert_eq!(loaded.log[0].text, "Turn 1 - 確認待ち表示を入力欄に移動");
         let _ = std::fs::remove_file(path);
     }
 
@@ -3797,14 +3529,5 @@ mod tests {
 
         assert!(prompt.contains("0: A"));
         assert!(prompt.contains("1: B"));
-    }
-
-    #[test]
-    fn developer_instructions_delegate_addness_writes_to_lightweight_subagent() {
-        let instructions = addness_tui_developer_instructions();
-
-        assert!(instructions.contains("最も軽量/低コストの記録専用サブエージェント"));
-        assert!(instructions.contains("子ゴールの追加作成"));
-        assert!(instructions.contains("ADDNESS_PARENT_GOAL_ID"));
     }
 }

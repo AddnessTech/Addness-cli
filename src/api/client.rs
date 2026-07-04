@@ -12,15 +12,29 @@ pub use comment::ListCommentsParams;
 pub use org::CreateOrganizationParams;
 
 use anyhow::{Context, Result};
+use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
-use reqwest::{Client, RequestBuilder, Response, StatusCode, Url};
+use reqwest::{Method, RequestBuilder, Response, StatusCode, Url};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 const API_RESOLVE_ENV: &str = "ADDNESS_API_RESOLVE";
+const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 120;
 const REQUEST_SEND_ATTEMPTS: usize = 3;
+
+fn http_timeout_from_env_value(value: Option<&str>) -> Duration {
+    value
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(DEFAULT_HTTP_TIMEOUT_SECS))
+}
+
+fn configured_http_timeout() -> Duration {
+    http_timeout_from_env_value(std::env::var("ADDNESS_HTTP_TIMEOUT_SECS").ok().as_deref())
+}
 
 #[derive(Clone)]
 pub struct ApiClient {
@@ -89,7 +103,6 @@ fn send_failure_context(url: &str, attempts: usize) -> String {
          {API_RESOLVE_ENV}=<host>=<ip> to temporarily bypass local name resolution."
     )
 }
-
 impl ApiClient {
     pub fn new(token: &str, base_url: &str) -> Result<Self> {
         let mut headers = HeaderMap::new();
@@ -101,7 +114,8 @@ impl ApiClient {
 
         let mut client_builder = Client::builder()
             .default_headers(headers)
-            .user_agent(format!("addness-cli/{}", env!("CARGO_PKG_VERSION")));
+            .user_agent(format!("addness-cli/{}", env!("CARGO_PKG_VERSION")))
+            .timeout(configured_http_timeout());
 
         if let Some((host, addrs)) = dns_override_for_base_url(base_url)? {
             client_builder = client_builder.resolve_to_addrs(&host, &addrs);
@@ -252,6 +266,37 @@ impl ApiClient {
         }
     }
 
+    fn request(
+        &self,
+        method: Method,
+        path: &str,
+        include_org_header: bool,
+    ) -> Result<(String, RequestBuilder)> {
+        let url = format!("{}{}", self.base_url, path);
+        let mut req = self.client.request(method, &url);
+
+        if include_org_header && let Some(org_id) = &self.org_id {
+            req = req.header(
+                HeaderName::from_static("x-organization-id"),
+                HeaderValue::from_str(org_id).context("Invalid organization ID")?,
+            );
+        }
+
+        Ok((url, req))
+    }
+
+    async fn send(&self, req: RequestBuilder, url: &str) -> Result<Response> {
+        let response = Self::send_request(req, url).await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(Self::api_error(status, &body));
+        }
+
+        Ok(response)
+    }
+
     async fn send_request(req: RequestBuilder, url: &str) -> Result<Response> {
         let retryable_req = req.try_clone();
         let mut first_req = Some(req);
@@ -295,22 +340,24 @@ impl ApiClient {
             && (err.is_connect() || err.is_timeout())
     }
 
-    /// x-organization-id ヘッダーなしでGETリクエストを発行する。
-    /// 組織に依存しないエンドポイント（org list等）で使用。
-    pub(super) async fn get_without_org<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        let url = format!("{}{}", self.base_url, path);
-        let response = Self::send_request(self.client.get(&url), &url).await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Self::api_error(status, &body));
-        }
-
-        response
+    async fn send_json<T: DeserializeOwned>(&self, req: RequestBuilder, url: &str) -> Result<T> {
+        self.send(req, url)
+            .await?
             .json::<T>()
             .await
             .with_context(|| format!("Failed to parse response from {url}"))
+    }
+
+    async fn send_no_content(&self, req: RequestBuilder, url: &str) -> Result<()> {
+        self.send(req, url).await?;
+        Ok(())
+    }
+
+    /// x-organization-id ヘッダーなしでGETリクエストを発行する。
+    /// 組織に依存しないエンドポイント（org list等）で使用。
+    pub(super) async fn get_without_org<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+        let (url, req) = self.request(Method::GET, path, false)?;
+        self.send_json(req, &url).await
     }
 
     /// ApiClient::get() は与えられた path をURLパスとして
@@ -319,28 +366,8 @@ impl ApiClient {
     /// mod api 以下に各エンティティに応じて
     /// このラッパをApiClientのメソッドとして実装する
     pub(super) async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        let url = format!("{}{}", self.base_url, path);
-        let mut req = self.client.get(&url);
-
-        if let Some(org_id) = &self.org_id {
-            req = req.header(
-                HeaderName::from_static("x-organization-id"),
-                HeaderValue::from_str(org_id).context("Invalid organization ID")?,
-            );
-        }
-
-        let response = Self::send_request(req, &url).await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Self::api_error(status, &body));
-        }
-
-        response
-            .json::<T>()
-            .await
-            .with_context(|| format!("Failed to parse response from {url}"))
+        let (url, req) = self.request(Method::GET, path, true)?;
+        self.send_json(req, &url).await
     }
 
     pub(super) async fn post<B: Serialize, T: DeserializeOwned>(
@@ -348,28 +375,8 @@ impl ApiClient {
         path: &str,
         body: &B,
     ) -> Result<T> {
-        let url = format!("{}{}", self.base_url, path);
-        let mut req = self.client.post(&url).json(body);
-
-        if let Some(org_id) = &self.org_id {
-            req = req.header(
-                HeaderName::from_static("x-organization-id"),
-                HeaderValue::from_str(org_id).context("Invalid organization ID")?,
-            );
-        }
-
-        let response = Self::send_request(req, &url).await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Self::api_error(status, &body));
-        }
-
-        response
-            .json::<T>()
-            .await
-            .with_context(|| format!("Failed to parse response from {url}"))
+        let (url, req) = self.request(Method::POST, path, true)?;
+        self.send_json(req.json(body), &url).await
     }
 
     /// x-organization-id ヘッダーなしでPOSTリクエストを発行する。
@@ -379,42 +386,14 @@ impl ApiClient {
         path: &str,
         body: &B,
     ) -> Result<T> {
-        let url = format!("{}{}", self.base_url, path);
-        let response = Self::send_request(self.client.post(&url).json(body), &url).await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Self::api_error(status, &body));
-        }
-
-        response
-            .json::<T>()
-            .await
-            .with_context(|| format!("Failed to parse response from {url}"))
+        let (url, req) = self.request(Method::POST, path, false)?;
+        self.send_json(req.json(body), &url).await
     }
 
     /// DELETE with JSON body. Returns no response body (204 No Content).
     pub(super) async fn delete_with_body<B: Serialize>(&self, path: &str, body: &B) -> Result<()> {
-        let url = format!("{}{}", self.base_url, path);
-        let mut req = self.client.delete(&url).json(body);
-
-        if let Some(org_id) = &self.org_id {
-            req = req.header(
-                HeaderName::from_static("x-organization-id"),
-                HeaderValue::from_str(org_id).context("Invalid organization ID")?,
-            );
-        }
-
-        let response = Self::send_request(req, &url).await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Self::api_error(status, &body));
-        }
-
-        Ok(())
+        let (url, req) = self.request(Method::DELETE, path, true)?;
+        self.send_no_content(req.json(body), &url).await
     }
 
     pub(super) async fn patch<T: DeserializeOwned, B: Serialize>(
@@ -422,102 +401,26 @@ impl ApiClient {
         path: &str,
         body: &B,
     ) -> Result<T> {
-        let url = format!("{}{}", self.base_url, path);
-        let mut req = self.client.patch(&url).json(body);
-
-        if let Some(org_id) = &self.org_id {
-            req = req.header(
-                HeaderName::from_static("x-organization-id"),
-                HeaderValue::from_str(org_id).context("Invalid organization ID")?,
-            );
-        }
-
-        let response = Self::send_request(req, &url).await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Self::api_error(status, &body));
-        }
-
-        response
-            .json::<T>()
-            .await
-            .with_context(|| format!("Failed to parse response from {url}"))
+        let (url, req) = self.request(Method::PATCH, path, true)?;
+        self.send_json(req.json(body), &url).await
     }
 
     /// POST with JSON body, expects 204 No Content response (no body parsing).
     pub(super) async fn post_no_content<B: Serialize>(&self, path: &str, body: &B) -> Result<()> {
-        let url = format!("{}{}", self.base_url, path);
-        let mut req = self.client.post(&url).json(body);
-
-        if let Some(org_id) = &self.org_id {
-            req = req.header(
-                HeaderName::from_static("x-organization-id"),
-                HeaderValue::from_str(org_id).context("Invalid organization ID")?,
-            );
-        }
-
-        let response = Self::send_request(req, &url).await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Self::api_error(status, &body));
-        }
-        Ok(())
+        let (url, req) = self.request(Method::POST, path, true)?;
+        self.send_no_content(req.json(body), &url).await
     }
 
     /// POST with no request body, expects JSON response.
     pub(super) async fn post_empty<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        let url = format!("{}{}", self.base_url, path);
-        let mut req = self.client.post(&url);
-
-        if let Some(org_id) = &self.org_id {
-            req = req.header(
-                HeaderName::from_static("x-organization-id"),
-                HeaderValue::from_str(org_id).context("Invalid organization ID")?,
-            );
-        }
-
-        let response = Self::send_request(req, &url).await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Self::api_error(status, &body));
-        }
-
-        response
-            .json::<T>()
-            .await
-            .with_context(|| format!("Failed to parse response from {url}"))
+        let (url, req) = self.request(Method::POST, path, true)?;
+        self.send_json(req, &url).await
     }
 
     /// PATCH with no request body, expects JSON response (used for resolve/unresolve).
     pub(super) async fn patch_empty<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        let url = format!("{}{}", self.base_url, path);
-        let mut req = self.client.patch(&url);
-
-        if let Some(org_id) = &self.org_id {
-            req = req.header(
-                HeaderName::from_static("x-organization-id"),
-                HeaderValue::from_str(org_id).context("Invalid organization ID")?,
-            );
-        }
-
-        let response = Self::send_request(req, &url).await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Self::api_error(status, &body));
-        }
-
-        response
-            .json::<T>()
-            .await
-            .with_context(|| format!("Failed to parse response from {url}"))
+        let (url, req) = self.request(Method::PATCH, path, true)?;
+        self.send_json(req, &url).await
     }
 
     /// PUT with JSON body and JSON response.
@@ -526,123 +429,81 @@ impl ApiClient {
         path: &str,
         body: &B,
     ) -> Result<T> {
-        let url = format!("{}{}", self.base_url, path);
-        let mut req = self.client.put(&url).json(body);
-
-        if let Some(org_id) = &self.org_id {
-            req = req.header(
-                HeaderName::from_static("x-organization-id"),
-                HeaderValue::from_str(org_id).context("Invalid organization ID")?,
-            );
-        }
-
-        let response = Self::send_request(req, &url).await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Self::api_error(status, &body));
-        }
-
-        response
-            .json::<T>()
-            .await
-            .with_context(|| format!("Failed to parse response from {url}"))
+        let (url, req) = self.request(Method::PUT, path, true)?;
+        self.send_json(req.json(body), &url).await
     }
 
     /// PUT with JSON body, expects 204 No Content response.
     pub(super) async fn put_no_content<B: Serialize>(&self, path: &str, body: &B) -> Result<()> {
-        let url = format!("{}{}", self.base_url, path);
-        let mut req = self.client.put(&url).json(body);
-
-        if let Some(org_id) = &self.org_id {
-            req = req.header(
-                HeaderName::from_static("x-organization-id"),
-                HeaderValue::from_str(org_id).context("Invalid organization ID")?,
-            );
-        }
-
-        let response = Self::send_request(req, &url).await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Self::api_error(status, &body));
-        }
-        Ok(())
+        let (url, req) = self.request(Method::PUT, path, true)?;
+        self.send_no_content(req.json(body), &url).await
     }
 
     /// PUT with no request body, expects 204 No Content response.
     pub(super) async fn put_empty_no_content(&self, path: &str) -> Result<()> {
-        let url = format!("{}{}", self.base_url, path);
-        let mut req = self.client.put(&url);
-
-        if let Some(org_id) = &self.org_id {
-            req = req.header(
-                HeaderName::from_static("x-organization-id"),
-                HeaderValue::from_str(org_id).context("Invalid organization ID")?,
-            );
-        }
-
-        let response = Self::send_request(req, &url).await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Self::api_error(status, &body));
-        }
-        Ok(())
+        let (url, req) = self.request(Method::PUT, path, true)?;
+        self.send_no_content(req, &url).await
     }
 
     /// PATCH with JSON body, expects 204 No Content response.
     pub(super) async fn patch_no_content<B: Serialize>(&self, path: &str, body: &B) -> Result<()> {
-        let url = format!("{}{}", self.base_url, path);
-        let mut req = self.client.patch(&url).json(body);
-
-        if let Some(org_id) = &self.org_id {
-            req = req.header(
-                HeaderName::from_static("x-organization-id"),
-                HeaderValue::from_str(org_id).context("Invalid organization ID")?,
-            );
-        }
-
-        let response = Self::send_request(req, &url).await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Self::api_error(status, &body));
-        }
-        Ok(())
+        let (url, req) = self.request(Method::PATCH, path, true)?;
+        self.send_no_content(req.json(body), &url).await
     }
 
     /// DELETE with no request body, expects 204 No Content response.
     pub(super) async fn delete_no_body(&self, path: &str) -> Result<()> {
-        let url = format!("{}{}", self.base_url, path);
-        let mut req = self.client.delete(&url);
-
-        if let Some(org_id) = &self.org_id {
-            req = req.header(
-                HeaderName::from_static("x-organization-id"),
-                HeaderValue::from_str(org_id).context("Invalid organization ID")?,
-            );
-        }
-
-        let response = Self::send_request(req, &url).await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Self::api_error(status, &body));
-        }
-        Ok(())
+        let (url, req) = self.request(Method::DELETE, path, true)?;
+        self.send_no_content(req, &url).await
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{API_RESOLVE_ENV, parse_dns_override_addrs, send_failure_context};
+    use super::{
+        API_RESOLVE_ENV, ApiClient, DEFAULT_HTTP_TIMEOUT_SECS, http_timeout_from_env_value,
+        parse_dns_override_addrs, send_failure_context,
+    };
+    use reqwest::StatusCode;
     use std::net::SocketAddr;
+    use std::time::Duration;
+
+    #[test]
+    fn http_timeout_uses_default_without_valid_override() {
+        assert_eq!(
+            http_timeout_from_env_value(None),
+            Duration::from_secs(DEFAULT_HTTP_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            http_timeout_from_env_value(Some("")),
+            Duration::from_secs(DEFAULT_HTTP_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            http_timeout_from_env_value(Some("0")),
+            Duration::from_secs(DEFAULT_HTTP_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            http_timeout_from_env_value(Some("abc")),
+            Duration::from_secs(DEFAULT_HTTP_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn http_timeout_accepts_positive_seconds_override() {
+        assert_eq!(
+            http_timeout_from_env_value(Some("15")),
+            Duration::from_secs(15)
+        );
+    }
+
+    #[test]
+    fn api_error_keeps_existing_auth_hint() {
+        let err = ApiClient::api_error(StatusCode::UNAUTHORIZED, "AUTH_INVALID_API_KEY");
+        let message = err.to_string();
+
+        assert!(message.contains("API error (401 Unauthorized): AUTH_INVALID_API_KEY"));
+        assert!(message.contains("Run: addness login"));
+    }
 
     #[test]
     fn dns_override_accepts_plain_ip_for_base_host() {

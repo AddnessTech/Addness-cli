@@ -2,6 +2,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
+use semver::Version;
+
 pub const CDN_VERSION_URL: &str = "https://cli.addness.com/releases/latest/version.txt";
 const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
 
@@ -56,6 +58,17 @@ fn touch_check_file() {
     }
 }
 
+fn parse_version(version: &str) -> Option<Version> {
+    Version::parse(version.trim().trim_start_matches('v')).ok()
+}
+
+pub fn is_update_available(current: &str, latest: &str) -> bool {
+    match (parse_version(current), parse_version(latest)) {
+        (Some(current), Some(latest)) => latest > current,
+        _ => false,
+    }
+}
+
 pub async fn check_for_update() {
     if !should_check() {
         return;
@@ -70,10 +83,29 @@ pub async fn check_for_update() {
     };
     let latest = latest.as_str();
 
-    if latest != current {
+    if is_update_available(current, latest) {
         eprintln!();
         eprintln!("  \x1b[33mA new version of addness is available: v{current} → v{latest}\x1b[0m");
         eprintln!("  \x1b[2mUpdate: addness update\x1b[0m");
         eprintln!();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_update_available;
+
+    #[test]
+    fn update_available_only_when_latest_is_newer() {
+        assert!(is_update_available("0.5.8", "0.5.9"));
+        assert!(is_update_available("v0.5.8", "v0.6.0"));
+        assert!(!is_update_available("0.5.8", "0.5.8"));
+        assert!(!is_update_available("0.5.8", "0.5.7"));
+    }
+
+    #[test]
+    fn update_available_ignores_invalid_versions() {
+        assert!(!is_update_available("0.5.8", "latest"));
+        assert!(!is_update_available("dev", "0.5.9"));
     }
 }

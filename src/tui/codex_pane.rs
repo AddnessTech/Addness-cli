@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub const CODEX_LOG_PREFIX_WIDTH: usize = 7;
 const CODEX_SESSION_HISTORY_DIR: &str = "codex-sessions";
@@ -648,6 +648,17 @@ impl CodexPane {
 
     pub fn input_line(&self) -> &str {
         &self.input_state.line
+    }
+
+    pub fn input_cursor(&self) -> usize {
+        self.input_state.cursor
+    }
+
+    pub fn captures_input_key(&self, key: KeyEvent) -> bool {
+        !self.finished
+            && self.pending_decision.is_none()
+            && !key.modifiers.contains(KeyModifiers::ALT)
+            && self.input_state.captures_key(key)
     }
 
     pub fn queued_prompt_count(&self) -> usize {
@@ -1402,6 +1413,13 @@ impl CodexPane {
         self.submit_user_line(&submitted);
     }
 
+    pub fn paste_input(&mut self, text: &str) {
+        if self.finished || self.pending_decision.is_some() {
+            return;
+        }
+        self.input_state.insert_text(text);
+    }
+
     /// TUI 側の操作からシステムプロンプト（F9 再開など）を codex に送信する。
     /// ユーザーの作業依頼ではないので last_prompt は更新しない。
     pub fn submit_system_line(&mut self, line: &str) {
@@ -1719,6 +1737,7 @@ impl CodexPane {
 #[derive(Default)]
 struct CodexInputState {
     line: String,
+    cursor: usize,
     exit_command_sent: bool,
     last_prompt: Option<String>,
 }
@@ -1733,6 +1752,29 @@ impl CodexInputState {
         }
     }
 
+    fn captures_key(&self, key: KeyEvent) -> bool {
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            return false;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return matches!(key.code, KeyCode::Char('c' | 'C' | 'u' | 'U'));
+        }
+
+        match key.code {
+            KeyCode::Char(_)
+            | KeyCode::Backspace
+            | KeyCode::Delete
+            | KeyCode::Enter
+            | KeyCode::Esc
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Home
+            | KeyCode::End => true,
+            KeyCode::Up | KeyCode::Down => self.line.contains('\n'),
+            _ => false,
+        }
+    }
+
     fn observe_key(&mut self, key: KeyEvent) -> Option<String> {
         if key.modifiers.contains(KeyModifiers::ALT) {
             return None;
@@ -1740,28 +1782,178 @@ impl CodexInputState {
 
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             if let KeyCode::Char('c' | 'C' | 'u' | 'U') = key.code {
-                self.line.clear();
+                self.clear();
             }
             return None;
         }
 
         match key.code {
-            KeyCode::Char(c) => self.line.push(c),
-            KeyCode::Backspace => {
-                self.line.pop();
-            }
+            KeyCode::Char(c) => self.insert_char(c),
+            KeyCode::Backspace => self.delete_before_cursor(),
+            KeyCode::Delete => self.delete_at_cursor(),
+            KeyCode::Left => self.move_prev_char(),
+            KeyCode::Right => self.move_next_char(),
+            KeyCode::Up => self.move_vertical(true),
+            KeyCode::Down => self.move_vertical(false),
+            KeyCode::Home => self.move_line_start(),
+            KeyCode::End => self.move_line_end(),
             KeyCode::Enter => {
-                let submitted = self.line.trim().to_string();
-                self.line.clear();
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    self.insert_char('\n');
+                    return None;
+                }
+
+                let submitted = normalize_submitted_line(&self.line);
+                self.clear();
                 return Some(submitted);
             }
             KeyCode::Esc => {
-                self.line.clear();
+                self.clear();
             }
             _ => {}
         }
         None
     }
+
+    fn insert_text(&mut self, text: &str) {
+        let normalized = normalize_input_text(text);
+        self.line.insert_str(self.cursor, &normalized);
+        self.cursor += normalized.len();
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        self.line.insert(self.cursor, ch);
+        self.cursor += ch.len_utf8();
+    }
+
+    fn delete_before_cursor(&mut self) {
+        let Some(prev) = prev_char_boundary(&self.line, self.cursor) else {
+            return;
+        };
+        self.line.drain(prev..self.cursor);
+        self.cursor = prev;
+    }
+
+    fn delete_at_cursor(&mut self) {
+        let Some(next) = next_char_boundary(&self.line, self.cursor) else {
+            return;
+        };
+        self.line.drain(self.cursor..next);
+    }
+
+    fn move_prev_char(&mut self) {
+        if let Some(prev) = prev_char_boundary(&self.line, self.cursor) {
+            self.cursor = prev;
+        }
+    }
+
+    fn move_next_char(&mut self) {
+        if let Some(next) = next_char_boundary(&self.line, self.cursor) {
+            self.cursor = next;
+        }
+    }
+
+    fn move_line_start(&mut self) {
+        let (start, _) = self.current_line_bounds();
+        self.cursor = start;
+    }
+
+    fn move_line_end(&mut self) {
+        let (_, end) = self.current_line_bounds();
+        self.cursor = end;
+    }
+
+    fn move_vertical(&mut self, up: bool) {
+        let (start, end) = self.current_line_bounds();
+        let target_col = input_width(&self.line[start..self.cursor]);
+
+        if up {
+            if start == 0 {
+                return;
+            }
+            let previous_end = start - 1;
+            let previous_start = self.line[..previous_end]
+                .rfind('\n')
+                .map_or(0, |idx| idx + 1);
+            self.cursor =
+                byte_index_for_width(&self.line, previous_start, previous_end, target_col);
+        } else {
+            if end == self.line.len() {
+                return;
+            }
+            let next_start = end + 1;
+            let next_end = self.line[next_start..]
+                .find('\n')
+                .map_or(self.line.len(), |idx| next_start + idx);
+            self.cursor = byte_index_for_width(&self.line, next_start, next_end, target_col);
+        }
+    }
+
+    fn current_line_bounds(&self) -> (usize, usize) {
+        let start = self.line[..self.cursor]
+            .rfind('\n')
+            .map_or(0, |idx| idx + 1);
+        let end = self.line[self.cursor..]
+            .find('\n')
+            .map_or(self.line.len(), |idx| self.cursor + idx);
+        (start, end)
+    }
+
+    fn clear(&mut self) {
+        self.line.clear();
+        self.cursor = 0;
+    }
+}
+
+fn normalize_input_text(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn prev_char_boundary(text: &str, cursor: usize) -> Option<usize> {
+    if cursor == 0 {
+        return None;
+    }
+    text[..cursor].char_indices().last().map(|(idx, _)| idx)
+}
+
+fn next_char_boundary(text: &str, cursor: usize) -> Option<usize> {
+    if cursor >= text.len() {
+        return None;
+    }
+    text[cursor..]
+        .chars()
+        .next()
+        .map(|ch| cursor + ch.len_utf8())
+}
+
+fn input_char_width(ch: char) -> usize {
+    if ch == '\t' {
+        4
+    } else {
+        UnicodeWidthChar::width(ch).unwrap_or(0)
+    }
+}
+
+fn input_width(text: &str) -> usize {
+    text.chars().map(input_char_width).sum()
+}
+
+fn byte_index_for_width(text: &str, start: usize, end: usize, target_width: usize) -> usize {
+    let mut width = 0usize;
+    let mut candidate = start;
+    for (offset, ch) in text[start..end].char_indices() {
+        let idx = start + offset;
+        let ch_width = input_char_width(ch);
+        if width + ch_width > target_width {
+            return idx;
+        }
+        width += ch_width;
+        candidate = idx + ch.len_utf8();
+        if width >= target_width {
+            return candidate;
+        }
+    }
+    candidate
 }
 
 fn spawn_line_reader<R>(reader: R, tx: Sender<CodexProcessEvent>, stderr: bool)
@@ -1787,7 +1979,7 @@ where
 }
 
 fn normalize_submitted_line(line: &str) -> String {
-    line.split_whitespace().collect::<Vec<_>>().join(" ")
+    normalize_input_text(line).trim().to_string()
 }
 
 enum AddnessActionKind {
@@ -3073,6 +3265,10 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    fn modified_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
     #[test]
     fn input_state_records_last_prompt_on_enter() {
         let mut state = CodexInputState::default();
@@ -3096,6 +3292,60 @@ mod tests {
         state.record_submitted(&submitted);
 
         assert!(state.exit_command_sent);
+    }
+
+    #[test]
+    fn input_state_paste_preserves_newlines_as_single_prompt() {
+        let mut state = CodexInputState::default();
+        state.insert_text("first line\r\nsecond line\nthird line");
+
+        let submitted = state.observe_key(key(KeyCode::Enter));
+
+        assert_eq!(
+            submitted.as_deref(),
+            Some("first line\nsecond line\nthird line")
+        );
+        assert_eq!(state.line, "");
+        assert_eq!(state.cursor, 0);
+    }
+
+    #[test]
+    fn input_state_edits_at_cursor_with_arrows_and_delete() {
+        let mut state = CodexInputState::default();
+        state.insert_text("abcd");
+        assert!(state.observe_key(key(KeyCode::Left)).is_none());
+        assert!(state.observe_key(key(KeyCode::Left)).is_none());
+        assert!(state.observe_key(key(KeyCode::Char('X'))).is_none());
+        assert!(state.observe_key(key(KeyCode::Delete)).is_none());
+
+        assert_eq!(state.line, "abXd");
+        assert_eq!(state.cursor, "abX".len());
+    }
+
+    #[test]
+    fn input_state_shift_enter_inserts_newline() {
+        let mut state = CodexInputState::default();
+        state.insert_text("before");
+        assert!(
+            state
+                .observe_key(modified_key(KeyCode::Enter, KeyModifiers::SHIFT))
+                .is_none()
+        );
+        state.insert_text("after");
+
+        let submitted = state.observe_key(key(KeyCode::Enter));
+
+        assert_eq!(submitted.as_deref(), Some("before\nafter"));
+    }
+
+    #[test]
+    fn input_state_vertical_arrows_move_between_lines() {
+        let mut state = CodexInputState::default();
+        state.insert_text("abc\ndef");
+        assert!(state.observe_key(key(KeyCode::Up)).is_none());
+        assert!(state.observe_key(key(KeyCode::Char('X'))).is_none());
+
+        assert_eq!(state.line, "abcX\ndef");
     }
 
     #[test]

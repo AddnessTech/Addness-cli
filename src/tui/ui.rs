@@ -2508,7 +2508,7 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
         return;
     }
 
-    let input_h = if inner.height >= 4 { 2 } else { 1 };
+    let input_h = codex_input_panel_height(pane, inner.width, inner.height);
     let decision_banner_h = if pane.decision_banner().is_some() {
         codex_decision_banner_height(inner.height)
     } else {
@@ -2589,6 +2589,7 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
     let status_width = input_chunk.width as usize;
     let status = codex_runtime_status(pane, status_width);
     let search_prefix = "  search: ";
+    let mut input_cursor = None;
     let input_lines = if pane.is_search_editing() {
         let prompt = format!(
             "{search_prefix}{}",
@@ -2609,24 +2610,46 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
             decision_banner_chunk.is_some(),
         )
     } else {
-        let prompt = if pane.finished {
-            "  Esc/q:戻る  c/s/d/v:還流  Alt-e/e/Ctrl-1..9:turn".to_string()
-        } else {
-            let input = ellipsize_width(pane.input_line(), input_width.saturating_sub(4));
-            format!("> {input}")
-        };
         let input_style = if pane.is_turn_running() {
             Style::default().fg(COLOR_WARN)
         } else {
             Style::default().fg(COLOR_TEXT)
         };
-        if input_chunk.height <= 1 {
-            vec![Line::from(Span::styled(prompt, input_style))]
+        let prompt_lines = if pane.finished {
+            vec![Line::from(Span::styled(
+                "  Esc/q:戻る  c/s/d/v:還流  Alt-e/e/Ctrl-1..9:turn",
+                input_style,
+            ))]
         } else {
-            vec![
-                Line::from(Span::styled(status, Style::default().fg(COLOR_MUTED))),
-                Line::from(Span::styled(prompt, input_style)),
-            ]
+            let prompt_rows = if input_chunk.height <= 1 {
+                1
+            } else {
+                input_chunk.height.saturating_sub(1) as usize
+            };
+            let render = codex_input_prompt_render(
+                pane.input_line(),
+                pane.input_cursor(),
+                input_width,
+                prompt_rows,
+                input_style,
+            );
+            let cursor_row_offset = if input_chunk.height <= 1 { 0 } else { 1 };
+            input_cursor = Some((
+                render.cursor_col as u16,
+                cursor_row_offset + render.cursor_row as u16,
+            ));
+            render.lines
+        };
+        if input_chunk.height <= 1 {
+            prompt_lines
+        } else {
+            let mut lines = Vec::with_capacity(prompt_lines.len() + 1);
+            lines.push(Line::from(Span::styled(
+                status,
+                Style::default().fg(COLOR_MUTED),
+            )));
+            lines.extend(prompt_lines);
+            lines
         }
     };
     frame.render_widget(
@@ -2647,16 +2670,151 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
     } else if !pane.finished
         && pane.scrollback == 0
         && !(pane.is_turn_running() && pane.decision_banner().is_some())
+        && let Some((cursor_col, cursor_row)) = input_cursor
     {
-        let cursor_col = (2 + UnicodeWidthStr::width(pane.input_line()))
-            .min(input_chunk.width.saturating_sub(1) as usize) as u16;
-        let cursor_row = if input_chunk.height <= 1 {
-            input_chunk.y
-        } else {
-            input_chunk.y + 1
-        };
-        frame.set_cursor_position((input_chunk.x + cursor_col, cursor_row));
+        frame.set_cursor_position((
+            input_chunk.x + cursor_col.min(input_chunk.width.saturating_sub(1)),
+            input_chunk.y + cursor_row.min(input_chunk.height.saturating_sub(1)),
+        ));
     }
+}
+
+struct CodexInputPromptRender {
+    lines: Vec<Line<'static>>,
+    cursor_col: usize,
+    cursor_row: usize,
+}
+
+#[derive(Clone)]
+struct CodexInputVisualLine {
+    text: String,
+    start: usize,
+    end: usize,
+}
+
+fn codex_input_panel_height(pane: &CodexPane, inner_width: u16, inner_height: u16) -> u16 {
+    let base = if inner_height >= 4 { 2 } else { 1 };
+    if pane.finished
+        || pane.is_search_editing()
+        || pane.decision_banner().is_some()
+        || inner_height < 4
+    {
+        return base;
+    }
+
+    let max_height: u16 = if inner_height >= 16 {
+        6
+    } else if inner_height >= 10 {
+        4
+    } else {
+        2
+    };
+    let max_prompt_rows = max_height.saturating_sub(1).max(1) as usize;
+    let prompt_width = inner_width.saturating_sub(4).max(1) as usize;
+    let prompt_rows = codex_input_visual_lines(pane.input_line(), prompt_width)
+        .len()
+        .min(max_prompt_rows)
+        .max(1) as u16;
+
+    (prompt_rows + 1).clamp(base, max_height)
+}
+
+fn codex_input_prompt_render(
+    input: &str,
+    cursor: usize,
+    max_width: usize,
+    max_rows: usize,
+    style: Style,
+) -> CodexInputPromptRender {
+    let text_width = max_width.saturating_sub(2).max(1);
+    let visual_lines = codex_input_visual_lines(input, text_width);
+    let cursor = cursor.min(input.len());
+    let cursor_line_index = visual_lines
+        .iter()
+        .rposition(|line| cursor >= line.start && cursor <= line.end)
+        .unwrap_or(0);
+    let rows = max_rows.max(1);
+    let start = cursor_line_index.saturating_add(1).saturating_sub(rows);
+    let end = (start + rows).min(visual_lines.len());
+
+    let mut cursor_col = 0usize;
+    let mut cursor_row = 0usize;
+    let lines = visual_lines[start..end]
+        .iter()
+        .enumerate()
+        .map(|(row, line)| {
+            let absolute_row = start + row;
+            let prefix = if absolute_row == 0 { "> " } else { "  " };
+            if absolute_row == cursor_line_index {
+                cursor_col = UnicodeWidthStr::width(prefix)
+                    + codex_input_text_width(&input[line.start..cursor.min(line.end)]);
+                cursor_row = row;
+            }
+            Line::from(vec![
+                Span::styled(prefix.to_string(), style),
+                Span::styled(line.text.clone(), style),
+            ])
+        })
+        .collect::<Vec<_>>();
+
+    CodexInputPromptRender {
+        lines,
+        cursor_col,
+        cursor_row,
+    }
+}
+
+fn codex_input_visual_lines(input: &str, max_width: usize) -> Vec<CodexInputVisualLine> {
+    let max_width = max_width.max(1);
+    let mut lines = Vec::new();
+    let mut start = 0usize;
+    let mut text = String::new();
+    let mut width = 0usize;
+
+    for (idx, ch) in input.char_indices() {
+        if ch == '\n' {
+            lines.push(CodexInputVisualLine {
+                text: std::mem::take(&mut text),
+                start,
+                end: idx,
+            });
+            start = idx + ch.len_utf8();
+            width = 0;
+            continue;
+        }
+
+        let ch_width = codex_input_char_width(ch);
+        if width > 0 && width + ch_width > max_width {
+            lines.push(CodexInputVisualLine {
+                text: std::mem::take(&mut text),
+                start,
+                end: idx,
+            });
+            start = idx;
+            width = 0;
+        }
+        text.push(ch);
+        width += ch_width;
+    }
+
+    lines.push(CodexInputVisualLine {
+        text,
+        start,
+        end: input.len(),
+    });
+    lines
+}
+
+fn codex_input_char_width(ch: char) -> usize {
+    if ch == '\t' {
+        4
+    } else {
+        UnicodeWidthChar::width(ch).unwrap_or(0)
+    }
+}
+
+fn codex_input_text_width(text: &str) -> usize {
+    text.chars().map(codex_input_char_width).sum()
 }
 
 fn draw_codex_decision_banner(
@@ -3910,9 +4068,9 @@ mod tests {
         ActivePane, App, COLOR_DANGER, COLOR_EVENT, COLOR_SUCCESS, COLOR_WARN,
         codex_activity_lines, codex_decision_banner_lines, codex_decision_choice_line,
         codex_decision_input_lines, codex_decision_title_hint, codex_header_line,
-        codex_log_entry_lines, codex_log_lines, codex_runtime_status, codex_visible_log_lines,
-        codex_work_label, dim_command_output_lines, draw_status_bar, ellipsize_width,
-        prompt_preview, summarize_tool_display_text,
+        codex_input_prompt_render, codex_log_entry_lines, codex_log_lines, codex_runtime_status,
+        codex_visible_log_lines, codex_work_label, dim_command_output_lines, draw_status_bar,
+        ellipsize_width, prompt_preview, summarize_tool_display_text,
     };
     use crate::api::ApiClient;
     use crate::tui::codex_pane::{
@@ -4106,6 +4264,35 @@ mod tests {
         assert!(text.contains("filter:Talk"));
         assert!(text.contains("search:c*"));
         assert!(text.contains("履歴"));
+    }
+
+    #[test]
+    fn codex_input_prompt_render_preserves_explicit_newlines() {
+        let render = codex_input_prompt_render(
+            "first\nsecond",
+            "first\nsecond".len(),
+            40,
+            4,
+            ratatui::style::Style::default(),
+        );
+        let lines = render.lines.iter().map(line_text).collect::<Vec<_>>();
+
+        assert_eq!(lines, vec!["> first", "  second"]);
+        assert_eq!(render.cursor_row, 1);
+        assert_eq!(render.cursor_col, 8);
+    }
+
+    #[test]
+    fn codex_input_prompt_render_keeps_cursor_line_visible_for_long_input() {
+        let input = "abcdefghijklmnopqrstuvwxyz";
+        let render =
+            codex_input_prompt_render(input, input.len(), 10, 1, ratatui::style::Style::default());
+        let text = line_text(&render.lines[0]);
+
+        assert!(text.contains("yz"));
+        assert!(!text.contains("abc"));
+        assert_eq!(render.cursor_row, 0);
+        assert!(render.cursor_col <= 9);
     }
 
     #[test]

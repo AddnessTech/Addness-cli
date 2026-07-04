@@ -2241,6 +2241,10 @@ impl App {
                 pane.scroll_to_live();
                 return;
             }
+            if pane.scrollback == 0 && pane.captures_input_key(key) {
+                pane.input(key);
+                return;
+            }
             if Self::handle_codex_log_scroll(pane, key, true, false) {
                 return;
             }
@@ -2249,6 +2253,23 @@ impl App {
                 pane.scroll_to_live();
             }
             pane.input(key);
+        }
+    }
+
+    fn handle_codex_paste(&mut self, text: &str) {
+        if let Some(pane) = self.codex.as_mut() {
+            if pane.scrollback > 0 {
+                pane.scroll_to_live();
+            }
+            pane.paste_input(text);
+        }
+    }
+
+    fn handle_modal_paste(&mut self, text: &str) {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        for ch in normalized.chars() {
+            let ch = if matches!(ch, '\n' | '\t') { ' ' } else { ch };
+            self.handle_modal_input(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
         }
     }
 
@@ -2751,6 +2772,18 @@ impl App {
         if let Event::Mouse(me) = event {
             // codex 使用中のみ有効なマウスキャプチャを、右側の会話領域に限定して扱う。
             self.handle_codex_mouse_batch(me)?;
+            return Ok(());
+        }
+
+        if let Event::Paste(text) = event {
+            if self.active_pane == ActivePane::Codex
+                && self.modal_state.is_none()
+                && !self.show_help
+            {
+                self.handle_codex_paste(&text);
+            } else if self.modal_state.is_some() && !self.show_help {
+                self.handle_modal_paste(&text);
+            }
             return Ok(());
         }
 

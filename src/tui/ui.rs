@@ -3232,7 +3232,7 @@ fn codex_log_prefix(line: &CodexLogLine) -> (&'static str, Style, Style) {
             Style::default().fg(COLOR_DANGER),
         ),
         CodexLogKind::Event => (
-            "INFO | ",
+            "     | ",
             Style::default().fg(COLOR_EVENT),
             Style::default().fg(COLOR_EVENT),
         ),
@@ -4281,7 +4281,7 @@ mod tests {
     }
 
     #[test]
-    fn dim_command_output_lines_keeps_evt_readable() {
+    fn dim_command_output_lines_keeps_event_notice_readable() {
         let entry = CodexLogLine {
             kind: CodexLogKind::Event,
             text: "waiting for approval".to_string(),
@@ -4299,7 +4299,7 @@ mod tests {
     }
 
     #[test]
-    fn event_log_lines_do_not_use_warn_yellow() {
+    fn event_log_lines_use_unlabeled_muted_prefix() {
         let entry = CodexLogLine {
             kind: CodexLogKind::Event,
             text: "waiting for approval".to_string(),
@@ -4307,7 +4307,9 @@ mod tests {
         let lines = codex_log_entry_lines(&entry, 80);
         let spans = &lines[0].line.spans;
 
-        assert!(line_text(&lines[0].line).starts_with("INFO | "));
+        assert!(line_text(&lines[0].line).starts_with("     | "));
+        assert!(!line_text(&lines[0].line).starts_with("EVT | "));
+        assert!(!line_text(&lines[0].line).starts_with("INFO | "));
         assert_ne!(spans[0].style.fg, Some(COLOR_WARN));
         assert_ne!(spans[1].style.fg, Some(COLOR_WARN));
         assert_eq!(spans[0].style.fg, Some(COLOR_EVENT));

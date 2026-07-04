@@ -4,7 +4,7 @@ use chrono::Local;
 
 use crate::api::UpdateGoalRequest;
 
-use super::codex_pane;
+use super::codex_pane::{self, CodexWorkSummary};
 
 pub(super) const CODEX_AUTO_RECORD_START: &str = "<!-- addness:codex:auto-record:start -->";
 pub(super) const CODEX_AUTO_RECORD_END: &str = "<!-- addness:codex:auto-record:end -->";
@@ -42,11 +42,66 @@ fn git_branch_name(cwd: &str) -> String {
     }
 }
 
-pub(super) fn codex_work_memo(cwd: &str, session_state: &str, last_prompt: Option<&str>) -> String {
+fn git_changed_files(cwd: &str) -> Vec<String> {
+    let output = std::process::Command::new("git")
+        .args(["diff", "--name-only", "HEAD"])
+        .current_dir(cwd)
+        .output();
+    match output {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .take(12)
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn markdown_list(items: &[String], empty: &str) -> String {
+    if items.is_empty() {
+        return format!("- {empty}");
+    }
+    items
+        .iter()
+        .map(|item| format!("- {item}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn codex_summary_markdown(summary: Option<&CodexWorkSummary>, touched_files: &[String]) -> String {
+    let Some(summary) = summary else {
+        return String::new();
+    };
+    format!(
+        "\n\n### 作業終了サマリ\n\
+         実装したこと:\n\
+         {}\n\n\
+         触ったファイル:\n\
+         {}\n\n\
+         通したチェック:\n\
+         {}\n\n\
+         残課題:\n\
+         {}",
+        markdown_list(&summary.implemented, "未記録"),
+        markdown_list(touched_files, "差分なし"),
+        markdown_list(&summary.checks, "未記録"),
+        markdown_list(&summary.remaining, "未記録").replace("- 未記録", "- なし/未記録")
+    )
+}
+
+pub(super) fn codex_work_memo(
+    cwd: &str,
+    session_state: &str,
+    last_prompt: Option<&str>,
+    summary: Option<&CodexWorkSummary>,
+) -> String {
     let cwd_path = PathBuf::from(cwd);
     let diff = codex_pane::git_diff_stat(&cwd_path);
     let status = git_status_short(cwd);
     let branch = git_branch_name(cwd);
+    let touched_files = git_changed_files(cwd);
     let diff_text = if diff.trim().is_empty() {
         "差分なし".to_string()
     } else {
@@ -61,6 +116,7 @@ pub(super) fn codex_work_memo(cwd: &str, session_state: &str, last_prompt: Optio
         .map(|p| p.split_whitespace().collect::<Vec<_>>().join(" "))
         .filter(|p| !p.is_empty())
         .unwrap_or_else(|| "未記録".to_string());
+    let summary_text = codex_summary_markdown(summary, &touched_files);
 
     format!(
         "## Codex自動メモ(機械)\n\
@@ -77,7 +133,7 @@ pub(super) fn codex_work_memo(cwd: &str, session_state: &str, last_prompt: Optio
          - git diff --stat HEAD:\n\
          ```text\n\
          {diff_text}\n\
-         ```",
+         ```{summary_text}",
         Local::now().format("%Y-%m-%d %H:%M")
     )
 }

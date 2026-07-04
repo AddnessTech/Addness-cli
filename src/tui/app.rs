@@ -17,13 +17,13 @@ use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
 use crate::api::{
-    ApiClient, CreateGoalRequest, DeliverableType, GoalStatus, Member, MemberId, Organization,
-    UpdateGoalRequest,
+    ApiClient, Comment, CreateGoalRequest, Deliverable, DeliverableType, GoalStatus, Member,
+    MemberId, Organization, UpdateGoalRequest,
 };
 use crate::dbg_log;
 
 use super::codex_memory::{codex_body_update_request, codex_trace_link_label, codex_work_memo};
-use super::codex_pane::{self, CodexPane, TerminalNotice};
+use super::codex_pane::{self, CodexPane, CodexWorkSummary, TerminalNotice};
 pub(super) use super::file_picker::PICKER_VISIBLE_ROWS;
 use super::file_picker::{
     FileEntry, FilePickerReturn, complete_path, initial_picker_dir, read_dir_entries,
@@ -329,26 +329,43 @@ pub enum ModalState {
 struct InitialData {
     orgs: Vec<Organization>,
     goal_tree: GoalTree,
-    members_list: Vec<Member>,
     /// 取得中に起きた最初のエラー（ステータスバーに表示する）。
     error: Option<String>,
 }
 
-/// ルートゴール（depth==0）のコメント・成果物を並列取得し `tree` に詰める。
-/// 失敗した件数を返す（呼び出し側でステータスバーに集約する）。
-/// 専用 helper(get_*_map) は失敗を stderr に出力して握り潰すため、TUI では使わない。
-/// 起動時のバックグラウンド取得と、組織切り替え時の `load_root_goal_details` で共有する。
-async fn fetch_root_goal_details_into(client: &ApiClient, tree: &mut GoalTree) -> usize {
-    let root_ids: Vec<String> = tree
-        .flatten()
+struct RootGoalDetail {
+    goal_id: String,
+    comments: Vec<Comment>,
+    deliverables: Vec<Deliverable>,
+}
+
+#[derive(Default)]
+struct RootGoalDetails {
+    items: Vec<RootGoalDetail>,
+    failed: usize,
+}
+
+struct DeferredInitialData {
+    members_list: Vec<Member>,
+    root_details: RootGoalDetails,
+    error: Option<String>,
+}
+
+fn root_goal_ids(tree: &GoalTree) -> Vec<String> {
+    tree.flatten()
         .iter()
         .filter_map(|row| match row {
             TreeRow::Goal { goal_id, depth, .. } if *depth == 0 => Some(goal_id.to_string()),
             _ => None,
         })
-        .collect();
+        .collect()
+}
+
+/// ルートゴール（depth==0）のコメント・成果物を並列取得する。
+/// 専用 helper(get_*_map) は失敗を stderr に出力して握り潰すため、TUI では使わない。
+async fn fetch_root_goal_details(client: &ApiClient, root_ids: Vec<String>) -> RootGoalDetails {
     if root_ids.is_empty() {
-        return 0;
+        return RootGoalDetails::default();
     }
 
     // 逐次 N 往復 → 概ね 1 往復に畳む。
@@ -359,19 +376,32 @@ async fn fetch_root_goal_details_into(client: &ApiClient, tree: &mut GoalTree) -
     .await;
 
     let mut failed = 0usize;
+    let mut items = Vec::new();
     for (id, r) in fetched {
         match r {
             Ok((comments, deliverables)) => {
-                tree.set_comments_for_goal_id(&id, comments.comments);
-                tree.set_deliverables_for_goal_id(&id, deliverables.data.deliverables);
+                items.push(RootGoalDetail {
+                    goal_id: id,
+                    comments: comments.comments,
+                    deliverables: deliverables.data.deliverables,
+                });
             }
             Err(_) => failed += 1,
         }
     }
+    RootGoalDetails { items, failed }
+}
+
+fn apply_root_goal_details(tree: &mut GoalTree, details: RootGoalDetails) -> usize {
+    let failed = details.failed;
+    for detail in details.items {
+        tree.set_comments_for_goal_id(&detail.goal_id, detail.comments);
+        tree.set_deliverables_for_goal_id(&detail.goal_id, detail.deliverables);
+    }
     failed
 }
 
-/// 組織・ゴールツリー（ルートゴールの詳細込み）・メンバーを取得する。
+/// 組織・ゴールツリーを取得する。
 /// `ApiClient` のクローンを所有し、`App` を借用しないため `spawn` できる。
 async fn fetch_initial_data(mut client: ApiClient) -> InitialData {
     let orgs = match client.list_organizations().await {
@@ -380,7 +410,6 @@ async fn fetch_initial_data(mut client: ApiClient) -> InitialData {
             return InitialData {
                 orgs: Vec::new(),
                 goal_tree: GoalTree::empty(),
-                members_list: Vec::new(),
                 error: Some(format!("Failed to load organizations: {e}")),
             };
         }
@@ -390,48 +419,43 @@ async fn fetch_initial_data(mut client: ApiClient) -> InitialData {
         return InitialData {
             orgs,
             goal_tree: GoalTree::empty(),
-            members_list: Vec::new(),
             error: None,
         };
     };
     client.set_org_id(Some(org_id.clone()));
 
-    // ゴールツリーとメンバーを並列取得する。
-    let (tree_res, members_res) = tokio::join!(
-        client.get_goal_tree(&org_id, 2),
-        client.get_members(&org_id)
-    );
-
-    let mut error: Option<String> = None;
-
-    let goal_tree = match tree_res {
-        Ok(resp) => {
-            let mut tree = GoalTree::from_tree_items(resp.data.items);
-            // 自動展開されるルートゴールのコメント・成果物を取得して埋める。
-            let failed = fetch_root_goal_details_into(&client, &mut tree).await;
-            if failed > 0 {
-                error.get_or_insert_with(|| format!("Failed to load details for {failed} goal(s)"));
-            }
-            tree
-        }
-        Err(e) => {
-            error = Some(format!("Failed to load goals: {e}"));
-            GoalTree::empty()
-        }
-    };
-
-    let members_list = match members_res {
-        Ok(resp) => resp.data.members,
-        Err(e) => {
-            error.get_or_insert_with(|| format!("Failed to load members: {e}"));
-            Vec::new()
-        }
+    let (goal_tree, error) = match client.get_goal_tree(&org_id, 2).await {
+        Ok(resp) => (GoalTree::from_tree_items(resp.data.items), None),
+        Err(e) => (
+            GoalTree::empty(),
+            Some(format!("Failed to load goals: {e}")),
+        ),
     };
 
     InitialData {
         orgs,
         goal_tree,
+        error,
+    }
+}
+
+async fn fetch_deferred_initial_data(
+    mut client: ApiClient,
+    org_id: String,
+    root_ids: Vec<String>,
+) -> DeferredInitialData {
+    client.set_org_id(Some(org_id.clone()));
+    let (members_res, root_details) = tokio::join!(
+        client.get_members(&org_id),
+        fetch_root_goal_details(&client, root_ids)
+    );
+    let (members_list, error) = match members_res {
+        Ok(resp) => (resp.data.members, None),
+        Err(e) => (Vec::new(), Some(format!("Failed to load members: {e}"))),
+    };
+    DeferredInitialData {
         members_list,
+        root_details,
         error,
     }
 }
@@ -478,9 +502,17 @@ const XTERM_MOUSE_CAPTURE_OFF: &[u8] =
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CodexTerminalScrollRoute {
-    ChildMouse,
     Scrollback,
     None,
+}
+
+fn is_permission_denied_error_text(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("403")
+        || lower.contains("forbidden")
+        || lower.contains("permission")
+        || lower.contains("objective.update")
+        || text.contains("権限")
 }
 
 /// codex ペインのライブ更新で取得する Addness 側のスナップショット。
@@ -509,6 +541,13 @@ struct DodJob {
 struct CodexBodyRecordOutcome {
     ok: bool,
     message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexBodyRecordResult {
+    Written,
+    SkippedPermission,
+    Failed,
 }
 
 impl DodJob {
@@ -605,6 +644,7 @@ pub struct App {
     /// 直近に描画した codex 端末ペインの外枠領域。マウス座標のローカル変換に使う。
     pub(super) codex_terminal_area: Option<Rect>,
     /// 直近に描画した Codex 左ペインのスクロール対象領域。
+    pub(super) codex_status_area: Option<Rect>,
     pub(super) codex_contract_area: Option<Rect>,
     pub(super) codex_activity_area: Option<Rect>,
     pub(super) codex_contract_scroll: usize,
@@ -628,6 +668,8 @@ pub struct App {
     codex_dod_job: Option<DodJob>,
     /// 最初の実依頼など、節目の Codex 作業メモを body に非同期記録するジョブ。
     codex_body_record_job: Option<JoinHandle<CodexBodyRecordOutcome>>,
+    /// 初回表示後にメンバー・ルートゴール詳細を埋める遅延ロードジョブ。
+    deferred_initial_load: Option<JoinHandle<DeferredInitialData>>,
 }
 
 impl App {
@@ -657,6 +699,7 @@ impl App {
             success_message: None,
             codex: None,
             codex_terminal_area: None,
+            codex_status_area: None,
             codex_contract_area: None,
             codex_activity_area: None,
             codex_contract_scroll: 0,
@@ -670,6 +713,7 @@ impl App {
             needs_full_clear: false,
             codex_dod_job: None,
             codex_body_record_job: None,
+            deferred_initial_load: None,
         }
     }
 
@@ -719,10 +763,10 @@ impl App {
             .unwrap_or_else(|_| InitialData {
                 orgs: Vec::new(),
                 goal_tree: GoalTree::empty(),
-                members_list: Vec::new(),
                 error: Some("Failed to load initial data".to_string()),
             });
         self.apply_initial_data(data);
+        self.start_deferred_initial_load();
 
         // ロード画面（ロゴ）から本UIへ切り替わる初回フレームの残像を消す。
         self.needs_full_clear = true;
@@ -730,6 +774,9 @@ impl App {
         while self.running {
             // 表示しようとしているタブのデータを必要になった時点で取得する。
             self.ensure_active_tab_loaded();
+            if self.poll_deferred_initial_load() {
+                needs_redraw = true;
+            }
             if needs_redraw {
                 // 構造遷移・リサイズ時は差分描画前に画面を全消去し、残像を断つ。
                 if self.needs_full_clear {
@@ -753,7 +800,7 @@ impl App {
 
             if self.codex.is_some() {
                 // codex は非同期に描画更新するので、キー入力が無くても一定間隔で
-                // PTY 出力を取り込む（ブロッキング read は使わない）。変化があった
+                // JSONL 出力を取り込む（ブロッキング read は使わない）。変化があった
                 // フレームだけ再描画し、アイドル時の無駄な再描画を避ける。
                 if event::poll(std::time::Duration::from_millis(20))? {
                     self.handle_events()?;
@@ -781,10 +828,47 @@ impl App {
             self.client.set_org_id(Some(org_id));
         }
         self.goal_tree = data.goal_tree;
-        self.set_members(data.members_list);
         if let Some(err) = data.error {
             self.error_message = Some(err);
         }
+    }
+
+    fn start_deferred_initial_load(&mut self) {
+        if let Some(handle) = self.deferred_initial_load.take() {
+            handle.abort();
+        }
+        let Some(org_id) = self.current_org_id().map(str::to_string) else {
+            return;
+        };
+        let root_ids = root_goal_ids(&self.goal_tree);
+        let client = self.client.clone();
+        self.deferred_initial_load = Some(
+            self.rt
+                .spawn(fetch_deferred_initial_data(client, org_id, root_ids)),
+        );
+    }
+
+    fn poll_deferred_initial_load(&mut self) -> bool {
+        let Some(handle) = self.deferred_initial_load.as_ref() else {
+            return false;
+        };
+        if !handle.is_finished() {
+            return false;
+        }
+        let handle = self.deferred_initial_load.take().unwrap();
+        let Ok(data) = self.rt.block_on(handle) else {
+            self.error_message = Some("Failed to load goal details".to_string());
+            return true;
+        };
+        self.set_members(data.members_list);
+        let failed = apply_root_goal_details(&mut self.goal_tree, data.root_details);
+        self.goal_tree.clamp_cursor();
+        if failed > 0 {
+            self.error_message = Some(format!("Failed to load details for {failed} goal(s)"));
+        } else if let Some(err) = data.error {
+            self.error_message = Some(err);
+        }
+        true
     }
 
     /// メンバー一覧をルックアップ用マップと表示用リストに反映し、カーソルを先頭へ戻す。
@@ -817,9 +901,7 @@ impl App {
         self.rt.block_on(future)
     }
 
-    /// 現在の組織配下のゴールツリーとメンバーを並列取得する。
-    /// 直列に取ると往復が積み上がるため `tokio::join!` で概ね1往復に畳む。
-    /// 起動時と組織切り替え時の両方から使う。
+    /// 現在の組織配下のゴールツリーを取得し、重い詳細は遅延ロードへ逃がす。
     fn load_org_scoped_data(&mut self) {
         let Some(org_id) = self.current_org_id().map(|s| s.to_string()) else {
             self.goal_tree = GoalTree::empty();
@@ -830,32 +912,18 @@ impl App {
 
         self.client.set_org_id(Some(org_id.clone()));
 
-        let client = &self.client;
-        let (tree_res, members_res) = self.rt.block_on(async {
-            tokio::join!(
-                client.get_goal_tree(&org_id, 2),
-                client.get_members(&org_id)
-            )
-        });
-
-        match tree_res {
+        match self.api_call(self.client.get_goal_tree(&org_id, 2)) {
             Ok(resp) => {
                 self.goal_tree = GoalTree::from_tree_items(resp.data.items);
-                // 自動展開されるルートゴールのコメント・成果物を取得する。
-                self.load_root_goal_details();
+                self.members = HashMap::new();
+                self.members_list = vec![];
+                self.start_deferred_initial_load();
             }
             Err(e) => {
                 self.goal_tree = GoalTree::empty();
-                self.error_message = Some(format!("Failed to load goals: {e}"));
-            }
-        }
-
-        match members_res {
-            Ok(resp) => self.set_members(resp.data.members),
-            Err(e) => {
                 self.members = HashMap::new();
                 self.members_list = vec![];
-                self.error_message = Some(format!("Failed to load members: {e}"));
+                self.error_message = Some(format!("Failed to load goals: {e}"));
             }
         }
     }
@@ -871,27 +939,12 @@ impl App {
         match self.api_call(self.client.get_goal_tree(&org_id, 2)) {
             Ok(resp) => {
                 self.goal_tree = GoalTree::from_tree_items(resp.data.items);
-
-                // Load comments and deliverables for auto-expanded root goals
-                self.load_root_goal_details();
+                self.start_deferred_initial_load();
             }
             Err(e) => {
                 self.goal_tree = GoalTree::empty();
                 self.error_message = Some(format!("Failed to load goals: {e}"));
             }
-        }
-    }
-
-    fn load_root_goal_details(&mut self) {
-        // ツリーを一時的に取り出してヘルパーに &mut で渡し、取得後に戻す。
-        // 起動時のバックグラウンド取得と同じ `fetch_root_goal_details_into` を共有する。
-        let mut tree = std::mem::replace(&mut self.goal_tree, GoalTree::empty());
-        let failed = self
-            .rt
-            .block_on(fetch_root_goal_details_into(&self.client, &mut tree));
-        self.goal_tree = tree;
-        if failed > 0 {
-            self.error_message = Some(format!("Failed to load details for {failed} goal(s)"));
         }
     }
 
@@ -1164,6 +1217,19 @@ impl App {
         ) {
             Ok(mut pane) => {
                 pane.push_activity(format!("{} codex を起動", Local::now().format("%H:%M")));
+                if pane.loaded_history_count() > 0 {
+                    pane.push_activity(format!(
+                        "{} 前回履歴を{}件復元",
+                        Local::now().format("%H:%M"),
+                        pane.loaded_history_count()
+                    ));
+                }
+                if let Some(path) = pane.history_path_label() {
+                    pane.push_activity(format!(
+                        "{} 履歴保存: {path}",
+                        Local::now().format("%H:%M")
+                    ));
+                }
                 pane.push_activity(format!(
                     "{} 軽量コンテキストで入力待ち",
                     Local::now().format("%H:%M")
@@ -1175,6 +1241,7 @@ impl App {
                 self.codex = Some(pane);
                 self.active_pane = ActivePane::Codex;
                 self.codex_terminal_area = None;
+                self.codex_status_area = None;
                 self.codex_contract_area = None;
                 self.codex_activity_area = None;
                 self.codex_contract_scroll = 0;
@@ -1210,14 +1277,21 @@ impl App {
         cwd: &str,
         session_state: &str,
         last_prompt: Option<&str>,
-    ) -> bool {
-        let record = codex_work_memo(cwd, session_state, last_prompt);
+        summary: Option<&CodexWorkSummary>,
+    ) -> CodexBodyRecordResult {
+        let record = codex_work_memo(cwd, session_state, last_prompt, summary);
 
         let goal = match self.api_call(self.client.get_goal(goal_id)) {
             Ok(resp) => resp.data,
             Err(e) => {
-                self.error_message = Some(format!("Codex自動記録の取得に失敗しました: {e}"));
-                return false;
+                let message = format!("{e}");
+                if is_permission_denied_error_text(&message) {
+                    self.success_message =
+                        Some("権限がないためCodex作業メモの自動記録をスキップしました".to_string());
+                    return CodexBodyRecordResult::SkippedPermission;
+                }
+                self.error_message = Some(format!("Codex自動記録の取得に失敗しました: {message}"));
+                return CodexBodyRecordResult::Failed;
             }
         };
         let req = codex_body_update_request(goal.body.as_deref(), &record);
@@ -1226,13 +1300,22 @@ impl App {
             Ok(_) => {
                 self.success_message =
                     Some("Codex作業メモをAddnessの現状(body)に書き込みました".to_string());
-                true
+                CodexBodyRecordResult::Written
             }
             Err(e) => {
-                self.error_message = Some(format!(
-                    "Codex作業メモの現状(body)書き込みに失敗しました: {e}"
-                ));
-                false
+                let message = format!("{e}");
+                if is_permission_denied_error_text(&message) {
+                    self.success_message = Some(
+                        "書き込み権限がないためCodex作業メモの自動記録をスキップしました"
+                            .to_string(),
+                    );
+                    CodexBodyRecordResult::SkippedPermission
+                } else {
+                    self.error_message = Some(format!(
+                        "Codex作業メモの現状(body)書き込みに失敗しました: {message}"
+                    ));
+                    CodexBodyRecordResult::Failed
+                }
             }
         }
     }
@@ -1257,7 +1340,7 @@ impl App {
             // git status/diff のサブプロセスは UI スレッドを固めないよう
             // ブロッキングプールで作る。
             let record = tokio::task::spawn_blocking(move || {
-                codex_work_memo(&cwd, "依頼受付", Some(&prompt))
+                codex_work_memo(&cwd, "依頼受付", Some(&prompt), None)
             })
             .await
             .unwrap_or_default();
@@ -1274,10 +1357,15 @@ impl App {
                     ok: true,
                     message: "現状(body)に作業メモを書込".to_string(),
                 },
-                Err(e) => CodexBodyRecordOutcome {
-                    ok: false,
-                    message: format!("現状(body)の作業メモに失敗: {e}"),
-                },
+                Err(e) => {
+                    let message = format!("{e}");
+                    let message = if is_permission_denied_error_text(&message) {
+                        "書き込み権限なしのため現状(body)の作業メモをスキップ".to_string()
+                    } else {
+                        format!("現状(body)の作業メモに失敗: {message}")
+                    };
+                    CodexBodyRecordOutcome { ok: false, message }
+                }
             }
         }));
         if let Some(pane) = self.codex.as_mut() {
@@ -1318,13 +1406,14 @@ impl App {
         if self.codex_body_record_job.is_some() {
             return false;
         }
-        let Some((goal_id, cwd, last_prompt)) = self.codex.as_mut().and_then(|pane| {
+        let Some((goal_id, cwd, last_prompt, summary)) = self.codex.as_mut().and_then(|pane| {
             if pane.finished && !pane.auto_record_attempted {
                 pane.auto_record_attempted = true;
                 Some((
                     pane.goal_id.clone(),
                     pane.cwd.clone(),
                     pane.last_prompt().map(str::to_string),
+                    pane.work_summary(),
                 ))
             } else {
                 None
@@ -1333,19 +1422,26 @@ impl App {
             return false;
         };
 
-        let ok = self.record_codex_session_to_goal_body(
+        let result = self.record_codex_session_to_goal_body(
             &goal_id,
             &cwd,
             "codex終了",
             last_prompt.as_deref(),
+            Some(&summary),
         );
         if let Some(pane) = self.codex.as_mut() {
             let now = Local::now().format("%H:%M");
-            if ok {
-                pane.last_addness_write_at = Some(Instant::now());
-                pane.push_activity(format!("{now} 現状(body)に終了メモを書込"));
-            } else {
-                pane.push_activity(format!("{now} 現状(body)の終了メモに失敗"));
+            match result {
+                CodexBodyRecordResult::Written => {
+                    pane.last_addness_write_at = Some(Instant::now());
+                    pane.push_activity(format!("{now} 現状(body)に終了メモを書込"));
+                }
+                CodexBodyRecordResult::SkippedPermission => {
+                    pane.push_activity(format!("{now} 書き込み権限なしのため終了メモをスキップ"));
+                }
+                CodexBodyRecordResult::Failed => {
+                    pane.push_activity(format!("{now} 現状(body)の終了メモに失敗"));
+                }
             }
         }
         true
@@ -1357,6 +1453,7 @@ impl App {
         // 通常画面に戻るのでマウスキャプチャを解除（テキスト選択を戻す）。
         Self::set_mouse_capture(false);
         self.codex_terminal_area = None;
+        self.codex_status_area = None;
         self.codex_contract_area = None;
         self.codex_activity_area = None;
         self.codex_contract_scroll = 0;
@@ -1379,6 +1476,7 @@ impl App {
                     &pane.cwd,
                     state,
                     pane.last_prompt(),
+                    Some(&pane.work_summary()),
                 );
             }
             pane.kill();
@@ -1396,7 +1494,7 @@ impl App {
         self.pending_codex_tree_reload = true;
     }
 
-    /// PTY 出力の取り込みとプロセス終了検知。codex 起動中に毎フレーム呼ぶ。
+    /// JSONL 出力の取り込みとプロセス終了検知。codex 起動中に毎フレーム呼ぶ。
     /// あわせて契約ペイン（DoD/タイトル）のライブ更新と DoD 判定を駆動する。
     /// 画面に影響する変化があれば `true` を返す（再描画判定に使う）。
     fn update_codex(&mut self) -> bool {
@@ -1726,11 +1824,14 @@ impl App {
     }
 
     /// codex ログのスクロールキーを処理する。
-    ///
-    /// codex 実行中はキー操作でログを遡らず、trackpad/wheel だけを使う。
-    /// 終了後は codex がキーを処理しないので、
-    /// 通常の矢印・PgUp/PgDn・Home/End もログ操作に使える。
-    fn handle_codex_log_scroll(pane: &mut CodexPane, key: KeyEvent, allow_plain: bool) -> bool {
+    /// `codex exec --json` の右ペインは Addness 側のリストなので、実行中でも
+    /// 通常の矢印・PgUp/PgDn・Home/End で履歴を遡れる。
+    fn handle_codex_log_scroll(
+        pane: &mut CodexPane,
+        key: KeyEvent,
+        allow_plain: bool,
+        allow_vim_keys: bool,
+    ) -> bool {
         let plain = key.modifiers.is_empty();
         if !allow_plain || !plain {
             return false;
@@ -1762,27 +1863,27 @@ impl App {
                 pane.scroll_to_live();
                 return true;
             }
-            KeyCode::Char('k') => {
+            KeyCode::Char('k') if allow_vim_keys => {
                 pane.scroll_lines(1);
                 return true;
             }
-            KeyCode::Char('j') => {
+            KeyCode::Char('j') if allow_vim_keys => {
                 pane.scroll_lines(-1);
                 return true;
             }
-            KeyCode::Char('u') => {
+            KeyCode::Char('u') if allow_vim_keys => {
                 pane.scroll_lines(page);
                 return true;
             }
-            KeyCode::Char('d') => {
+            KeyCode::Char('d') if allow_vim_keys => {
                 pane.scroll_lines(-page);
                 return true;
             }
-            KeyCode::Char('g') => {
+            KeyCode::Char('g') if allow_vim_keys => {
                 pane.scroll_to_top();
                 return true;
             }
-            KeyCode::Char('G') => {
+            KeyCode::Char('G') if allow_vim_keys => {
                 pane.scroll_to_live();
                 return true;
             }
@@ -1809,6 +1910,36 @@ impl App {
     /// 実行中は F12 で終了、trackpad/wheel でログをスクロールし、それ以外のキーは codex へ転送する。
     /// 終了後は還流バー（c/s/d）で成果を Addness に書き戻し、Esc/q で閉じる。
     fn handle_codex_key(&mut self, key: KeyEvent) {
+        if let Some(pane) = self.codex.as_mut() {
+            if pane.handle_search_key(key) {
+                return;
+            }
+            if pane.handle_decision_key(key) {
+                return;
+            }
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                match key.code {
+                    KeyCode::Char('t' | 'T') => {
+                        pane.cycle_log_filter();
+                        return;
+                    }
+                    KeyCode::Char('f' | 'F') => {
+                        pane.begin_search();
+                        return;
+                    }
+                    KeyCode::Char('l' | 'L') => {
+                        pane.clear_search();
+                        return;
+                    }
+                    KeyCode::Char('e' | 'E') => {
+                        pane.toggle_old_turns_collapsed();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         let finished = self.codex.as_ref().map(|c| c.finished).unwrap_or(true);
         if finished {
             // 還流アクションのキー操作時は、古いステータスメッセージを消して鮮度を保つ
@@ -1844,7 +1975,7 @@ impl App {
             }
             // 終了後は codex がキーを処理しないので、ログを遡れるようにする。
             if let Some(pane) = self.codex.as_mut()
-                && Self::handle_codex_log_scroll(pane, key, true)
+                && Self::handle_codex_log_scroll(pane, key, true, true)
             {
                 return;
             }
@@ -1864,6 +1995,9 @@ impl App {
             }
             if pane.scrollback > 0 && key.code == KeyCode::Esc {
                 pane.scroll_to_live();
+                return;
+            }
+            if Self::handle_codex_log_scroll(pane, key, true, false) {
                 return;
             }
             // 過去ログを見たまま通常入力すると入力位置が見えないので、入力前にライブへ戻す。
@@ -1961,34 +2095,17 @@ impl App {
             };
             if let Some(pane) = self.codex.as_mut() {
                 let batch = Self::mouse_scroll_batch_label(event_count);
-                let terminal_point =
-                    Self::point_in_inner_area_clamped(area, mouse.column, mouse.row);
+                let terminal_point = Self::point_in_area(Some(area), mouse.column, mouse.row);
                 let before = pane.scrollback;
                 pane.scroll_lines(delta);
                 let after = pane.scrollback;
-                match Self::codex_terminal_scroll_route(
-                    before,
-                    after,
-                    pane.finished,
-                    pane.mouse_reporting_enabled(),
-                    terminal_point,
-                ) {
+                match Self::codex_terminal_scroll_route(before, after, terminal_point) {
                     CodexTerminalScrollRoute::Scrollback => {
                         self.codex_last_scroll_input = Some(format!(
                             "mouse {:?}{batch} -> codex {before}->{after}",
                             mouse.kind
                         ));
                         return;
-                    }
-                    CodexTerminalScrollRoute::ChildMouse => {
-                        if let Some((column, row)) = terminal_point {
-                            pane.input_mouse_wheel(mouse.kind, column, row, mouse.modifiers);
-                            self.codex_last_scroll_input = Some(format!(
-                                "mouse {:?}{batch} -> codex {before}->{after} pty-mouse",
-                                mouse.kind
-                            ));
-                            return;
-                        }
                     }
                     CodexTerminalScrollRoute::None => {
                         self.codex_last_scroll_input = Some(format!(
@@ -2002,11 +2119,13 @@ impl App {
             return;
         }
 
-        if Self::point_in_area(self.codex_contract_area, mouse.column, mouse.row) {
-            Self::scroll_index(&mut self.codex_contract_scroll, delta);
+        if Self::point_in_area(self.codex_status_area, mouse.column, mouse.row)
+            || Self::point_in_area(self.codex_contract_area, mouse.column, mouse.row)
+        {
+            Self::scroll_document_offset(&mut self.codex_contract_scroll, delta);
             let batch = Self::mouse_scroll_batch_label(event_count);
             self.codex_last_scroll_input =
-                Some(format!("mouse {:?}{batch} -> Addness", mouse.kind));
+                Some(format!("mouse {:?}{batch} -> Addnessゴール", mouse.kind));
             return;
         }
 
@@ -2048,18 +2167,13 @@ impl App {
     fn codex_terminal_scroll_route(
         before: usize,
         after: usize,
-        finished: bool,
-        mouse_reporting_enabled: bool,
-        terminal_point: Option<(u16, u16)>,
+        terminal_point_inside: bool,
     ) -> CodexTerminalScrollRoute {
         if after != before {
             return CodexTerminalScrollRoute::Scrollback;
         }
-        if terminal_point.is_none() {
+        if !terminal_point_inside {
             return CodexTerminalScrollRoute::None;
-        }
-        if !finished && mouse_reporting_enabled {
-            return CodexTerminalScrollRoute::ChildMouse;
         }
         CodexTerminalScrollRoute::None
     }
@@ -2070,6 +2184,10 @@ impl App {
         } else {
             *offset = offset.saturating_sub((-delta) as usize);
         }
+    }
+
+    fn scroll_document_offset(offset: &mut usize, delta: isize) {
+        Self::scroll_index(offset, -delta);
     }
 
     fn point_in_area(area: Option<Rect>, column: u16, row: u16) -> bool {
@@ -2097,27 +2215,6 @@ impl App {
         if column < inner.x || row < inner.y || column >= right || row >= bottom {
             return None;
         }
-        Some((column - inner.x, row - inner.y))
-    }
-
-    fn point_in_inner_area_clamped(area: Rect, column: u16, row: u16) -> Option<(u16, u16)> {
-        let inner = Rect {
-            x: area.x.saturating_add(1),
-            y: area.y.saturating_add(1),
-            width: area.width.saturating_sub(2),
-            height: area.height.saturating_sub(2),
-        };
-        if inner.width == 0 || inner.height == 0 {
-            return None;
-        }
-        if !Self::point_in_area(Some(area), column, row) {
-            return None;
-        }
-
-        let right = inner.x.saturating_add(inner.width).saturating_sub(1);
-        let bottom = inner.y.saturating_add(inner.height).saturating_sub(1);
-        let column = column.clamp(inner.x, right);
-        let row = row.clamp(inner.y, bottom);
         Some((column - inner.x, row - inner.y))
     }
 
@@ -2408,7 +2505,7 @@ impl App {
         }
 
         if let Event::Mouse(me) = event {
-            // codex 使用中のみ有効なマウスキャプチャを、右側の PTY 端末領域に限定して扱う。
+            // codex 使用中のみ有効なマウスキャプチャを、右側の会話領域に限定して扱う。
             self.handle_codex_mouse_batch(me)?;
             return Ok(());
         }
@@ -4453,24 +4550,6 @@ mod codex_mouse_tests {
     }
 
     #[test]
-    fn point_in_inner_area_clamped_maps_frame_to_nearest_terminal_cell() {
-        let area = Rect {
-            x: 10,
-            y: 5,
-            width: 20,
-            height: 8,
-        };
-
-        assert_eq!(App::point_in_inner_area_clamped(area, 10, 5), Some((0, 0)));
-        assert_eq!(
-            App::point_in_inner_area_clamped(area, 29, 12),
-            Some((17, 5))
-        );
-        assert_eq!(App::point_in_inner_area_clamped(area, 15, 8), Some((4, 2)));
-        assert_eq!(App::point_in_inner_area_clamped(area, 30, 12), None);
-    }
-
-    #[test]
     fn mouse_scroll_delta_maps_trackpad_wheel_to_history_direction() {
         assert_eq!(
             App::mouse_scroll_delta(MouseEventKind::ScrollUp),
@@ -4529,25 +4608,17 @@ mod codex_mouse_tests {
     }
 
     #[test]
-    fn codex_terminal_scroll_route_prefers_scrollback_then_child_mouse() {
+    fn codex_terminal_scroll_route_prefers_scrollback() {
         assert_eq!(
-            App::codex_terminal_scroll_route(0, 3, false, true, Some((1, 1))),
+            App::codex_terminal_scroll_route(0, 3, true),
             CodexTerminalScrollRoute::Scrollback
         );
         assert_eq!(
-            App::codex_terminal_scroll_route(0, 0, false, true, Some((1, 1))),
-            CodexTerminalScrollRoute::ChildMouse
-        );
-        assert_eq!(
-            App::codex_terminal_scroll_route(0, 0, false, false, Some((1, 1))),
+            App::codex_terminal_scroll_route(0, 0, true),
             CodexTerminalScrollRoute::None
         );
         assert_eq!(
-            App::codex_terminal_scroll_route(0, 0, true, true, Some((1, 1))),
-            CodexTerminalScrollRoute::None
-        );
-        assert_eq!(
-            App::codex_terminal_scroll_route(0, 0, false, true, None),
+            App::codex_terminal_scroll_route(0, 0, false),
             CodexTerminalScrollRoute::None
         );
     }
@@ -4559,7 +4630,7 @@ mod codex_mouse_tests {
         let mut app = App::new(client, rt.handle().clone());
         let mut output = String::new();
         for row in 1..=100 {
-            output.push_str(&format!("\x1b[{row};1Hrow {row:03}"));
+            output.push_str(&format!("row {row:03}\n"));
         }
         app.codex = Some(CodexPane::test_with_output(100, 20, 0, &output));
         app.codex.as_mut().unwrap().resize(4, 20);
@@ -4597,7 +4668,7 @@ mod codex_mouse_tests {
         let mut app = App::new(client, rt.handle().clone());
         let mut output = String::new();
         for row in 1..=100 {
-            output.push_str(&format!("\x1b[{row};1Hrow {row:03}"));
+            output.push_str(&format!("row {row:03}\n"));
         }
         app.codex = Some(CodexPane::test_with_output(100, 20, 0, &output));
         app.codex.as_mut().unwrap().resize(4, 20);
@@ -4629,6 +4700,93 @@ mod codex_mouse_tests {
     }
 
     #[test]
+    fn handle_codex_mouse_scroll_routes_left_panes_by_pointer_area() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = ApiClient::new("t", "http://localhost").unwrap();
+        let mut app = App::new(client, rt.handle().clone());
+        app.codex = Some(CodexPane::test_with_output(20, 20, 0, ""));
+        app.active_pane = ActivePane::Codex;
+        app.codex_status_area = Some(Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 5,
+        });
+        app.codex_contract_area = Some(Rect {
+            x: 0,
+            y: 5,
+            width: 20,
+            height: 10,
+        });
+        app.codex_activity_area = Some(Rect {
+            x: 0,
+            y: 15,
+            width: 20,
+            height: 5,
+        });
+
+        app.handle_codex_mouse_scroll(
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 2,
+                row: 6,
+                modifiers: KeyModifiers::NONE,
+            },
+            CODEX_WHEEL_LINES,
+            1,
+        );
+        assert_eq!(app.codex_contract_scroll, 0);
+        assert_eq!(
+            app.codex_last_scroll_input.as_deref(),
+            Some("mouse ScrollUp -> Addnessゴール")
+        );
+
+        app.handle_codex_mouse_scroll(
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 2,
+                row: 6,
+                modifiers: KeyModifiers::NONE,
+            },
+            -CODEX_WHEEL_LINES,
+            1,
+        );
+        assert_eq!(app.codex_contract_scroll, CODEX_WHEEL_LINES as usize);
+        assert_eq!(
+            app.codex_last_scroll_input.as_deref(),
+            Some("mouse ScrollDown -> Addnessゴール")
+        );
+
+        app.handle_codex_mouse_scroll(
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 2,
+                row: 16,
+                modifiers: KeyModifiers::NONE,
+            },
+            CODEX_WHEEL_LINES,
+            1,
+        );
+        assert_eq!(app.codex_activity_scroll, CODEX_WHEEL_LINES as usize);
+        assert_eq!(
+            app.codex_last_scroll_input.as_deref(),
+            Some("mouse ScrollUp -> Addness更新")
+        );
+
+        app.handle_codex_mouse_scroll(
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 2,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            },
+            CODEX_WHEEL_LINES,
+            1,
+        );
+        assert_eq!(app.codex_contract_scroll, 0);
+    }
+
+    #[test]
     fn shifted_codex_navigation_keys_are_swallowed() {
         assert!(App::is_codex_shift_navigation_key(KeyEvent::new(
             KeyCode::Up,
@@ -4656,7 +4814,7 @@ mod dod_tests {
         CODEX_TRACEABILITY_START, codex_trace_link_label, ensure_codex_memory_sections,
         upsert_codex_auto_record,
     };
-    use super::{extract_json_object, parse_dod_results};
+    use super::{extract_json_object, is_permission_denied_error_text, parse_dod_results};
 
     #[test]
     fn extract_json_object_strips_surrounding_text() {
@@ -4761,6 +4919,17 @@ mod dod_tests {
             codex_trace_link_label("press release draft", Some("https://example.com/doc"))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn permission_denied_error_text_detects_goal_write_errors() {
+        assert!(is_permission_denied_error_text(
+            "API error (403 Forbidden): objective.update denied"
+        ));
+        assert!(is_permission_denied_error_text(
+            "この操作を行う権限がありません"
+        ));
+        assert!(!is_permission_denied_error_text("API error (500): server"));
     }
 
     #[test]

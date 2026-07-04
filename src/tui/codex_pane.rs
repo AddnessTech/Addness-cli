@@ -1,46 +1,30 @@
-//! TUI 内に codex を擬似端末（PTY）として埋め込むためのモジュール。
+//! TUI 内で `codex exec --json` を起動し、JSONL イベントを Addness 側の
+//! 会話履歴として描画するためのモジュール。
 //!
-//! codex 自体がフルスクリーンの対話型 TUI なので、PTY 上で起動し、その VT 出力を
-//! vt100 でパースして ratatui のペインに描画、キー入力を PTY へ転送する。
-//! codex は同梱の `addness` CLI を通じて Addness（タスク DB）を読み書きする想定で、
-//! 起動時に対象ゴールの文脈をプロンプトとして注入する。
+//! Codex の対話型 TUI は使わず、入力・履歴・スクロール・イベント表示を
+//! Addness 側で持つ。各ユーザー入力ごとに `codex exec --json` を 1 ターン実行し、
+//! 2 ターン目以降は `codex exec resume <thread_id> --json` で同じ Codex セッションを
+//! 継続する。
 
-use std::io::{Read, Write};
+use std::collections::{BTreeSet, VecDeque};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
-use tui_term::{vt100, widget::Screen};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use unicode_width::UnicodeWidthStr;
 
-const CODEX_PTY_EXTRA_SCROLL_ROWS_DEFAULT: u16 = 160;
-const CODEX_PTY_EXTRA_SCROLL_ROWS_MAX: u16 = 1000;
-const CODEX_PTY_EXTRA_SCROLL_ROWS_ENV: &str = "ADDNESS_CODEX_EXTRA_SCROLL_ROWS";
-
-fn pty_extra_scroll_rows() -> u16 {
-    extra_scroll_rows_from_env_value(
-        std::env::var(CODEX_PTY_EXTRA_SCROLL_ROWS_ENV)
-            .ok()
-            .as_deref(),
-    )
-}
-
-fn extra_scroll_rows_from_env_value(value: Option<&str>) -> u16 {
-    let Some(value) = value else {
-        return CODEX_PTY_EXTRA_SCROLL_ROWS_DEFAULT;
-    };
-    value
-        .trim()
-        .parse::<u16>()
-        .map(|rows| rows.min(CODEX_PTY_EXTRA_SCROLL_ROWS_MAX))
-        .unwrap_or(CODEX_PTY_EXTRA_SCROLL_ROWS_DEFAULT)
-}
-
-fn pty_rows_for_visible(visible_rows: u16) -> u16 {
-    visible_rows.max(1).saturating_add(pty_extra_scroll_rows())
-}
+pub const CODEX_LOG_PREFIX_WIDTH: usize = 7;
+const CODEX_SESSION_HISTORY_DIR: &str = "codex-sessions";
+const CODEX_SESSION_HISTORY_MAX_LOG_LINES: usize = 5_000;
+const CODEX_SESSION_HISTORY_MAX_RECORDS: usize = 20_000;
+const CODEX_SESSION_HISTORY_MAX_BYTES: u64 = 20 * 1024 * 1024;
 
 /// codex 実行ファイルのパスを解決する。
 /// 環境変数 `ADDNESS_CODEX_BIN` を最優先で見て、無ければ PATH 上を探す。
@@ -76,18 +60,223 @@ pub fn git_diff_stat(cwd: &Path) -> String {
     }
 }
 
+/// Addness 独自 UI に表示する Codex ログ行の種類。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CodexLogKind {
+    User,
+    Assistant,
+    Tool,
+    Turn,
+    System,
+    Error,
+    Event,
+}
+
+/// Addness 独自 UI に表示する Codex ログ行。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexLogLine {
+    pub kind: CodexLogKind,
+    pub text: String,
+}
+
+impl CodexLogLine {
+    fn new(kind: CodexLogKind, text: impl Into<String>) -> Self {
+        Self {
+            kind,
+            text: text.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexLogFilter {
+    All,
+    Conversation,
+    Tools,
+    Errors,
+}
+
+impl CodexLogFilter {
+    fn next(self) -> Self {
+        match self {
+            Self::All => Self::Conversation,
+            Self::Conversation => Self::Tools,
+            Self::Tools => Self::Errors,
+            Self::Errors => Self::All,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Conversation => "Talk",
+            Self::Tools => "Tools",
+            Self::Errors => "Errors",
+        }
+    }
+}
+
+fn matches_log_filter(kind: CodexLogKind, filter: CodexLogFilter) -> bool {
+    match filter {
+        CodexLogFilter::All => true,
+        CodexLogFilter::Conversation => {
+            matches!(
+                kind,
+                CodexLogKind::User | CodexLogKind::Assistant | CodexLogKind::Turn
+            )
+        }
+        CodexLogFilter::Tools => {
+            matches!(kind, CodexLogKind::Tool | CodexLogKind::Event)
+        }
+        CodexLogFilter::Errors => matches!(kind, CodexLogKind::Error),
+    }
+}
+
+enum CodexProcessEvent {
+    Stdout(String),
+    Stderr(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "record", rename_all = "snake_case")]
+enum CodexSessionRecord {
+    Log { kind: CodexLogKind, text: String },
+    AssistantDelta { text: String },
+    RawEvent { stream: String, line: String },
+}
+
+struct LoadedCodexSession {
+    log: Vec<CodexLogLine>,
+    record_count: usize,
+}
+
+struct CodexPaneSpawnOptions<'a> {
+    codex_bin: &'a Path,
+    cwd: &'a Path,
+    addness_bin: &'a str,
+    goal_id: String,
+    goal_title: String,
+    dod: String,
+    status_label: String,
+    session_log_path: Option<PathBuf>,
+}
+
+/// 子ゴール 1 件の表示用情報。
+pub struct ChildGoal {
+    pub id: String,
+    pub title: String,
+    pub icon: &'static str,
+    /// 新着ハイライトの有効期限（None=通常表示）。
+    pub new_until: Option<Instant>,
+}
+
+/// ホスト側 TUI が端末へ通知すべき Codex イベント。
+pub struct TerminalNotice {
+    pub title: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexRunState {
+    InputWaiting,
+    Thinking,
+    CommandRunning,
+    Confirming,
+    Completed,
+}
+
+impl CodexRunState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::InputWaiting => "入力待ち",
+            Self::Thinking => "考え中",
+            Self::CommandRunning => "コマンド実行中",
+            Self::Confirming => "確認待ち",
+            Self::Completed => "完了",
+        }
+    }
+
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::InputWaiting => "READY",
+            Self::Thinking => "THINK",
+            Self::CommandRunning => "RUN",
+            Self::Confirming => "WAIT",
+            Self::Completed => "DONE",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodexDecisionKind {
+    Approval,
+    Permission,
+    Dangerous,
+    YesNo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexDecisionBanner {
+    pub kind: CodexDecisionKind,
+    pub message: String,
+    pub accept_key: char,
+    pub accept_label: &'static str,
+    pub deny_key: char,
+    pub deny_label: &'static str,
+}
+
+impl CodexDecisionBanner {
+    fn new(kind: CodexDecisionKind, message: String) -> Self {
+        match kind {
+            CodexDecisionKind::Approval => Self {
+                kind,
+                message,
+                accept_key: 'a',
+                accept_label: "承認",
+                deny_key: 'd',
+                deny_label: "拒否",
+            },
+            CodexDecisionKind::Permission | CodexDecisionKind::Dangerous => Self {
+                kind,
+                message,
+                accept_key: 'a',
+                accept_label: "許可",
+                deny_key: 'd',
+                deny_label: "拒否",
+            },
+            CodexDecisionKind::YesNo => Self {
+                kind,
+                message,
+                accept_key: 'y',
+                accept_label: "Yes",
+                deny_key: 'n',
+                deny_label: "No",
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CodexWorkSummary {
+    pub implemented: Vec<String>,
+    pub checks: Vec<String>,
+    pub remaining: Vec<String>,
+}
+
 /// 埋め込み codex セッションの状態。
 pub struct CodexPane {
-    parser: vt100::Parser,
-    master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
-    child: Box<dyn Child + Send + Sync>,
-    rx: Receiver<Vec<u8>>,
-    /// codex プロセスが終了済みか。
+    codex_bin: PathBuf,
+    addness_bin: String,
+    child: Option<Child>,
+    tx: Sender<CodexProcessEvent>,
+    rx: Receiver<CodexProcessEvent>,
+    /// Codex プロセスが終了済みか。通常のターン完了では true にせず、
+    /// ユーザーが `/exit` した場合やペインを閉じる場合にだけ終了扱いにする。
     pub finished: bool,
+    /// 現在の `codex exec` ターンが実行中か。
+    turn_running: bool,
     rows: u16,
     cols: u16,
-    visible_rows: u16,
     /// 還流先となる対象ゴールの ID。
     pub goal_id: String,
     /// 契約ペイン表示用に保持する対象ゴールのタイトルと DoD。
@@ -113,68 +302,1217 @@ pub struct CodexPane {
     pub children: Vec<ChildGoal>,
     /// codex が直近に実行した addness 操作の表示ラベル（参照/書込中インジケータ）。
     pub action: Option<String>,
+    /// codex が現在実行中として報告したコマンド。
+    current_command: Option<String>,
+    current_command_started_at: Option<Instant>,
     /// Addness をメモリとして使っているかを左ペインで示すための最終読込/書込時刻。
     pub last_addness_read_at: Option<Instant>,
     pub last_addness_write_at: Option<Instant>,
+    pub last_addness_read_label: Option<String>,
+    pub last_addness_write_label: Option<String>,
     /// ステータス・DoD が変化した時刻（変化行を数秒ハイライトするのに使う）。
     pub status_changed_at: Option<Instant>,
     pub dod_changed_at: Option<Instant>,
     /// codex ログのスクロールバック位置（0=最新、増えるほど過去）。
     pub scrollback: usize,
+    /// 直近の描画で計算した表示行数ベースの最大スクロールバック。
+    rendered_history_max_scrollback: Option<usize>,
     /// Addness 側の更新ログ（codex の書き込みやステータス変化を可視化）。新しいものほど末尾。
     pub activity: Vec<String>,
-    /// ホスト端末へ通知済みの Codex イベントキー。画面上に同じ確認待ちが残る間の連打を防ぐ。
-    last_terminal_notice_key: Option<String>,
     /// codex セッション終了時の Addness body 自動記録を試行済みか。
     pub auto_record_attempted: bool,
     /// 最初の実依頼の body 自動記録を済み（再試行しない）とするフラグ。
     body_record_done: bool,
     input_state: CodexInputState,
+    queued_prompts: VecDeque<String>,
+    /// `codex exec --json` が返した Codex thread id。2ターン目以降の resume に使う。
+    thread_id: Option<String>,
+    /// いま実行中のターンに対応するユーザー入力。turn.started の見出しに使う。
+    current_turn_prompt: Option<String>,
+    /// Codex の turn 番号。UI上の区切りに使う。
+    turn_count: usize,
+    collapsed_turns: BTreeSet<usize>,
+    /// Addness 側で保持する会話・イベント履歴。
+    log: Vec<CodexLogLine>,
+    /// Addness 側で永続化する codex exec JSONL/UI 履歴。
+    session_log_path: Option<PathBuf>,
+    /// セッションログファイル内の概算レコード数（trim 判断とUI表示用）。
+    session_record_count: usize,
+    /// 起動時に復元した表示用ログ件数。
+    loaded_history_count: usize,
+    /// ストリーミング中の assistant 行。delta イベントが来た場合はこの行を伸ばす。
+    streaming_assistant_index: Option<usize>,
+    /// 端末通知待ちイベント。
+    pending_notices: VecDeque<TerminalNotice>,
+    /// 直近の exec 子プロセス終了イベントを JSON 側で受け取ったか。
+    turn_finished_by_event: bool,
+    /// Codex 履歴の表示フィルタ。
+    log_filter: CodexLogFilter,
+    /// Codex 履歴検索クエリ。
+    search_query: String,
+    /// 検索入力中か。
+    search_editing: bool,
+    pending_decision: Option<CodexDecisionBanner>,
 }
 
-pub struct CodexScreenView<'a> {
-    screen: &'a vt100::Screen,
-    row_offset: u16,
-    hide_cursor: bool,
-}
-
-impl Screen for CodexScreenView<'_> {
-    type C = vt100::Cell;
-
-    fn cell(&self, row: u16, col: u16) -> Option<&Self::C> {
-        self.screen.cell(row.saturating_add(self.row_offset), col)
+impl CodexPane {
+    /// codex exec JSON セッションを開始する。
+    ///
+    /// 起動時点では Codex プロセスを走らせず、Addness 側の入力欄で最初の依頼を待つ。
+    /// 最初の Enter で `codex exec --json` を起動し、以降は `codex exec resume` を使う。
+    pub fn spawn(
+        codex_bin: &Path,
+        cwd: &Path,
+        addness_bin: &str,
+        goal_id: String,
+        goal_title: String,
+        dod: String,
+        status_label: String,
+    ) -> Result<Self> {
+        Self::spawn_inner(CodexPaneSpawnOptions {
+            codex_bin,
+            cwd,
+            addness_bin,
+            session_log_path: codex_session_log_path(&goal_id),
+            goal_id,
+            goal_title,
+            dod,
+            status_label,
+        })
     }
 
-    fn hide_cursor(&self) -> bool {
-        self.hide_cursor || self.screen.hide_cursor()
-    }
+    fn spawn_inner(options: CodexPaneSpawnOptions<'_>) -> Result<Self> {
+        let CodexPaneSpawnOptions {
+            codex_bin,
+            cwd,
+            addness_bin,
+            goal_id,
+            goal_title,
+            dod,
+            status_label,
+            session_log_path,
+        } = options;
+        let dod_items = split_dod_items(&dod);
+        let dod_checks = vec![None; dod_items.len()];
+        let (tx, rx) = mpsc::channel::<CodexProcessEvent>();
+        let loaded = session_log_path
+            .as_deref()
+            .map(load_codex_session)
+            .transpose()
+            .unwrap_or(None)
+            .unwrap_or_else(|| LoadedCodexSession {
+                log: Vec::new(),
+                record_count: 0,
+            });
+        let loaded_history_count = loaded.log.len();
+        let turn_count = loaded
+            .log
+            .iter()
+            .filter(|line| line.kind == CodexLogKind::Turn)
+            .count();
+        let collapsed_turns = (1..turn_count).collect::<BTreeSet<_>>();
 
-    fn cursor_position(&self) -> (u16, u16) {
-        let (row, col) = self.screen.cursor_position();
-        if row < self.row_offset {
-            return (u16::MAX, col);
+        let mut pane = Self {
+            codex_bin: codex_bin.to_path_buf(),
+            addness_bin: addness_bin.to_string(),
+            child: None,
+            tx,
+            rx,
+            finished: false,
+            turn_running: false,
+            rows: 24,
+            cols: 80,
+            goal_id,
+            goal_title,
+            cwd: cwd.display().to_string(),
+            status_label,
+            dod_items,
+            dod_checks,
+            assessing: false,
+            child_count: None,
+            comment_count: None,
+            deliverable_count: None,
+            trace_links: Vec::new(),
+            children: Vec::new(),
+            action: None,
+            current_command: None,
+            current_command_started_at: None,
+            last_addness_read_at: None,
+            last_addness_write_at: None,
+            last_addness_read_label: None,
+            last_addness_write_label: None,
+            status_changed_at: None,
+            dod_changed_at: None,
+            scrollback: 0,
+            rendered_history_max_scrollback: None,
+            activity: Vec::new(),
+            auto_record_attempted: false,
+            body_record_done: false,
+            input_state: CodexInputState::default(),
+            queued_prompts: VecDeque::new(),
+            thread_id: None,
+            current_turn_prompt: None,
+            turn_count,
+            collapsed_turns,
+            log: loaded.log,
+            session_log_path,
+            session_record_count: loaded.record_count,
+            loaded_history_count,
+            streaming_assistant_index: None,
+            pending_notices: VecDeque::new(),
+            turn_finished_by_event: false,
+            log_filter: CodexLogFilter::All,
+            search_query: String::new(),
+            search_editing: false,
+            pending_decision: None,
+            dod,
+        };
+        if pane.loaded_history_count > 0 {
+            pane.push_log(
+                CodexLogKind::System,
+                format!(
+                    "前回のAddness UI履歴を {} 件読み込みました。続きは Enter で送信できます。",
+                    pane.loaded_history_count
+                ),
+            );
         }
-        (row - self.row_offset, col)
+        pane.push_log(
+            CodexLogKind::System,
+            "Addness独自UIで待機中。入力して Enter で codex exec --json を実行します。",
+        );
+        Ok(pane)
     }
 
-    fn cursor_shape(&self) -> tui_term::widget::CursorShape {
-        self.screen.cursor_shape()
+    #[cfg(test)]
+    pub(crate) fn test_with_output(
+        rows: u16,
+        cols: u16,
+        _scrollback_len: usize,
+        output: &str,
+    ) -> Self {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let mut pane = Self::spawn(
+            Path::new("codex"),
+            &cwd,
+            "addness",
+            "test-goal".to_string(),
+            "Test goal".to_string(),
+            String::new(),
+            "TEST".to_string(),
+        )
+        .unwrap();
+        pane.rows = rows.max(1);
+        pane.cols = cols.max(1);
+        pane.log.clear();
+        pane.session_log_path = None;
+        pane.session_record_count = 0;
+        pane.loaded_history_count = 0;
+        pane.turn_count = 0;
+        pane.rendered_history_max_scrollback = None;
+        pane.log_filter = CodexLogFilter::All;
+        pane.search_query.clear();
+        pane.search_editing = false;
+        pane.collapsed_turns.clear();
+        pane.pending_decision = None;
+        for line in output.lines() {
+            pane.push_log(CodexLogKind::Assistant, line.to_string());
+        }
+        pane.finished = true;
+        pane
+    }
+
+    /// ログを delta 行スクロールする（正=過去へ、負=最新へ）。
+    pub fn scroll_lines(&mut self, delta: isize) {
+        let max = self.max_view_scrollback();
+        let target = (self.scrollback as isize + delta).max(0) as usize;
+        self.scrollback = target.min(max);
+    }
+
+    /// 1 ページ分の行数（スクロール量）。
+    pub fn page(&self) -> usize {
+        self.rows.saturating_sub(3).max(1) as usize
+    }
+
+    /// 最古（バッファ先頭）までスクロールする。
+    pub fn scroll_to_top(&mut self) {
+        self.scrollback = self.max_view_scrollback();
+    }
+
+    /// 最新（ライブ）位置へ戻す。
+    pub fn scroll_to_live(&mut self) {
+        self.scrollback = 0;
+    }
+
+    pub fn is_turn_running(&self) -> bool {
+        self.turn_running || self.child.is_some()
+    }
+
+    pub fn run_state(&self) -> CodexRunState {
+        if self.finished {
+            CodexRunState::Completed
+        } else if self.pending_decision.is_some() {
+            CodexRunState::Confirming
+        } else if self.current_command.is_some() {
+            CodexRunState::CommandRunning
+        } else if self.is_turn_running() {
+            CodexRunState::Thinking
+        } else {
+            CodexRunState::InputWaiting
+        }
+    }
+
+    pub fn current_command(&self) -> Option<&str> {
+        self.current_command.as_deref()
+    }
+
+    pub fn current_command_elapsed_secs(&self) -> Option<u64> {
+        self.current_command_started_at
+            .map(|t| t.elapsed().as_secs())
+    }
+
+    pub fn thread_id(&self) -> Option<&str> {
+        self.thread_id.as_deref()
+    }
+
+    pub fn turn_count(&self) -> usize {
+        self.turn_count
+    }
+
+    pub fn collapsed_turn_count(&self) -> usize {
+        self.collapsed_turns.len()
+    }
+
+    pub fn decision_banner(&self) -> Option<&CodexDecisionBanner> {
+        self.pending_decision.as_ref()
+    }
+
+    pub fn last_assistant_text(&self) -> Option<&str> {
+        self.log
+            .iter()
+            .rev()
+            .find(|line| line.kind == CodexLogKind::Assistant)
+            .map(|line| line.text.as_str())
+    }
+
+    pub fn input_line(&self) -> &str {
+        &self.input_state.line
+    }
+
+    pub fn queued_prompt_count(&self) -> usize {
+        self.queued_prompts.len()
+    }
+
+    pub fn filtered_log_lines(&self) -> Vec<&CodexLogLine> {
+        let query = self.normalized_search_query();
+        let collapse_turns = query.is_empty()
+            && matches!(
+                self.log_filter,
+                CodexLogFilter::All | CodexLogFilter::Conversation
+            );
+        let mut current_collapsed_turn = None;
+        let mut visible = Vec::new();
+        for line in &self.log {
+            if line.kind == CodexLogKind::Turn {
+                current_collapsed_turn = turn_number_from_label(&line.text)
+                    .filter(|n| collapse_turns && self.collapsed_turns.contains(n));
+                if self.log_line_visible(line, &query) {
+                    visible.push(line);
+                }
+                continue;
+            }
+            if current_collapsed_turn.is_some() {
+                continue;
+            }
+            if self.log_line_visible(line, &query) {
+                visible.push(line);
+            }
+        }
+        visible
+    }
+
+    pub fn toggle_old_turns_collapsed(&mut self) {
+        if self.collapsed_turns.is_empty() {
+            self.collapse_completed_turns();
+        } else {
+            self.collapsed_turns.clear();
+        }
+        self.invalidate_rendered_history_metrics();
+        self.scrollback = self.scrollback.min(self.max_view_scrollback());
+    }
+
+    fn collapse_completed_turns(&mut self) {
+        self.collapsed_turns.clear();
+        let keep_open = if self.turn_running {
+            self.turn_count
+        } else {
+            self.turn_count.saturating_add(1)
+        };
+        for turn in 1..keep_open {
+            self.collapsed_turns.insert(turn);
+        }
+    }
+
+    pub fn work_summary(&self) -> CodexWorkSummary {
+        CodexWorkSummary {
+            implemented: summarize_implemented_work(&self.log),
+            checks: summarize_checks(&self.log),
+            remaining: summarize_remaining_work(&self.log),
+        }
+    }
+
+    pub fn handle_decision_key(&mut self, key: KeyEvent) -> bool {
+        let Some(decision) = self.pending_decision.clone() else {
+            return false;
+        };
+        if !key.modifiers.is_empty() {
+            return false;
+        }
+        let KeyCode::Char(ch) = key.code else {
+            return false;
+        };
+        let ch = ch.to_ascii_lowercase();
+        let response = if ch == decision.accept_key || ch == 'y' {
+            Some(decision.accept_label)
+        } else if ch == decision.deny_key || ch == 'n' {
+            Some(decision.deny_label)
+        } else {
+            None
+        };
+        let Some(response) = response else {
+            return false;
+        };
+        self.pending_decision = None;
+        self.action = Some(format!("確認応答: {response}"));
+        self.push_activity(format!("確認待ちに {response} で応答"));
+        self.push_terminal_notice("Codex 確認応答", format!("{response} を選択しました"));
+        true
+    }
+
+    pub fn log_filter_label(&self) -> &'static str {
+        self.log_filter.label()
+    }
+
+    pub fn search_query(&self) -> &str {
+        &self.search_query
+    }
+
+    pub fn is_search_editing(&self) -> bool {
+        self.search_editing
+    }
+
+    pub fn cycle_log_filter(&mut self) {
+        self.log_filter = self.log_filter.next();
+        self.invalidate_rendered_history_metrics();
+        self.scrollback = self.scrollback.min(self.max_view_scrollback());
+    }
+
+    pub fn begin_search(&mut self) {
+        self.search_editing = true;
+        self.invalidate_rendered_history_metrics();
+        self.scrollback = self.scrollback.min(self.max_view_scrollback());
+    }
+
+    pub fn clear_search(&mut self) {
+        self.search_query.clear();
+        self.search_editing = false;
+        self.invalidate_rendered_history_metrics();
+        self.scrollback = self.scrollback.min(self.max_view_scrollback());
+    }
+
+    pub fn handle_search_key(&mut self, key: KeyEvent) -> bool {
+        if !self.search_editing {
+            return false;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => {
+                self.search_editing = false;
+                true
+            }
+            KeyCode::Backspace => {
+                self.search_query.pop();
+                self.invalidate_rendered_history_metrics();
+                self.scrollback = self.scrollback.min(self.max_view_scrollback());
+                true
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.search_query.clear();
+                self.invalidate_rendered_history_metrics();
+                self.scrollback = self.scrollback.min(self.max_view_scrollback());
+                true
+            }
+            KeyCode::Char(ch)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                self.search_query.push(ch);
+                self.invalidate_rendered_history_metrics();
+                self.scrollback = self.scrollback.min(self.max_view_scrollback());
+                true
+            }
+            _ => true,
+        }
+    }
+
+    pub fn history_label(&self) -> String {
+        if self.session_log_path.is_some() {
+            format!("履歴 {}件 保存中", self.log.len())
+        } else {
+            format!("履歴 {}件 メモリのみ", self.log.len())
+        }
+    }
+
+    pub fn history_path_label(&self) -> Option<String> {
+        self.session_log_path.as_deref().map(compact_home_path)
+    }
+
+    pub fn loaded_history_count(&self) -> usize {
+        self.loaded_history_count
+    }
+
+    pub fn sync_rendered_history_metrics(&mut self, total_lines: usize, viewport_height: usize) {
+        let max = total_lines.saturating_sub(viewport_height);
+        self.rendered_history_max_scrollback = Some(max);
+        self.scrollback = self.scrollback.min(max);
+    }
+
+    fn invalidate_rendered_history_metrics(&mut self) {
+        self.rendered_history_max_scrollback = None;
+    }
+
+    fn max_view_scrollback(&self) -> usize {
+        if let Some(max) = self.rendered_history_max_scrollback {
+            return max;
+        }
+        let query = self.normalized_search_query();
+        self.log
+            .iter()
+            .filter(|line| self.log_line_visible(line, &query))
+            .map(|line| rendered_log_line_height(&line.text, self.cols as usize))
+            .sum::<usize>()
+            .saturating_sub(self.log_viewport_height())
+    }
+
+    fn normalized_search_query(&self) -> String {
+        self.search_query.trim().to_lowercase()
+    }
+
+    fn log_line_visible(&self, line: &CodexLogLine, query: &str) -> bool {
+        if !matches_log_filter(line.kind, self.log_filter) {
+            return false;
+        }
+        if query.is_empty() {
+            return true;
+        }
+        contains_case_insensitive(&line.text, query)
+    }
+
+    fn log_viewport_height(&self) -> usize {
+        // 枠の上下と入力欄2行を除いた概算。描画側も同じ領域に収める。
+        self.rows.saturating_sub(4).max(1) as usize
+    }
+
+    /// Addness 側の更新ログへ 1 行追加する（古いものから捨てて最大 50 件保持）。
+    pub fn push_activity(&mut self, line: String) {
+        self.activity.push(line);
+        let len = self.activity.len();
+        if len > 50 {
+            self.activity.drain(0..len - 50);
+        }
+    }
+
+    fn push_log(&mut self, kind: CodexLogKind, text: impl Into<String>) {
+        self.invalidate_rendered_history_metrics();
+        let line = CodexLogLine::new(kind, text);
+        self.persist_session_record(CodexSessionRecord::Log {
+            kind: line.kind,
+            text: line.text.clone(),
+        });
+        self.log.push(line);
+        self.trim_in_memory_log();
+        if !matches!(kind, CodexLogKind::Assistant) {
+            self.streaming_assistant_index = None;
+        }
+        if self.scrollback == 0 {
+            self.scroll_to_live();
+        } else {
+            self.scrollback = self.scrollback.min(self.max_view_scrollback());
+        }
+    }
+
+    fn append_assistant_delta(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.invalidate_rendered_history_metrics();
+        if let Some(index) = self.streaming_assistant_index
+            && let Some(line) = self.log.get_mut(index)
+        {
+            line.text.push_str(text);
+            self.persist_session_record(CodexSessionRecord::AssistantDelta {
+                text: text.to_string(),
+            });
+            return;
+        }
+        self.persist_session_record(CodexSessionRecord::Log {
+            kind: CodexLogKind::Assistant,
+            text: text.to_string(),
+        });
+        self.log
+            .push(CodexLogLine::new(CodexLogKind::Assistant, text));
+        self.trim_in_memory_log();
+        self.streaming_assistant_index = Some(self.log.len().saturating_sub(1));
+    }
+
+    fn trim_in_memory_log(&mut self) {
+        let len = self.log.len();
+        if len <= CODEX_SESSION_HISTORY_MAX_LOG_LINES {
+            return;
+        }
+        let removed = len - CODEX_SESSION_HISTORY_MAX_LOG_LINES;
+        self.log.drain(0..removed);
+        self.streaming_assistant_index = self
+            .streaming_assistant_index
+            .and_then(|idx| idx.checked_sub(removed));
+    }
+
+    fn persist_raw_event(&mut self, stream: &str, line: &str) {
+        self.persist_session_record(CodexSessionRecord::RawEvent {
+            stream: stream.to_string(),
+            line: line.to_string(),
+        });
+    }
+
+    fn persist_session_record(&mut self, record: CodexSessionRecord) {
+        let Some(path) = self.session_log_path.clone() else {
+            return;
+        };
+        if append_codex_session_record(&path, &record).is_err() {
+            return;
+        }
+        self.session_record_count = self.session_record_count.saturating_add(1);
+        let should_trim = self.session_record_count > CODEX_SESSION_HISTORY_MAX_RECORDS
+            || fs::metadata(&path)
+                .map(|m| m.len() > CODEX_SESSION_HISTORY_MAX_BYTES)
+                .unwrap_or(false);
+        if should_trim && let Ok(count) = trim_codex_session_log(&path) {
+            self.session_record_count = count;
+        }
+    }
+
+    /// 子ゴールのライブリストを差し替える。新規 ID は一定時間ハイライトする。
+    /// 初回（既存が空）の取得では全件を新着扱いしない。
+    pub fn update_children(&mut self, incoming: Vec<(String, String, &'static str)>) {
+        let had_any = !self.children.is_empty();
+        let old_ids: std::collections::HashSet<String> =
+            self.children.iter().map(|c| c.id.clone()).collect();
+        let new_until = Instant::now() + std::time::Duration::from_secs(4);
+        self.children = incoming
+            .into_iter()
+            .map(|(id, title, icon)| {
+                let is_new = had_any && !old_ids.contains(&id);
+                ChildGoal {
+                    new_until: is_new.then_some(new_until),
+                    id,
+                    title,
+                    icon,
+                }
+            })
+            .collect();
+    }
+
+    /// JSONL と子プロセス終了を取り込み、画面に影響する変化があれば `true` を返す。
+    pub fn update(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(event) = self.rx.try_recv() {
+            changed = true;
+            match event {
+                CodexProcessEvent::Stdout(line) => self.handle_stdout_line(&line),
+                CodexProcessEvent::Stderr(line) => self.handle_stderr_line(&line),
+            }
+        }
+
+        if let Some(child) = self.child.as_mut() {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    self.child = None;
+                    self.turn_running = false;
+                    self.current_command = None;
+                    self.current_command_started_at = None;
+                    self.streaming_assistant_index = None;
+                    self.pending_decision = None;
+                    if !self.turn_finished_by_event {
+                        if status.success() {
+                            self.push_log(CodexLogKind::System, "Codex ターンが完了しました");
+                            self.push_terminal_notice("Codex 完了", "Codex の出力が完了しました");
+                        } else {
+                            let message = format!("Codex ターンが失敗しました: {status}");
+                            self.push_log(CodexLogKind::Error, message.clone());
+                            self.push_terminal_notice("Codex 失敗", message);
+                        }
+                    }
+                    self.turn_finished_by_event = false;
+                    self.current_turn_prompt = None;
+                    self.start_next_queued_turn_if_idle();
+                    changed = true;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    self.child = None;
+                    self.turn_running = false;
+                    self.current_command = None;
+                    self.current_command_started_at = None;
+                    self.pending_decision = None;
+                    self.current_turn_prompt = None;
+                    let message = format!("Codex 状態確認に失敗: {e}");
+                    self.push_log(CodexLogKind::Error, message.clone());
+                    self.push_terminal_notice("Codex エラー", message);
+                    self.start_next_queued_turn_if_idle();
+                    changed = true;
+                }
+            }
+        }
+
+        changed
+    }
+
+    fn handle_stdout_line(&mut self, line: &str) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        self.persist_raw_event("stdout", trimmed);
+        match serde_json::from_str::<Value>(trimmed) {
+            Ok(value) => self.handle_json_event(value),
+            Err(_) => self.push_log(CodexLogKind::Event, trimmed.to_string()),
+        }
+    }
+
+    fn handle_stderr_line(&mut self, line: &str) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        // Codex の PATH alias 警告など、会話上重要でない既知ノイズは表示しない。
+        if trimmed.contains("could not create PATH aliases") {
+            return;
+        }
+        self.persist_raw_event("stderr", trimmed);
+        if let Some(decision) = decision_banner("stderr", Some(trimmed)) {
+            self.set_pending_decision(decision);
+        }
+        self.push_log(CodexLogKind::Event, trimmed.to_string());
+    }
+
+    fn handle_json_event(&mut self, value: Value) {
+        let event_type = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("event")
+            .to_string();
+
+        match event_type.as_str() {
+            "thread.started" => {
+                if let Some(thread_id) = string_at_any(&value, &["thread_id", "threadId", "id"]) {
+                    self.thread_id = Some(thread_id.clone());
+                    self.push_log(CodexLogKind::System, format!("Codex thread: {thread_id}"));
+                } else {
+                    self.push_log(CodexLogKind::System, "Codex thread started");
+                }
+            }
+            "turn.started" => {
+                self.turn_running = true;
+                self.turn_finished_by_event = false;
+                self.current_command = None;
+                self.current_command_started_at = None;
+                self.pending_decision = None;
+                if self.turn_count > 0 {
+                    self.collapsed_turns.insert(self.turn_count);
+                }
+                self.turn_count = self.turn_count.saturating_add(1);
+                let label = self
+                    .current_turn_prompt
+                    .as_deref()
+                    .or_else(|| self.last_prompt())
+                    .map(compact_turn_prompt)
+                    .filter(|prompt| !prompt.is_empty())
+                    .map(|prompt| format!("Turn {} - {prompt}", self.turn_count))
+                    .unwrap_or_else(|| format!("Turn {}", self.turn_count));
+                self.push_log(CodexLogKind::Turn, label);
+            }
+            "turn.completed" | "turn.finished" => {
+                self.turn_running = false;
+                self.turn_finished_by_event = true;
+                self.current_command = None;
+                self.current_command_started_at = None;
+                self.streaming_assistant_index = None;
+                self.pending_decision = None;
+                self.push_log(CodexLogKind::System, "Codex ターンが完了しました");
+                self.push_terminal_notice("Codex 完了", "Codex の出力が完了しました");
+            }
+            "turn.failed" => {
+                self.turn_running = false;
+                self.turn_finished_by_event = true;
+                self.current_command = None;
+                self.current_command_started_at = None;
+                self.streaming_assistant_index = None;
+                self.pending_decision = None;
+                let message = nested_error_message(&value)
+                    .or_else(|| first_text_field(&value))
+                    .unwrap_or_else(|| "Codex ターンが失敗しました".to_string());
+                self.push_log(CodexLogKind::Error, message.clone());
+                self.push_terminal_notice("Codex 失敗", message);
+            }
+            "error" => {
+                let message = nested_error_message(&value)
+                    .or_else(|| first_text_field(&value))
+                    .unwrap_or_else(|| "Codex エラー".to_string());
+                self.push_log(CodexLogKind::Error, message.clone());
+                self.push_terminal_notice("Codex エラー", message);
+            }
+            _ => self.handle_generic_json_event(&event_type, &value),
+        }
+    }
+
+    fn handle_generic_json_event(&mut self, event_type: &str, value: &Value) {
+        if let Some(decision) = decision_banner(event_type, first_text_field(value).as_deref()) {
+            self.set_pending_decision(decision);
+        }
+
+        if let Some(display) = tool_display(event_type, value) {
+            if let Some(command) = display.command_text.as_deref() {
+                if is_tool_completion_event(event_type) {
+                    self.current_command = None;
+                    self.current_command_started_at = None;
+                } else {
+                    self.current_command = Some(compact_tool_text(command));
+                    self.current_command_started_at = Some(Instant::now());
+                }
+            }
+            if let Some(action_text) = display.action_text.as_deref() {
+                self.refresh_action_from_text(action_text);
+            }
+            self.record_addness_tool_activity(&display);
+            self.push_log(CodexLogKind::Tool, display.label);
+            return;
+        }
+
+        if event_type.contains("message") || event_type.contains("output_text") {
+            let text = first_text_field(value).unwrap_or_default();
+            if text.is_empty() {
+                self.push_log(CodexLogKind::Event, event_type.to_string());
+            } else if event_type.contains("delta") {
+                self.append_assistant_delta(&text);
+            } else {
+                self.streaming_assistant_index = None;
+                self.push_log(CodexLogKind::Assistant, text);
+            }
+            return;
+        }
+
+        if event_type.contains("exec")
+            || event_type.contains("tool")
+            || event_type.contains("function")
+            || event_type.contains("mcp")
+        {
+            let text = first_text_field(value).unwrap_or_else(|| event_type.to_string());
+            if is_tool_completion_event(event_type) {
+                self.current_command = None;
+                self.current_command_started_at = None;
+            } else {
+                self.current_command = Some(compact_tool_text(&text));
+                self.current_command_started_at = Some(Instant::now());
+            }
+            self.refresh_action_from_text(&text);
+            self.push_log(CodexLogKind::Tool, format!("{event_type}: {text}"));
+            return;
+        }
+
+        if let Some(text) = first_text_field(value)
+            && !text.is_empty()
+        {
+            self.push_log(CodexLogKind::Event, format!("{event_type}: {text}"));
+            return;
+        }
+
+        self.push_log(CodexLogKind::Event, event_type.to_string());
+    }
+
+    fn refresh_action_from_text(&mut self, text: &str) {
+        if let Some(rest) = addness_command_rest(text) {
+            let (label, kind) = action_label(rest);
+            match kind {
+                AddnessActionKind::Read => {
+                    self.last_addness_read_at = Some(Instant::now());
+                    self.last_addness_read_label = Some(label.clone());
+                }
+                AddnessActionKind::Write => {
+                    self.last_addness_write_at = Some(Instant::now());
+                    self.last_addness_write_label = Some(label.clone());
+                }
+            }
+            self.action = Some(label);
+        }
+    }
+
+    fn set_pending_decision(&mut self, decision: CodexDecisionBanner) {
+        let message = decision.message.clone();
+        self.pending_decision = Some(decision);
+        self.push_terminal_notice("Codex 確認待ち", message);
+    }
+
+    fn record_addness_tool_activity(&mut self, display: &ToolDisplay) {
+        let Some(command) = display.command_text.as_deref() else {
+            return;
+        };
+        if addness_command_rest(command).is_none() && !looks_like_addness_command_text(command) {
+            return;
+        }
+        let Some(activity) = addness_activity_summary(command, display.output_text.as_deref())
+        else {
+            return;
+        };
+        let now = chrono::Local::now().format("%H:%M");
+        self.push_activity(format!("{now} {activity}"));
+    }
+
+    /// Codex の画面状態から、ホスト端末へ流すべき通知を 1 件だけ取り出す。
+    pub fn take_terminal_notice(&mut self) -> Option<TerminalNotice> {
+        self.pending_notices.pop_front()
+    }
+
+    fn push_terminal_notice(&mut self, title: impl Into<String>, message: impl Into<String>) {
+        self.pending_notices.push_back(TerminalNotice {
+            title: title.into(),
+            message: message.into(),
+        });
+    }
+
+    /// 描画領域に合わせて保持サイズを更新する（変化時のみ）。
+    pub fn resize(&mut self, rows: u16, cols: u16) {
+        let rows = rows.max(1);
+        let cols = cols.max(1);
+        if rows == self.rows && cols == self.cols {
+            return;
+        }
+        self.rows = rows;
+        self.cols = cols;
+        self.invalidate_rendered_history_metrics();
+        self.scrollback = self.scrollback.min(self.max_view_scrollback());
+    }
+
+    /// キー入力を Addness 側の入力欄へ反映する。
+    pub fn input(&mut self, key: KeyEvent) {
+        if self.finished {
+            return;
+        }
+
+        if self.is_turn_running()
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c' | 'C'))
+        {
+            self.kill_current_turn();
+            self.start_next_queued_turn_if_idle();
+            return;
+        }
+
+        if self.pending_decision.is_some() {
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('c' | 'C'))
+            {
+                self.kill_current_turn();
+            }
+            return;
+        }
+
+        let Some(submitted) = self.input_state.observe_key(key) else {
+            return;
+        };
+        self.submit_user_line(&submitted);
+    }
+
+    /// TUI 側の操作からシステムプロンプト（F9 再開など）を codex に送信する。
+    /// ユーザーの作業依頼ではないので last_prompt は更新しない。
+    pub fn submit_system_line(&mut self, line: &str) {
+        let submitted = normalize_submitted_line(line);
+        if submitted.is_empty() || self.is_turn_running() || self.finished {
+            return;
+        }
+        self.push_log(CodexLogKind::System, format!("Addness: {submitted}"));
+        self.start_turn(&submitted);
+    }
+
+    fn submit_user_line(&mut self, submitted: &str) {
+        let submitted = normalize_submitted_line(submitted);
+        if submitted.is_empty() {
+            return;
+        }
+        self.input_state.record_submitted(&submitted);
+        self.push_log(CodexLogKind::User, submitted.clone());
+
+        if self.is_turn_running() {
+            self.queued_prompts.push_back(submitted);
+            let count = self.queued_prompts.len();
+            self.action = Some(format!("次ターン予約 {count}件"));
+            self.push_log(
+                CodexLogKind::System,
+                format!("Codex 実行中のため次のターンに予約しました（待ち{count}件）"),
+            );
+            return;
+        }
+
+        self.run_submitted_line(submitted);
+    }
+
+    fn run_submitted_line(&mut self, submitted: String) {
+        if submitted == "/exit" {
+            self.finish_from_exit_command();
+            return;
+        }
+
+        self.start_turn(&submitted);
+    }
+
+    fn finish_from_exit_command(&mut self) {
+        self.finished = true;
+        self.queued_prompts.clear();
+        self.pending_decision = None;
+        self.current_command = None;
+        self.current_command_started_at = None;
+        self.current_turn_prompt = None;
+        self.push_log(CodexLogKind::System, "Codex セッションを終了します");
+    }
+
+    fn start_turn(&mut self, prompt: &str) {
+        if self.is_turn_running() {
+            self.push_log(CodexLogKind::System, "前の Codex ターンがまだ実行中です");
+            return;
+        }
+
+        let command_result = self.spawn_exec_process(prompt);
+        match command_result {
+            Ok(child) => {
+                self.child = Some(child);
+                self.turn_running = true;
+                self.turn_finished_by_event = false;
+                self.pending_decision = None;
+                self.current_turn_prompt = Some(prompt.to_string());
+                self.scroll_to_live();
+            }
+            Err(e) => {
+                let message = format!("codex exec の起動に失敗しました: {e}");
+                self.push_log(CodexLogKind::Error, message.clone());
+                self.push_terminal_notice("Codex 起動失敗", message);
+            }
+        }
+    }
+
+    fn start_next_queued_turn_if_idle(&mut self) -> bool {
+        if self.finished || self.is_turn_running() {
+            return false;
+        }
+        let Some(submitted) = self.queued_prompts.pop_front() else {
+            return false;
+        };
+        let remaining = self.queued_prompts.len();
+        self.action = if remaining > 0 {
+            Some(format!("予約入力を実行中 残り{remaining}件"))
+        } else {
+            Some("予約入力を実行中".to_string())
+        };
+        self.push_log(CodexLogKind::System, "予約した入力を実行します");
+        self.run_submitted_line(submitted);
+        true
+    }
+
+    fn spawn_exec_process(&self, prompt: &str) -> Result<Child> {
+        let mut cmd = Command::new(&self.codex_bin);
+        for arg in codex_exec_args(self.thread_id.as_deref(), &self.cwd) {
+            cmd.arg(arg);
+        }
+
+        cmd.current_dir(&self.cwd);
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        cmd.env("ADDNESS_TUI_CODEX", "1");
+        cmd.env("ADDNESS_GOAL_ID", &self.goal_id);
+        cmd.env("ADDNESS_GOAL_TITLE", &self.goal_title);
+        cmd.env("ADDNESS_GOAL_STATUS", &self.status_label);
+        cmd.env("ADDNESS_GOAL_DOD", &self.dod);
+        cmd.env("ADDNESS_BIN", &self.addness_bin);
+
+        let mut child = cmd.spawn().context("codex exec の起動に失敗しました")?;
+
+        if let Some(mut stdin) = child.stdin.take()
+            && let Err(e) = stdin.write_all(prompt.as_bytes())
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e).context("codex exec へのプロンプト送信に失敗しました");
+        }
+
+        let stdout = child
+            .stdout
+            .take()
+            .context("codex exec stdout の取得に失敗しました")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("codex exec stderr の取得に失敗しました")?;
+
+        spawn_line_reader(stdout, self.tx.clone(), false);
+        spawn_line_reader(stderr, self.tx.clone(), true);
+
+        Ok(child)
+    }
+
+    fn kill_current_turn(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.child = None;
+        self.turn_running = false;
+        self.current_command = None;
+        self.current_command_started_at = None;
+        self.streaming_assistant_index = None;
+        self.pending_decision = None;
+        self.current_turn_prompt = None;
+        self.push_log(CodexLogKind::System, "Codex ターンを中断しました");
+    }
+
+    /// ユーザーが codex に最後に送信した入力行。
+    pub fn last_prompt(&self) -> Option<&str> {
+        self.input_state.last_prompt.as_deref()
+    }
+
+    /// ユーザーが codex 内で `/exit` を送信し、その結果プロセスも終了しているか。
+    pub fn should_close_after_exit_command(&self) -> bool {
+        self.finished && self.input_state.exit_command_sent && !self.turn_running
+    }
+
+    /// 最初の実依頼を一度だけ body へ自動記録する。記録済み（or 失敗済み）なら None。
+    /// 失敗しても再試行はせず、終了/中断時の記録に委ねる（best-effort）。
+    pub fn prompt_needs_body_record(&self) -> Option<&str> {
+        if self.body_record_done {
+            return None;
+        }
+        self.last_prompt()
+    }
+
+    /// 最初の実依頼の自動記録を済み（再試行しない）として扱う。
+    pub fn mark_body_recorded_prompt(&mut self) {
+        self.body_record_done = true;
+    }
+
+    /// codex プロセスを終了させる（ペインを閉じる時に呼ぶ）。
+    /// kill 後に wait してゾンビプロセス化を防ぐ。
+    pub fn kill(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.child = None;
+        self.turn_running = false;
+        self.current_command = None;
+        self.current_command_started_at = None;
+        self.pending_decision = None;
+        self.current_turn_prompt = None;
+        self.queued_prompts.clear();
+    }
+
+    /// DoD を更新する。内容が変わった場合のみ項目・判定を作り直し `true` を返す。
+    pub fn set_dod(&mut self, dod: String) -> bool {
+        if dod == self.dod {
+            return false;
+        }
+        self.dod = dod;
+        self.dod_items = split_dod_items(&self.dod);
+        self.dod_checks = vec![None; self.dod_items.len()];
+        true
+    }
+
+    /// DoD 自動判定の結果（項目インデックス → 達成可否）を反映する。
+    pub fn apply_dod_results(&mut self, results: &[(usize, bool)]) {
+        for &(i, met) in results {
+            if let Some(slot) = self.dod_checks.get_mut(i) {
+                *slot = Some(met);
+            }
+        }
     }
 }
 
-/// 子ゴール 1 件の表示用情報。
-pub struct ChildGoal {
-    pub id: String,
-    pub title: String,
-    pub icon: &'static str,
-    /// 新着ハイライトの有効期限（None=通常表示）。
-    pub new_until: Option<Instant>,
+#[derive(Default)]
+struct CodexInputState {
+    line: String,
+    exit_command_sent: bool,
+    last_prompt: Option<String>,
 }
 
-/// ホスト側 TUI が端末へ通知すべき Codex イベント。
-pub struct TerminalNotice {
-    pub title: String,
-    pub message: String,
+impl CodexInputState {
+    fn record_submitted(&mut self, submitted: &str) {
+        if !submitted.is_empty() && submitted != "/exit" {
+            self.last_prompt = Some(submitted.to_string());
+        }
+        if submitted == "/exit" {
+            self.exit_command_sent = true;
+        }
+    }
+
+    fn observe_key(&mut self, key: KeyEvent) -> Option<String> {
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            return None;
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            if let KeyCode::Char('c' | 'C' | 'u' | 'U') = key.code {
+                self.line.clear();
+            }
+            return None;
+        }
+
+        match key.code {
+            KeyCode::Char(c) => self.line.push(c),
+            KeyCode::Backspace => {
+                self.line.pop();
+            }
+            KeyCode::Enter => {
+                let submitted = self.line.trim().to_string();
+                self.line.clear();
+                return Some(submitted);
+            }
+            KeyCode::Esc => {
+                self.line.clear();
+            }
+            _ => {}
+        }
+        None
+    }
+}
+
+fn spawn_line_reader<R>(reader: R, tx: Sender<CodexProcessEvent>, stderr: bool)
+where
+    R: std::io::Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let reader = BufReader::new(reader);
+        for line in reader.lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            let event = if stderr {
+                CodexProcessEvent::Stderr(line)
+            } else {
+                CodexProcessEvent::Stdout(line)
+            };
+            if tx.send(event).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+fn normalize_submitted_line(line: &str) -> String {
+    line.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 enum AddnessActionKind {
@@ -182,10 +1520,105 @@ enum AddnessActionKind {
     Write,
 }
 
+fn addness_command_rest(text: &str) -> Option<&str> {
+    if let Some(idx) = text.find("addness ") {
+        return Some(text[idx + "addness ".len()..].trim());
+    }
+
+    for marker in [
+        "\"$ADDNESS_BIN\" ",
+        "'$ADDNESS_BIN' ",
+        "$ADDNESS_BIN ",
+        "${ADDNESS_BIN} ",
+    ] {
+        if let Some(idx) = text.find(marker) {
+            return Some(text[idx + marker.len()..].trim());
+        }
+    }
+
+    None
+}
+
 fn rest_has_flag(rest: &str, flag: &str) -> bool {
     let with_eq = format!("{flag}=");
     rest.split_whitespace()
         .any(|part| part == flag || part.starts_with(&with_eq))
+}
+
+fn addness_activity_summary(command: &str, output: Option<&str>) -> Option<String> {
+    let rest = addness_command_rest(command).unwrap_or(command);
+    let mut parts = rest.split_whitespace();
+    let first = parts.next().unwrap_or("");
+    let second = parts.next().unwrap_or("");
+    let json_summary = output.and_then(addness_json_output_summary);
+
+    let kind = match (first, second) {
+        ("goal", "update") if rest_has_flag(rest, "--body") => "body変更",
+        ("goal", "update") if rest_has_flag(rest, "--description") => "DoD変更",
+        ("goal", "update") if rest_has_flag(rest, "--status") => "ステータス変更",
+        ("goal", "update") if rest_has_flag(rest, "--title") => "タイトル変更",
+        ("goal", "create") => "子ゴール追加",
+        ("comment", "create") => "コメント追加",
+        ("link", "progress") => "進捗リンク追加",
+        ("link", "pr") => "PRリンク追加",
+        ("deliverable", _) => "成果物変更",
+        ("goal", "get" | "list" | "children" | "tree" | "search" | "siblings") => "ゴール読込",
+        ("comment", _) => "コメント読込",
+        ("status" | "summary", _) => "状態読込",
+        _ => {
+            if looks_like_addness_command_text(command) {
+                "Addness操作"
+            } else {
+                return None;
+            }
+        }
+    };
+
+    let detail = json_summary
+        .map(|summary| format!(": {summary}"))
+        .unwrap_or_default();
+    Some(format!("Addness {kind}{detail}"))
+}
+
+fn looks_like_addness_command_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("addness")
+        || lower.contains("$addness_bin")
+        || lower.contains(" goal ")
+        || lower.contains(" comment ")
+        || lower.contains(" deliverable ")
+        || lower.contains(" link ")
+}
+
+fn addness_json_output_summary(output: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(output.trim()).ok()?;
+    if let Some(title) = addness_json_title(&value) {
+        return Some(compact_tool_text(title));
+    }
+    match value {
+        Value::Array(items) => Some(format!("{}件", items.len())),
+        Value::Object(map) => Some(format!("{}キー", map.len())),
+        _ => Some("JSON".to_string()),
+    }
+}
+
+fn addness_json_title(value: &Value) -> Option<&str> {
+    value
+        .get("title")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("name").and_then(Value::as_str))
+        .or_else(|| {
+            value
+                .get("goal")
+                .and_then(|goal| goal.get("title"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            value
+                .get("data")
+                .and_then(|data| data.get("title"))
+                .and_then(Value::as_str)
+        })
 }
 
 fn rest_has_any_flag(rest: &str, flags: &[&str]) -> bool {
@@ -269,692 +1702,813 @@ fn split_dod_items(dod: &str) -> Vec<String> {
         .collect()
 }
 
-fn terminal_notice_candidate(
-    screen_contents: &str,
-    action: Option<&str>,
-    finished: bool,
-) -> Option<(String, TerminalNotice)> {
-    if let Some(notice) = decision_prompt_notice(screen_contents) {
-        return Some(notice);
-    }
-
-    if let Some(action) = action
-        && let Some(notice) = action_terminal_notice(action)
-    {
-        return Some(notice);
-    }
-
-    if finished {
-        return Some((
-            "finished".to_string(),
-            TerminalNotice {
-                title: "Codex 終了".to_string(),
-                message: "Codex セッションが終了しました".to_string(),
-            },
-        ));
-    }
-
-    None
+fn codex_session_log_path(goal_id: &str) -> Option<PathBuf> {
+    dirs::home_dir().map(|home| {
+        home.join(".addness")
+            .join(CODEX_SESSION_HISTORY_DIR)
+            .join(format!("{}.jsonl", safe_path_component(goal_id)))
+    })
 }
 
-fn decision_prompt_notice(screen_contents: &str) -> Option<(String, TerminalNotice)> {
-    let lines = screen_contents
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>();
-    let start = lines.len().saturating_sub(18);
-    let tail = &lines[start..];
-    if tail.is_empty() {
-        return None;
+fn safe_path_component(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+        if out.len() >= 96 {
+            break;
+        }
     }
-
-    let tail_text = tail.join("\n");
-    if !looks_like_decision_prompt(&tail_text) {
-        return None;
-    }
-
-    let prompt_line = tail
-        .iter()
-        .rev()
-        .find(|line| looks_like_decision_prompt(line))
-        .copied()
-        .unwrap_or_else(|| tail.last().copied().unwrap_or(""));
-    let summary_start = tail.len().saturating_sub(4);
-    let summary = compact_notice_text(&tail[summary_start..].join(" / "), 180);
-    let key = format!("decision:{}", compact_notice_text(prompt_line, 120));
-    let message = if summary.is_empty() {
-        "Codex が判断待ちです".to_string()
+    if out.is_empty() {
+        "codex-session".to_string()
     } else {
-        format!("Codex が判断待ちです: {summary}")
+        out
+    }
+}
+
+fn compact_home_path(path: &Path) -> String {
+    if let Some(home) = dirs::home_dir()
+        && let Ok(stripped) = path.strip_prefix(&home)
+    {
+        return format!("~/{}", stripped.display());
+    }
+    path.display().to_string()
+}
+
+fn load_codex_session(path: &Path) -> Result<LoadedCodexSession> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LoadedCodexSession {
+                log: Vec::new(),
+                record_count: 0,
+            });
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("履歴ファイルを開けません: {}", path.display()));
+        }
     };
 
-    Some((
-        key,
-        TerminalNotice {
-            title: "Codex 確認待ち".to_string(),
-            message,
-        },
-    ))
-}
-
-fn looks_like_decision_prompt(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    let has_choice = lower.contains("y/n")
-        || lower.contains("yes/no")
-        || lower.contains("yes / no")
-        || lower.contains("[yes]")
-        || lower.contains("[no]")
-        || lower.contains("(yes)")
-        || lower.contains("(no)");
-    let has_english_prompt = lower.contains("do you want")
-        || lower.contains("approval")
-        || lower.contains("approve")
-        || lower.contains("allow")
-        || lower.contains("permission")
-        || lower.contains("confirm")
-        || lower.contains("continue")
-        || lower.contains("proceed");
-    let has_japanese_prompt = text.contains("承認")
-        || text.contains("許可")
-        || text.contains("確認")
-        || text.contains("続行")
-        || text.contains("実行しますか")
-        || text.contains("よろしいですか")
-        || text.contains("選択してください")
-        || text.contains("判断");
-    let has_question = lower.contains('?')
-        || text.contains('？')
-        || text.contains("しますか")
-        || text.contains("してください");
-
-    has_choice || ((has_english_prompt || has_japanese_prompt) && has_question)
-}
-
-fn action_terminal_notice(action: &str) -> Option<(String, TerminalNotice)> {
-    let (key, title, message) = match action {
-        "作業完了通知を送信中" => (
-            "action:done",
-            "Codex 作業完了",
-            "Codex が作業完了通知を送信しています",
-        ),
-        "確認依頼通知を送信中" => (
-            "action:review",
-            "Codex 確認依頼",
-            "Codex が確認依頼通知を送信しています",
-        ),
-        "ブロック通知を送信中" => (
-            "action:blocked",
-            "Codex ブロック中",
-            "Codex がブロック通知を送信しています",
-        ),
-        _ => return None,
-    };
-
-    Some((
-        key.to_string(),
-        TerminalNotice {
-            title: title.to_string(),
-            message: message.to_string(),
-        },
-    ))
-}
-
-fn compact_notice_text(input: &str, max_chars: usize) -> String {
-    let collapsed = input.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.chars().count() <= max_chars {
-        return collapsed;
+    let mut log = Vec::new();
+    let mut record_count = 0usize;
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        record_count = record_count.saturating_add(1);
+        let Ok(record) = serde_json::from_str::<CodexSessionRecord>(&line) else {
+            continue;
+        };
+        match record {
+            CodexSessionRecord::Log { kind, text } => log.push(CodexLogLine::new(kind, text)),
+            CodexSessionRecord::AssistantDelta { text } => {
+                if let Some(last) = log.last_mut()
+                    && last.kind == CodexLogKind::Assistant
+                {
+                    last.text.push_str(&text);
+                    continue;
+                }
+                log.push(CodexLogLine::new(CodexLogKind::Assistant, text));
+            }
+            CodexSessionRecord::RawEvent { .. } => {}
+        }
+        if log.len() > CODEX_SESSION_HISTORY_MAX_LOG_LINES {
+            let removed = log.len() - CODEX_SESSION_HISTORY_MAX_LOG_LINES;
+            log.drain(0..removed);
+        }
     }
 
-    let keep = max_chars.saturating_sub(3);
-    let mut out = collapsed.chars().take(keep).collect::<String>();
+    Ok(LoadedCodexSession { log, record_count })
+}
+
+fn append_codex_session_record(path: &Path, record: &CodexSessionRecord) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("履歴ディレクトリを作成できません: {}", parent.display()))?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("履歴ファイルを開けません: {}", path.display()))?;
+    serde_json::to_writer(&mut file, record).context("履歴レコードのJSON化に失敗しました")?;
+    writeln!(file).context("履歴レコードの書き込みに失敗しました")?;
+    Ok(())
+}
+
+fn trim_codex_session_log(path: &Path) -> Result<usize> {
+    let file = File::open(path)
+        .with_context(|| format!("履歴ファイルを開けません: {}", path.display()))?;
+    let lines = BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+
+    let mut kept = Vec::new();
+    let mut bytes = 0u64;
+    for line in lines.iter().rev() {
+        let line_bytes = line.len() as u64 + 1;
+        if kept.len() >= CODEX_SESSION_HISTORY_MAX_RECORDS {
+            break;
+        }
+        if !kept.is_empty() && bytes.saturating_add(line_bytes) > CODEX_SESSION_HISTORY_MAX_BYTES {
+            break;
+        }
+        kept.push(line.clone());
+        bytes = bytes.saturating_add(line_bytes);
+    }
+    kept.reverse();
+    let mut file = File::create(path)
+        .with_context(|| format!("履歴ファイルを切り詰められません: {}", path.display()))?;
+    for line in &kept {
+        writeln!(file, "{line}").context("履歴ファイルの再書き込みに失敗しました")?;
+    }
+    Ok(kept.len())
+}
+
+fn rendered_log_line_height(text: &str, width: usize) -> usize {
+    let content_width = width.saturating_sub(CODEX_LOG_PREFIX_WIDTH).max(1);
+    let normalized = text.replace('\r', "");
+    let mut total = 0usize;
+    for segment in normalized.split('\n') {
+        let width = UnicodeWidthStr::width(segment);
+        total += width.saturating_add(content_width - 1) / content_width;
+        if segment.is_empty() {
+            total += 1;
+        }
+    }
+    total.max(1)
+}
+
+fn contains_case_insensitive(text: &str, lowercase_query: &str) -> bool {
+    if lowercase_query.is_empty() {
+        return true;
+    }
+    if lowercase_query.is_ascii() {
+        let needle = lowercase_query.as_bytes();
+        return text
+            .as_bytes()
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle));
+    }
+    text.to_lowercase().contains(lowercase_query)
+}
+
+fn compact_turn_prompt(prompt: &str) -> String {
+    let normalized = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    const MAX_CHARS: usize = 64;
+    if normalized.chars().count() <= MAX_CHARS {
+        return normalized;
+    }
+    let mut out = normalized.chars().take(MAX_CHARS).collect::<String>();
     out.push_str("...");
     out
 }
 
-impl CodexPane {
-    /// codex を PTY 上で起動する。
-    /// 対象ゴールの文脈は環境変数で渡し、codex の初期プロンプト引数として
-    /// Addness CLI での想起指示を渡す。
-    pub fn spawn(
-        codex_bin: &Path,
-        cwd: &Path,
-        addness_bin: &str,
-        goal_id: String,
-        goal_title: String,
-        dod: String,
-        status_label: String,
-    ) -> Result<Self> {
-        let visible_rows: u16 = 24;
-        let rows: u16 = pty_rows_for_visible(visible_rows);
-        let cols: u16 = 80;
-        // DoD 項目は一度だけ分割し、チェック状態はその件数で初期化する。
-        let dod_items = split_dod_items(&dod);
-        let dod_checks = vec![None; dod_items.len()];
+fn turn_number_from_label(label: &str) -> Option<usize> {
+    let rest = label.strip_prefix("Turn ")?;
+    let digits = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    digits.parse().ok()
+}
 
-        let pty_system = native_pty_system();
-        let pair = pty_system
-            .openpty(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
+fn summarize_implemented_work(log: &[CodexLogLine]) -> Vec<String> {
+    log.iter()
+        .rev()
+        .filter(|line| line.kind == CodexLogKind::Assistant)
+        .flat_map(|line| line.text.lines())
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .filter(|line| !line.starts_with("```"))
+        .take(3)
+        .map(compact_tool_text)
+        .collect()
+}
+
+fn summarize_checks(log: &[CodexLogLine]) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in log.iter().filter(|line| line.kind == CodexLogKind::Tool) {
+        let lower = line.text.to_ascii_lowercase();
+        if !(lower.contains("cargo fmt")
+            || lower.contains("cargo clippy")
+            || lower.contains("cargo test")
+            || lower.contains("cargo build")
+            || lower.contains("git diff"))
+        {
+            continue;
+        }
+        let summary = line
+            .text
+            .lines()
+            .find(|text| {
+                text.contains("test result:")
+                    || text.contains("Finished ")
+                    || text.contains("files changed")
             })
-            .context("PTY の確保に失敗しました")?;
-
-        let mut cmd = CommandBuilder::new(codex_bin);
-        for arg in codex_spawn_args(eager_startup_recall_enabled()) {
-            cmd.arg(arg);
+            .or_else(|| line.text.lines().find(|text| text.contains("exit ")))
+            .unwrap_or_else(|| line.text.lines().next().unwrap_or(""));
+        let summary = compact_tool_text(summary);
+        if !summary.is_empty() && !out.iter().any(|seen| seen == &summary) {
+            out.push(summary);
         }
-        cmd.cwd(cwd);
-        // 親プロセスの環境を引き継ぐ（PATH 等を codex のサブプロセスに渡すため）。
-        // vars() は非UTF-8な環境変数があると panic するため vars_os() を使う。
-        for (key, value) in std::env::vars_os() {
-            cmd.env(key, value);
+    }
+    out
+}
+
+fn summarize_remaining_work(log: &[CodexLogLine]) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in log.iter().rev() {
+        if matches!(line.kind, CodexLogKind::Error) {
+            out.push(compact_tool_text(&line.text));
         }
-        cmd.env("TERM", "xterm-256color");
-        // 対象ゴールの文脈を環境変数で渡す（AGENTS.md がこれを使って想起を指示する）。
-        cmd.env("ADDNESS_TUI_CODEX", "1");
-        cmd.env("ADDNESS_GOAL_ID", &goal_id);
-        cmd.env("ADDNESS_GOAL_TITLE", &goal_title);
-        cmd.env("ADDNESS_GOAL_STATUS", &status_label);
-        cmd.env("ADDNESS_GOAL_DOD", &dod);
-        cmd.env("ADDNESS_BIN", addness_bin);
+        if out.len() >= 3 {
+            break;
+        }
+    }
+    if out.is_empty() {
+        out.push("未記録".to_string());
+    }
+    out
+}
 
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .context("codex の起動に失敗しました")?;
-        // slave を閉じておかないと、子プロセス終了時に reader が EOF を受け取れない。
-        drop(pair.slave);
+fn string_at_any(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str))
+        .map(str::to_string)
+}
 
-        let reader = pair
-            .master
-            .try_clone_reader()
-            .context("PTY reader の複製に失敗しました")?;
-        let writer = pair
-            .master
-            .take_writer()
-            .context("PTY writer の取得に失敗しました")?;
-
-        let (tx, rx) = mpsc::channel::<Vec<u8>>();
-        std::thread::spawn(move || {
-            let mut reader = reader;
-            let mut buf = [0u8; 8192];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => break, // EOF
-                    Ok(n) => {
-                        if tx.send(buf[..n].to_vec()).is_err() {
-                            break;
-                        }
-                    }
-                    // 一時的な割り込み（SIGWINCH 等による EINTR）は EOF ではないので継続。
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(_) => break,
-                }
-            }
-        });
-
-        Ok(Self {
-            parser: vt100::Parser::new(rows, cols, 1000),
-            master: pair.master,
-            writer,
-            child,
-            rx,
-            finished: false,
-            rows,
-            cols,
-            visible_rows,
-            goal_id,
-            goal_title,
-            cwd: cwd.display().to_string(),
-            status_label,
-            dod_items,
-            dod_checks,
-            assessing: false,
-            child_count: None,
-            comment_count: None,
-            deliverable_count: None,
-            trace_links: Vec::new(),
-            children: Vec::new(),
-            action: None,
-            last_addness_read_at: None,
-            last_addness_write_at: None,
-            status_changed_at: None,
-            dod_changed_at: None,
-            scrollback: 0,
-            activity: Vec::new(),
-            last_terminal_notice_key: None,
-            auto_record_attempted: false,
-            body_record_done: false,
-            input_state: CodexInputState::default(),
-            dod,
+fn nested_error_message(value: &Value) -> Option<String> {
+    value
+        .get("error")
+        .and_then(|error| {
+            error
+                .get("message")
+                .and_then(Value::as_str)
+                .or_else(|| error.as_str())
         })
+        .map(str::to_string)
+}
+
+fn decision_banner(event_type: &str, text: Option<&str>) -> Option<CodexDecisionBanner> {
+    let event_lower = event_type.to_ascii_lowercase();
+    let event_requests_decision = [
+        "approval",
+        "confirm",
+        "permission",
+        "decision",
+        "requires_action",
+        "input_requested",
+        "user_input",
+        "consent",
+    ]
+    .iter()
+    .any(|needle| event_lower.contains(needle));
+
+    let message = text
+        .map(compact_tool_text)
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| event_type.to_string());
+    let text_lower = message.to_lowercase();
+    let kind = if [
+        "danger",
+        "dangerous",
+        "destructive",
+        "rm ",
+        "delete",
+        "reset --hard",
+        "force",
+        "破壊",
+        "危険",
+    ]
+    .iter()
+    .any(|needle| text_lower.contains(needle))
+    {
+        CodexDecisionKind::Dangerous
+    } else if ["permission", "forbidden", "403", "権限", "許可"]
+        .iter()
+        .any(|needle| text_lower.contains(needle) || event_lower.contains(needle))
+    {
+        CodexDecisionKind::Permission
+    } else if ["approval", "approve", "承認"]
+        .iter()
+        .any(|needle| text_lower.contains(needle) || event_lower.contains(needle))
+    {
+        CodexDecisionKind::Approval
+    } else {
+        CodexDecisionKind::YesNo
+    };
+    let text_requests_decision = [
+        "yes/no",
+        "y/n",
+        "approve",
+        "approval",
+        "allow",
+        "deny",
+        "confirm",
+        "permission",
+        "proceed",
+        "承認",
+        "許可",
+        "確認",
+        "続行",
+    ]
+    .iter()
+    .any(|needle| text_lower.contains(needle));
+
+    (event_requests_decision || text_requests_decision)
+        .then_some(CodexDecisionBanner::new(kind, message))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToolDisplay {
+    label: String,
+    action_text: Option<String>,
+    command_text: Option<String>,
+    output_text: Option<String>,
+}
+
+fn tool_display(event_type: &str, value: &Value) -> Option<ToolDisplay> {
+    if !is_tool_like_event(event_type, value) {
+        return None;
     }
 
-    #[cfg(test)]
-    pub(crate) fn test_with_output(
-        rows: u16,
-        cols: u16,
-        scrollback_len: usize,
-        output: &str,
-    ) -> Self {
-        let rows = rows.max(1);
-        let cols = cols.max(1);
-        let pty_system = native_pty_system();
-        let pair = pty_system
-            .openpty(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .unwrap();
-        let mut child = pair
-            .slave
-            .spawn_command(CommandBuilder::new("true"))
-            .unwrap();
-        let _ = child.wait();
-        drop(pair.slave);
-        let writer = pair.master.take_writer().unwrap();
-        let (_tx, rx) = mpsc::channel::<Vec<u8>>();
-        let mut parser = vt100::Parser::new(rows, cols, scrollback_len);
-        parser.process(output.as_bytes());
+    let name = tool_name(value).unwrap_or_else(|| event_type.to_string());
+    let display_name = tool_display_name(event_type, &name);
+    let command = command_text(value).map(|text| compact_tool_text(&text));
+    let output = tool_output_text(value).map(|text| compact_tool_text(&text));
+    let exit_code = scalar_field_text(value, &["exit_code", "exitCode"]);
+    let duration = scalar_field_text(value, &["duration", "duration_ms", "durationMs"]);
+    let cwd = scalar_field_text(value, &["cwd", "workdir", "working_directory", "codex_cwd"]);
 
-        Self {
-            parser,
-            master: pair.master,
-            writer,
-            child,
-            rx,
-            finished: true,
-            rows,
-            cols,
-            visible_rows: rows,
-            goal_id: "test-goal".to_string(),
-            goal_title: "Test goal".to_string(),
-            cwd: std::env::current_dir().unwrap().display().to_string(),
-            status_label: "TEST".to_string(),
-            dod_items: Vec::new(),
-            dod_checks: Vec::new(),
-            assessing: false,
-            child_count: None,
-            comment_count: None,
-            deliverable_count: None,
-            trace_links: Vec::new(),
-            children: Vec::new(),
-            action: None,
-            last_addness_read_at: None,
-            last_addness_write_at: None,
-            status_changed_at: None,
-            dod_changed_at: None,
-            scrollback: 0,
-            activity: Vec::new(),
-            last_terminal_notice_key: None,
-            auto_record_attempted: false,
-            body_record_done: false,
-            input_state: CodexInputState::default(),
-            dod: String::new(),
-        }
+    let mut attrs = Vec::new();
+    if let Some(exit_code) = exit_code.as_deref() {
+        attrs.push(format!("exit {exit_code}"));
+    }
+    if let Some(duration) = duration.as_deref() {
+        attrs.push(format!("duration {duration}"));
     }
 
-    /// ログを delta 行スクロールする（正=過去へ、負=最新へ）。
-    pub fn scroll_lines(&mut self, delta: isize) {
-        let max = self.max_view_scrollback();
-        let target = (self.scrollback as isize + delta).max(0) as usize;
-        self.scrollback = target.min(max);
-    }
+    let suffix = if attrs.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", attrs.join(", "))
+    };
 
-    /// 1 ページ分の行数（スクロール量）。
-    pub fn page(&self) -> usize {
-        self.visible_rows.saturating_sub(1).max(1) as usize
-    }
-
-    /// 最古（バッファ先頭）までスクロールする。
-    pub fn scroll_to_top(&mut self) {
-        self.scrollback = self.max_view_scrollback();
-    }
-
-    /// 最新（ライブ）位置へ戻す。
-    pub fn scroll_to_live(&mut self) {
-        self.scrollback = 0;
-    }
-
-    fn max_view_scrollback(&self) -> usize {
-        self.live_row_offset().into()
-    }
-
-    fn row_offset(&self) -> u16 {
-        let live_offset = self.live_row_offset();
-        let scrollback = u16::try_from(self.scrollback).unwrap_or(u16::MAX);
-        live_offset.saturating_sub(scrollback)
-    }
-
-    fn live_row_offset(&self) -> u16 {
-        let last_content_row = self.last_content_row().unwrap_or(0);
-        let (cursor_row, _) = self.parser.screen().cursor_position();
-        let anchor_row = last_content_row.max(cursor_row.min(self.rows.saturating_sub(1)));
-        anchor_row
-            .saturating_add(1)
-            .saturating_sub(self.visible_rows)
-    }
-
-    fn last_content_row(&self) -> Option<u16> {
-        let screen = self.parser.screen();
-        for row in (0..self.rows).rev() {
-            for col in 0..self.cols {
-                if screen.cell(row, col).is_some_and(vt100::Cell::has_contents) {
-                    return Some(row);
-                }
-            }
-        }
-        None
-    }
-
-    fn live_contents(&self) -> String {
-        self.parser.screen().contents()
-    }
-
-    /// codex の画面（直近の出力）を走査し、最後に実行された addness 操作を
-    /// 「いま参照/書込中」ラベルとして self.action に反映する。update() から呼ぶ。
-    fn refresh_action(&mut self) {
-        let contents = self.live_contents();
-        let lines: Vec<&str> = contents.lines().collect();
-        // 画面下部（最近の出力）だけを見て、moved-on したら自然に消えるようにする。
-        let start = lines.len().saturating_sub(10);
-        let mut latest: Option<(String, AddnessActionKind)> = None;
-        for line in &lines[start..] {
-            if let Some(idx) = line.find("addness ") {
-                let rest = line[idx + "addness ".len()..].trim();
-                latest = Some(action_label(rest));
-            }
-        }
-        if let Some((label, kind)) = latest {
-            match kind {
-                AddnessActionKind::Read => self.last_addness_read_at = Some(Instant::now()),
-                AddnessActionKind::Write => self.last_addness_write_at = Some(Instant::now()),
-            }
-            self.action = Some(label);
-        } else {
-            self.action = None;
-        }
-    }
-
-    /// 子ゴールのライブリストを差し替える。新規 ID は一定時間ハイライトする。
-    /// 初回（既存が空）の取得では全件を新着扱いしない。
-    pub fn update_children(&mut self, incoming: Vec<(String, String, &'static str)>) {
-        let had_any = !self.children.is_empty();
-        let old_ids: std::collections::HashSet<String> =
-            self.children.iter().map(|c| c.id.clone()).collect();
-        let new_until = Instant::now() + std::time::Duration::from_secs(4);
-        self.children = incoming
-            .into_iter()
-            .map(|(id, title, icon)| {
-                let is_new = had_any && !old_ids.contains(&id);
-                ChildGoal {
-                    new_until: is_new.then_some(new_until),
-                    id,
-                    title,
-                    icon,
-                }
-            })
-            .collect();
-    }
-
-    /// Addness 側の更新ログへ 1 行追加する（古いものから捨てて最大 50 件保持）。
-    pub fn push_activity(&mut self, line: String) {
-        self.activity.push(line);
-        let len = self.activity.len();
-        if len > 50 {
-            self.activity.drain(0..len - 50);
-        }
-    }
-
-    /// PTY から届いた出力を取り込み、プロセス終了を検知する。毎フレーム呼ぶ。
-    /// 画面に影響する変化（出力取り込み or 終了検知）があれば `true` を返す。
-    pub fn update(&mut self) -> bool {
-        let mut changed = false;
-        while let Ok(bytes) = self.rx.try_recv() {
-            self.parser.process(&bytes);
-            changed = true;
-        }
-        // 画面が更新されたら「いま参照/書込中」インジケータを更新する。
-        if changed {
-            self.refresh_action();
-        }
-        if !self.finished && matches!(self.child.try_wait(), Ok(Some(_))) {
-            self.finished = true;
-            changed = true;
-        }
-        changed
-    }
-
-    /// Codex の画面状態から、ホスト端末へ流すべき通知を 1 件だけ取り出す。
-    pub fn take_terminal_notice(&mut self) -> Option<TerminalNotice> {
-        let contents = self.live_contents();
-        let candidate = terminal_notice_candidate(&contents, self.action.as_deref(), self.finished);
-        let Some((key, notice)) = candidate else {
-            self.last_terminal_notice_key = None;
-            return None;
-        };
-
-        if self.last_terminal_notice_key.as_deref() == Some(key.as_str()) {
-            return None;
-        }
-        self.last_terminal_notice_key = Some(key);
-        Some(notice)
-    }
-
-    /// 描画領域に合わせて PTY と vt100 のサイズを更新する（変化時のみ）。
-    pub fn resize(&mut self, rows: u16, cols: u16) {
-        let visible_rows = rows.max(1);
-        let rows = pty_rows_for_visible(visible_rows);
-        let cols = cols.max(1);
-        let visible_changed = visible_rows != self.visible_rows;
-        if rows == self.rows && cols == self.cols && !visible_changed {
-            return;
-        }
-        self.rows = rows;
-        self.cols = cols;
-        self.visible_rows = visible_rows;
-        self.scrollback = self.scrollback.min(self.max_view_scrollback());
-        self.parser.screen_mut().set_size(rows, cols);
-        let _ = self.master.resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
+    let Some(primary) = command.as_deref().or(output.as_deref()) else {
+        return Some(ToolDisplay {
+            label: format!("{display_name}{suffix}"),
+            action_text: None,
+            command_text: None,
+            output_text: None,
         });
+    };
+
+    let is_code_edit = is_code_edit_tool(event_type, &name, command.as_deref(), output.as_deref());
+    let state = tool_state_label(
+        event_type,
+        exit_code.as_deref(),
+        command.as_deref(),
+        is_code_edit,
+    );
+    let mut label = format!("{state} {primary}");
+    if !display_name.is_empty() && !primary.contains(&display_name) {
+        label.push_str(&format!("  [{display_name}]"));
+    }
+    if !suffix.is_empty() {
+        label.push_str(&suffix);
+    }
+    if let Some(cwd) = cwd.as_deref()
+        && !cwd.is_empty()
+        && command.is_some()
+    {
+        label.push_str(&format!("  [cwd: {cwd}]"));
+    }
+    if let (Some(command), Some(output)) = (command.as_deref(), output.as_deref())
+        && !output.is_empty()
+        && output != command
+    {
+        label.push('\n');
+        label.push_str(output);
     }
 
-    /// 描画用の vt100 スクリーン。
-    #[cfg(test)]
-    pub fn screen(&self) -> &vt100::Screen {
-        self.parser.screen()
-    }
+    Some(ToolDisplay {
+        label,
+        action_text: command.clone(),
+        command_text: command,
+        output_text: output,
+    })
+}
 
-    pub fn screen_view(&self) -> CodexScreenView<'_> {
-        CodexScreenView {
-            screen: self.parser.screen(),
-            row_offset: self.row_offset(),
-            hide_cursor: self.scrollback > 0,
+fn tool_state_label(
+    event_type: &str,
+    exit_code: Option<&str>,
+    command: Option<&str>,
+    is_code_edit: bool,
+) -> &'static str {
+    let lower_event = event_type.to_ascii_lowercase();
+    let lower_command = command.unwrap_or("").to_ascii_lowercase();
+    if lower_event.contains("begin") || lower_event.contains("start") {
+        return "RUNNING";
+    }
+    if lower_command.contains("git diff") || lower_command.contains("git status") {
+        return "DIFF";
+    }
+    if let Some(code) = exit_code {
+        if code == "0" {
+            return if is_code_edit { "EDIT" } else { "OK" };
         }
+        return "FAIL";
     }
-
-    pub fn visible_cursor_position(&self) -> Option<(u16, u16)> {
-        if self.scrollback > 0 || self.parser.screen().hide_cursor() {
-            return None;
-        }
-        let (row, col) = self.parser.screen().cursor_position();
-        let offset = self.row_offset();
-        let visible_row = row.checked_sub(offset)?;
-        (visible_row < self.visible_rows).then_some((visible_row, col))
+    if lower_event.contains("failed") || lower_event.contains("error") {
+        return "FAIL";
     }
-
-    /// 子プロセスの TUI が xterm mouse reporting を有効化しているか。
-    pub fn mouse_reporting_enabled(&self) -> bool {
-        !matches!(
-            self.parser.screen().mouse_protocol_mode(),
-            vt100::MouseProtocolMode::None
-        )
+    if is_code_edit {
+        return "EDIT";
     }
-
-    /// キー入力を端末バイト列へ変換して PTY へ書き込む。
-    pub fn input(&mut self, key: KeyEvent) {
-        self.input_state.observe_key(key);
-        let bytes = encode_key(key);
-        if bytes.is_empty() {
-            return;
-        }
-        let _ = self.writer.write_all(&bytes);
-        let _ = self.writer.flush();
+    if is_tool_completion_event(event_type) {
+        return "OK";
     }
+    "RUNNING"
+}
 
-    /// マウスホイール/トラックパッドのスクロールを PTY 内の codex へ転送する。
-    /// column/row は codex 端末内の 0 始まり座標。
-    pub fn input_mouse_wheel(
-        &mut self,
-        kind: MouseEventKind,
-        column: u16,
-        row: u16,
-        modifiers: KeyModifiers,
-    ) -> bool {
-        let Some(bytes) = encode_mouse_wheel(kind, column, row, modifiers) else {
-            return false;
-        };
-        let _ = self.writer.write_all(&bytes);
-        let _ = self.writer.flush();
-        true
+fn is_code_edit_tool(
+    event_type: &str,
+    name: &str,
+    command: Option<&str>,
+    output: Option<&str>,
+) -> bool {
+    let event_type = event_type.to_ascii_lowercase();
+    let name = name.to_ascii_lowercase();
+    if name == "apply_patch"
+        || name.contains("edit")
+        || name.contains("write_file")
+        || name.contains("file_write")
+        || name.contains("update_file")
+    {
+        return true;
     }
+    [Some(event_type.as_str()), command, output]
+        .into_iter()
+        .flatten()
+        .any(looks_like_code_edit_text)
+}
 
-    /// TUI 側の操作からシステムプロンプト（F9 再開など）を codex に送信する。
-    /// ユーザーの作業依頼ではないので last_prompt は更新しない
-    /// （「最後の送信」表示や body 記録の核を定型文で汚さないため）。
-    pub fn submit_system_line(&mut self, line: &str) {
-        let submitted = line.split_whitespace().collect::<Vec<_>>().join(" ");
-        if submitted.is_empty() {
-            return;
-        }
-        let _ = self.writer.write_all(submitted.as_bytes());
-        let _ = self.writer.write_all(b"\r");
-        let _ = self.writer.flush();
-    }
+fn looks_like_code_edit_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("apply_patch")
+        || text.contains("*** Begin Patch")
+        || text.contains("*** Update File:")
+        || text.contains("*** Add File:")
+        || text.contains("*** Delete File:")
+}
 
-    /// ユーザーが codex 内で `/exit` を送信し、その結果プロセスも終了しているか。
-    pub fn should_close_after_exit_command(&self) -> bool {
-        self.finished && self.input_state.exit_command_sent
-    }
+fn is_tool_completion_event(event_type: &str) -> bool {
+    let event_type = event_type.to_ascii_lowercase();
+    event_type.contains("end")
+        || event_type.contains("completed")
+        || event_type.contains("finished")
+        || event_type.contains("failed")
+        || event_type.contains("result")
+}
 
-    /// ユーザーが codex に最後に送信した入力行。
-    pub fn last_prompt(&self) -> Option<&str> {
-        self.input_state.last_prompt.as_deref()
-    }
-
-    /// 最初の実依頼を一度だけ body へ自動記録する。記録済み（or 失敗済み）なら None。
-    /// 失敗しても再試行はせず、終了/中断時の記録に委ねる（best-effort）。
-    /// 以降の節目は LLM 自身の `## Codex作業メモ` 更新に任せ、毎依頼の書き込みを避ける。
-    pub fn prompt_needs_body_record(&self) -> Option<&str> {
-        if self.body_record_done {
-            return None;
-        }
-        self.last_prompt()
-    }
-
-    /// 最初の実依頼の自動記録を済み（再試行しない）として扱う。
-    pub fn mark_body_recorded_prompt(&mut self) {
-        self.body_record_done = true;
-    }
-
-    /// codex プロセスを終了させる（ペインを閉じる時に呼ぶ）。
-    /// kill 後に wait してゾンビプロセス化を防ぐ。
-    pub fn kill(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-
-    /// DoD を更新する。テキストが変わった場合のみ項目と判定をリセットする
-    /// （ライブ更新で 3 秒ごとに呼ばれても、内容不変ならチェックを保持する）。
-    /// DoD を更新する。内容が変わった場合のみ項目・判定を作り直し `true` を返す。
-    pub fn set_dod(&mut self, dod: String) -> bool {
-        if dod == self.dod {
-            return false;
-        }
-        self.dod = dod;
-        self.dod_items = split_dod_items(&self.dod);
-        self.dod_checks = vec![None; self.dod_items.len()];
-        true
-    }
-
-    /// DoD 自動判定の結果（項目インデックス → 達成可否）を反映する。
-    pub fn apply_dod_results(&mut self, results: &[(usize, bool)]) {
-        for &(i, met) in results {
-            if let Some(slot) = self.dod_checks.get_mut(i) {
-                *slot = Some(met);
-            }
-        }
+fn tool_display_name(event_type: &str, name: &str) -> String {
+    if event_type == "response_item" || event_type == "event" || event_type == name {
+        name.to_string()
+    } else {
+        format!("{event_type}/{name}")
     }
 }
 
-#[derive(Default)]
-struct CodexInputState {
-    line: String,
-    exit_command_sent: bool,
-    last_prompt: Option<String>,
+fn is_tool_like_event(event_type: &str, value: &Value) -> bool {
+    let event_type = event_type.to_ascii_lowercase();
+    if event_type.contains("exec")
+        || event_type.contains("tool")
+        || event_type.contains("function")
+        || event_type.contains("mcp")
+    {
+        return true;
+    }
+    value_has_tool_hint(value)
 }
 
-impl CodexInputState {
-    fn record_submitted(&mut self, submitted: &str) {
-        if !submitted.is_empty() {
-            self.last_prompt = Some(submitted.to_string());
-        }
-        if submitted == "/exit" {
-            self.exit_command_sent = true;
-        }
-    }
+fn value_has_tool_hint(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            if map
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(is_tool_like_name)
+            {
+                return true;
+            }
+            if map
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(is_tool_like_kind)
+            {
+                return true;
+            }
+            if map
+                .get("kind")
+                .and_then(Value::as_str)
+                .is_some_and(is_tool_like_kind)
+            {
+                return true;
+            }
+            if map.contains_key("codex_command")
+                || map.contains_key("codex_parsed_cmd")
+                || map.contains_key("parsed_cmd")
+            {
+                return true;
+            }
+            if map.contains_key("cmd")
+                && (map.contains_key("workdir")
+                    || map.contains_key("cwd")
+                    || map.contains_key("yield_time_ms")
+                    || map.contains_key("sandbox_permissions"))
+            {
+                return true;
+            }
 
-    fn observe_key(&mut self, key: KeyEvent) {
-        if key.modifiers.contains(KeyModifiers::ALT) {
-            return;
+            for key in [
+                "payload",
+                "item",
+                "event",
+                "data",
+                "result",
+                "call",
+                "tool_call",
+                "toolCall",
+                "function",
+            ] {
+                if let Some(child) = map.get(key)
+                    && value_has_tool_hint(child)
+                {
+                    return true;
+                }
+            }
+            false
         }
-
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            if let KeyCode::Char('c' | 'C' | 'u' | 'U') = key.code {
-                self.line.clear();
-            }
-            return;
-        }
-
-        match key.code {
-            KeyCode::Char(c) => self.line.push(c),
-            KeyCode::Backspace => {
-                self.line.pop();
-            }
-            KeyCode::Enter => {
-                let submitted = self.line.trim().to_string();
-                self.record_submitted(&submitted);
-                self.line.clear();
-            }
-            KeyCode::Esc => {
-                self.line.clear();
-            }
-            _ => {}
-        }
+        Value::Array(values) => values.iter().any(value_has_tool_hint),
+        _ => false,
     }
 }
 
-fn startup_recall_prompt() -> &'static str {
-    "Addness TUIセッションを開始してください。起動時指示に従って対象ゴールを想起してから進めてください。"
+fn is_tool_like_kind(kind: &str) -> bool {
+    let kind = kind.to_ascii_lowercase();
+    kind.contains("tool")
+        || kind.contains("exec")
+        || kind.contains("mcp")
+        || kind == "function_call"
+        || kind == "local_shell_call"
+        || kind == "shell_call"
+}
+
+fn is_tool_like_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.contains("exec")
+        || name.contains("tool")
+        || name.contains("mcp")
+        || name == "apply_patch"
+        || name == "shell_command"
+        || name == "run_command"
+        || name == "terminal"
+        || name == "bash"
+}
+
+fn tool_name(value: &Value) -> Option<String> {
+    recursive_scalar_field_text(
+        value,
+        &[
+            "name",
+            "tool_name",
+            "toolName",
+            "function_name",
+            "functionName",
+        ],
+    )
+}
+
+fn first_text_field(value: &Value) -> Option<String> {
+    const TEXT_KEYS: &[&str] = &[
+        "message", "text", "content", "delta", "summary", "output", "stdout", "stderr",
+    ];
+
+    match value {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(values) => values.iter().find_map(first_text_field),
+        Value::Object(map) => {
+            for key in TEXT_KEYS {
+                if let Some(found) = map.get(*key).and_then(first_text_field)
+                    && !found.is_empty()
+                {
+                    return Some(found);
+                }
+            }
+            for key in [
+                "payload",
+                "item",
+                "event",
+                "data",
+                "result",
+                "call",
+                "tool_call",
+                "toolCall",
+            ] {
+                if let Some(found) = map.get(key).and_then(first_text_field)
+                    && !found.is_empty()
+                {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn command_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(map) => {
+            for key in [
+                "command",
+                "cmd",
+                "codex_command",
+                "parsed_cmd",
+                "codex_parsed_cmd",
+                "interaction_input",
+                "argv",
+                "args",
+                "arguments",
+                "input",
+            ] {
+                if let Some(text) = map.get(key).and_then(command_text)
+                    && !text.is_empty()
+                {
+                    return Some(text);
+                }
+            }
+            for key in [
+                "payload",
+                "item",
+                "call",
+                "tool_call",
+                "toolCall",
+                "data",
+                "event",
+                "result",
+            ] {
+                if let Some(text) = map.get(key).and_then(command_text)
+                    && !text.is_empty()
+                {
+                    return Some(text);
+                }
+            }
+            None
+        }
+        Value::Array(values) => {
+            let parts = values
+                .iter()
+                .filter_map(command_text)
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>();
+            (!parts.is_empty()).then(|| parts.join(" "))
+        }
+        Value::String(s) => json_string_value(s)
+            .and_then(|value| command_text(&value))
+            .or_else(|| Some(s.clone())),
+        _ => None,
+    }
+}
+
+fn tool_output_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(values) => values.iter().find_map(tool_output_text),
+        Value::Object(map) => {
+            for key in [
+                "formatted_output",
+                "aggregated_output",
+                "stdout",
+                "stderr",
+                "output",
+                "delta",
+            ] {
+                if let Some(found) = map.get(key).and_then(tool_output_text)
+                    && !found.is_empty()
+                {
+                    return Some(found);
+                }
+            }
+            for key in [
+                "payload",
+                "item",
+                "event",
+                "data",
+                "result",
+                "call",
+                "tool_call",
+                "toolCall",
+            ] {
+                if let Some(found) = map.get(key).and_then(tool_output_text)
+                    && !found.is_empty()
+                {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn scalar_field_text(value: &Value, keys: &[&str]) -> Option<String> {
+    recursive_scalar_field_text(value, keys).map(|text| compact_tool_text(&text))
+}
+
+fn recursive_scalar_field_text(value: &Value, keys: &[&str]) -> Option<String> {
+    match value {
+        Value::Object(map) => {
+            for key in keys {
+                if let Some(text) = map.get(*key).and_then(scalar_value_text)
+                    && !text.is_empty()
+                {
+                    return Some(text);
+                }
+            }
+            for key in [
+                "payload",
+                "item",
+                "event",
+                "data",
+                "result",
+                "call",
+                "tool_call",
+                "toolCall",
+                "function",
+                "arguments",
+                "params",
+                "input",
+            ] {
+                if let Some(found) = map
+                    .get(key)
+                    .and_then(|child| recursive_scalar_field_text(child, keys))
+                    && !found.is_empty()
+                {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Value::Array(values) => values
+            .iter()
+            .find_map(|child| recursive_scalar_field_text(child, keys)),
+        Value::String(s) => {
+            json_string_value(s).and_then(|child| recursive_scalar_field_text(&child, keys))
+        }
+        _ => None,
+    }
+}
+
+fn scalar_value_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+fn json_string_value(s: &str) -> Option<Value> {
+    let trimmed = s.trim();
+    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+        return None;
+    }
+    serde_json::from_str(trimmed).ok()
+}
+
+fn compact_tool_text(text: &str) -> String {
+    const MAX_CHARS: usize = 2_000;
+    let trimmed = text.trim();
+    let mut out = String::new();
+    for (idx, ch) in trimmed.chars().enumerate() {
+        if idx == MAX_CHARS {
+            out.push_str("...");
+            return out;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 pub fn resume_prompt() -> &'static str {
     "Addnessの対象ゴールを読み、前回の続きから再開してください。bodyの `## Codex作業メモ` / `## Codex決定ログ` / `## PR/Release Traceability`、DoD、子ゴール、コメント、成果物を確認し、前回の続き・未完了・次の一手を短く整理してから進めてください。"
-}
-
-fn eager_startup_recall_enabled() -> bool {
-    std::env::var("ADDNESS_CODEX_EAGER_RECALL")
-        .ok()
-        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
 }
 
 fn addness_tui_developer_instructions() -> &'static str {
@@ -1026,6 +2580,38 @@ fn codex_config_arg(key: CodexConfigKey, value: &str) -> String {
     format!("{}={}", key.as_str(), toml_basic_string(value))
 }
 
+fn codex_exec_args(thread_id: Option<&str>, cwd: &str) -> Vec<String> {
+    let developer_instructions = codex_config_arg(
+        CodexConfigKey::DeveloperInstructions,
+        addness_tui_developer_instructions(),
+    );
+    if let Some(thread_id) = thread_id {
+        return vec![
+            "exec".to_string(),
+            "resume".to_string(),
+            "--json".to_string(),
+            "-c".to_string(),
+            developer_instructions,
+            thread_id.to_string(),
+            "-".to_string(),
+        ];
+    }
+
+    vec![
+        "exec".to_string(),
+        "--json".to_string(),
+        "--color".to_string(),
+        "never".to_string(),
+        "-s".to_string(),
+        "workspace-write".to_string(),
+        "-C".to_string(),
+        cwd.to_string(),
+        "-c".to_string(),
+        developer_instructions,
+        "-".to_string(),
+    ]
+}
+
 fn toml_basic_string(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('"');
@@ -1089,631 +2675,484 @@ DoD項目（番号: 内容）:
     )
 }
 
-fn codex_spawn_args(eager_recall: bool) -> Vec<String> {
-    let mut args = vec![
-        // 埋め込み PTY では Codex の会話履歴を Addness 側の scrollback で扱う。
-        // alternate screen のままだと Codex 内部で消えた行をホスト側が遡れない。
-        "--no-alt-screen".to_string(),
-        // 長い運用ルールはチャットに残さず developer_instructions として渡す。
-        "-c".to_string(),
-        codex_config_arg(
-            CodexConfigKey::DeveloperInstructions,
-            addness_tui_developer_instructions(),
-        ),
-    ];
-    // デフォルトでは初期プロンプトを送らず、ユーザーが即入力できる状態で起動する。
-    // 完全な Addness 読込は developer instructions に従って必要時に遅延実行する。
-    if eager_recall {
-        args.push(startup_recall_prompt().to_string());
-    }
-    args
-}
-
-/// crossterm の `KeyEvent` を xterm 互換の端末バイト列へエンコードする。
-fn encode_key(key: KeyEvent) -> Vec<u8> {
-    if key.modifiers == KeyModifiers::SHIFT
-        && let Some(bytes) = encode_shift_navigation_key(key.code)
-    {
-        return bytes;
-    }
-
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
-
-    let mut out: Vec<u8> = match key.code {
-        KeyCode::Char(c) => {
-            if ctrl {
-                let upper = c.to_ascii_uppercase() as u32;
-                if (b'@' as u32..=b'_' as u32).contains(&upper) {
-                    vec![(upper as u8) & 0x1f]
-                } else if c == ' ' {
-                    vec![0]
-                } else {
-                    let mut buf = [0u8; 4];
-                    c.encode_utf8(&mut buf).as_bytes().to_vec()
-                }
-            } else {
-                let mut buf = [0u8; 4];
-                c.encode_utf8(&mut buf).as_bytes().to_vec()
-            }
-        }
-        KeyCode::Enter => vec![b'\r'],
-        KeyCode::Tab => vec![b'\t'],
-        KeyCode::BackTab => b"\x1b[Z".to_vec(),
-        KeyCode::Backspace => vec![0x7f],
-        KeyCode::Esc => vec![0x1b],
-        KeyCode::Left => b"\x1b[D".to_vec(),
-        KeyCode::Right => b"\x1b[C".to_vec(),
-        KeyCode::Up => b"\x1b[A".to_vec(),
-        KeyCode::Down => b"\x1b[B".to_vec(),
-        KeyCode::Home => b"\x1b[H".to_vec(),
-        KeyCode::End => b"\x1b[F".to_vec(),
-        KeyCode::PageUp => b"\x1b[5~".to_vec(),
-        KeyCode::PageDown => b"\x1b[6~".to_vec(),
-        KeyCode::Delete => b"\x1b[3~".to_vec(),
-        KeyCode::Insert => b"\x1b[2~".to_vec(),
-        KeyCode::F(n) => match n {
-            1 => b"\x1bOP".to_vec(),
-            2 => b"\x1bOQ".to_vec(),
-            3 => b"\x1bOR".to_vec(),
-            4 => b"\x1bOS".to_vec(),
-            5 => b"\x1b[15~".to_vec(),
-            6 => b"\x1b[17~".to_vec(),
-            7 => b"\x1b[18~".to_vec(),
-            8 => b"\x1b[19~".to_vec(),
-            9 => b"\x1b[20~".to_vec(),
-            10 => b"\x1b[21~".to_vec(),
-            11 => b"\x1b[23~".to_vec(),
-            _ => Vec::new(),
-        },
-        _ => Vec::new(),
-    };
-
-    // Alt 修飾は ESC プレフィックスで表現する（Esc 単体は除く）。
-    if alt && !out.is_empty() && key.code != KeyCode::Esc {
-        let mut prefixed = vec![0x1b];
-        prefixed.append(&mut out);
-        return prefixed;
-    }
-    out
-}
-
-fn encode_shift_navigation_key(code: KeyCode) -> Option<Vec<u8>> {
-    let suffix = match code {
-        KeyCode::Up => b'A',
-        KeyCode::Down => b'B',
-        KeyCode::Right => b'C',
-        KeyCode::Left => b'D',
-        KeyCode::Home => b'H',
-        KeyCode::End => b'F',
-        _ => return None,
-    };
-    Some(format!("\x1b[1;2{}", suffix as char).into_bytes())
-}
-
-/// crossterm のホイールイベントを xterm SGR mouse mode の入力列へ変換する。
-fn encode_mouse_wheel(
-    kind: MouseEventKind,
-    column: u16,
-    row: u16,
-    modifiers: KeyModifiers,
-) -> Option<Vec<u8>> {
-    let mut cb = match kind {
-        MouseEventKind::ScrollUp => 64,
-        MouseEventKind::ScrollDown => 65,
-        MouseEventKind::ScrollLeft => 66,
-        MouseEventKind::ScrollRight => 67,
-        _ => return None,
-    };
-    if modifiers.contains(KeyModifiers::SHIFT) {
-        cb += 4;
-    }
-    if modifiers.contains(KeyModifiers::ALT) {
-        cb += 8;
-    }
-    if modifiers.contains(KeyModifiers::CONTROL) {
-        cb += 16;
-    }
-
-    let x = column.saturating_add(1);
-    let y = row.saturating_add(1);
-    Some(format!("\x1b[<{cb};{x};{y}M").into_bytes())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    fn key_mod(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
-        KeyEvent::new(code, mods)
-    }
-
     #[test]
-    fn encode_plain_char() {
-        assert_eq!(encode_key(key(KeyCode::Char('a'))), vec![b'a']);
-    }
-
-    #[test]
-    fn encode_ctrl_c_is_etx() {
-        assert_eq!(
-            encode_key(key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-            vec![0x03]
-        );
-    }
-
-    #[test]
-    fn encode_ctrl_space_is_nul() {
-        assert_eq!(
-            encode_key(key_mod(KeyCode::Char(' '), KeyModifiers::CONTROL)),
-            vec![0]
-        );
-    }
-
-    #[test]
-    fn encode_special_keys() {
-        assert_eq!(encode_key(key(KeyCode::Enter)), vec![b'\r']);
-        assert_eq!(encode_key(key(KeyCode::Esc)), vec![0x1b]);
-        assert_eq!(encode_key(key(KeyCode::Backspace)), vec![0x7f]);
-        assert_eq!(encode_key(key(KeyCode::Up)), b"\x1b[A".to_vec());
-        assert_eq!(encode_key(key(KeyCode::Left)), b"\x1b[D".to_vec());
-        assert_eq!(encode_key(key(KeyCode::PageUp)), b"\x1b[5~".to_vec());
-        assert_eq!(encode_key(key(KeyCode::PageDown)), b"\x1b[6~".to_vec());
-    }
-
-    #[test]
-    fn encode_shift_navigation_keys_use_xterm_modified_sequences() {
-        assert_eq!(
-            encode_key(key_mod(KeyCode::Up, KeyModifiers::SHIFT)),
-            b"\x1b[1;2A".to_vec()
-        );
-        assert_eq!(
-            encode_key(key_mod(KeyCode::Down, KeyModifiers::SHIFT)),
-            b"\x1b[1;2B".to_vec()
-        );
-    }
-
-    #[test]
-    fn encode_alt_prefixes_escape() {
-        assert_eq!(
-            encode_key(key_mod(KeyCode::Char('x'), KeyModifiers::ALT)),
-            vec![0x1b, b'x']
-        );
-    }
-
-    #[test]
-    fn encode_mouse_wheel_uses_sgr_coordinates() {
-        assert_eq!(
-            encode_mouse_wheel(MouseEventKind::ScrollUp, 0, 0, KeyModifiers::NONE),
-            Some(b"\x1b[<64;1;1M".to_vec())
-        );
-        assert_eq!(
-            encode_mouse_wheel(MouseEventKind::ScrollDown, 12, 4, KeyModifiers::NONE),
-            Some(b"\x1b[<65;13;5M".to_vec())
-        );
-    }
-
-    #[test]
-    fn encode_mouse_wheel_preserves_modifiers() {
-        assert_eq!(
-            encode_mouse_wheel(
-                MouseEventKind::ScrollRight,
-                2,
-                3,
-                KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL
-            ),
-            Some(b"\x1b[<95;3;4M".to_vec())
-        );
-    }
-
-    #[test]
-    fn encode_mouse_wheel_ignores_non_wheel_events() {
-        assert_eq!(
-            encode_mouse_wheel(MouseEventKind::Moved, 0, 0, KeyModifiers::NONE),
-            None
-        );
-    }
-
-    #[test]
-    fn vt100_scrollback_exposes_previous_lines() {
-        let mut parser = vt100::Parser::new(3, 12, 10);
-        for i in 0..6 {
-            parser.process(format!("line {i}\r\n").as_bytes());
-        }
-
-        let live = parser.screen().contents();
-        parser.screen_mut().set_scrollback(2);
-        let scrolled = parser.screen().contents();
-
-        assert_ne!(live, scrolled);
-        assert!(scrolled.contains("line 2"));
-        assert!(scrolled.contains("line 3"));
-    }
-
-    #[test]
-    fn pseudo_terminal_renders_vt100_scrollback_offset() {
-        use ratatui::{
-            Terminal,
-            backend::TestBackend,
-            widgets::{Block, Borders},
-        };
-        use tui_term::widget::PseudoTerminal;
-
-        fn render(screen: &vt100::Screen) -> String {
-            let mut terminal = Terminal::new(TestBackend::new(22, 6)).unwrap();
-            terminal
-                .draw(|frame| {
-                    let widget =
-                        PseudoTerminal::new(screen).block(Block::default().borders(Borders::ALL));
-                    frame.render_widget(widget, frame.area());
-                })
-                .unwrap();
-            let buffer = terminal.backend().buffer().clone();
-            let mut text = String::new();
-            for y in 0..buffer.area.height {
-                for x in 0..buffer.area.width {
-                    text.push_str(buffer[(x, y)].symbol());
-                }
-                text.push('\n');
-            }
-            text
-        }
-
-        let mut parser = vt100::Parser::new(4, 20, 10);
-        for i in 0..8 {
-            parser.process(format!("line {i}\r\n").as_bytes());
-        }
-
-        let live = render(parser.screen());
-        parser.screen_mut().set_scrollback(3);
-        let scrolled = render(parser.screen());
-
-        assert_ne!(live, scrolled);
-        assert!(
-            scrolled.contains("line 3") || scrolled.contains("line 4"),
-            "rendered scrollback should show earlier lines:\n{scrolled}"
-        );
-    }
-
-    #[test]
-    fn pseudo_terminal_renders_oversized_pty_view_scrollback() {
-        use ratatui::{
-            Terminal,
-            backend::TestBackend,
-            widgets::{Block, Borders},
-        };
-        use tui_term::widget::PseudoTerminal;
-
-        fn render(pane: &CodexPane) -> String {
-            let mut terminal = Terminal::new(TestBackend::new(22, 6)).unwrap();
-            terminal
-                .draw(|frame| {
-                    let view = pane.screen_view();
-                    let widget =
-                        PseudoTerminal::new(&view).block(Block::default().borders(Borders::ALL));
-                    frame.render_widget(widget, frame.area());
-                })
-                .unwrap();
-            let buffer = terminal.backend().buffer().clone();
-            let mut text = String::new();
-            for y in 0..buffer.area.height {
-                for x in 0..buffer.area.width {
-                    text.push_str(buffer[(x, y)].symbol());
-                }
-                text.push('\n');
-            }
-            text
-        }
-
-        let mut output = String::new();
-        for row in 1..=10 {
-            output.push_str(&format!("\x1b[{row};1Hrow {row:02}"));
-        }
-        let mut pane = CodexPane::test_with_output(10, 20, 0, &output);
-        pane.visible_rows = 4;
-
-        assert_eq!(pane.screen().scrollback(), 0);
-        let live = render(&pane);
-        assert!(
-            live.contains("row 07") && live.contains("row 10"),
-            "live viewport should show bottom rows without vt100 scrollback:\n{live}"
-        );
-
-        pane.scroll_lines(3);
-        assert_eq!(pane.screen().scrollback(), 0);
-        let scrolled = render(&pane);
-        assert!(
-            scrolled.contains("row 04") && scrolled.contains("row 07"),
-            "scrolled viewport should move up inside the same terminal screen:\n{scrolled}"
-        );
-    }
-
-    #[test]
-    fn scrollback_clamps_to_oversized_pty_view() {
-        let mut output = String::new();
-        for row in 1..=10 {
-            output.push_str(&format!("\x1b[{row};1Hrow {row:02}"));
-        }
-        let mut pane = CodexPane::test_with_output(10, 20, 0, &output);
-        pane.visible_rows = 4;
-
-        pane.scroll_lines(99);
-
-        assert_eq!(pane.scrollback, 6);
-    }
-
-    #[test]
-    fn resize_keeps_extra_scroll_rows_above_visible_viewport() {
-        let mut pane = CodexPane::test_with_output(10, 20, 0, "\x1b[10;1Hbottom");
-
-        pane.resize(7, 20);
-
-        assert_eq!(pane.visible_rows, 7);
-        assert_eq!(pane.rows, 7 + pty_extra_scroll_rows());
-    }
-
-    #[test]
-    fn extra_scroll_rows_default_and_env_value_are_bounded() {
-        assert_eq!(
-            extra_scroll_rows_from_env_value(None),
-            CODEX_PTY_EXTRA_SCROLL_ROWS_DEFAULT
-        );
-        assert_eq!(extra_scroll_rows_from_env_value(Some("320")), 320);
-        assert_eq!(
-            extra_scroll_rows_from_env_value(Some("5000")),
-            CODEX_PTY_EXTRA_SCROLL_ROWS_MAX
-        );
-        assert_eq!(
-            extra_scroll_rows_from_env_value(Some("not-a-number")),
-            CODEX_PTY_EXTRA_SCROLL_ROWS_DEFAULT
-        );
-    }
-
-    #[test]
-    fn vt100_tracks_mouse_reporting_modes_from_child_tui() {
-        let mut parser = vt100::Parser::new(3, 12, 10);
-
-        assert!(matches!(
-            parser.screen().mouse_protocol_mode(),
-            vt100::MouseProtocolMode::None
-        ));
-
-        parser.process(b"\x1b[?1006h\x1b[?1002h");
-
-        assert!(matches!(
-            parser.screen().mouse_protocol_encoding(),
-            vt100::MouseProtocolEncoding::Sgr
-        ));
-        assert!(matches!(
-            parser.screen().mouse_protocol_mode(),
-            vt100::MouseProtocolMode::ButtonMotion
-        ));
-    }
-
-    #[test]
-    fn codex_input_state_detects_exit_command_on_enter() {
-        let mut state = CodexInputState::default();
-        for ch in "/exit".chars() {
-            state.observe_key(key(KeyCode::Char(ch)));
-        }
-        assert!(!state.exit_command_sent);
-
-        state.observe_key(key(KeyCode::Enter));
-
-        assert!(state.exit_command_sent);
-    }
-
-    #[test]
-    fn codex_input_state_records_last_prompt_on_enter() {
+    fn input_state_records_last_prompt_on_enter() {
         let mut state = CodexInputState::default();
         for ch in "  cargo test を実行して  ".chars() {
-            state.observe_key(key(KeyCode::Char(ch)));
+            assert!(state.observe_key(key(KeyCode::Char(ch))).is_none());
         }
-        state.observe_key(key(KeyCode::Enter));
+        let submitted = state.observe_key(key(KeyCode::Enter));
+        assert_eq!(submitted.as_deref(), Some("cargo test を実行して"));
+        state.record_submitted(submitted.as_deref().unwrap());
 
         assert_eq!(state.last_prompt.as_deref(), Some("cargo test を実行して"));
     }
 
     #[test]
-    fn codex_input_state_record_submitted_tracks_resume_prompt() {
+    fn input_state_detects_exit_command_on_enter() {
         let mut state = CodexInputState::default();
-        state.record_submitted(resume_prompt());
-
-        assert_eq!(state.last_prompt.as_deref(), Some(resume_prompt()));
-        assert!(!state.exit_command_sent);
-    }
-
-    #[test]
-    fn codex_input_state_keeps_last_prompt_on_blank_enter() {
-        let mut state = CodexInputState::default();
-        for ch in "最初の依頼".chars() {
-            state.observe_key(key(KeyCode::Char(ch)));
+        for ch in "/exit".chars() {
+            assert!(state.observe_key(key(KeyCode::Char(ch))).is_none());
         }
-        state.observe_key(key(KeyCode::Enter));
-        state.observe_key(key(KeyCode::Enter));
-
-        assert_eq!(state.last_prompt.as_deref(), Some("最初の依頼"));
-    }
-
-    #[test]
-    fn codex_input_state_ignores_non_exit_lines() {
-        let mut state = CodexInputState::default();
-        for ch in "please /exit later".chars() {
-            state.observe_key(key(KeyCode::Char(ch)));
-        }
-        state.observe_key(key(KeyCode::Enter));
-
-        assert!(!state.exit_command_sent);
-    }
-
-    #[test]
-    fn codex_input_state_handles_backspace_before_exit() {
-        let mut state = CodexInputState::default();
-        for ch in "/exitt".chars() {
-            state.observe_key(key(KeyCode::Char(ch)));
-        }
-        state.observe_key(key(KeyCode::Backspace));
-        state.observe_key(key(KeyCode::Enter));
+        let submitted = state.observe_key(key(KeyCode::Enter)).unwrap();
+        state.record_submitted(&submitted);
 
         assert!(state.exit_command_sent);
     }
 
     #[test]
-    fn codex_input_state_clears_line_on_ctrl_u() {
-        let mut state = CodexInputState::default();
-        for ch in "/exit".chars() {
-            state.observe_key(key(KeyCode::Char(ch)));
+    fn input_during_running_queues_next_turn() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.finished = false;
+        pane.turn_running = true;
+
+        for ch in "j/kも入力".chars() {
+            pane.input(key(KeyCode::Char(ch)));
         }
-        state.observe_key(key_mod(KeyCode::Char('u'), KeyModifiers::CONTROL));
-        state.observe_key(key(KeyCode::Enter));
+        pane.input(key(KeyCode::Enter));
 
-        assert!(!state.exit_command_sent);
-    }
-
-    #[test]
-    fn split_dod_items_trims_and_skips_blank_lines() {
-        let dod = "  /authをmodule化\n\n テストが緑 \n";
-        assert_eq!(
-            split_dod_items(dod),
-            vec!["/authをmodule化".to_string(), "テストが緑".to_string()]
+        assert_eq!(pane.queued_prompt_count(), 1);
+        assert_eq!(pane.input_line(), "");
+        assert_eq!(pane.last_prompt(), Some("j/kも入力"));
+        assert!(
+            pane.log
+                .iter()
+                .any(|line| line.kind == CodexLogKind::User && line.text == "j/kも入力")
         );
+        assert!(pane.log.iter().any(
+            |line| line.kind == CodexLogKind::System && line.text.contains("次のターンに予約")
+        ));
     }
 
     #[test]
-    fn split_dod_items_empty() {
-        assert!(split_dod_items("   \n\n").is_empty());
+    fn queued_exit_finishes_when_turn_becomes_idle() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.finished = false;
+        pane.turn_running = true;
+
+        for ch in "/exit".chars() {
+            pane.input(key(KeyCode::Char(ch)));
+        }
+        pane.input(key(KeyCode::Enter));
+
+        assert!(!pane.finished);
+        assert_eq!(pane.queued_prompt_count(), 1);
+
+        pane.turn_running = false;
+        assert!(pane.start_next_queued_turn_if_idle());
+
+        assert!(pane.finished);
+        assert_eq!(pane.queued_prompt_count(), 0);
     }
 
     #[test]
-    fn action_label_shows_goal_body_update_as_current_state_write() {
-        let (label, kind) = action_label("goal update goal-1 --body-file /tmp/status.md --json");
+    fn scrollback_clamps_to_log_history() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "1\n2\n3\n4\n5\n6\n7\n8\n9\n10");
+        pane.resize(6, 20);
 
-        assert_eq!(label, "現状(body)を書込中");
-        assert!(matches!(kind, AddnessActionKind::Write));
+        pane.scroll_lines(99);
+
+        assert_eq!(pane.scrollback, pane.max_view_scrollback());
     }
 
     #[test]
-    fn action_label_shows_goal_description_update_as_dod_write() {
-        let (label, kind) = action_label("goal update goal-1 --description \"DoD\" --json");
+    fn rendered_history_metrics_define_exact_scrollback_limit() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
 
-        assert_eq!(label, "方針(DoD)を書込中");
-        assert!(matches!(kind, AddnessActionKind::Write));
+        pane.sync_rendered_history_metrics(100, 10);
+        pane.scroll_to_top();
+        assert_eq!(pane.scrollback, 90);
+
+        pane.sync_rendered_history_metrics(12, 10);
+        assert_eq!(pane.scrollback, 2);
     }
 
     #[test]
-    fn action_label_shows_notification_send() {
-        let (label, kind) =
-            action_label("notification send --kind done --body \"完了しました\" --json");
+    fn thread_started_event_records_thread_id() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.handle_stdout_line(r#"{"type":"thread.started","thread_id":"abc"}"#);
 
-        assert_eq!(label, "作業完了通知を送信中");
-        assert!(matches!(kind, AddnessActionKind::Write));
+        assert_eq!(pane.thread_id(), Some("abc"));
+        assert!(pane.log.iter().any(|line| line.text.contains("abc")));
     }
 
     #[test]
-    fn terminal_notice_detects_yes_no_prompt() {
-        let (_, notice) =
-            terminal_notice_candidate("Do you want to allow this command?\n[y/N]", None, false)
-                .unwrap();
+    fn turn_started_event_records_turn_separator() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.input_state.last_prompt = Some("  実装を進めて\nください  ".to_string());
 
-        assert_eq!(notice.title, "Codex 確認待ち");
-        assert!(notice.message.contains("判断待ち"));
+        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
+
+        let line = pane.log.last().unwrap();
+        assert_eq!(line.kind, CodexLogKind::Turn);
+        assert_eq!(line.text, "Turn 1 - 実装を進めて ください");
+        assert!(pane.is_turn_running());
     }
 
     #[test]
-    fn terminal_notice_detects_japanese_approval_prompt() {
-        let (_, notice) = terminal_notice_candidate(
-            "このコマンドの実行を許可しますか？\n1. はい\n2. いいえ",
-            None,
-            false,
-        )
+    fn run_state_tracks_command_and_confirmation() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        assert_eq!(pane.run_state(), CodexRunState::Completed);
+        pane.finished = false;
+        assert_eq!(pane.run_state(), CodexRunState::InputWaiting);
+
+        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
+        assert_eq!(pane.run_state(), CodexRunState::Thinking);
+
+        pane.handle_stdout_line(
+            r#"{"type":"exec_command_begin","parsed_cmd":"cargo test","codex_cwd":"/repo"}"#,
+        );
+        assert_eq!(pane.run_state(), CodexRunState::CommandRunning);
+        assert_eq!(pane.current_command(), Some("cargo test"));
+
+        pane.handle_stdout_line(r#"{"type":"approval_requested","message":"Run command? y/n"}"#);
+        let banner = pane.decision_banner().unwrap();
+        assert_eq!(pane.run_state(), CodexRunState::Confirming);
+        assert_eq!(banner.kind, CodexDecisionKind::Approval);
+
+        assert!(pane.handle_decision_key(key(KeyCode::Char('a'))));
+        assert!(pane.decision_banner().is_none());
+        assert_eq!(pane.run_state(), CodexRunState::CommandRunning);
+    }
+
+    #[test]
+    fn old_turns_are_collapsed_until_toggled_open() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.finished = false;
+        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
+        pane.push_log(CodexLogKind::Assistant, "old response");
+        pane.handle_stdout_line(r#"{"type":"turn.completed"}"#);
+        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
+        pane.push_log(CodexLogKind::Assistant, "new response");
+
+        let collapsed = pane
+            .filtered_log_lines()
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(collapsed.contains(&"Turn 1"));
+        assert!(!collapsed.contains(&"old response"));
+        assert!(collapsed.contains(&"new response"));
+
+        pane.toggle_old_turns_collapsed();
+        let expanded = pane
+            .filtered_log_lines()
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(expanded.contains(&"old response"));
+    }
+
+    #[test]
+    fn filtered_log_lines_supports_filter_and_search() {
+        let mut pane = CodexPane::test_with_output(8, 40, 0, "");
+        pane.push_log(CodexLogKind::Turn, "Turn 1");
+        pane.push_log(CodexLogKind::User, "cargo test して");
+        pane.push_log(CodexLogKind::Assistant, "確認します");
+        pane.push_log(CodexLogKind::Tool, "exec_command_begin: cargo test");
+        pane.push_log(CodexLogKind::Error, "limit");
+
+        pane.cycle_log_filter();
+        let conversation = pane.filtered_log_lines();
+        assert_eq!(conversation.len(), 3);
+        assert!(conversation.iter().all(|line| matches!(
+            line.kind,
+            CodexLogKind::Turn | CodexLogKind::User | CodexLogKind::Assistant
+        )));
+
+        pane.cycle_log_filter();
+        pane.search_query = "cargo".to_string();
+        let tools = pane.filtered_log_lines();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].kind, CodexLogKind::Tool);
+    }
+
+    #[test]
+    fn error_event_sets_terminal_notice() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.handle_stdout_line(r#"{"type":"error","message":"limit"}"#);
+
+        let notice = pane.take_terminal_notice().unwrap();
+        assert_eq!(notice.title, "Codex エラー");
+        assert_eq!(notice.message, "limit");
+    }
+
+    #[test]
+    fn turn_completed_sets_terminal_notice() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.handle_stdout_line(r#"{"type":"turn.completed"}"#);
+
+        let notice = pane.take_terminal_notice().unwrap();
+        assert_eq!(notice.title, "Codex 完了");
+        assert_eq!(notice.message, "Codex の出力が完了しました");
+    }
+
+    #[test]
+    fn approval_event_sets_terminal_notice_without_overwriting_next_notice() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.handle_stdout_line(r#"{"type":"approval_requested","message":"Run command? yes/no"}"#);
+        pane.handle_stdout_line(r#"{"type":"turn.completed"}"#);
+
+        let first = pane.take_terminal_notice().unwrap();
+        let second = pane.take_terminal_notice().unwrap();
+        assert_eq!(first.title, "Codex 確認待ち");
+        assert!(first.message.contains("yes/no"));
+        assert_eq!(second.title, "Codex 完了");
+    }
+
+    #[test]
+    fn assistant_delta_appends_to_same_line() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.handle_stdout_line(r#"{"type":"agent_message.delta","delta":"hel"}"#);
+        pane.handle_stdout_line(r#"{"type":"agent_message.delta","delta":"lo"}"#);
+
+        let assistant = pane
+            .log
+            .iter()
+            .filter(|line| line.kind == CodexLogKind::Assistant)
+            .collect::<Vec<_>>();
+        assert_eq!(assistant.len(), 1);
+        assert_eq!(assistant[0].text, "hello");
+    }
+
+    #[test]
+    fn session_history_persists_raw_events_and_restores_display_log() {
+        let path = std::env::temp_dir().join(format!(
+            "addness-codex-history-{}-{}.jsonl",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+        {
+            let history_path = path.clone();
+            let mut pane = CodexPane::spawn_inner(CodexPaneSpawnOptions {
+                codex_bin: Path::new("codex"),
+                cwd: &cwd,
+                addness_bin: "addness",
+                goal_id: "goal/history".to_string(),
+                goal_title: "History goal".to_string(),
+                dod: String::new(),
+                status_label: "TEST".to_string(),
+                session_log_path: Some(history_path),
+            })
+            .unwrap();
+            pane.handle_stdout_line(r#"{"type":"agent_message.delta","delta":"hel"}"#);
+            pane.handle_stdout_line(r#"{"type":"agent_message.delta","delta":"lo"}"#);
+        }
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains(r#""record":"raw_event""#));
+        assert!(saved.contains(r#""record":"assistant_delta""#));
+
+        let history_path = path.clone();
+        let pane = CodexPane::spawn_inner(CodexPaneSpawnOptions {
+            codex_bin: Path::new("codex"),
+            cwd: &cwd,
+            addness_bin: "addness",
+            goal_id: "goal/history".to_string(),
+            goal_title: "History goal".to_string(),
+            dod: String::new(),
+            status_label: "TEST".to_string(),
+            session_log_path: Some(history_path),
+        })
         .unwrap();
 
-        assert_eq!(notice.title, "Codex 確認待ち");
+        assert!(pane.loaded_history_count() > 0);
+        assert!(
+            pane.log
+                .iter()
+                .any(|line| line.kind == CodexLogKind::Assistant && line.text == "hello")
+        );
+        assert!(pane.history_label().contains("保存中"));
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn terminal_notice_ignores_plain_output() {
-        assert!(terminal_notice_candidate("cargo test finished", None, false).is_none());
-    }
-
-    #[test]
-    fn terminal_notice_reports_notification_action() {
-        let (_, notice) =
-            terminal_notice_candidate("", Some("作業完了通知を送信中"), false).unwrap();
-
-        assert_eq!(notice.title, "Codex 作業完了");
-    }
-
-    #[test]
-    fn startup_instructions_defer_full_addness_recall_but_use_addness_proactively() {
-        let prompt = startup_recall_prompt();
-        let instructions = addness_tui_developer_instructions();
-
-        assert!(prompt.contains("Addness TUIセッションを開始"));
-        assert!(resume_prompt().contains("前回の続き"));
-        assert!(prompt.len() < 80 * 2);
-        assert!(instructions.contains("起動直後は Addness CLI を実行せず"));
-        assert!(instructions.contains("ユーザーの最初の入力を待ってください"));
-        assert!(instructions.contains("軽量コンテキスト"));
-        assert!(instructions.contains("ADDNESS_GOAL_TITLE"));
-        assert!(instructions.contains("ADDNESS_GOAL_STATUS"));
-        assert!(instructions.contains("ADDNESS_GOAL_DOD"));
-        assert!(instructions.contains("最初の依頼が「何をするかの相談」"));
-        assert!(instructions.contains("想起コマンド"));
-        assert!(instructions.contains("\"$ADDNESS_BIN\" goal get \"$ADDNESS_GOAL_ID\""));
-        assert!(instructions.contains("--json --with-deliverable --with-comment"));
-        assert!(instructions.contains("組織/プロジェクト専用の共有DB"));
-        assert!(instructions.contains("長期作業メモリ"));
-        assert!(instructions.contains("真実源"));
-        assert!(instructions.contains("起動しただけでは Addness に書き込まない"));
-        assert!(instructions.contains("作業を始めた時"));
-        assert!(instructions.contains("重要な発見や制約が分かった時"));
-        assert!(instructions.contains("## Codex作業メモ"));
-        assert!(instructions.contains("## Codex決定ログ"));
-        assert!(instructions.contains("## PR/Release Traceability"));
-        assert!(instructions.contains("link pr --goal"));
-        assert!(instructions.contains("deliverable add --goal"));
-        assert!(instructions.contains("notification send --kind done"));
-        assert!(instructions.contains("goal update --body-file"));
-        assert!(instructions.contains("子ゴール分解が不十分"));
-        assert!(instructions.contains("goal update \"$ADDNESS_GOAL_ID\" --description"));
-    }
-
-    #[test]
-    fn codex_config_arg_escapes_developer_instructions_as_toml() {
-        let arg = codex_config_arg(
-            CodexConfigKey::DeveloperInstructions,
-            "quote: \" / path: C:\\tmp\nnext\tline",
+    fn response_item_exec_command_arguments_json_renders_tool_line() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.handle_stdout_line(
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo test\",\"workdir\":\"/repo\"}"}}"#,
         );
 
-        assert_eq!(
-            arg,
-            "developer_instructions=\"quote: \\\" / path: C:\\\\tmp\\nnext\\tline\""
+        let line = pane.log.last().unwrap();
+        assert_eq!(line.kind, CodexLogKind::Tool);
+        assert!(line.text.contains("exec_command"));
+        assert!(line.text.contains("cargo test"));
+        assert!(line.text.contains("/repo"));
+    }
+
+    #[test]
+    fn addness_bin_exec_command_updates_action_indicator() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.handle_stdout_line(
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"\\\"$ADDNESS_BIN\\\" goal get goal-1 --json\",\"workdir\":\"/repo\"}"}}"#,
+        );
+
+        assert_eq!(pane.action.as_deref(), Some("ゴール文脈を読込中"));
+        assert!(pane.last_addness_read_at.is_some());
+    }
+
+    #[test]
+    fn exec_command_begin_renders_command_from_native_fields() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.handle_stdout_line(
+            r#"{"type":"exec_command_begin","parsed_cmd":"cargo check","codex_cwd":"/repo"}"#,
+        );
+
+        let line = pane.log.last().unwrap();
+        assert_eq!(line.kind, CodexLogKind::Tool);
+        assert!(line.text.contains("exec_command_begin"));
+        assert!(line.text.contains("cargo check"));
+        assert!(line.text.contains("/repo"));
+        assert_eq!(pane.current_command(), Some("cargo check"));
+    }
+
+    #[test]
+    fn apply_patch_renders_as_code_edit_tool() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.handle_stdout_line(
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"apply_patch","arguments":"*** Begin Patch\n*** Update File: src/tui/ui.rs\n@@\n*** End Patch\n"}}"#,
+        );
+
+        let line = pane.log.last().unwrap();
+        assert_eq!(line.kind, CodexLogKind::Tool);
+        assert!(line.text.starts_with("EDIT "));
+        assert!(line.text.contains("*** Update File: src/tui/ui.rs"));
+    }
+
+    #[test]
+    fn exec_command_end_renders_exit_code_and_output() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.handle_stdout_line(
+            r#"{"type":"exec_command_end","cmd":"cargo check","exit_code":0,"formatted_output":"Finished dev profile"}"#,
+        );
+
+        let line = pane.log.last().unwrap();
+        assert_eq!(line.kind, CodexLogKind::Tool);
+        assert!(line.text.contains("exec_command_end"));
+        assert!(line.text.contains("exit 0"));
+        assert!(line.text.contains("cargo check"));
+        assert!(line.text.contains("Finished dev profile"));
+        assert_eq!(pane.current_command(), None);
+    }
+
+    #[test]
+    fn turn_completed_clears_current_command() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.handle_stdout_line(
+            r#"{"type":"exec_command_begin","parsed_cmd":"cargo check","codex_cwd":"/repo"}"#,
+        );
+        assert_eq!(pane.current_command(), Some("cargo check"));
+
+        pane.handle_stdout_line(r#"{"type":"turn.completed"}"#);
+
+        assert_eq!(pane.current_command(), None);
+    }
+
+    #[test]
+    fn addness_tool_activity_summarizes_semantic_change() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.handle_stdout_line(
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"$ADDNESS_BIN goal update goal-1 --body memo --json\",\"workdir\":\"/repo\"}"},"formatted_output":"{\"title\":\"重要ゴール\"}"}"#,
+        );
+
+        assert!(pane.last_addness_write_at.is_some());
+        assert!(
+            pane.activity
+                .iter()
+                .any(|line| line.contains("Addness body変更: 重要ゴール"))
         );
     }
 
     #[test]
-    fn codex_spawn_args_use_inline_codex_with_developer_instructions() {
-        let args = codex_spawn_args(false);
+    fn work_summary_extracts_assistant_checks_and_errors() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.push_log(
+            CodexLogKind::Assistant,
+            "UIを改善しました\nテストを追加しました",
+        );
+        pane.push_log(
+            CodexLogKind::Tool,
+            "OK cargo test (exit 0)\ntest result: ok. 99 passed; 0 failed;",
+        );
+        pane.push_log(CodexLogKind::Error, "残課題: なし");
 
-        assert_eq!(args.first().map(String::as_str), Some("--no-alt-screen"));
+        let summary = pane.work_summary();
+        assert!(
+            summary
+                .implemented
+                .iter()
+                .any(|line| line.contains("UIを改善"))
+        );
+        assert!(
+            summary
+                .checks
+                .iter()
+                .any(|line| line.contains("test result: ok"))
+        );
+        assert!(summary.remaining.iter().any(|line| line.contains("残課題")));
+    }
+
+    #[test]
+    fn agent_message_text_is_not_classified_as_tool() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.handle_stdout_line(
+            r#"{"type":"agent_message","message":"I would run cargo test next."}"#,
+        );
+
+        let line = pane.log.last().unwrap();
+        assert_eq!(line.kind, CodexLogKind::Assistant);
+        assert_eq!(line.text, "I would run cargo test next.");
+    }
+
+    #[test]
+    fn codex_exec_args_start_new_json_turn() {
+        let args = codex_exec_args(None, "/repo");
+
+        assert_eq!(args[0], "exec");
+        assert!(args.contains(&"--json".to_string()));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-s", "workspace-write"])
+        );
+        assert!(args.windows(2).any(|pair| pair == ["-C", "/repo"]));
+        assert_eq!(args.last().map(String::as_str), Some("-"));
         assert!(
             args.iter()
                 .any(|arg| arg.starts_with("developer_instructions="))
         );
-        assert!(!args.iter().any(|arg| arg == startup_recall_prompt()));
     }
 
     #[test]
-    fn codex_spawn_args_can_append_eager_startup_recall_prompt() {
-        let args = codex_spawn_args(true);
+    fn codex_exec_args_resume_existing_json_thread() {
+        let args = codex_exec_args(Some("thread-1"), "/repo");
 
-        assert_eq!(
-            args.last().map(String::as_str),
-            Some(startup_recall_prompt())
-        );
+        assert_eq!(args[0], "exec");
+        assert_eq!(args[1], "resume");
+        assert!(args.contains(&"--json".to_string()));
+        assert!(args.contains(&"thread-1".to_string()));
+        assert_eq!(args.last().map(String::as_str), Some("-"));
+        assert!(!args.contains(&"-C".to_string()));
+        assert!(!args.contains(&"-s".to_string()));
+    }
+
+    #[test]
+    fn dod_prompt_lists_items() {
+        let prompt = build_dod_assessment_prompt(&["A".to_string(), "B".to_string()]);
+
+        assert!(prompt.contains("0: A"));
+        assert!(prompt.contains("1: B"));
     }
 }

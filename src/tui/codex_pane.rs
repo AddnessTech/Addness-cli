@@ -140,15 +140,53 @@ enum CodexProcessEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "record", rename_all = "snake_case")]
 enum CodexSessionRecord {
-    Log { kind: CodexLogKind, text: String },
-    UpdateTurn { turn: usize, text: String },
-    AssistantDelta { text: String },
-    RawEvent { stream: String, line: String },
+    Log {
+        kind: CodexLogKind,
+        text: String,
+    },
+    UpdateTurn {
+        turn: usize,
+        text: String,
+    },
+    AssistantDelta {
+        text: String,
+    },
+    GoalMode {
+        objective: Option<String>,
+        paused: bool,
+    },
+    RawEvent {
+        stream: String,
+        line: String,
+    },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct CodexGoalMode {
+    objective: Option<String>,
+    paused: bool,
+}
+
+impl CodexGoalMode {
+    fn is_active(&self) -> bool {
+        self.objective.is_some() && !self.paused
+    }
+
+    fn label(&self) -> Option<String> {
+        self.objective.as_ref().map(|objective| {
+            if self.paused {
+                format!("paused: {objective}")
+            } else {
+                format!("active: {objective}")
+            }
+        })
+    }
 }
 
 struct LoadedCodexSession {
     log: Vec<CodexLogLine>,
     record_count: usize,
+    goal_mode: CodexGoalMode,
 }
 
 struct CodexPaneSpawnOptions<'a> {
@@ -400,6 +438,8 @@ pub struct CodexPane {
     search_query: String,
     /// 検索入力中か。
     search_editing: bool,
+    /// Addness 独自UI上で `codex exec` に注入する永続目標。
+    goal_mode: CodexGoalMode,
     pending_decision: Option<CodexDecisionBanner>,
 }
 
@@ -451,7 +491,9 @@ impl CodexPane {
             .unwrap_or_else(|| LoadedCodexSession {
                 log: Vec::new(),
                 record_count: 0,
+                goal_mode: CodexGoalMode::default(),
             });
+        let goal_mode = loaded.goal_mode.clone();
         let loaded_history_count = loaded.log.len();
         let turn_count = loaded
             .log
@@ -517,6 +559,7 @@ impl CodexPane {
             search_query: String::new(),
             search_editing: false,
             pending_decision: None,
+            goal_mode,
             dod,
         };
         if pane.loaded_history_count > 0 {
@@ -566,11 +609,20 @@ impl CodexPane {
         pane.search_editing = false;
         pane.collapsed_turns.clear();
         pane.pending_decision = None;
+        pane.goal_mode = CodexGoalMode::default();
         for line in output.lines() {
             pane.push_log(CodexLogKind::Assistant, line.to_string());
         }
         pane.finished = true;
         pane
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_add_completed_turn(&mut self, assistant_text: &str) {
+        self.turn_running = false;
+        self.turn_count = self.turn_count.saturating_add(1);
+        self.push_log(CodexLogKind::Turn, format!("Turn {}", self.turn_count));
+        self.push_log(CodexLogKind::Assistant, assistant_text.to_string());
     }
 
     /// ログを delta 行スクロールする（正=過去へ、負=最新へ）。
@@ -644,6 +696,10 @@ impl CodexPane {
             .rev()
             .find(|line| line.kind == CodexLogKind::Assistant)
             .map(|line| line.text.as_str())
+    }
+
+    pub fn goal_mode_label(&self) -> Option<String> {
+        self.goal_mode.label()
     }
 
     pub fn input_line(&self) -> &str {
@@ -842,10 +898,7 @@ impl CodexPane {
         let Some(response) = response else {
             return false;
         };
-        self.pending_decision = None;
-        self.action = Some(format!("確認応答: {response}"));
-        self.push_activity(format!("確認待ちに {response} で応答"));
-        self.push_terminal_notice("Codex 確認応答", format!("{response} を選択しました"));
+        self.resolve_pending_decision(response, false);
         true
     }
 
@@ -1339,8 +1392,30 @@ impl CodexPane {
 
     fn set_pending_decision(&mut self, decision: CodexDecisionBanner) {
         let message = decision.message.clone();
+        if decision.kind == CodexDecisionKind::YesNo {
+            let response = decision.accept_label;
+            self.pending_decision = Some(decision);
+            self.resolve_pending_decision(response, true);
+            return;
+        }
         self.pending_decision = Some(decision);
         self.push_terminal_notice("Codex 確認待ち", message);
+    }
+
+    fn resolve_pending_decision(&mut self, response: &'static str, auto: bool) {
+        self.pending_decision = None;
+        if auto {
+            self.action = Some(format!("確認自動応答: {response}"));
+            self.push_activity(format!("確認待ちに {response} で自動応答"));
+            self.push_terminal_notice(
+                "Codex 確認自動応答",
+                format!("{response} を自動選択しました"),
+            );
+        } else {
+            self.action = Some(format!("確認応答: {response}"));
+            self.push_activity(format!("確認待ちに {response} で応答"));
+            self.push_terminal_notice("Codex 確認応答", format!("{response} を選択しました"));
+        }
     }
 
     fn record_addness_tool_activity(&mut self, display: &ToolDisplay) {
@@ -1437,6 +1512,10 @@ impl CodexPane {
             return;
         }
 
+        if self.handle_local_slash_command(&submitted) {
+            return;
+        }
+
         if self.pending_task_prompt.is_some() {
             self.queued_prompts.push_back(submitted);
             let count = self.queued_prompts.len();
@@ -1493,12 +1572,13 @@ impl CodexPane {
     }
 
     fn run_submitted_line(&mut self, submitted: String) {
-        if submitted == "/exit" {
+        if matches!(submitted.as_str(), "/exit" | "/quit") {
             self.finish_from_exit_command();
             return;
         }
 
-        self.start_turn(&submitted);
+        let exec_prompt = self.prompt_with_goal_mode(&submitted);
+        self.start_turn_with_display_prompt(&exec_prompt, &submitted);
     }
 
     fn finish_from_exit_command(&mut self) {
@@ -1512,6 +1592,10 @@ impl CodexPane {
     }
 
     fn start_turn(&mut self, prompt: &str) {
+        self.start_turn_with_display_prompt(prompt, prompt);
+    }
+
+    fn start_turn_with_display_prompt(&mut self, prompt: &str, display_prompt: &str) {
         if self.is_turn_running() {
             self.push_log(CodexLogKind::System, "前の Codex ターンがまだ実行中です");
             return;
@@ -1524,7 +1608,7 @@ impl CodexPane {
                 self.turn_running = true;
                 self.turn_finished_by_event = false;
                 self.pending_decision = None;
-                self.current_turn_prompt = Some(prompt.to_string());
+                self.current_turn_prompt = Some(display_prompt.to_string());
                 self.scroll_to_live();
             }
             Err(e) => {
@@ -1533,6 +1617,156 @@ impl CodexPane {
                 self.push_terminal_notice("Codex 起動失敗", message);
             }
         }
+    }
+
+    fn handle_local_slash_command(&mut self, submitted: &str) -> bool {
+        let Some(command_line) = submitted.strip_prefix('/') else {
+            return false;
+        };
+        if command_line.trim().is_empty() {
+            return false;
+        }
+
+        let mut parts = command_line.trim().splitn(2, char::is_whitespace);
+        let command = parts.next().unwrap_or_default().to_ascii_lowercase();
+        let args = parts.next().unwrap_or_default().trim();
+        match command.as_str() {
+            "goal" => {
+                self.handle_goal_slash_command(args);
+                true
+            }
+            "help" => {
+                self.push_slash_help();
+                true
+            }
+            "status" => {
+                self.push_slash_status();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn handle_goal_slash_command(&mut self, args: &str) {
+        if args.is_empty() {
+            self.push_goal_mode_status();
+            return;
+        }
+
+        let mut parts = args.splitn(2, char::is_whitespace);
+        let action = parts.next().unwrap_or_default();
+        let rest = parts.next().unwrap_or_default().trim();
+        match action.to_ascii_lowercase().as_str() {
+            "pause" => {
+                if self.goal_mode.objective.is_none() {
+                    self.push_log(CodexLogKind::System, "Goal mode: 目標は未設定です");
+                    return;
+                }
+                self.goal_mode.paused = true;
+                self.persist_goal_mode();
+                self.action = Some("Goal mode paused".to_string());
+                self.push_activity("Goal mode を一時停止しました".to_string());
+                self.push_log(CodexLogKind::System, "Goal mode を一時停止しました");
+            }
+            "resume" => {
+                if self.goal_mode.objective.is_none() {
+                    self.push_log(CodexLogKind::System, "Goal mode: 目標は未設定です");
+                    return;
+                }
+                self.goal_mode.paused = false;
+                self.persist_goal_mode();
+                self.action = Some("Goal mode active".to_string());
+                self.push_activity("Goal mode を再開しました".to_string());
+                self.push_log(CodexLogKind::System, "Goal mode を再開しました");
+            }
+            "clear" => {
+                self.goal_mode = CodexGoalMode::default();
+                self.persist_goal_mode();
+                self.action = Some("Goal mode cleared".to_string());
+                self.push_activity("Goal mode を解除しました".to_string());
+                self.push_log(CodexLogKind::System, "Goal mode を解除しました");
+            }
+            "set" if !rest.is_empty() => self.set_goal_mode_objective(rest),
+            _ => self.set_goal_mode_objective(args),
+        }
+    }
+
+    fn set_goal_mode_objective(&mut self, objective: &str) {
+        let objective = normalize_submitted_line(objective);
+        if objective.is_empty() {
+            self.push_log(CodexLogKind::Error, "Goal mode の目標が空です");
+            return;
+        }
+        if objective.chars().count() > 4_000 {
+            self.push_log(
+                CodexLogKind::Error,
+                "Goal mode の目標は 4,000 文字以内にしてください",
+            );
+            return;
+        }
+
+        self.goal_mode = CodexGoalMode {
+            objective: Some(objective.clone()),
+            paused: false,
+        };
+        self.persist_goal_mode();
+        self.action = Some("Goal mode active".to_string());
+        self.push_activity("Goal mode を設定しました".to_string());
+        self.push_log(CodexLogKind::System, format!("Goal mode: {objective}"));
+    }
+
+    fn push_goal_mode_status(&mut self) {
+        let status = match self.goal_mode.label() {
+            Some(label) => format!("Goal mode: {label}"),
+            None => "Goal mode: off".to_string(),
+        };
+        self.push_log(CodexLogKind::System, status);
+    }
+
+    fn push_slash_help(&mut self) {
+        self.push_log(
+            CodexLogKind::System,
+            "Slash commands: /goal <目標>, /goal pause, /goal resume, /goal clear, /status, /help, /exit",
+        );
+    }
+
+    fn push_slash_status(&mut self) {
+        let goal = self.goal_mode.label().unwrap_or_else(|| "off".to_string());
+        let thread = self.thread_id.as_deref().unwrap_or("new");
+        self.push_log(
+            CodexLogKind::System,
+            format!(
+                "Status: goal={goal}, sandbox=workspace-write, turn={}, thread={thread}",
+                self.turn_count
+            ),
+        );
+    }
+
+    fn persist_goal_mode(&mut self) {
+        self.persist_session_record(CodexSessionRecord::GoalMode {
+            objective: self.goal_mode.objective.clone(),
+            paused: self.goal_mode.paused,
+        });
+    }
+
+    fn prompt_with_goal_mode(&self, submitted: &str) -> String {
+        let Some(objective) = self.goal_mode.objective.as_deref() else {
+            return submitted.to_string();
+        };
+        if !self.goal_mode.is_active() {
+            return submitted.to_string();
+        }
+        format!(
+            r#"Codex Goal mode is active.
+
+Persistent goal:
+{objective}
+
+Current user request:
+{submitted}
+
+Keep working toward the persistent goal across turns. If the current request conflicts with the goal, explain the conflict before proceeding."#
+        )
     }
 
     fn start_next_queued_turn_if_idle(&mut self) -> bool {
@@ -2212,6 +2446,7 @@ fn load_codex_session(path: &Path) -> Result<LoadedCodexSession> {
             return Ok(LoadedCodexSession {
                 log: Vec::new(),
                 record_count: 0,
+                goal_mode: CodexGoalMode::default(),
             });
         }
         Err(e) => {
@@ -2220,6 +2455,7 @@ fn load_codex_session(path: &Path) -> Result<LoadedCodexSession> {
     };
 
     let mut log = Vec::new();
+    let mut goal_mode = CodexGoalMode::default();
     let mut record_count = 0usize;
     for line in BufReader::new(file).lines().map_while(Result::ok) {
         if line.trim().is_empty() {
@@ -2243,6 +2479,9 @@ fn load_codex_session(path: &Path) -> Result<LoadedCodexSession> {
                 }
                 log.push(CodexLogLine::new(CodexLogKind::Assistant, text));
             }
+            CodexSessionRecord::GoalMode { objective, paused } => {
+                goal_mode = CodexGoalMode { objective, paused };
+            }
             CodexSessionRecord::RawEvent { .. } => {}
         }
         if log.len() > CODEX_SESSION_HISTORY_MAX_LOG_LINES {
@@ -2251,7 +2490,11 @@ fn load_codex_session(path: &Path) -> Result<LoadedCodexSession> {
         }
     }
 
-    Ok(LoadedCodexSession { log, record_count })
+    Ok(LoadedCodexSession {
+        log,
+        record_count,
+        goal_mode,
+    })
 }
 
 fn append_codex_session_record(path: &Path, record: &CodexSessionRecord) -> Result<()> {
@@ -3269,6 +3512,13 @@ mod tests {
         KeyEvent::new(code, modifiers)
     }
 
+    fn submit_line(pane: &mut CodexPane, text: &str) {
+        for ch in text.chars() {
+            pane.input(key(KeyCode::Char(ch)));
+        }
+        pane.input(key(KeyCode::Enter));
+    }
+
     #[test]
     fn input_state_records_last_prompt_on_enter() {
         let mut state = CodexInputState::default();
@@ -3394,6 +3644,63 @@ mod tests {
     }
 
     #[test]
+    fn goal_slash_command_sets_goal_without_starting_turn() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.finished = false;
+
+        submit_line(&mut pane, "/goal Finish the migration");
+
+        assert_eq!(
+            pane.goal_mode.objective.as_deref(),
+            Some("Finish the migration")
+        );
+        assert!(pane.goal_mode.is_active());
+        assert_eq!(pane.turn_count(), 0);
+        assert!(pane.log.iter().any(|line| {
+            line.kind == CodexLogKind::System && line.text.contains("Finish the migration")
+        }));
+    }
+
+    #[test]
+    fn goal_slash_command_pauses_resumes_and_clears_goal() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.finished = false;
+
+        submit_line(&mut pane, "/goal Finish the migration");
+        submit_line(&mut pane, "/goal pause");
+        assert_eq!(
+            pane.goal_mode.objective.as_deref(),
+            Some("Finish the migration")
+        );
+        assert!(pane.goal_mode.paused);
+
+        submit_line(&mut pane, "/goal resume");
+        assert!(pane.goal_mode.is_active());
+
+        submit_line(&mut pane, "/goal clear");
+        assert_eq!(pane.goal_mode.objective, None);
+        assert!(!pane.goal_mode.is_active());
+    }
+
+    #[test]
+    fn goal_mode_wraps_next_prompt_when_active() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.goal_mode = CodexGoalMode {
+            objective: Some("Finish the migration".to_string()),
+            paused: false,
+        };
+
+        let prompt = pane.prompt_with_goal_mode("run tests");
+
+        assert!(prompt.contains("Codex Goal mode is active"));
+        assert!(prompt.contains("Finish the migration"));
+        assert!(prompt.contains("run tests"));
+
+        pane.goal_mode.paused = true;
+        assert_eq!(pane.prompt_with_goal_mode("run tests"), "run tests");
+    }
+
+    #[test]
     fn scrollback_clamps_to_log_history() {
         let mut pane = CodexPane::test_with_output(8, 20, 0, "1\n2\n3\n4\n5\n6\n7\n8\n9\n10");
         pane.resize(6, 20);
@@ -3484,6 +3791,38 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("確認待ちに 常に許可 で応答"))
         );
+    }
+
+    #[test]
+    fn yes_no_decision_auto_accepts_yes() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.finished = false;
+        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
+        pane.handle_stdout_line(r#"{"type":"input_requested","message":"Continue? y/n"}"#);
+
+        assert!(pane.decision_banner().is_none());
+        assert_eq!(pane.action.as_deref(), Some("確認自動応答: Yes"));
+        assert!(
+            pane.activity
+                .iter()
+                .any(|line| line.contains("確認待ちに Yes で自動応答"))
+        );
+        let notice = pane.take_terminal_notice().unwrap();
+        assert_eq!(notice.title, "Codex 確認自動応答");
+    }
+
+    #[test]
+    fn permission_decision_stays_manual() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.finished = false;
+        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
+        pane.handle_stdout_line(
+            r#"{"type":"permission_requested","message":"Need filesystem permission"}"#,
+        );
+
+        let banner = pane.decision_banner().unwrap();
+        assert_eq!(banner.kind, CodexDecisionKind::Permission);
+        assert_eq!(pane.action.as_deref(), None);
     }
 
     #[test]

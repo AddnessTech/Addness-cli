@@ -811,11 +811,11 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
             .map(|c| c.is_turn_running())
             .unwrap_or(false);
         let hint = if finished {
-            " [c]コメント  [s]状態  [d]成果物(PR/Release)  [v]DoD判定  Esc/q: 閉じる "
+            " [c]コメント  [s]状態  [d]成果物(PR/Release)  [v]DoD判定  Ctrl+?:操作一覧  Esc/q:閉じる "
         } else if running {
-            " codex exec --json 実行中  |  入力+Enter:次ターン予約  |  Ctrl-C:中断  |  F12:終了 "
+            " codex exec --json 実行中  |  入力+Enter:次ターン予約  |  Ctrl-O:turn  |  Ctrl-C:中断  |  Ctrl+?:操作一覧  |  F12:終了 "
         } else {
-            " 入力してEnterでcodex exec --json  |  Trackpad/矢印:履歴  |  F9:Addness再開  |  F12:終了 "
+            " 入力してEnterでcodex exec --json  |  空Enter/Ctrl-O:turn  |  Trackpad/矢印:履歴  |  Ctrl+?:操作一覧  |  F12:終了 "
         };
         let status = Paragraph::new(Line::from(Span::styled(
             hint,
@@ -1088,9 +1088,23 @@ fn draw_codex_help_overlay(frame: &mut Frame) {
         blank(),
         section("turn開閉"),
         kv("Alt-e", "最新または表示中のturnを開閉"),
+        kv("Ctrl-O", "入力可能状態でも最新turnを開閉"),
+        kv(
+            "Enter / Space",
+            "履歴表示中・終了後・空入力時に表示中turnを開閉",
+        ),
         kv("e / E", "表示中turnを開閉 / 古いturnを一括開閉"),
         kv("Ctrl-E", "古いturnを一括開閉"),
-        kv("Ctrl-1..9", "指定番号のturnを直接開閉"),
+        kv(
+            "1..9 / Ctrl-1..9",
+            "履歴中は数字、いつでもCtrl+数字で指定turnを開閉",
+        ),
+        blank(),
+        section("slash commands"),
+        kv("/goal <目標>", "Goal modeを開始 / 更新"),
+        kv("/goal pause/resume", "Goal modeを一時停止 / 再開"),
+        kv("/goal clear", "Goal modeを解除"),
+        kv("/status / /help", "状態表示 / slash一覧"),
         blank(),
         section("終了後の還流"),
         kv("c / s / d / v", "コメント / 状態 / 成果物 / DoD判定"),
@@ -2246,7 +2260,13 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
             at.is_some_and(|t| now.duration_since(t) < std::time::Duration::from_secs(4))
         };
 
-        let status_panel_h = if chunks[0].height >= 28 { 12 } else { 11 };
+        let status_panel_h = if chunks[0].height >= 30 {
+            15
+        } else if chunks[0].height >= 24 {
+            13
+        } else {
+            11
+        };
         let panes = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -2509,16 +2529,8 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
     }
 
     let input_h = codex_input_panel_height(pane, inner.width, inner.height);
-    let decision_banner_h = if pane.decision_banner().is_some() {
-        codex_decision_banner_height(inner.height)
-    } else {
-        0
-    };
     let header_h = u16::from(inner.height >= 6);
     let mut constraints = Vec::new();
-    if decision_banner_h > 0 {
-        constraints.push(Constraint::Length(decision_banner_h));
-    }
     if header_h > 0 {
         constraints.push(Constraint::Length(header_h));
     }
@@ -2529,13 +2541,6 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
         .constraints(constraints)
         .split(inner);
     let mut chunk_index = 0usize;
-    let decision_banner_chunk = if decision_banner_h > 0 {
-        let chunk = chunks[chunk_index];
-        chunk_index += 1;
-        Some(chunk)
-    } else {
-        None
-    };
     let header_chunk = if header_h > 0 {
         let chunk = chunks[chunk_index];
         chunk_index += 1;
@@ -2545,12 +2550,6 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
     };
     let history_chunk = chunks[chunk_index];
     let input_chunk = chunks[chunk_index + 1];
-
-    if let (Some(decision_banner_chunk), Some(decision)) =
-        (decision_banner_chunk, pane.decision_banner())
-    {
-        draw_codex_decision_banner(frame, decision_banner_chunk, decision);
-    }
 
     if let Some(header_chunk) = header_chunk {
         frame.render_widget(
@@ -2562,14 +2561,13 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
     let filtered_log = pane.filtered_log_lines();
     let history_width = history_chunk.width as usize;
     let history_height = history_chunk.height as usize;
-    let (mut history_lines, total_history_lines) = codex_visible_log_lines(
+    let (history_lines, total_history_lines) = codex_visible_log_lines(
         &filtered_log,
         history_width,
         pane.scrollback,
         history_height,
     );
     pane.sync_rendered_history_metrics(total_history_lines, history_height);
-    dim_command_output_lines(&mut history_lines);
     let history = if history_lines.is_empty() {
         Paragraph::new(Line::from(Span::styled(
             "入力待ち",
@@ -2603,12 +2601,7 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
             Style::default().fg(COLOR_TEXT),
         ))]
     } else if let Some(decision) = pane.decision_banner() {
-        codex_decision_input_lines(
-            decision,
-            input_width,
-            input_chunk.height,
-            decision_banner_chunk.is_some(),
-        )
+        codex_decision_input_lines(decision, input_width, input_chunk.height)
     } else {
         let input_style = if pane.is_turn_running() {
             Style::default().fg(COLOR_WARN)
@@ -2617,7 +2610,7 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
         };
         let prompt_lines = if pane.finished {
             vec![Line::from(Span::styled(
-                "  Esc/q:戻る  c/s/d/v:還流  Alt-e/e/Ctrl-1..9:turn",
+                "  Esc/q:戻る  c/s/d/v:還流  Enter/Space/e/1..9:turn",
                 input_style,
             ))]
         } else {
@@ -2694,11 +2687,19 @@ struct CodexInputVisualLine {
 
 fn codex_input_panel_height(pane: &CodexPane, inner_width: u16, inner_height: u16) -> u16 {
     let base = if inner_height >= 4 { 2 } else { 1 };
-    if pane.finished
-        || pane.is_search_editing()
-        || pane.decision_banner().is_some()
-        || inner_height < 4
-    {
+    if pane.decision_banner().is_some() {
+        let height = if inner_height >= 14 {
+            6
+        } else if inner_height >= 10 {
+            5
+        } else if inner_height >= 6 {
+            4
+        } else {
+            base
+        };
+        return height.min(inner_height.max(1));
+    }
+    if pane.finished || pane.is_search_editing() || inner_height < 4 {
         return base;
     }
 
@@ -2817,110 +2818,14 @@ fn codex_input_text_width(text: &str) -> usize {
     text.chars().map(codex_input_char_width).sum()
 }
 
-fn draw_codex_decision_banner(
-    frame: &mut Frame,
-    area: Rect,
-    decision: &super::codex_pane::CodexDecisionBanner,
-) {
-    let color = codex_decision_color(&decision.kind);
-    let title = format!(
-        " Codex 確認待ち: {} ",
-        codex_decision_kind_label(&decision.kind)
-    );
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(color))
-        .title(title);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-
-    frame.render_widget(
-        Paragraph::new(codex_decision_banner_lines(
-            decision,
-            inner.width as usize,
-            inner.height,
-        )),
-        inner,
-    );
-}
-
-fn codex_decision_banner_height(inner_height: u16) -> u16 {
-    if inner_height >= 10 {
-        4
-    } else if inner_height >= 7 {
-        3
-    } else {
-        0
-    }
-}
-
-fn codex_decision_banner_lines(
-    decision: &super::codex_pane::CodexDecisionBanner,
-    max_width: usize,
-    max_lines: u16,
-) -> Vec<Line<'static>> {
-    let color = codex_decision_color(&decision.kind);
-    let subject = codex_decision_subject_label(&decision.kind);
-    let subject_prefix = format!("  {subject}: ");
-
-    if max_lines <= 1 {
-        let text = format!(
-            "{subject_prefix}{}  | {}",
-            decision.message,
-            decision_choice_summary(decision)
-        );
-        return vec![Line::from(Span::styled(
-            ellipsize_width(&text, max_width),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ))];
-    }
-
-    let subject_width = UnicodeWidthStr::width(subject_prefix.as_str());
-    vec![
-        Line::from(vec![
-            Span::styled(
-                subject_prefix,
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                ellipsize_width(&decision.message, max_width.saturating_sub(subject_width)),
-                Style::default().fg(COLOR_TEXT_STRONG),
-            ),
-        ]),
-        codex_decision_choice_line(decision, max_width),
-    ]
-}
-
 fn codex_decision_input_lines(
     decision: &super::codex_pane::CodexDecisionBanner,
     max_width: usize,
     input_height: u16,
-    message_visible_above: bool,
 ) -> Vec<Line<'static>> {
     let color = codex_decision_color(&decision.kind);
     let label = codex_decision_input_label(&decision.kind);
     let label_width = UnicodeWidthStr::width(label);
-
-    if message_visible_above {
-        if input_height <= 1 {
-            let text = format!("{label}  {}", decision_choice_summary(decision));
-            return vec![Line::from(Span::styled(
-                ellipsize_width(&text, max_width),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ))];
-        }
-
-        return vec![
-            Line::from(Span::styled(
-                label.trim_end().to_string(),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            )),
-            codex_decision_choice_line(decision, max_width),
-        ];
-    }
 
     if input_height <= 1 {
         let mut choices = format!(
@@ -2950,19 +2855,86 @@ fn codex_decision_input_lines(
         ])];
     }
 
-    vec![
-        Line::from(vec![
-            Span::styled(
-                label,
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                ellipsize_width(&decision.message, max_width.saturating_sub(label_width)),
-                Style::default().fg(COLOR_TEXT),
-            ),
-        ]),
-        codex_decision_choice_line(decision, max_width),
-    ]
+    if input_height == 2 {
+        return vec![
+            Line::from(vec![
+                Span::styled(
+                    label,
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    ellipsize_width(&decision.message, max_width.saturating_sub(label_width)),
+                    Style::default().fg(COLOR_TEXT_STRONG),
+                ),
+            ]),
+            codex_decision_choice_line(decision, max_width),
+        ];
+    }
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(
+            "  ? ",
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            label.trim_end().to_string(),
+            Style::default()
+                .fg(COLOR_TEXT_STRONG)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    let message_rows = input_height.saturating_sub(2) as usize;
+    lines.extend(codex_decision_message_lines(
+        decision,
+        max_width,
+        message_rows,
+        color,
+    ));
+    while lines.len() + 1 < input_height as usize {
+        lines.push(Line::from(""));
+    }
+    lines.push(codex_decision_choice_line(decision, max_width));
+    lines
+}
+
+fn codex_decision_message_lines(
+    decision: &super::codex_pane::CodexDecisionBanner,
+    max_width: usize,
+    max_lines: usize,
+    color: Color,
+) -> Vec<Line<'static>> {
+    if max_lines == 0 {
+        return Vec::new();
+    }
+    let subject = codex_decision_subject_label(&decision.kind);
+    let text = format!("  {subject}: {}", decision.message);
+    let mut parts = wrap_log_text(&text, max_width);
+    let truncated = parts.len() > max_lines;
+    parts.truncate(max_lines);
+    if truncated && let Some(last) = parts.last_mut() {
+        *last = ellipsize_width(&format!("{last}..."), max_width);
+    }
+
+    parts
+        .into_iter()
+        .enumerate()
+        .map(|(idx, part)| {
+            if idx > 0 {
+                return Line::from(Span::styled(part, Style::default().fg(COLOR_TEXT_STRONG)));
+            }
+            let Some((head, tail)) = part.split_once(':') else {
+                return Line::from(Span::styled(part, Style::default().fg(COLOR_TEXT_STRONG)));
+            };
+            Line::from(vec![
+                Span::styled(
+                    format!("{head}:"),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(tail.to_string(), Style::default().fg(COLOR_TEXT_STRONG)),
+            ])
+        })
+        .collect()
 }
 
 fn codex_decision_input_label(kind: &CodexDecisionKind) -> &'static str {
@@ -2971,15 +2943,6 @@ fn codex_decision_input_label(kind: &CodexDecisionKind) -> &'static str {
         CodexDecisionKind::Permission => "確認待ち: 権限 ",
         CodexDecisionKind::Dangerous => "確認待ち: 危険操作 ",
         CodexDecisionKind::YesNo => "確認待ち ",
-    }
-}
-
-fn codex_decision_kind_label(kind: &CodexDecisionKind) -> &'static str {
-    match kind {
-        CodexDecisionKind::Approval => "承認",
-        CodexDecisionKind::Permission => "権限",
-        CodexDecisionKind::Dangerous => "危険操作",
-        CodexDecisionKind::YesNo => "確認",
     }
 }
 
@@ -3011,7 +2974,7 @@ fn codex_decision_title_hint(decision: &super::codex_pane::CodexDecisionBanner) 
             }
         }
     };
-    format!(" codex exec 確認待ち — 上部で内容確認 / {keys} ")
+    format!(" codex exec 確認待ち — 下の確認欄で選択 / {keys} ")
 }
 
 fn codex_decision_choice_line(
@@ -3069,17 +3032,6 @@ fn codex_decision_choice_line(
     Line::from(spans)
 }
 
-fn decision_choice_summary(decision: &super::codex_pane::CodexDecisionBanner) -> String {
-    let mut choices = vec![
-        decision_choice_text(decision, true),
-        decision_choice_text(decision, false),
-    ];
-    if let Some(always) = decision_always_choice_text(decision) {
-        choices.push(always);
-    }
-    choices.join("    ")
-}
-
 fn decision_choice_text(
     decision: &super::codex_pane::CodexDecisionBanner,
     is_accept: bool,
@@ -3124,7 +3076,7 @@ fn codex_header_line(pane: &CodexPane, max_width: usize) -> Line<'static> {
         .map(short_thread_id)
         .unwrap_or_else(|| "new".to_string());
     let text = format!(
-        " {state} {} | Turn {} | fold:{} | filter:{} | {search} | thread:{thread} | {} | Ctrl-T/F/L e/E C-1..9",
+        " {state} {} | Turn {} | fold:{} | filter:{} | {search} | thread:{thread} | {} | Ctrl-T/F/L/O e/E 1..9",
         run_state.label(),
         pane.turn_count(),
         pane.collapsed_turn_count(),
@@ -3186,7 +3138,6 @@ fn codex_activity_lines(activity: &[String], width: usize) -> Vec<Line<'static>>
 
 #[derive(Clone)]
 struct RenderedCodexLine {
-    is_command_output: bool,
     line: Line<'static>,
 }
 
@@ -3263,7 +3214,6 @@ fn codex_separator_line(kind: CodexLogKind, max_width: usize) -> RenderedCodexLi
         .saturating_sub(UnicodeWidthStr::width(head))
         .max(1);
     RenderedCodexLine {
-        is_command_output: false,
         line: Line::from(vec![
             Span::styled(head, Style::default().fg(color)),
             Span::styled(
@@ -3289,7 +3239,6 @@ fn codex_log_entry_lines(line: &CodexLogLine, max_width: usize) -> Vec<RenderedC
         } else {
             Style::default().fg(COLOR_PANEL)
         };
-        let is_command_output = matches!(line.kind, CodexLogKind::Tool) && idx > 0 && !is_edit_tool;
         let part_style = if is_edit_tool {
             codex_edit_diff_style(&part, text_style)
         } else {
@@ -3303,7 +3252,6 @@ fn codex_log_entry_lines(line: &CodexLogLine, max_width: usize) -> Vec<RenderedC
             prefix_style,
         ));
         lines.push(RenderedCodexLine {
-            is_command_output,
             line: Line::from(spans),
         });
     }
@@ -3767,14 +3715,6 @@ fn json_output_summary(output: &str) -> Option<String> {
     }
 }
 
-fn dim_command_output_lines(lines: &mut [RenderedCodexLine]) {
-    for line in lines.iter_mut().filter(|line| line.is_command_output) {
-        for span in &mut line.line.spans {
-            span.style = span.style.add_modifier(Modifier::DIM);
-        }
-    }
-}
-
 fn codex_runtime_status(pane: &CodexPane, max_width: usize) -> String {
     let state = if pane.finished {
         "DONE"
@@ -3898,6 +3838,15 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
         ),
         value_width,
     );
+    let goal_mode = pane
+        .goal_mode_label()
+        .map(|label| ellipsize_width(&label, value_width))
+        .unwrap_or_else(|| "off".to_string());
+    let goal_mode_style = if pane.goal_mode_label().is_some() {
+        Style::default().fg(COLOR_ADDNESS)
+    } else {
+        Style::default().fg(COLOR_MUTED)
+    };
     let assistant = pane
         .last_assistant_text()
         .map(|p| prompt_preview(p, prompt_width))
@@ -3918,7 +3867,7 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
         Style::default().fg(COLOR_MUTED)
     };
 
-    let lines = vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::styled("状態 ", Style::default().fg(COLOR_MUTED)),
             Span::styled(run_state.label(), state_style),
@@ -3944,13 +3893,22 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
             Span::styled(history, Style::default().fg(COLOR_MUTED)),
         ]),
         Line::from(vec![
+            Span::styled("Goal ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(goal_mode, goal_mode_style),
+        ]),
+        Line::from(vec![
             Span::styled("Codex ", Style::default().fg(COLOR_MUTED)),
             Span::styled(assistant, assistant_style),
         ]),
-        Line::from(""),
-        Line::from(Span::styled("最後の送信", Style::default().fg(COLOR_MUTED))),
-        Line::from(Span::styled(prompt, prompt_style)),
     ];
+    lines.push(Line::from(""));
+    lines.extend(codex_dashboard_shortcut_lines(prompt_width));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "最後の送信",
+        Style::default().fg(COLOR_MUTED),
+    )));
+    lines.push(Line::from(Span::styled(prompt, prompt_style)));
 
     let panel = Paragraph::new(lines)
         .block(
@@ -3973,6 +3931,25 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
         )
         .wrap(ratatui::widgets::Wrap { trim: true });
     frame.render_widget(panel, area);
+}
+
+fn codex_dashboard_shortcut_lines(max_width: usize) -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            "操作一覧",
+            Style::default()
+                .fg(COLOR_TEXT_STRONG)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            ellipsize_width("  /goal:目標  Ctrl+?:全体", max_width),
+            Style::default().fg(COLOR_TEXT),
+        )),
+        Line::from(Span::styled(
+            ellipsize_width("  Ctrl-O:turn  ↑↓/PgUp:履歴", max_width),
+            Style::default().fg(COLOR_MUTED),
+        )),
+    ]
 }
 
 fn codex_memory_label(
@@ -4066,11 +4043,11 @@ fn ellipsize_width(text: &str, max_width: usize) -> String {
 mod tests {
     use super::{
         ActivePane, App, COLOR_DANGER, COLOR_EVENT, COLOR_SUCCESS, COLOR_WARN,
-        codex_activity_lines, codex_decision_banner_lines, codex_decision_choice_line,
+        codex_activity_lines, codex_dashboard_shortcut_lines, codex_decision_choice_line,
         codex_decision_input_lines, codex_decision_title_hint, codex_header_line,
         codex_input_prompt_render, codex_log_entry_lines, codex_log_lines, codex_runtime_status,
-        codex_visible_log_lines, codex_work_label, dim_command_output_lines, draw_status_bar,
-        ellipsize_width, prompt_preview, summarize_tool_display_text,
+        codex_visible_log_lines, codex_work_label, draw_status_bar, ellipsize_width,
+        prompt_preview, summarize_tool_display_text,
     };
     use crate::api::ApiClient;
     use crate::tui::codex_pane::{
@@ -4306,7 +4283,7 @@ mod tests {
             deny_label: "No",
         };
 
-        let lines = codex_decision_input_lines(&decision, 80, 2, false)
+        let lines = codex_decision_input_lines(&decision, 80, 2)
             .into_iter()
             .map(|line| line_text(&line))
             .collect::<Vec<_>>();
@@ -4318,7 +4295,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_decision_banner_lines_show_command_and_choices() {
+    fn codex_decision_input_lines_use_bottom_question_area() {
         let decision = CodexDecisionBanner {
             kind: CodexDecisionKind::Approval,
             message: "cargo test --workspace".to_string(),
@@ -4328,12 +4305,13 @@ mod tests {
             deny_label: "拒否",
         };
 
-        let rendered = codex_decision_banner_lines(&decision, 80, 2)
+        let rendered = codex_decision_input_lines(&decision, 80, 5)
             .iter()
             .map(line_text)
             .collect::<Vec<_>>()
             .join("\n");
 
+        assert!(rendered.contains("? 確認待ち: 承認"));
         assert!(rendered.contains("実行予定: cargo test --workspace"));
         assert!(rendered.contains("[A/Y] 承認"));
         assert!(rendered.contains("[D/N] 拒否"));
@@ -4362,11 +4340,12 @@ mod tests {
         assert!(codex_decision_title_hint(&approval).contains("l:常に許可"));
         assert!(!codex_decision_title_hint(&yes_no).contains("常に許可"));
         assert!(codex_decision_title_hint(&yes_no).contains("y/n"));
-        assert!(codex_decision_title_hint(&approval).contains("上部で内容確認"));
+        assert!(codex_decision_title_hint(&approval).contains("下の確認欄"));
+        assert!(!codex_decision_title_hint(&approval).contains("上部で内容確認"));
     }
 
     #[test]
-    fn codex_decision_input_lines_keep_prompt_when_no_top_banner() {
+    fn codex_decision_input_lines_keep_prompt_in_two_rows() {
         let decision = CodexDecisionBanner {
             kind: CodexDecisionKind::Approval,
             message: "Run cargo test?".to_string(),
@@ -4376,7 +4355,7 @@ mod tests {
             deny_label: "拒否",
         };
 
-        let lines = codex_decision_input_lines(&decision, 80, 2, false);
+        let lines = codex_decision_input_lines(&decision, 80, 2);
 
         assert_eq!(line_text(&lines[0]), "確認待ち: 承認 Run cargo test?");
         assert!(line_text(&lines[1]).contains("[A/Y] 承認"));
@@ -4385,7 +4364,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_decision_input_lines_use_choices_when_top_banner_is_visible() {
+    fn codex_decision_input_panel_uses_bottom_question_format() {
         let decision = CodexDecisionBanner {
             kind: CodexDecisionKind::Approval,
             message: "Run cargo test?".to_string(),
@@ -4395,13 +4374,12 @@ mod tests {
             deny_label: "拒否",
         };
 
-        let lines = codex_decision_input_lines(&decision, 80, 2, true);
+        let lines = codex_decision_input_lines(&decision, 80, 5);
 
-        assert_eq!(line_text(&lines[0]), "確認待ち: 承認");
-        assert!(!line_text(&lines[0]).contains("Run cargo test"));
-        assert!(line_text(&lines[1]).contains("[A/Y] 承認"));
-        assert!(line_text(&lines[1]).contains("[D/N] 拒否"));
-        assert!(line_text(&lines[1]).contains("[L] 常に許可"));
+        assert!(line_text(&lines[0]).contains("? 確認待ち: 承認"));
+        assert!(line_text(&lines[1]).contains("実行予定: Run cargo test?"));
+        assert!(line_text(lines.last().unwrap()).contains("[A/Y] 承認"));
+        assert_eq!(lines.len(), 5);
     }
 
     #[test]
@@ -4415,7 +4393,7 @@ mod tests {
             deny_label: "拒否",
         };
 
-        let lines = codex_decision_input_lines(&decision, 80, 1, true);
+        let lines = codex_decision_input_lines(&decision, 80, 1);
         let text = line_text(&lines[0]);
 
         assert!(text.contains("確認待ち: 権限"));
@@ -4444,14 +4422,12 @@ mod tests {
     }
 
     #[test]
-    fn dim_command_output_lines_dims_only_command_output() {
+    fn command_output_lines_stay_readable() {
         let entry = CodexLogLine {
             kind: CodexLogKind::Tool,
             text: "exec_command_end (exit 0): cargo test\nok".to_string(),
         };
-        let mut lines = codex_log_entry_lines(&entry, 80);
-
-        dim_command_output_lines(&mut lines);
+        let lines = codex_log_entry_lines(&entry, 80);
 
         assert!(
             !lines[0].line.spans[0]
@@ -4460,7 +4436,7 @@ mod tests {
                 .contains(Modifier::DIM)
         );
         assert!(
-            lines[1].line.spans[0]
+            !lines[1].line.spans[0]
                 .style
                 .add_modifier
                 .contains(Modifier::DIM)
@@ -4468,14 +4444,12 @@ mod tests {
     }
 
     #[test]
-    fn dim_command_output_lines_keeps_event_notice_readable() {
+    fn event_notice_lines_stay_readable() {
         let entry = CodexLogLine {
             kind: CodexLogKind::Event,
             text: "waiting for approval".to_string(),
         };
-        let mut lines = codex_log_entry_lines(&entry, 80);
-
-        dim_command_output_lines(&mut lines);
+        let lines = codex_log_entry_lines(&entry, 80);
 
         assert!(
             !lines[0].line.spans[0]
@@ -4612,5 +4586,35 @@ mod tests {
             !text.contains("last:"),
             "status should not show last label:\n{text}"
         );
+    }
+
+    #[test]
+    fn codex_status_bar_advertises_ctrl_help_overlay() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = ApiClient::new("t", "http://localhost").unwrap();
+        let mut app = App::new(client, rt.handle().clone());
+        app.active_pane = ActivePane::Codex;
+        app.codex = Some(CodexPane::test_with_output(10, 80, 0, ""));
+
+        let text = render_status_text(&app, 140);
+
+        assert!(
+            text.contains("Ctrl+?"),
+            "codex status should expose the help shortcut:\n{text}"
+        );
+    }
+
+    #[test]
+    fn codex_dashboard_shortcuts_show_help_entrypoint() {
+        let text = codex_dashboard_shortcut_lines(80)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("操作一覧"));
+        assert!(text.contains("Ctrl+?"));
+        assert!(text.contains("/goal"));
+        assert!(text.contains("Ctrl-O"));
     }
 }

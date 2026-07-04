@@ -2153,6 +2153,10 @@ impl App {
                         pane.clear_search();
                         return;
                     }
+                    KeyCode::Char('o' | 'O') | KeyCode::Enter | KeyCode::Char(' ') => {
+                        pane.toggle_visible_turn_collapsed();
+                        return;
+                    }
                     KeyCode::Char('e' | 'E') => {
                         pane.toggle_old_turns_collapsed();
                         return;
@@ -2166,17 +2170,35 @@ impl App {
                 }
             }
             if pane.decision_banner().is_none()
+                && pane.scrollback == 0
+                && !pane.finished
+                && pane.input_line().is_empty()
+                && key.modifiers.is_empty()
+                && matches!(key.code, KeyCode::Enter | KeyCode::Char(' '))
+            {
+                pane.toggle_visible_turn_collapsed();
+                return;
+            }
+            if pane.decision_banner().is_none()
                 && (pane.scrollback > 0 || pane.finished)
                 && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
             {
                 match key.code {
+                    KeyCode::Enter | KeyCode::Char(' ') if key.modifiers.is_empty() => {
+                        pane.toggle_visible_turn_collapsed();
+                        return;
+                    }
                     KeyCode::Char('e') => {
-                        if pane.toggle_visible_turn_collapsed() {
-                            return;
-                        }
+                        pane.toggle_visible_turn_collapsed();
+                        return;
                     }
                     KeyCode::Char('E') => {
                         pane.toggle_old_turns_collapsed();
+                        return;
+                    }
+                    KeyCode::Char(ch) if key.modifiers.is_empty() && ('1'..='9').contains(&ch) => {
+                        let turn = ch.to_digit(10).unwrap_or_default() as usize;
+                        pane.toggle_turn_collapsed_by_number(turn);
                         return;
                     }
                     _ => {}
@@ -2840,7 +2862,7 @@ impl App {
         key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(
                 key.code,
-                KeyCode::Char('?') | KeyCode::Char('/') | KeyCode::Backspace
+                KeyCode::Char('?') | KeyCode::Char('/') | KeyCode::Backspace | KeyCode::Delete
             )
     }
 
@@ -4785,6 +4807,154 @@ mod picker_interaction_tests {
             app.modal_state,
             Some(ModalState::AddDeliverable { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod codex_help_key_tests {
+    use super::*;
+
+    #[test]
+    fn ctrl_help_key_accepts_common_terminal_encodings() {
+        assert!(App::is_ctrl_help_key(KeyEvent::new(
+            KeyCode::Char('?'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        )));
+        assert!(App::is_ctrl_help_key(KeyEvent::new(
+            KeyCode::Char('/'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(App::is_ctrl_help_key(KeyEvent::new(
+            KeyCode::Backspace,
+            KeyModifiers::CONTROL,
+        )));
+        assert!(App::is_ctrl_help_key(KeyEvent::new(
+            KeyCode::Delete,
+            KeyModifiers::CONTROL,
+        )));
+    }
+
+    #[test]
+    fn ctrl_help_key_does_not_steal_plain_backspace_or_slash() {
+        assert!(!App::is_ctrl_help_key(KeyEvent::new(
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+        )));
+        assert!(!App::is_ctrl_help_key(KeyEvent::new(
+            KeyCode::Char('/'),
+            KeyModifiers::NONE,
+        )));
+        assert!(!App::is_ctrl_help_key(KeyEvent::new(
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL,
+        )));
+    }
+}
+
+#[cfg(test)]
+mod codex_turn_key_tests {
+    use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn modified_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    fn app_with_codex_turns(scrollback: usize) -> (tokio::runtime::Runtime, App) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = ApiClient::new("t", "http://localhost").unwrap();
+        let mut app = App::new(client, rt.handle().clone());
+        let mut pane = CodexPane::test_with_output(6, 80, 0, "");
+        pane.finished = false;
+        pane.test_add_completed_turn("first response");
+        pane.test_add_completed_turn("second response");
+        pane.scrollback = scrollback;
+        app.active_pane = ActivePane::Codex;
+        app.codex = Some(pane);
+        (rt, app)
+    }
+
+    fn app_with_codex_history() -> (tokio::runtime::Runtime, App) {
+        app_with_codex_turns(1)
+    }
+
+    fn app_with_codex_live_input() -> (tokio::runtime::Runtime, App) {
+        app_with_codex_turns(0)
+    }
+
+    #[test]
+    fn history_enter_toggles_visible_turn_without_submitting_input() {
+        let (_rt, mut app) = app_with_codex_history();
+
+        app.handle_codex_key(key(KeyCode::Enter));
+
+        let pane = app.codex.as_ref().unwrap();
+        assert_eq!(pane.input_line(), "");
+        assert_eq!(pane.collapsed_turn_count(), 1);
+    }
+
+    #[test]
+    fn history_plain_digit_toggles_numbered_turn_without_typing() {
+        let (_rt, mut app) = app_with_codex_history();
+
+        app.handle_codex_key(key(KeyCode::Char('1')));
+
+        let pane = app.codex.as_ref().unwrap();
+        assert_eq!(pane.input_line(), "");
+        assert_eq!(pane.collapsed_turn_count(), 1);
+    }
+
+    #[test]
+    fn live_empty_enter_toggles_latest_turn_without_submitting_input() {
+        let (_rt, mut app) = app_with_codex_live_input();
+
+        app.handle_codex_key(key(KeyCode::Enter));
+
+        let pane = app.codex.as_ref().unwrap();
+        assert_eq!(pane.input_line(), "");
+        assert_eq!(pane.collapsed_turn_count(), 1);
+    }
+
+    #[test]
+    fn live_empty_space_toggles_latest_turn_without_typing_space() {
+        let (_rt, mut app) = app_with_codex_live_input();
+
+        app.handle_codex_key(key(KeyCode::Char(' ')));
+
+        let pane = app.codex.as_ref().unwrap();
+        assert_eq!(pane.input_line(), "");
+        assert_eq!(pane.collapsed_turn_count(), 1);
+    }
+
+    #[test]
+    fn live_ctrl_o_toggles_latest_turn_without_typing() {
+        let (_rt, mut app) = app_with_codex_live_input();
+
+        app.handle_codex_key(modified_key(KeyCode::Char('o'), KeyModifiers::CONTROL));
+
+        let pane = app.codex.as_ref().unwrap();
+        assert_eq!(pane.input_line(), "");
+        assert_eq!(pane.collapsed_turn_count(), 1);
+    }
+
+    #[test]
+    fn live_plain_digit_still_types_into_codex_prompt() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = ApiClient::new("t", "http://localhost").unwrap();
+        let mut app = App::new(client, rt.handle().clone());
+        let mut pane = CodexPane::test_with_output(6, 80, 0, "");
+        pane.finished = false;
+        app.active_pane = ActivePane::Codex;
+        app.codex = Some(pane);
+
+        app.handle_codex_key(key(KeyCode::Char('1')));
+
+        let pane = app.codex.as_ref().unwrap();
+        assert_eq!(pane.input_line(), "1");
+        assert_eq!(pane.collapsed_turn_count(), 0);
     }
 }
 

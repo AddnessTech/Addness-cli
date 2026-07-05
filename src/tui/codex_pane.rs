@@ -59,6 +59,27 @@ enum PromptDelivery {
     Arg,
 }
 
+/// backend 非依存に正規化したターンライフサイクルイベント。
+///
+/// codex の `thread.started` / `turn.*` / `error` といった型名の違いを
+/// この共通形へマップし、`CodexPane` 側は型名文字列ではなくこの enum で
+/// 分岐する。ツール実行やアシスタント本文など表層に近いイベントは、当面
+/// `handle_generic_json_event` 側で扱うため `Other` に集約する。
+enum AgentEvent {
+    /// セッション開始（codex: `thread.started`）。値はセッション/スレッド ID。
+    SessionStarted(Option<String>),
+    /// ターン開始（codex: `turn.started`）。
+    TurnStarted,
+    /// ターン完了（codex: `turn.completed` / `turn.finished`）。
+    TurnCompleted,
+    /// ターン失敗（codex: `turn.failed`）。値は表示用メッセージ。
+    TurnFailed(String),
+    /// エラー通知（codex: `error`）。値は表示用メッセージ。
+    Error(String),
+    /// 上記以外。ツール実行・本文など、backend 共通の表層処理へ委ねる。
+    Other,
+}
+
 /// TUI から起動できるコーディングエージェントの継ぎ目。
 ///
 /// 同一 TUI から複数のエージェント（現状 codex、将来 Claude Code 等）を
@@ -68,22 +89,27 @@ enum PromptDelivery {
 ///
 /// 現状は `CodexBackend` のみが実装する。
 ///
-/// このステップでは呼び出し側が存在する継ぎ目（`turn_args` / `prompt_delivery` /
-/// `help_text`）のみを定義する。バイナリ解決（`resolve_bin`）・resume 可否
-/// （`supports_resume`）・イベント正規化（`parse_line` → 共通 `AgentEvent`）・
-/// `Settings` の関連型化は、呼び出し側（app.rs）の抽象化と Claude backend の
-/// 追加に合わせて後続ステップで加える。
+/// 設定型は関連型 `Settings` に閉じ込め、ライフサイクルイベントの型名解釈
+/// （`parse_lifecycle_event` / `session_id_from_event`）を backend 側へ寄せる。
+/// バイナリ解決（`resolve_bin`）・resume 可否・ツール/本文イベントの正規化は、
+/// 呼び出し側（app.rs）の抽象化と Claude backend の追加に合わせ後続で加える。
 trait AgentBackend {
+    /// backend 固有の実行設定型。
+    type Settings;
+
     /// 通常ターンの CLI 引数を生成する（新規 / resume を `session` で分岐）。
-    fn turn_args(
-        &self,
-        session: Option<&str>,
-        cwd: &str,
-        settings: &CodexExecSettings,
-    ) -> Vec<String>;
+    fn turn_args(&self, session: Option<&str>, cwd: &str, settings: &Self::Settings)
+    -> Vec<String>;
 
     /// プロンプトの受け渡し方式。
     fn prompt_delivery(&self) -> PromptDelivery;
+
+    /// JSON イベント 1 件を backend 非依存のライフサイクルイベントへ正規化する。
+    /// ツール/本文など表層イベントは `AgentEvent::Other` に集約する。
+    fn parse_lifecycle_event(&self, value: &Value) -> AgentEvent;
+
+    /// セッション開始イベントからセッション/スレッド ID を抽出する。
+    fn session_id_from_event(&self, value: &Value) -> Option<String>;
 
     /// スラッシュコマンドのヘルプ本文。
     fn help_text(&self) -> &'static str;
@@ -93,11 +119,13 @@ trait AgentBackend {
 struct CodexBackend;
 
 impl AgentBackend for CodexBackend {
+    type Settings = CodexExecSettings;
+
     fn turn_args(
         &self,
         session: Option<&str>,
         cwd: &str,
-        settings: &CodexExecSettings,
+        settings: &Self::Settings,
     ) -> Vec<String> {
         codex_exec_args(session, cwd, settings)
     }
@@ -105,6 +133,32 @@ impl AgentBackend for CodexBackend {
     fn prompt_delivery(&self) -> PromptDelivery {
         // codex exec は stdin から読み、引数末尾の `-` と対になる。
         PromptDelivery::Stdin
+    }
+
+    fn session_id_from_event(&self, value: &Value) -> Option<String> {
+        string_at_any(value, &["thread_id", "threadId", "id"])
+    }
+
+    fn parse_lifecycle_event(&self, value: &Value) -> AgentEvent {
+        let event_type = value.get("type").and_then(Value::as_str).unwrap_or("event");
+        match event_type {
+            "thread.started" => AgentEvent::SessionStarted(self.session_id_from_event(value)),
+            "turn.started" => AgentEvent::TurnStarted,
+            "turn.completed" | "turn.finished" => AgentEvent::TurnCompleted,
+            "turn.failed" => {
+                let message = nested_error_message(value)
+                    .or_else(|| first_text_field(value))
+                    .unwrap_or_else(|| "Codex ターンが失敗しました".to_string());
+                AgentEvent::TurnFailed(message)
+            }
+            "error" => {
+                let message = nested_error_message(value)
+                    .or_else(|| first_text_field(value))
+                    .unwrap_or_else(|| "Codex エラー".to_string());
+                AgentEvent::Error(message)
+            }
+            _ => AgentEvent::Other,
+        }
     }
 
     fn help_text(&self) -> &'static str {
@@ -3372,22 +3426,15 @@ impl CodexPane {
             self.last_token_usage_label = Some(summary);
         }
 
-        let event_type = value
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or("event")
-            .to_string();
-
-        match event_type.as_str() {
-            "thread.started" => {
-                if let Some(thread_id) = string_at_any(&value, &["thread_id", "threadId", "id"]) {
-                    self.thread_id = Some(thread_id.clone());
-                    self.push_log(CodexLogKind::System, "Codex セッションを開始しました");
-                } else {
-                    self.push_log(CodexLogKind::System, "Codex セッションを開始しました");
+        // 型名文字列の解釈は backend に委ね、pane 側は正規化イベントで分岐する。
+        match self.backend.parse_lifecycle_event(&value) {
+            AgentEvent::SessionStarted(session_id) => {
+                if let Some(session_id) = session_id {
+                    self.thread_id = Some(session_id);
                 }
+                self.push_log(CodexLogKind::System, "Codex セッションを開始しました");
             }
-            "turn.started" => {
+            AgentEvent::TurnStarted => {
                 self.turn_running = true;
                 self.turn_finished_by_event = false;
                 self.current_command = None;
@@ -3408,7 +3455,7 @@ impl CodexPane {
                     .unwrap_or_else(|| format!("Turn {}", self.turn_count));
                 self.push_log(CodexLogKind::Turn, label);
             }
-            "turn.completed" | "turn.finished" => {
+            AgentEvent::TurnCompleted => {
                 self.turn_running = false;
                 self.turn_finished_by_event = true;
                 self.current_command = None;
@@ -3421,29 +3468,26 @@ impl CodexPane {
                 self.push_log(CodexLogKind::System, "Codex の応答が完了しました");
                 self.push_terminal_notice("Codex 完了", "Codex の出力が完了しました");
             }
-            "turn.failed" => {
+            AgentEvent::TurnFailed(message) => {
                 self.turn_running = false;
                 self.turn_finished_by_event = true;
                 self.current_command = None;
                 self.current_command_started_at = None;
                 self.streaming_assistant_index = None;
                 self.pending_decision = None;
-                let message = nested_error_message(&value)
-                    .or_else(|| first_text_field(&value))
-                    .unwrap_or_else(|| "Codex ターンが失敗しました".to_string());
                 self.push_log(CodexLogKind::Error, message.clone());
                 self.refresh_current_turn_title();
                 self.queue_completed_turn_body_record();
                 self.push_terminal_notice("Codex 失敗", message);
             }
-            "error" => {
-                let message = nested_error_message(&value)
-                    .or_else(|| first_text_field(&value))
-                    .unwrap_or_else(|| "Codex エラー".to_string());
+            AgentEvent::Error(message) => {
                 self.push_log(CodexLogKind::Error, message.clone());
                 self.push_terminal_notice("Codex エラー", message);
             }
-            _ => self.handle_generic_json_event(&event_type, &value),
+            AgentEvent::Other => {
+                let event_type = value.get("type").and_then(Value::as_str).unwrap_or("event");
+                self.handle_generic_json_event(event_type, &value);
+            }
         }
     }
 
@@ -9999,6 +10043,47 @@ mod tests {
         let line = pane.log.last().unwrap();
         assert_eq!(line.kind, CodexLogKind::Assistant);
         assert_eq!(line.text, "I would run cargo test next.");
+    }
+
+    #[test]
+    fn codex_backend_normalizes_lifecycle_events() {
+        let backend = CodexBackend;
+
+        let started = serde_json::json!({"type": "thread.started", "thread_id": "abc123"});
+        assert!(matches!(
+            backend.parse_lifecycle_event(&started),
+            AgentEvent::SessionStarted(Some(id)) if id == "abc123"
+        ));
+        assert_eq!(
+            backend.session_id_from_event(&started).as_deref(),
+            Some("abc123")
+        );
+
+        assert!(matches!(
+            backend.parse_lifecycle_event(&serde_json::json!({"type": "turn.started"})),
+            AgentEvent::TurnStarted
+        ));
+        assert!(matches!(
+            backend.parse_lifecycle_event(&serde_json::json!({"type": "turn.completed"})),
+            AgentEvent::TurnCompleted
+        ));
+        assert!(matches!(
+            backend.parse_lifecycle_event(&serde_json::json!({"type": "turn.finished"})),
+            AgentEvent::TurnCompleted
+        ));
+        assert!(matches!(
+            backend.parse_lifecycle_event(&serde_json::json!({"type": "turn.failed"})),
+            AgentEvent::TurnFailed(_)
+        ));
+        assert!(matches!(
+            backend.parse_lifecycle_event(&serde_json::json!({"type": "error"})),
+            AgentEvent::Error(_)
+        ));
+        // ツール/本文など表層イベントは Other に集約される。
+        assert!(matches!(
+            backend.parse_lifecycle_event(&serde_json::json!({"type": "item.completed"})),
+            AgentEvent::Other
+        ));
     }
 
     #[test]

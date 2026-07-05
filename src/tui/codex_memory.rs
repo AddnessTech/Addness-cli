@@ -8,6 +8,8 @@ use super::codex_pane::{self, CodexWorkSummary};
 
 pub(super) const CODEX_AUTO_RECORD_START: &str = "<!-- addness:codex:auto-record:start -->";
 pub(super) const CODEX_AUTO_RECORD_END: &str = "<!-- addness:codex:auto-record:end -->";
+pub(super) const CODEX_WORK_MEMO_START: &str = "<!-- addness:codex:work-memo:start -->";
+pub(super) const CODEX_WORK_MEMO_END: &str = "<!-- addness:codex:work-memo:end -->";
 pub(super) const CODEX_DECISION_LOG_START: &str = "<!-- addness:codex:decision-log:start -->";
 pub(super) const CODEX_DECISION_LOG_END: &str = "<!-- addness:codex:decision-log:end -->";
 pub(super) const CODEX_TRACEABILITY_START: &str = "<!-- addness:codex:traceability:start -->";
@@ -70,6 +72,36 @@ fn markdown_list(items: &[String], empty: &str) -> String {
         .join("\n")
 }
 
+fn compact_memo_line(text: &str, max_chars: usize) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out = String::new();
+    for (idx, ch) in compact.chars().enumerate() {
+        if idx == max_chars {
+            out.push_str("...");
+            return out;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn resume_hint(summary: Option<&CodexWorkSummary>, prompt_text: &str) -> String {
+    if let Some(item) = summary.and_then(|summary| summary.remaining.first()) {
+        return format!("未完了点から再開: {}", compact_memo_line(item, 180));
+    }
+    if summary.is_some_and(|summary| !summary.implemented.is_empty() || !summary.checks.is_empty())
+    {
+        return "実装/検証サマリを確認し、残課題がなければユーザーの次依頼から続行".to_string();
+    }
+    if prompt_text != "未記録" {
+        return format!(
+            "最後の依頼を起点に再開: {}",
+            compact_memo_line(prompt_text, 180)
+        );
+    }
+    "Codex作業メモ、差分、子ゴールを確認して再開".to_string()
+}
+
 fn codex_summary_markdown(summary: Option<&CodexWorkSummary>, touched_files: &[String]) -> String {
     let Some(summary) = summary else {
         return String::new();
@@ -117,12 +149,14 @@ pub(super) fn codex_work_memo(
         .filter(|p| !p.is_empty())
         .unwrap_or_else(|| "未記録".to_string());
     let summary_text = codex_summary_markdown(summary, &touched_files);
+    let resume_hint = resume_hint(summary, &prompt_text);
 
     format!(
         "## Codex自動メモ(機械)\n\
          - 更新: {}\n\
          - セッション: {session_state}\n\
          - 最後の依頼: {prompt_text}\n\
+         - 次回の入口: {resume_hint}\n\
          - 作業フォルダ: {cwd}\n\
          - ブランチ: {branch}\n\
          - 現在地: プロジェクト固有の判断・決定・次の手は `## Codex作業メモ` / `## Codex決定ログ` / `## PR/Release Traceability` へ集約する（この機械メモは自動更新なので編集不要）\n\
@@ -154,6 +188,11 @@ fn ensure_codex_block(existing: String, start: &str, end: &str, block_body: &str
 }
 
 pub(super) fn ensure_codex_memory_sections(body: String) -> String {
+    let work_memo = "## Codex作業メモ\n\
+        - 現在地: 未記録\n\
+        - 次の手: 未記録\n\
+        - メモリ運用: このゴール固有の前提・判断・未完了点はここに集約し、Codexの通常memoryへ混ぜない。"
+        .replace("\n        ", "\n");
     let decision_log = "## Codex決定ログ\n\
         - （決定が出たら `YYYY-MM-DD HH:MM - 決定: ... / 理由: ... / 影響: ...` の形で追記）"
         .replace("\n        ", "\n");
@@ -162,6 +201,7 @@ pub(super) fn ensure_codex_memory_sections(body: String) -> String {
         - tag/release: 未登録\n\
         - CI: 未記録"
         .replace("\n        ", "\n");
+    let body = ensure_codex_block(body, CODEX_WORK_MEMO_START, CODEX_WORK_MEMO_END, &work_memo);
     let body = ensure_codex_block(
         body,
         CODEX_DECISION_LOG_START,
@@ -236,4 +276,43 @@ pub(super) fn codex_trace_link_label(name: &str, url: Option<&str>) -> Option<St
         return None;
     };
     Some(format!("{kind}: {name}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{codex_work_memo, resume_hint};
+    use crate::tui::codex_pane::CodexWorkSummary;
+
+    #[test]
+    fn resume_hint_prefers_remaining_work() {
+        let summary = CodexWorkSummary {
+            remaining: vec!["実TUIで確認UIを目視検証する".to_string()],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resume_hint(Some(&summary), "前の依頼"),
+            "未完了点から再開: 実TUIで確認UIを目視検証する"
+        );
+    }
+
+    #[test]
+    fn codex_work_memo_includes_resume_entrypoint() {
+        let summary = CodexWorkSummary {
+            implemented: vec!["Addness開発者指示を軽量化".to_string()],
+            checks: vec!["cargo test addness_developer".to_string()],
+            remaining: vec!["実TUIで表示密度を確認".to_string()],
+        };
+
+        let memo = codex_work_memo(
+            ".",
+            "turn 3完了",
+            Some("Addness in Codexを通常Codex並みに動かす"),
+            Some(&summary),
+        );
+
+        assert!(memo.contains("- 次回の入口: 未完了点から再開: 実TUIで表示密度を確認"));
+        assert!(memo.contains("### 作業終了サマリ"));
+        assert!(memo.contains("Addness開発者指示を軽量化"));
+    }
 }

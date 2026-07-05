@@ -13,7 +13,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{ActivePane, App, DeliverableFormField, FormField, ModalState};
 use super::codex_pane::{
-    CODEX_LOG_PREFIX_WIDTH, CodexDecisionKind, CodexLogKind, CodexLogLine, CodexPane,
+    CODEX_LOG_PREFIX_WIDTH, ChildGoal, CodexDecisionKind, CodexLogKind, CodexLogLine, CodexPane,
 };
 use super::goal_tree::{CommentView, TreeRow};
 use crate::api::{DeliverableType, GoalStatus, Member, MemberId};
@@ -30,8 +30,8 @@ const COLOR_MUTED: Color = Color::Rgb(112, 122, 134);
 const COLOR_EVENT: Color = Color::Rgb(142, 150, 160);
 const COLOR_PANEL: Color = Color::Rgb(76, 84, 96);
 const COLOR_INPUT_BG: Color = Color::Rgb(27, 30, 36);
-const CODEX_TOOL_COMMAND_PREVIEW_WIDTH: usize = 96;
-const CODEX_EDIT_DIFF_PREVIEW_LINES: usize = 8;
+const CODEX_TOOL_COMMAND_PREVIEW_WIDTH: usize = 56;
+const CODEX_EDIT_DIFF_PREVIEW_LINES: usize = 3;
 
 /// Replace @uuid mentions in text with @member_name
 fn replace_member_mentions(text: &str, members: &HashMap<MemberId, Member>) -> String {
@@ -813,9 +813,9 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
         let hint = if finished {
             " [c]コメント  [s]状態  [d]成果物(PR/Release)  [v]DoD判定  Ctrl+?:操作一覧  Esc/q:閉じる "
         } else if running {
-            " codex exec --json 実行中  |  入力+Enter:次ターン予約  |  Ctrl-O:turn  |  Ctrl-C:中断  |  Ctrl+?:操作一覧  |  F12:終了 "
+            " Codex 実行中  |  Ctrl-T:表示切替  |  F7:turn一覧  |  入力+Enter:次ターン予約  |  Ctrl-C:中断 "
         } else {
-            " 入力してEnterでcodex exec --json  |  空Enter/Ctrl-O:turn  |  Trackpad/矢印:履歴  |  Ctrl+?:操作一覧  |  F12:終了 "
+            " 入力してEnterでCodexへ送信  |  Ctrl-T:表示切替  |  F7:turn一覧  |  F2-F6:設定/差分  |  Ctrl+?:操作一覧 "
         };
         let status = Paragraph::new(Line::from(Span::styled(
             hint,
@@ -1007,6 +1007,9 @@ fn draw_help_overlay(frame: &mut Frame) {
         blank(),
         section("codex連携 (o →「codexで作業」)"),
         kv("起動", "選択ゴールの文脈付きでcodexをペイン起動"),
+        kv("F2 / F3", "モデル / 推論強度を切替"),
+        kv("F4 / F5", "承認モード / sandboxを切替"),
+        kv("F6", "作業ツリーのdiffビューを表示 / 戻る"),
         kv("F9", "Addnessの作業メモ・決定ログから再開"),
         kv(
             "Trackpad/ホイール",
@@ -1069,9 +1072,13 @@ fn draw_codex_help_overlay(frame: &mut Frame) {
     let lines: Vec<Line> = vec![
         section("Codex in Addness"),
         kv("Ctrl+?", "この操作一覧を表示 / 閉じる"),
-        kv("入力 + Enter", "Codexへ依頼を送信（初回は子ゴールを作成）"),
+        kv("入力 + Enter", "Codexへ依頼を送信（必要ならAddnessを参照）"),
         kv("入力中 Enter", "実行中なら次ターンに予約"),
         kv("Ctrl-C", "実行中のCodexターンを中断"),
+        kv("F2 / F3", "次ターンのモデル / 推論強度を切替"),
+        kv("F4 / F5", "承認モード / sandboxを切替"),
+        kv("F6", "ファイル編集diffビューを表示 / ログへ戻る"),
+        kv("F7", "turn一覧パネルを開く"),
         kv("F9", "Addnessの作業メモ・決定ログから再開"),
         kv("F12", "Codexペインを終了して戻る"),
         blank(),
@@ -1082,7 +1089,7 @@ fn draw_codex_help_overlay(frame: &mut Frame) {
         ),
         kv("↑↓ / PgUp/PgDn", "Codex履歴をスクロール"),
         kv("Home / End", "履歴先頭 / 最新へ移動"),
-        kv("Ctrl-T", "履歴表示を All / Talk / Tools / Errors で切替"),
+        kv("Ctrl-T", "表示を 会話 / 実行 / 失敗 / 全部 で切替"),
         kv("Ctrl-F", "履歴検索を開始"),
         kv("Ctrl-L", "検索解除"),
         blank(),
@@ -1096,15 +1103,194 @@ fn draw_codex_help_overlay(frame: &mut Frame) {
         kv("e / E", "表示中turnを開閉 / 古いturnを一括開閉"),
         kv("Ctrl-E", "古いturnを一括開閉"),
         kv(
-            "1..9 / Ctrl-1..9",
-            "履歴中は数字、いつでもCtrl+数字で指定turnを開閉",
+            "/turn <N>",
+            "会話中でも指定turnを展開（close/toggle/all対応）",
+        ),
+        kv(
+            "turn一覧",
+            "Enter/o=展開 c=格納 Space=開閉 a=全展開 Esc=閉じる",
         ),
         blank(),
-        section("slash commands"),
+        section("codex commands"),
+        kv("/sessions [N]", "Codex session候補を番号付きで表示"),
+        kv(
+            "/codex-resume <args>",
+            "root codex resumeをno-alt-screenで実行",
+        ),
+        kv(
+            "/resume-last",
+            "最新Codex sessionをexec resume --lastで継続",
+        ),
+        kv("/resume-last-all", "cwd外も含めて最新Codexセッションを継続"),
+        kv("/resume-session <N>", "番号またはidのCodexセッションを継続"),
+        kv(
+            "/resume-session-all",
+            "cwd外も含めて番号またはidのセッションを継続",
+        ),
+        kv(
+            "/resume-interactive-*",
+            "root codex resumeをno-alt-screenで実行",
+        ),
+        kv("/side [prompt]", "現在セッションから別会話を開始"),
+        kv("/fork <args>", "root codex forkをno-alt-screenで実行"),
+        kv(
+            "/fork-last / /fork-session",
+            "最新または指定セッションをfork",
+        ),
+        kv("/fork-last-all", "cwd外も含めて最新Codexセッションをfork"),
+        kv(
+            "/fork-session-all",
+            "cwd外も含めて番号またはidのセッションをfork",
+        ),
+        kv("/rename <title>", "現在のCodexセッション名を変更"),
+        kv(
+            "/archive/unarchive/delete",
+            "番号またはidのセッションを管理",
+        ),
+        kv(
+            "/codex <args>",
+            "任意のCodexサブコマンドをTUIログに実行表示",
+        ),
+        kv(
+            "/new / /clear",
+            "新しいCodexセッション開始 / 表示ログをクリア",
+        ),
+        kv("/init", "AGENTS.md を作成 / 更新する初期化依頼を送信"),
+        kv("/ide", "IDE連携コンテキストの利用可否を表示"),
+        kv("/compact / /plan", "会話圧縮 / 実装前計画をCodexへ送信"),
+        kv("/import", "Claude Code等の設定候補を検出 / AGENTS化依頼"),
+        kv("/hooks", "Codex hook設定のoverrideを表示・設定"),
+        kv("/skills", "ローカルCodex skill一覧 / skill使用依頼"),
+        kv("/exec|/e <prompt>", "Goal modeを通さずCodexへ直接送信"),
+        kv(
+            "/interactive [prompt]",
+            "root codex [PROMPT]をno-alt-screenで実行",
+        ),
+        kv(
+            "/doctor / /features",
+            "codex doctor / features list等を実行",
+        ),
+        kv("/mcp / /plugin", "MCP / plugin の一覧・管理コマンドを実行"),
+        kv(
+            "/apps",
+            "Codex Desktop/app-server/remote controlの入口を表示",
+        ),
+        kv("/cloud", "Codex Cloud taskのlist/status/apply/diff等を実行"),
+        kv("/login / /logout", "ログイン状態確認 / ログアウト"),
+        kv("/version / /update", "codex --version / update を実行"),
+        kv("/app / /app-server", "Codex Desktop起動 / app-server管理"),
+        kv("/remote-control", "app-server remote control をstart/stop"),
+        kv("/debug / /completion", "debug出力 / shell completion生成"),
+        kv(
+            "/mcp-server / /exec-server",
+            "server系コマンド（空ならhelp表示）",
+        ),
+        kv("/sandbox-run", "Codex sandbox command を実行"),
+        kv("/review <args>", "codex review を実行"),
+        kv("/exec-review", "Codex reviewを機械判定向けに実行"),
+        kv("/apply|/a <task_id>", "codex apply <task_id> を実行"),
+        blank(),
+        section("goal helpers"),
         kv("/goal <目標>", "Goal modeを開始 / 更新"),
         kv("/goal pause/resume", "Goal modeを一時停止 / 再開"),
         kv("/goal clear", "Goal modeを解除"),
-        kv("/status / /help", "状態表示 / slash一覧"),
+        kv(
+            "/organize [task]",
+            "Addness子ゴールへ分解し、最初の実装単位へ進む",
+        ),
+        kv(
+            "/remember <内容>",
+            "プロジェクト固有メモをAddnessの作業メモへ保存",
+        ),
+        kv("/handoff [メモ]", "現在の会話をAddnessへ再開用に保存"),
+        blank(),
+        section("codex options for next turn"),
+        kv("/settings", "モデル・推論・承認・sandbox設定を表示"),
+        kv("/cd <dir>", "次の新規Codexセッションの作業ルートを変更"),
+        kv("/model [name]", "モデルを切替 / 任意のmodel名を直接指定"),
+        kv(
+            "/reasoning [effort]",
+            "推論強度を切替 / low, medium等を直接指定",
+        ),
+        kv(
+            "/approval|/approvals / /sandbox",
+            "承認モード / sandboxを切替または直接指定",
+        ),
+        kv("/permissions", "承認/sandbox権限を表示・変更"),
+        kv(
+            "/personality",
+            "friendly / pragmatic の通信スタイルを次ターンへ適用",
+        ),
+        kv(
+            "/statusline",
+            "通常Codexのstatus line項目・色設定を次ターンへ適用",
+        ),
+        kv(
+            "/theme / /pets",
+            "通常Codexのtheme / pet設定を次ターンへ適用",
+        ),
+        kv(
+            "/vim / /raw",
+            "Vim composer / raw output設定を次ターンへ適用",
+        ),
+        kv("/keymap", "通常Codex keymap overrideを次ターンへ適用"),
+        kv("/memories", "Addness DB固定。作業メモは/rememberで保存"),
+        kv("/color", "Codex実行の色設定を never / auto / always に変更"),
+        kv("/search / /oss", "web search / OSS provider modeを切替"),
+        kv("/remote", "remote app server接続先を指定 / clear"),
+        kv(
+            "/remote-auth-token-env",
+            "remote認証tokenの環境変数名を指定 / clear",
+        ),
+        kv("/no-alt-screen", "Codexのno-alt-screenを切替"),
+        kv("/local-provider", "config / lmstudio / ollama を切替・指定"),
+        kv("/profile <name>", "Codex profileを次ターンへ適用"),
+        kv(
+            "/image <path>",
+            "画像を次ターンへ添付（list/clear/remove N）",
+        ),
+        kv("/add-dir <path>", "追加の書込許可ディレクトリを渡す"),
+        kv("/attachments", "画像添付と追加dirを一覧・追加・クリア"),
+        kv(
+            "/sandbox-add-read-dir",
+            "通常Codexのread-dir指定を--add-dirとして渡す",
+        ),
+        kv(
+            "/setup-default-sandbox",
+            "workspace-write/on-requestのsandboxプリセット",
+        ),
+        kv("/config key=value", "任意のCodex config overrideを追加"),
+        kv("/enable / /disable", "feature flagを有効化 / 無効化"),
+        kv("/strict-config", "未知のconfig項目をCodexエラーとして扱う"),
+        kv(
+            "/ignore-* / /ephemeral",
+            "user config・rules・git check・履歴保存を切替",
+        ),
+        kv(
+            "/bypass / /bypass-hook-trust",
+            "承認/sandbox回避・hook trust回避を切替",
+        ),
+        kv(
+            "/output-schema",
+            "最終応答JSON Schemaファイルを指定 / clear",
+        ),
+        kv(
+            "/output-last-message",
+            "最終メッセージ出力先ファイルを指定 / clear",
+        ),
+        blank(),
+        section("tui helpers"),
+        kv("/diff / /history", "diffビュー / セッション履歴を表示"),
+        kv(
+            "/rollout / /debug-config",
+            "履歴パス / 現在config診断を表示",
+        ),
+        kv("/ps / /stop", "実行中turnと予約を表示 / 中断"),
+        kv("/feedback", "送信用の診断情報ドラフトをログに表示"),
+        kv("/test-approval", "承認UIの確認用リクエストを表示"),
+        kv("/btw", "最後のassistant応答をMarkdownとして表示"),
+        kv("/resume", "F9と同じ再開プロンプトを送信"),
+        kv("/status / /usage / /help", "状態 / token使用量 / slash一覧"),
         blank(),
         section("終了後の還流"),
         kv("c / s / d / v", "コメント / 状態 / 成果物 / DoD判定"),
@@ -1134,6 +1320,15 @@ fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
     let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     Rect::new(x, y, popup_width, height.min(area.height))
+}
+
+fn bottom_rect(percent_x: u16, height: u16, bottom_margin: u16, area: Rect) -> Rect {
+    let popup_width = area.width * percent_x / 100;
+    let height = height.min(area.height);
+    let bottom_margin = bottom_margin.min(area.height.saturating_sub(height));
+    let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
+    let y = area.y + area.height.saturating_sub(height + bottom_margin);
+    Rect::new(x, y, popup_width, height)
 }
 
 /// モーダル/ポップアップ領域を消去する。
@@ -1381,6 +1576,103 @@ fn draw_edit_goal_modal(frame: &mut Frame, app: &App) {
     frame.render_widget(status_widget, field_layout[2]);
 }
 
+fn draw_destructive_confirm_panel(
+    frame: &mut Frame,
+    action: &str,
+    subject_label: &str,
+    subject: &str,
+    detail: &str,
+    selected: usize,
+) {
+    let area = bottom_rect(76, 8, 3, frame.area());
+    clear_modal_area(frame, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLOR_DANGER))
+        .title(format!(" 確認待ち: {action} "))
+        .title_bottom(
+            Line::from(" n: キャンセル | y: 今回だけ | a: これからずっと許可 | ←→: 選択 | Enter ")
+                .style(Style::default().fg(COLOR_MUTED)),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                "? ",
+                Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                action.to_string(),
+                Style::default()
+                    .fg(COLOR_TEXT_STRONG)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])),
+        layout[0],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!("{subject_label}: "),
+                Style::default().fg(COLOR_WARN),
+            ),
+            Span::styled(
+                ellipsize_width(
+                    subject,
+                    layout[1]
+                        .width
+                        .saturating_sub((UnicodeWidthStr::width(subject_label) + 2) as u16)
+                        as usize,
+                ),
+                Style::default().fg(COLOR_TEXT_STRONG),
+            ),
+        ])),
+        layout[1],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("実行内容: ", Style::default().fg(COLOR_WARN)),
+            Span::styled(
+                ellipsize_width(detail, layout[2].width.saturating_sub(10) as usize),
+                Style::default().fg(COLOR_TEXT),
+            ),
+        ])),
+        layout[2],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "! この操作は取り消せません。",
+            Style::default()
+                .fg(COLOR_DANGER)
+                .add_modifier(Modifier::BOLD),
+        ))),
+        layout[3],
+    );
+    draw_confirm_buttons(
+        frame,
+        layout[4],
+        selected,
+        "N キャンセル",
+        "Y 今回だけ削除",
+        "A これからずっと許可",
+    );
+}
+
 fn draw_delete_goal_modal(frame: &mut Frame, app: &App) {
     let Some(ModalState::DeleteGoal {
         goal_title,
@@ -1391,81 +1683,14 @@ fn draw_delete_goal_modal(frame: &mut Frame, app: &App) {
         return;
     };
 
-    let area = centered_rect(60, 10, frame.area());
-    clear_modal_area(frame, area);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Red))
-        .title(" 削除の確認 ")
-        .title_bottom(
-            Line::from(" ←→/hl: 選択 | Enter: 実行 | Esc: キャンセル ")
-                .style(Style::default().fg(Color::DarkGray)),
-        );
-
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2), // Goal title
-            Constraint::Length(2), // Warning message
-            Constraint::Length(1), // Spacer
-            Constraint::Length(1), // Buttons
-            Constraint::Min(0),    // Spacer
-        ])
-        .split(inner);
-
-    // Goal title
-    let title_text = Paragraph::new(Line::from(vec![
-        Span::styled("削除するゴール: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            goal_title.as_str(),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]));
-    frame.render_widget(title_text, layout[0]);
-
-    // Warning message
-    let warning = Paragraph::new(Line::from(vec![
-        Span::styled("! ", Style::default().fg(Color::Red)),
-        Span::styled(
-            "この操作は取り消せません。本当に削除しますか？",
-            Style::default().fg(Color::Red),
-        ),
-    ]));
-    frame.render_widget(warning, layout[1]);
-
-    // Buttons
-    let cancel_style = if *confirm_index == 0 {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::White)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::White)
-    };
-
-    let delete_style = if *confirm_index == 1 {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Red)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Red)
-    };
-
-    let buttons = Line::from(vec![
-        Span::raw("  "),
-        Span::styled("[ キャンセル ]", cancel_style),
-        Span::raw("    "),
-        Span::styled("[ 削除 ]", delete_style),
-    ]);
-
-    frame.render_widget(Paragraph::new(buttons), layout[3]);
+    draw_destructive_confirm_panel(
+        frame,
+        "ゴール削除",
+        "ゴール",
+        goal_title,
+        "このゴールを削除します。",
+        *confirm_index,
+    );
 }
 
 fn draw_action_menu(frame: &mut Frame, app: &App) {
@@ -1756,49 +1981,14 @@ fn draw_delete_deliverable_modal(frame: &mut Frame, app: &App) {
         return;
     };
 
-    let area = centered_rect(60, 10, frame.area());
-    clear_modal_area(frame, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Red))
-        .title(" Delete Deliverable ")
-        .title_bottom(
-            Line::from(" ←→/hl: Select | Enter: Apply | Esc: Cancel ")
-                .style(Style::default().fg(Color::DarkGray)),
-        );
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Length(2),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(0),
-        ])
-        .split(inner);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("Delete: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                deliverable_name.as_str(),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ])),
-        layout[0],
+    draw_destructive_confirm_panel(
+        frame,
+        "成果物削除",
+        "成果物",
+        deliverable_name,
+        "この成果物を削除します。",
+        *confirm_index,
     );
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "This cannot be undone.",
-            Style::default().fg(Color::Red),
-        ))),
-        layout[1],
-    );
-    draw_confirm_buttons(frame, layout[3], *confirm_index, "Cancel", "Delete");
 }
 
 fn draw_add_comment_modal(frame: &mut Frame, app: &App) {
@@ -1913,49 +2103,14 @@ fn draw_delete_comment_modal(frame: &mut Frame, app: &App) {
         return;
     };
 
-    let area = centered_rect(60, 10, frame.area());
-    clear_modal_area(frame, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Red))
-        .title(" Delete Comment ")
-        .title_bottom(
-            Line::from(" ←→/hl: Select | Enter: Apply | Esc: Cancel ")
-                .style(Style::default().fg(Color::DarkGray)),
-        );
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Length(2),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(0),
-        ])
-        .split(inner);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("Delete: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                excerpt.as_str(),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ])),
-        layout[0],
+    draw_destructive_confirm_panel(
+        frame,
+        "コメント削除",
+        "コメント",
+        excerpt,
+        "このコメントを削除します。",
+        *confirm_index,
     );
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "This cannot be undone.",
-            Style::default().fg(Color::Red),
-        ))),
-        layout[1],
-    );
-    draw_confirm_buttons(frame, layout[3], *confirm_index, "Cancel", "Delete");
 }
 
 fn draw_react_comment_modal(frame: &mut Frame, app: &App) {
@@ -2159,6 +2314,7 @@ fn draw_confirm_buttons(
     selected: usize,
     cancel_label: &str,
     confirm_label: &str,
+    always_label: &str,
 ) {
     let cancel_style = if selected == 0 {
         Style::default()
@@ -2176,12 +2332,22 @@ fn draw_confirm_buttons(
     } else {
         Style::default().fg(Color::Red)
     };
+    let always_style = if selected == 2 {
+        Style::default()
+            .fg(Color::Black)
+            .bg(COLOR_WARN)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(COLOR_WARN)
+    };
 
     let buttons = Paragraph::new(Line::from(vec![
         Span::raw("  "),
         Span::styled(format!(" [ {cancel_label} ] "), cancel_style),
         Span::raw("    "),
         Span::styled(format!(" [ {confirm_label} ] "), confirm_style),
+        Span::raw("    "),
+        Span::styled(format!(" [ {always_label} ] "), always_style),
     ]));
     frame.render_widget(buttons, area);
 }
@@ -2233,7 +2399,7 @@ fn draw_members(frame: &mut Frame, area: Rect, app: &mut App, border_color: Colo
 }
 
 /// codex ペインを契約併置型で描画する。
-/// 左に対象ゴール／DoD（契約）、右に `codex exec --json` の会話履歴を描画する。
+/// 左に対象ゴール／DoD（契約）、右に Codex の会話履歴を描画する。
 fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
     // 左の Addness ペインは固定幅で広めに取り、進行が読み取りやすいようにする。
     let addness_w = (area.width / 3).clamp(28, 52);
@@ -2261,11 +2427,11 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
         };
 
         let status_panel_h = if chunks[0].height >= 30 {
-            15
-        } else if chunks[0].height >= 24 {
-            13
+            12
+        } else if chunks[0].height >= 22 {
+            10
         } else {
-            11
+            8
         };
         let panes = Layout::default()
             .direction(Direction::Vertical)
@@ -2289,6 +2455,25 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
                 format!("» {action}"),
                 Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD),
             )));
+            lines.push(Line::from(""));
+        }
+        if let Some(active) = pane.active_work_package_label() {
+            lines.push(Line::from(vec![
+                Span::styled("作業単位: ", Style::default().fg(COLOR_MUTED)),
+                Span::styled(
+                    active,
+                    Style::default()
+                        .fg(COLOR_ADDNESS)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            lines.push(Line::from(""));
+        }
+        if let Some(queue) = pane.queued_work_package_label() {
+            lines.push(Line::from(vec![
+                Span::styled("待機: ", Style::default().fg(COLOR_MUTED)),
+                Span::styled(queue, Style::default().fg(COLOR_WARN)),
+            ]));
             lines.push(Line::from(""));
         }
 
@@ -2397,34 +2582,13 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
                 Style::default().fg(COLOR_MUTED),
             )));
         } else {
-            for child in &pane.children {
-                let is_new = child.new_until.is_some_and(|t| t > now);
-                let title_style = if is_new {
-                    Style::default().fg(Color::Black).bg(COLOR_WARN)
-                } else if child.is_completed {
-                    Style::default()
-                        .fg(COLOR_MUTED)
-                        .add_modifier(Modifier::CROSSED_OUT)
-                } else {
-                    Style::default().fg(COLOR_TEXT)
-                };
-                let marker_style = if child.is_completed {
-                    Style::default().fg(COLOR_SUCCESS)
-                } else {
-                    Style::default().fg(COLOR_MUTED)
-                };
-                let status_style = if child.is_completed {
-                    Style::default().fg(COLOR_SUCCESS)
-                } else if child.status_label == "進行中" {
-                    Style::default().fg(COLOR_WARN)
-                } else {
-                    Style::default().fg(COLOR_MUTED)
-                };
-                lines.push(Line::from(vec![
-                    Span::styled(format!("{} ", child.icon), marker_style),
-                    Span::styled(child.title.as_str(), title_style),
-                    Span::styled(format!("  {}", child.status_label), status_style),
-                ]));
+            for (idx, child) in pane.children.iter().enumerate() {
+                lines.extend(codex_child_goal_lines(
+                    child,
+                    now,
+                    idx + 1,
+                    pane.child_goal_is_active(child),
+                ));
             }
         }
 
@@ -2484,32 +2648,33 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
         pane.resize(rows, cols);
         let (title, color) = if pane.finished {
             let t = if pane.scrollback > 0 {
-                " codex exec 終了 — ↑↓/PgUp/PgDn/Home/End: ログ  Esc/qで戻る ".to_string()
+                " Codex 終了 — ↑↓/PgUp/PgDn/Home/End: 履歴  Esc/qで戻る ".to_string()
             } else {
-                " codex exec 終了 — ↑↓: ログ  [c]コメント [s]状態 [d]成果物 [v]DoD判定  Esc/q: 戻る "
+                " Codex 終了 — ↑↓: 履歴  [c]コメント [s]状態 [d]成果物 [v]DoD判定  Esc/q: 戻る "
                     .to_string()
             };
             (t, COLOR_PANEL)
         } else if let Some(decision) = pane.decision_banner() {
             (codex_decision_title_hint(decision), COLOR_WARN)
+        } else if pane.diff_view().is_some() {
+            (
+                " Codex 差分表示 — F6:会話へ戻る  ↑↓/PgUp/PgDn/Home/End:差分 ".to_string(),
+                COLOR_CODEX,
+            )
         } else if pane.is_turn_running() {
             (
-                " codex exec --json 実行中 — JSONLをAddnessで表示  Ctrl-C:ターン中断  F12:終了 "
-                    .to_string(),
+                " Codex 実行中 — F7:turn一覧  Ctrl-T:表示切替  F6:差分  Ctrl-C:中断 ".to_string(),
                 COLOR_WARN,
             )
         } else if pane.scrollback > 0 {
             (
-                " codex exec --json — Esc: ライブへ戻る ".to_string(),
+                " Codex 履歴表示 — Esc: 最新へ戻る ".to_string(),
                 COLOR_PANEL,
             )
         } else {
-            let thread = pane
-                .thread_id()
-                .map(|id| format!("  thread:{}", short_thread_id(id)))
-                .unwrap_or_default();
             (
-                format!(" codex exec --json 入力待ち{thread}  F9:Addness再開  F12:終了 "),
+                " Codex 入力待ち — F7:turn一覧  Ctrl-T:表示切替  F2-F6:設定/差分  F9:再開 "
+                    .to_string(),
                 COLOR_PANEL,
             )
         };
@@ -2518,7 +2683,67 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
             .border_style(Style::default().fg(color))
             .title(title);
         draw_codex_exec_panel(frame, term_area, block, pane);
+        if pane.turn_picker_open() {
+            draw_codex_turn_picker(frame, term_area, pane);
+        }
     }
+}
+
+fn draw_codex_turn_picker(frame: &mut Frame, area: Rect, pane: &CodexPane) {
+    let items = pane.turn_picker_items();
+    let selected_turn = pane.turn_picker_selected_turn();
+    let height = (items.len() as u16 + 4).clamp(6, area.height.saturating_sub(2).max(6));
+    let picker_area = bottom_rect(82, height, 2, area);
+    clear_modal_area(frame, picker_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLOR_CODEX))
+        .title(" Turn一覧 ")
+        .title_bottom(
+            Line::from(
+                " ↑↓/jk: 選択 | Enter/o: 展開 | c: 格納 | Space: 開閉 | a: 全展開 | Esc/q: 閉じる ",
+            )
+            .style(Style::default().fg(COLOR_MUTED)),
+        );
+    let inner = block.inner(picker_area);
+    frame.render_widget(block, picker_area);
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "格納されたturnを会話中でも明示的に展開できます",
+        Style::default().fg(COLOR_MUTED),
+    )));
+    for item in items {
+        let selected = selected_turn == Some(item.turn);
+        let marker = if selected { ">" } else { " " };
+        let state = if item.current {
+            "実行中"
+        } else if item.collapsed {
+            "格納"
+        } else {
+            "展開"
+        };
+        let style = if selected {
+            Style::default()
+                .fg(COLOR_TEXT_STRONG)
+                .add_modifier(Modifier::BOLD)
+        } else if item.collapsed {
+            Style::default().fg(COLOR_WARN)
+        } else {
+            Style::default().fg(COLOR_TEXT)
+        };
+        let text = format!(
+            "{marker} Turn {:>2} [{state}] {}",
+            item.turn,
+            prompt_preview(&item.title, inner.width.saturating_sub(18) as usize)
+        );
+        lines.push(Line::from(Span::styled(text, style)));
+    }
+    if lines.len() > inner.height as usize {
+        lines.truncate(inner.height as usize);
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: &mut CodexPane) {
@@ -2529,7 +2754,11 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
     }
 
     let input_h = codex_input_panel_height(pane, inner.width, inner.height);
-    let header_h = u16::from(inner.height >= 6);
+    let header_h = if inner.height >= 7 {
+        2
+    } else {
+        u16::from(inner.height >= 6)
+    };
     let mut constraints = Vec::new();
     if header_h > 0 {
         constraints.push(Constraint::Length(header_h));
@@ -2553,20 +2782,29 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
 
     if let Some(header_chunk) = header_chunk {
         frame.render_widget(
-            Paragraph::new(codex_header_line(pane, header_chunk.width as usize)),
+            Paragraph::new(codex_header_lines(
+                pane,
+                header_chunk.width as usize,
+                header_chunk.height as usize,
+            )),
             header_chunk,
         );
     }
 
-    let filtered_log = pane.filtered_log_lines();
     let history_width = history_chunk.width as usize;
     let history_height = history_chunk.height as usize;
-    let (history_lines, total_history_lines) = codex_visible_log_lines(
-        &filtered_log,
-        history_width,
-        pane.scrollback,
-        history_height,
-    );
+    let diff_view = pane.diff_view().map(str::to_string);
+    let (history_lines, total_history_lines) = if let Some(diff) = diff_view.as_deref() {
+        codex_visible_diff_lines(diff, history_width, pane.scrollback, history_height)
+    } else {
+        let filtered_log = pane.filtered_log_lines();
+        codex_visible_log_lines(
+            &filtered_log,
+            history_width,
+            pane.scrollback,
+            history_height,
+        )
+    };
     pane.sync_rendered_history_metrics(total_history_lines, history_height);
     let history = if history_lines.is_empty() {
         Paragraph::new(Line::from(Span::styled(
@@ -2610,7 +2848,7 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
         };
         let prompt_lines = if pane.finished {
             vec![Line::from(Span::styled(
-                "  Esc/q:戻る  c/s/d/v:還流  Enter/Space/e/1..9:turn",
+                "  Esc/q:戻る  c/s/d/v:還流  F7:turn一覧  /turn <N>",
                 input_style,
             ))]
         } else {
@@ -2942,7 +3180,7 @@ fn codex_decision_input_label(kind: &CodexDecisionKind) -> &'static str {
         CodexDecisionKind::Approval => "確認待ち: 承認 ",
         CodexDecisionKind::Permission => "確認待ち: 権限 ",
         CodexDecisionKind::Dangerous => "確認待ち: 危険操作 ",
-        CodexDecisionKind::YesNo => "確認待ち ",
+        CodexDecisionKind::YesNo => "確認待ち: Yes/No ",
     }
 }
 
@@ -2968,13 +3206,13 @@ fn codex_decision_title_hint(decision: &super::codex_pane::CodexDecisionBanner) 
         CodexDecisionKind::Dangerous => "a/y または d/n",
         CodexDecisionKind::Approval | CodexDecisionKind::Permission => {
             if decision.always_choice().is_some() {
-                "a/y・d/n・l:常に許可"
+                "a/y・d/n・l:ずっと許可"
             } else {
                 "a/y または d/n"
             }
         }
     };
-    format!(" codex exec 確認待ち — 下の確認欄で選択 / {keys} ")
+    format!(" Codex 確認待ち — 下の確認欄で選択 / {keys} ")
 }
 
 fn codex_decision_choice_line(
@@ -3057,38 +3295,68 @@ fn decision_always_choice_text(
         .map(|(key, label)| format!("[{}] {label}", key.to_ascii_uppercase()))
 }
 
-fn codex_header_line(pane: &CodexPane, max_width: usize) -> Line<'static> {
+fn codex_header_lines(pane: &CodexPane, max_width: usize, max_rows: usize) -> Vec<Line<'static>> {
     let run_state = pane.run_state();
-    let state = run_state.code();
-    let search = if pane.search_query().is_empty() {
-        if pane.is_search_editing() {
-            "search:input".to_string()
-        } else {
-            "search:off".to_string()
-        }
-    } else if pane.is_search_editing() {
-        format!("search:{}*", pane.search_query())
-    } else {
-        format!("search:{}", pane.search_query())
-    };
-    let thread = pane
-        .thread_id()
-        .map(short_thread_id)
-        .unwrap_or_else(|| "new".to_string());
-    let text = format!(
-        " {state} {} | Turn {} | fold:{} | filter:{} | {search} | thread:{thread} | {} | Ctrl-T/F/L/O e/E 1..9",
-        run_state.label(),
-        pane.turn_count(),
-        pane.collapsed_turn_count(),
-        pane.log_filter_label(),
-        pane.history_label()
-    );
-    let style = if pane.decision_banner().is_some() || pane.is_turn_running() {
+    let focus = codex_current_activity_label(pane, max_width.saturating_sub(6));
+    let focus_style = if pane.decision_banner().is_some() || pane.is_turn_running() {
         Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(COLOR_TEXT_STRONG)
+    };
+    let mut parts = vec![
+        format!("状態: {}", run_state.label()),
+        format!("Turn {}", pane.turn_count()),
+        format!("表示:{}", pane.log_filter_label()),
+    ];
+    if pane.collapsed_turn_count() > 0 {
+        parts.push(format!("格納{}", pane.collapsed_turn_count()));
+    }
+    if pane.diff_view().is_some() {
+        parts.push("差分表示中".to_string());
+    }
+    if pane.is_search_editing() {
+        let query = if pane.search_query().is_empty() {
+            "入力中".to_string()
+        } else {
+            format!("{}*", pane.search_query())
+        };
+        parts.push(format!("検索:{query}"));
+    } else if !pane.search_query().is_empty() {
+        parts.push(format!("検索:{}", pane.search_query()));
+    }
+    parts.push("Ctrl-T:表示切替 F7:turn一覧".to_string());
+    if max_rows <= 1 {
+        let text = format!(" 今: {focus} | {}", parts.join(" | "));
+        return vec![Line::from(Span::styled(
+            ellipsize_width(&text, max_width),
+            focus_style,
+        ))];
+    }
+
+    let summary = format!(" {}", parts.join(" | "));
+    let summary_style = if pane.decision_banner().is_some() || pane.is_turn_running() {
+        Style::default().fg(COLOR_WARN)
     } else {
         Style::default().fg(COLOR_MUTED)
     };
-    Line::from(Span::styled(ellipsize_width(&text, max_width), style))
+    vec![
+        Line::from(vec![
+            Span::styled(" 今 ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(focus, focus_style),
+        ]),
+        Line::from(Span::styled(
+            ellipsize_width(&summary, max_width),
+            summary_style,
+        )),
+    ]
+}
+
+#[cfg(test)]
+fn codex_header_line(pane: &CodexPane, max_width: usize) -> Line<'static> {
+    codex_header_lines(pane, max_width, 1)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| Line::from(""))
 }
 
 fn rendered_lines_height(lines: &[Line<'_>], width: usize) -> usize {
@@ -3136,6 +3404,69 @@ fn codex_activity_lines(activity: &[String], width: usize) -> Vec<Line<'static>>
     out
 }
 
+fn codex_child_goal_lines(
+    child: &ChildGoal,
+    now: Instant,
+    ordinal: usize,
+    active: bool,
+) -> Vec<Line<'static>> {
+    let is_new = child.new_until.is_some_and(|t| t > now);
+    let title_style = if active {
+        Style::default()
+            .fg(Color::Black)
+            .bg(COLOR_ADDNESS)
+            .add_modifier(Modifier::BOLD)
+    } else if is_new {
+        Style::default().fg(Color::Black).bg(COLOR_WARN)
+    } else if child.is_completed {
+        Style::default()
+            .fg(COLOR_MUTED)
+            .add_modifier(Modifier::CROSSED_OUT)
+    } else {
+        Style::default().fg(COLOR_TEXT)
+    };
+    let marker_style = if child.is_completed {
+        Style::default().fg(COLOR_SUCCESS)
+    } else {
+        Style::default().fg(COLOR_MUTED)
+    };
+    let status_style = if child.is_completed {
+        Style::default().fg(COLOR_SUCCESS)
+    } else if child.status_label == "進行中" {
+        Style::default().fg(COLOR_WARN)
+    } else {
+        Style::default().fg(COLOR_MUTED)
+    };
+    let ordinal_style = if active {
+        Style::default()
+            .fg(COLOR_ADDNESS)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(COLOR_MUTED)
+    };
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            format!("{}{ordinal:>2}. ", if active { ">" } else { "" }),
+            ordinal_style,
+        ),
+        Span::styled(format!("{} ", child.icon), marker_style),
+        Span::styled(child.title.clone(), title_style),
+        Span::styled(format!("  {}", child.status_label), status_style),
+    ])];
+    if let Some(dod) = child
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|dod| !dod.is_empty())
+    {
+        lines.push(Line::from(vec![
+            Span::styled("     DoD ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(prompt_preview(dod, 96), Style::default().fg(COLOR_MUTED)),
+        ]));
+    }
+    lines
+}
+
 #[derive(Clone)]
 struct RenderedCodexLine {
     line: Line<'static>,
@@ -3146,7 +3477,7 @@ fn codex_log_lines(lines: &[&CodexLogLine], max_width: usize) -> Vec<RenderedCod
         .iter()
         .flat_map(|line| {
             let mut rendered = Vec::new();
-            if matches!(line.kind, CodexLogKind::Turn | CodexLogKind::Tool) {
+            if line.kind == CodexLogKind::Turn {
                 rendered.push(codex_separator_line(line.kind, max_width));
             }
             rendered.extend(codex_log_entry_lines(line, max_width));
@@ -3198,8 +3529,84 @@ fn codex_visible_log_lines(
     (visible, total)
 }
 
+fn codex_visible_diff_lines(
+    diff: &str,
+    max_width: usize,
+    scrollback: usize,
+    viewport_height: usize,
+) -> (Vec<RenderedCodexLine>, usize) {
+    if viewport_height == 0 {
+        return (Vec::new(), 0);
+    }
+    let all = codex_diff_lines(diff, max_width);
+    let total = all.len();
+    let max_scrollback = total.saturating_sub(viewport_height);
+    let scrollback = scrollback.min(max_scrollback);
+    let view_end = total.saturating_sub(scrollback);
+    let view_start = view_end.saturating_sub(viewport_height);
+    (all[view_start..view_end].to_vec(), total)
+}
+
+fn codex_diff_lines(diff: &str, max_width: usize) -> Vec<RenderedCodexLine> {
+    let content_width = max_width.saturating_sub(CODEX_LOG_PREFIX_WIDTH).max(1);
+    let mut lines = Vec::new();
+    for raw in diff.replace('\r', "").lines() {
+        let style = codex_diff_line_style(raw);
+        for (idx, part) in wrap_log_text(raw, content_width).into_iter().enumerate() {
+            let prefix = if idx == 0 { "差分 | " } else { "     | " };
+            let prefix_style = if idx == 0 {
+                Style::default()
+                    .fg(COLOR_CODEX)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(COLOR_PANEL)
+            };
+            lines.push(RenderedCodexLine {
+                line: Line::from(vec![
+                    Span::styled(prefix, prefix_style),
+                    Span::styled(part, style),
+                ]),
+            });
+        }
+    }
+    if lines.is_empty() {
+        lines.push(RenderedCodexLine {
+            line: Line::from(Span::styled(
+                "差分 | 差分はありません。",
+                Style::default().fg(COLOR_MUTED),
+            )),
+        });
+    }
+    lines
+}
+
+fn codex_diff_line_style(line: &str) -> Style {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('+') && !trimmed.starts_with("+++") {
+        Style::default()
+            .fg(COLOR_SUCCESS)
+            .add_modifier(Modifier::BOLD)
+    } else if trimmed.starts_with('-') && !trimmed.starts_with("---") {
+        Style::default()
+            .fg(COLOR_DANGER)
+            .add_modifier(Modifier::BOLD)
+    } else if trimmed.starts_with("@@") {
+        Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD)
+    } else if trimmed.starts_with("diff ")
+        || trimmed.starts_with("index ")
+        || trimmed.starts_with("---")
+        || trimmed.starts_with("+++")
+        || trimmed.starts_with("## ")
+        || trimmed.contains("omitted")
+    {
+        Style::default().fg(COLOR_MUTED)
+    } else {
+        Style::default().fg(COLOR_TEXT)
+    }
+}
+
 fn codex_log_line_rendered_count(line: &CodexLogLine, max_width: usize) -> usize {
-    let separator = usize::from(matches!(line.kind, CodexLogKind::Turn | CodexLogKind::Tool));
+    let separator = usize::from(line.kind == CodexLogKind::Turn);
     let content_width = max_width.saturating_sub(CODEX_LOG_PREFIX_WIDTH).max(1);
     separator + wrapped_log_line_count(&codex_log_display_text(line), content_width)
 }
@@ -3207,7 +3614,6 @@ fn codex_log_line_rendered_count(line: &CodexLogLine, max_width: usize) -> usize
 fn codex_separator_line(kind: CodexLogKind, max_width: usize) -> RenderedCodexLine {
     let (head, fill, color) = match kind {
         CodexLogKind::Turn => ("-----+ ", '-', COLOR_PANEL),
-        CodexLogKind::Tool => (".....+ ", '.', COLOR_PANEL),
         _ => ("     | ", '-', COLOR_PANEL),
     };
     let fill_width = max_width
@@ -3287,11 +3693,16 @@ fn codex_edit_diff_style(part: &str, fallback: Style) -> Style {
             .add_modifier(Modifier::BOLD)
     } else if trimmed.starts_with("@@") {
         Style::default().fg(COLOR_MUTED)
-    } else if trimmed.starts_with("update:")
+    } else if trimmed.starts_with("更新:")
+        || trimmed.starts_with("追加:")
+        || trimmed.starts_with("削除:")
+        || trimmed.starts_with("移動:")
+        || trimmed.starts_with("update:")
         || trimmed.starts_with("add:")
         || trimmed.starts_with("delete:")
         || trimmed.starts_with("move:")
         || trimmed.ends_with("files changed")
+        || trimmed.ends_with("件のファイル変更")
     {
         Style::default()
             .fg(COLOR_TEXT_STRONG)
@@ -3304,14 +3715,14 @@ fn codex_edit_diff_style(part: &str, fallback: Style) -> Style {
 fn codex_log_prefix(line: &CodexLogLine) -> (&'static str, Style, Style) {
     match line.kind {
         CodexLogKind::User => (
-            "YOU  | ",
+            "依頼 | ",
             Style::default()
                 .fg(COLOR_ADDNESS)
                 .add_modifier(Modifier::BOLD),
             Style::default().fg(COLOR_TEXT),
         ),
         CodexLogKind::Assistant => (
-            "CODEX| ",
+            "返答 | ",
             Style::default()
                 .fg(COLOR_TEXT_STRONG)
                 .add_modifier(Modifier::BOLD),
@@ -3319,19 +3730,19 @@ fn codex_log_prefix(line: &CodexLogLine) -> (&'static str, Style, Style) {
         ),
         CodexLogKind::Tool => codex_tool_prefix(&line.text),
         CodexLogKind::Turn => (
-            "TURN | ",
+            "turn | ",
             Style::default()
                 .fg(COLOR_CODEX)
                 .add_modifier(Modifier::BOLD),
             Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD),
         ),
         CodexLogKind::System => (
-            "INFO | ",
+            "     | ",
             Style::default().fg(COLOR_MUTED),
             Style::default().fg(COLOR_MUTED),
         ),
         CodexLogKind::Error => (
-            "ERR! | ",
+            "失敗 | ",
             Style::default()
                 .fg(COLOR_DANGER)
                 .add_modifier(Modifier::BOLD),
@@ -3348,7 +3759,7 @@ fn codex_log_prefix(line: &CodexLogLine) -> (&'static str, Style, Style) {
 fn codex_tool_prefix(text: &str) -> (&'static str, Style, Style) {
     if text.starts_with("EDIT ") {
         (
-            "EDIT | ",
+            "編集 | ",
             Style::default()
                 .fg(COLOR_CODEX)
                 .add_modifier(Modifier::BOLD),
@@ -3356,7 +3767,7 @@ fn codex_tool_prefix(text: &str) -> (&'static str, Style, Style) {
         )
     } else if text.starts_with("DIFF ") {
         (
-            "DIFF | ",
+            "差分 | ",
             Style::default()
                 .fg(COLOR_MUTED)
                 .add_modifier(Modifier::BOLD),
@@ -3364,7 +3775,7 @@ fn codex_tool_prefix(text: &str) -> (&'static str, Style, Style) {
         )
     } else if text.starts_with("FAIL ") || text.contains("exit ") && !text.contains("exit 0") {
         (
-            "FAIL | ",
+            "失敗 | ",
             Style::default()
                 .fg(COLOR_DANGER)
                 .add_modifier(Modifier::BOLD),
@@ -3372,7 +3783,7 @@ fn codex_tool_prefix(text: &str) -> (&'static str, Style, Style) {
         )
     } else if text.starts_with("OK ") || text.contains("exit 0") {
         (
-            "OK   | ",
+            "完了 | ",
             Style::default()
                 .fg(COLOR_SUCCESS)
                 .add_modifier(Modifier::BOLD),
@@ -3380,19 +3791,19 @@ fn codex_tool_prefix(text: &str) -> (&'static str, Style, Style) {
         )
     } else if text.contains("output_delta") || text.contains('\n') {
         (
-            "OUT  | ",
+            "出力 | ",
             Style::default().fg(COLOR_MUTED),
             Style::default().fg(COLOR_TEXT),
         )
     } else if text.starts_with("RUNNING ") {
         (
-            "RUN  | ",
+            "実行 | ",
             Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD),
             Style::default().fg(COLOR_TEXT),
         )
     } else {
         (
-            "RUN  | ",
+            "作業 | ",
             Style::default().fg(COLOR_MUTED),
             Style::default().fg(COLOR_TEXT),
         )
@@ -3516,19 +3927,40 @@ fn split_tool_state_prefix(text: &str) -> (Option<&str>, &str) {
 
 fn tool_command_tree_head(state: Option<&str>, command: &str) -> String {
     let verb = if state == Some("RUNNING") {
-        "Running"
+        "実行中"
     } else {
-        "Ran"
+        "実行"
     };
-    let command = ellipsize_width(command, CODEX_TOOL_COMMAND_PREVIEW_WIDTH);
-    format!("• {verb} {command}")
+    let compact = compact_tool_command_name(command);
+    let command = ellipsize_width(&compact, CODEX_TOOL_COMMAND_PREVIEW_WIDTH);
+    format!("• {verb}: {command}")
+}
+
+fn compact_tool_command_name(command: &str) -> String {
+    if looks_like_code_edit_display_text(command)
+        && let Some(path) = code_edit_changes(command)
+            .first()
+            .map(|change| change.path.clone())
+    {
+        return path;
+    }
+    if looks_like_addness_command(command) {
+        return "addness".to_string();
+    }
+    let concise = concise_command_name(command);
+    if !concise.is_empty() {
+        return concise;
+    }
+    let (_, command) = split_tool_state_prefix(command.trim());
+    let first_line = command.lines().next().unwrap_or("").trim();
+    ellipsize_width(first_line, CODEX_TOOL_COMMAND_PREVIEW_WIDTH)
 }
 
 fn tool_output_tree_preview(output: &str) -> String {
     match non_empty_line_count(output) {
-        0 => "output: empty".to_string(),
-        1 => "output: 1 line".to_string(),
-        n => format!("output: {n} lines"),
+        0 => "出力なし".to_string(),
+        1 => "出力1行".to_string(),
+        n => format!("出力{n}行"),
     }
 }
 
@@ -3539,16 +3971,16 @@ fn non_empty_line_count(text: &str) -> usize {
 fn compact_command_result(kind: &str, output: &str) -> Option<String> {
     let lower = output.to_ascii_lowercase();
     if output.lines().any(|line| line.contains("Finished ")) || lower.trim() == "ok" {
-        return Some(format!("{kind}: ok"));
+        return Some(format!("{kind}: 成功"));
     }
     if output
         .lines()
         .any(|line| line.contains("test result:") && line.to_ascii_lowercase().contains(" ok."))
     {
-        return Some(format!("{kind}: ok"));
+        return Some(format!("{kind}: 成功"));
     }
     if lower.contains("fail") || lower.contains("error") {
-        return Some(format!("{kind}: failed"));
+        return Some(format!("{kind}: 失敗"));
     }
     None
 }
@@ -3565,21 +3997,21 @@ fn code_edit_display_text(text: &str) -> Option<String> {
     }
     let changes = code_edit_changes(text);
     if changes.is_empty() {
-        let first_line = text.lines().next().unwrap_or("code edit").trim();
+        let first_line = text.lines().next().unwrap_or("コード編集").trim();
         let title = first_line.strip_prefix("EDIT ").unwrap_or(first_line);
         let title = if title.is_empty() || title.contains("*** Begin Patch") {
-            "code edit"
+            "コード編集"
         } else {
             title
         };
-        return Some(format!("{title}\n  code edit"));
+        return Some(format!("{title}\n  コード編集"));
     }
 
     let first = changes.first()?;
     let title = if changes.len() == 1 {
         format!("{}: {}", first.action, first.path)
     } else {
-        format!("{} files changed", changes.len())
+        format!("{}件のファイル変更", changes.len())
     };
     let mut lines = vec![title];
     if changes.len() > 1 {
@@ -3588,7 +4020,7 @@ fn code_edit_display_text(text: &str) -> Option<String> {
         }
         let omitted = changes.len().saturating_sub(3);
         if omitted > 0 {
-            lines.push(format!("  ... +{omitted} more"));
+            lines.push(format!("  ... 他{omitted}件"));
         }
     }
     lines.extend(code_edit_diff_preview(text, CODEX_EDIT_DIFF_PREVIEW_LINES));
@@ -3610,10 +4042,10 @@ fn code_edit_changes(text: &str) -> Vec<CodeEditChange> {
     for line in text.lines() {
         let trimmed = line.trim();
         let change = [
-            ("*** Update File: ", "update"),
-            ("*** Add File: ", "add"),
-            ("*** Delete File: ", "delete"),
-            ("*** Move to: ", "move"),
+            ("*** Update File: ", "更新"),
+            ("*** Add File: ", "追加"),
+            ("*** Delete File: ", "削除"),
+            ("*** Move to: ", "移動"),
         ]
         .into_iter()
         .find_map(|(prefix, action)| {
@@ -3656,7 +4088,7 @@ fn code_edit_diff_preview(text: &str, max_lines: usize) -> Vec<String> {
     }
 
     if omitted > 0 {
-        out.push(format!("... +{omitted} diff lines"));
+        out.push(format!("... 差分行を{omitted}行省略"));
     }
     out
 }
@@ -3665,7 +4097,7 @@ fn special_tool_summary(head: &str, output: &str) -> Option<String> {
     let lower = head.to_ascii_lowercase();
 
     if lower.contains("cargo test") {
-        return compact_command_result("tests", output);
+        return compact_command_result("テスト", output);
     }
 
     if lower.contains("cargo clippy") {
@@ -3673,14 +4105,14 @@ fn special_tool_summary(head: &str, output: &str) -> Option<String> {
     }
 
     if lower.contains("cargo build") {
-        return compact_command_result("build", output);
+        return compact_command_result("ビルド", output);
     }
 
     if lower.contains("git diff") || lower.contains("git status") {
         if output.trim().is_empty() {
-            return Some("git: no output".to_string());
+            return Some("差分: 出力なし".to_string());
         }
-        return Some(format!("git: {} lines", non_empty_line_count(output)));
+        return Some(format!("差分: {}行", non_empty_line_count(output)));
     }
 
     if looks_like_addness_command(head)
@@ -3689,7 +4121,75 @@ fn special_tool_summary(head: &str, output: &str) -> Option<String> {
         return Some(format!("addness: {summary}"));
     }
 
+    if looks_like_codex_management_command(head) {
+        return Some(codex_management_output_summary(head, output));
+    }
+
     None
+}
+
+fn looks_like_codex_management_command(head: &str) -> bool {
+    let lower = head.to_ascii_lowercase();
+    [
+        "codex mcp",
+        "codex plugin",
+        "codex cloud",
+        "codex login",
+        "codex logout",
+        "codex update",
+        "codex app",
+        "codex app-server",
+        "codex remote-control",
+        "codex debug",
+        "codex completion",
+        "codex mcp-server",
+        "codex exec-server",
+        "codex features",
+        "codex doctor",
+    ]
+    .iter()
+    .any(|prefix| lower.contains(prefix))
+}
+
+fn codex_management_output_summary(head: &str, output: &str) -> String {
+    let lower = head.to_ascii_lowercase();
+    let noun = if lower.contains(" mcp") {
+        "mcp"
+    } else if lower.contains(" plugin") {
+        "plugins"
+    } else if lower.contains(" cloud") {
+        "cloud"
+    } else if lower.contains(" login") || lower.contains(" logout") {
+        "auth"
+    } else if lower.contains(" app-server")
+        || lower.contains(" remote-control")
+        || lower.contains(" mcp-server")
+        || lower.contains(" exec-server")
+    {
+        "server"
+    } else if lower.contains(" debug") {
+        "debug"
+    } else if lower.contains(" completion") {
+        "completion"
+    } else if lower.contains(" features") {
+        "features"
+    } else if lower.contains(" doctor") {
+        "doctor"
+    } else {
+        "codex"
+    };
+
+    if let Some(summary) = json_output_summary(output) {
+        return format!("{noun}: {summary}");
+    }
+    let count = non_empty_line_count(output);
+    if count == 0 {
+        format!("{noun}: 出力なし")
+    } else if count == 1 {
+        format!("{noun}: {}", output.trim())
+    } else {
+        format!("{noun}: {count}行")
+    }
 }
 
 fn looks_like_addness_command(head: &str) -> bool {
@@ -3706,27 +4206,26 @@ fn looks_like_addness_command(head: &str) -> bool {
 fn json_output_summary(output: &str) -> Option<String> {
     let value = serde_json::from_str::<Value>(output.trim()).ok()?;
     if value.get("goal").is_some() || value.get("title").is_some() {
-        return Some("goal".to_string());
+        return Some("ゴール".to_string());
     }
     match value {
-        Value::Array(items) => Some(format!("json array {} items", items.len())),
-        Value::Object(map) => Some(format!("json object {} keys", map.len())),
-        _ => Some("json value".to_string()),
+        Value::Array(items) => Some(format!("一覧{}件", items.len())),
+        Value::Object(map) => Some(format!("{}項目", map.len())),
+        _ => Some("値".to_string()),
     }
 }
 
 fn codex_runtime_status(pane: &CodexPane, max_width: usize) -> String {
-    let state = if pane.finished {
-        "DONE"
-    } else if pane.is_turn_running() {
-        "RUNNING"
-    } else {
-        "READY"
-    };
-    let history = pane.history_label();
+    let state = pane.run_state().label();
+    let view = format!("表示:{} Ctrl-Tで切替", pane.log_filter_label());
     let fixed_width = UnicodeWidthStr::width(state)
-        .saturating_add(UnicodeWidthStr::width(history.as_str()))
+        .saturating_add(UnicodeWidthStr::width(view.as_str()))
         .saturating_add(8);
+    let detail = codex_current_activity_label(pane, max_width.saturating_sub(fixed_width));
+    ellipsize_width(&format!("  {state}  {detail}  |  {view}"), max_width)
+}
+
+fn codex_current_activity_label(pane: &CodexPane, max_width: usize) -> String {
     let detail = if pane.is_turn_running() {
         let queued = pane.queued_prompt_count();
         let input_hint = if queued > 0 {
@@ -3734,16 +4233,21 @@ fn codex_runtime_status(pane: &CodexPane, max_width: usize) -> String {
         } else {
             " / Enterで次ターン予約".to_string()
         };
-        if let Some(command) = pane.current_command() {
-            ellipsize_width(
-                &format!("● 実行中: {command}{input_hint}"),
-                max_width.saturating_sub(fixed_width),
+        if let Some(decision) = pane.decision_banner() {
+            format!("確認待ち: {}", decision.message)
+        } else if let Some(command) = pane.current_command() {
+            let elapsed = pane
+                .current_command_elapsed_secs()
+                .map(|secs| format!(" {secs}s"))
+                .unwrap_or_default();
+            format!(
+                "{}{elapsed}{input_hint}",
+                codex_command_activity_summary(command)
             )
+        } else if let Some(action) = pane.action.as_deref() {
+            format!("作業中: {action}{input_hint}")
         } else {
-            ellipsize_width(
-                &format!("● Codex応答中{input_hint}"),
-                max_width.saturating_sub(fixed_width),
-            )
+            format!("Codexが考えています{input_hint}")
         }
     } else {
         codex_work_label(
@@ -3751,17 +4255,164 @@ fn codex_runtime_status(pane: &CodexPane, max_width: usize) -> String {
             pane.assessing,
             pane.action.as_deref(),
             pane.last_prompt(),
-            max_width.saturating_sub(fixed_width),
+            max_width,
         )
     };
-    ellipsize_width(&format!("  {state}  {detail}  |  {history}"), max_width)
+    ellipsize_width(&detail, max_width)
 }
 
-fn short_thread_id(id: &str) -> String {
-    if id.chars().count() <= 8 {
-        return id.to_string();
+fn codex_command_activity_summary(command: &str) -> String {
+    let kind = codex_command_activity_kind(command);
+    let subject = codex_command_subject(command);
+    if subject.is_empty() {
+        kind.to_string()
+    } else {
+        format!("{kind} ({subject})")
     }
-    id.chars().take(8).collect()
+}
+
+fn codex_command_activity_kind(command: &str) -> &'static str {
+    let lower = command.to_ascii_lowercase();
+    if looks_like_code_edit_display_text(command) {
+        return "ファイルを編集中";
+    }
+    if looks_like_addness_command(command) {
+        return if lower.contains(" update ")
+            || lower.contains(" create ")
+            || lower.contains(" deliverable ")
+            || lower.contains(" link ")
+            || lower.contains(" notification ")
+        {
+            "Addnessへ記録中"
+        } else {
+            "Addnessを確認中"
+        };
+    }
+    if lower.contains("cargo test")
+        || lower.contains("go test")
+        || lower.contains("npm test")
+        || lower.contains("pnpm test")
+        || lower.contains("yarn test")
+        || lower.contains("pytest")
+    {
+        return "テストを実行中";
+    }
+    if lower.contains("cargo clippy")
+        || lower.contains(" clippy")
+        || lower.contains("eslint")
+        || lower.contains(" lint")
+    {
+        return "lintを確認中";
+    }
+    if lower.contains("cargo fmt")
+        || lower.contains("rustfmt")
+        || lower.contains("prettier")
+        || lower.contains(" format")
+    {
+        return "フォーマットを確認中";
+    }
+    if lower.contains("cargo build")
+        || lower.contains("go build")
+        || lower.contains("npm run build")
+        || lower.contains("pnpm build")
+        || lower.contains("yarn build")
+        || lower.contains("swift build")
+    {
+        return "ビルド中";
+    }
+    if lower.contains("git diff")
+        || lower.contains("git status")
+        || lower.contains("git log")
+        || lower.contains("git show")
+    {
+        return "差分を確認中";
+    }
+    if lower.contains("git add")
+        || lower.contains("git commit")
+        || lower.contains("git push")
+        || lower.contains("git fetch")
+        || lower.contains("git pull")
+        || lower.contains("git merge")
+        || lower.contains("git rebase")
+        || lower.contains("git cherry-pick")
+        || lower.contains("git tag")
+    {
+        return "Git操作中";
+    }
+    if lower.starts_with("rg ")
+        || lower.contains(" rg ")
+        || lower.starts_with("grep ")
+        || lower.contains(" grep ")
+        || lower.starts_with("find ")
+        || lower.contains(" find ")
+        || lower.starts_with("ls ")
+        || lower.contains(" ls ")
+        || lower.starts_with("sed ")
+        || lower.contains(" sed ")
+        || lower.starts_with("cat ")
+        || lower.contains(" cat ")
+        || lower.starts_with("head ")
+        || lower.contains(" head ")
+        || lower.starts_with("tail ")
+        || lower.contains(" tail ")
+        || lower.starts_with("nl ")
+        || lower.contains(" nl ")
+        || lower.starts_with("wc ")
+        || lower.contains(" wc ")
+    {
+        return "ファイルを確認中";
+    }
+    if lower.contains("curl ") || lower.contains(" gh ") || lower.starts_with("gh ") {
+        return "外部情報を確認中";
+    }
+    "コマンド実行中"
+}
+
+fn codex_command_subject(command: &str) -> String {
+    if looks_like_code_edit_display_text(command)
+        && let Some(path) = code_edit_changes(command)
+            .first()
+            .map(|change| change.path.clone())
+    {
+        return ellipsize_width(&path, 36);
+    }
+    if looks_like_addness_command(command) {
+        return "Addness".to_string();
+    }
+    concise_command_name(command)
+}
+
+fn concise_command_name(command: &str) -> String {
+    let (_, command) = split_tool_state_prefix(command.trim());
+    let first_line = command.lines().next().unwrap_or("").trim();
+    let first_line = if let Some(rest) = first_line.strip_prefix('[') {
+        rest.split_once(']')
+            .map(|(_, tail)| tail.trim())
+            .unwrap_or(first_line)
+    } else {
+        first_line
+    };
+    if first_line.is_empty() {
+        return String::new();
+    }
+
+    let parts = first_line.split_whitespace().collect::<Vec<_>>();
+    let keep = match parts.as_slice() {
+        ["cargo", sub, ..] => vec!["cargo", *sub],
+        ["codex", sub, ..] => vec!["codex", *sub],
+        ["git", sub, ..] => vec!["git", *sub],
+        ["go", sub, ..] => vec!["go", *sub],
+        ["npm", "run", sub, ..] => vec!["npm", "run", *sub],
+        ["pnpm", sub, ..] => vec!["pnpm", *sub],
+        ["yarn", sub, ..] => vec!["yarn", *sub],
+        [cmd, ..] => vec![*cmd],
+        [] => Vec::new(),
+    };
+    if keep.is_empty() {
+        String::new()
+    } else {
+        ellipsize_width(&keep.join(" "), 36)
+    }
 }
 
 fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
@@ -3785,68 +4436,47 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
             Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD)
         }
     };
-    let work = if let Some(decision) = pane.decision_banner() {
-        ellipsize_width(&format!("確認: {}", decision.message), value_width)
-    } else {
-        codex_work_label(
-            pane.finished,
-            pane.assessing,
-            pane.action.as_deref(),
-            pane.last_prompt(),
-            value_width,
-        )
-    };
-    let command = pane
-        .current_command()
-        .map(|command| {
-            let elapsed = pane
-                .current_command_elapsed_secs()
-                .map(|secs| format!(" {secs}s"))
-                .unwrap_or_default();
-            ellipsize_width(&format!("{command}{elapsed}"), value_width)
-        })
-        .unwrap_or_else(|| {
-            if pane.is_turn_running() {
-                "Codex応答中".to_string()
-            } else {
-                "なし".to_string()
-            }
-        });
-    let command_style = if pane.current_command().is_some() || pane.is_turn_running() {
+    let focus = codex_current_activity_label(pane, prompt_width);
+    let focus_style = if pane.current_command().is_some()
+        || pane.is_turn_running()
+        || pane.decision_banner().is_some()
+    {
         Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(COLOR_MUTED)
+        Style::default().fg(COLOR_TEXT_STRONG)
     };
-    let memory = codex_memory_label(
+    let memory_mode = ellipsize_width(&pane.memory_mode_label(), value_width);
+    let memory_mode_style = if pane.memory_mode_is_addness_safe() {
+        Style::default().fg(COLOR_ADDNESS)
+    } else {
+        Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD)
+    };
+    let sync = codex_memory_label(
         pane.last_addness_read_at,
         pane.last_addness_write_at,
         pane.last_addness_read_label.as_deref(),
         pane.last_addness_write_label.as_deref(),
         value_width,
     );
-    let memory_style =
-        if pane.last_addness_write_at.is_some() || pane.last_addness_read_at.is_some() {
-            Style::default().fg(COLOR_ADDNESS)
-        } else {
-            Style::default().fg(COLOR_MUTED)
-        };
-    let history = ellipsize_width(
+    let sync_style = if pane.last_addness_write_at.is_some() || pane.last_addness_read_at.is_some()
+    {
+        Style::default().fg(COLOR_ADDNESS)
+    } else {
+        Style::default().fg(COLOR_MUTED)
+    };
+    let view = ellipsize_width(
         &format!(
-            "{} / 折畳{}",
+            "{} / {} / 格納{}",
+            pane.log_filter_label(),
             pane.history_label(),
             pane.collapsed_turn_count()
         ),
         value_width,
     );
-    let goal_mode = pane
-        .goal_mode_label()
-        .map(|label| ellipsize_width(&label, value_width))
-        .unwrap_or_else(|| "off".to_string());
-    let goal_mode_style = if pane.goal_mode_label().is_some() {
-        Style::default().fg(COLOR_ADDNESS)
-    } else {
-        Style::default().fg(COLOR_MUTED)
-    };
+    let settings = ellipsize_width(
+        &format!("{} / {}", pane.settings_label(), pane.diff_label()),
+        value_width,
+    );
     let assistant = pane
         .last_assistant_text()
         .map(|p| prompt_preview(p, prompt_width))
@@ -3869,6 +4499,10 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
 
     let mut lines = vec![
         Line::from(vec![
+            Span::styled("今 ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(focus, focus_style),
+        ]),
+        Line::from(vec![
             Span::styled("状態 ", Style::default().fg(COLOR_MUTED)),
             Span::styled(run_state.label(), state_style),
             Span::styled(
@@ -3877,38 +4511,74 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
             ),
         ]),
         Line::from(vec![
-            Span::styled("作業 ", Style::default().fg(COLOR_MUTED)),
-            Span::styled(work, Style::default().fg(COLOR_TEXT)),
-        ]),
-        Line::from(vec![
-            Span::styled("コマンド ", Style::default().fg(COLOR_MUTED)),
-            Span::styled(command, command_style),
+            Span::styled("表示 ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(view, Style::default().fg(COLOR_MUTED)),
         ]),
         Line::from(vec![
             Span::styled("記憶 ", Style::default().fg(COLOR_MUTED)),
-            Span::styled(memory, memory_style),
+            Span::styled(memory_mode, memory_mode_style),
         ]),
         Line::from(vec![
-            Span::styled("履歴 ", Style::default().fg(COLOR_MUTED)),
-            Span::styled(history, Style::default().fg(COLOR_MUTED)),
+            Span::styled("同期 ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(sync, sync_style),
         ]),
         Line::from(vec![
-            Span::styled("Goal ", Style::default().fg(COLOR_MUTED)),
-            Span::styled(goal_mode, goal_mode_style),
-        ]),
-        Line::from(vec![
-            Span::styled("Codex ", Style::default().fg(COLOR_MUTED)),
-            Span::styled(assistant, assistant_style),
+            Span::styled("設定 ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(settings, Style::default().fg(COLOR_TEXT)),
         ]),
     ];
+    if let Some(active) = pane.active_work_package_label() {
+        lines.insert(
+            1,
+            Line::from(vec![
+                Span::styled("作業単位 ", Style::default().fg(COLOR_MUTED)),
+                Span::styled(
+                    active,
+                    Style::default()
+                        .fg(COLOR_ADDNESS)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+        );
+    }
+    if let Some(queue) = pane.queued_work_package_label() {
+        lines.insert(
+            if pane.active_work_package_label().is_some() {
+                2
+            } else {
+                1
+            },
+            Line::from(vec![
+                Span::styled("待機 ", Style::default().fg(COLOR_MUTED)),
+                Span::styled(queue, Style::default().fg(COLOR_WARN)),
+            ]),
+        );
+    }
+    if let Some(label) = pane.goal_mode_label() {
+        lines.push(Line::from(vec![
+            Span::styled("Goal ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(
+                ellipsize_width(&label, value_width),
+                Style::default().fg(COLOR_ADDNESS),
+            ),
+        ]));
+    }
+    if area.height >= 11 {
+        lines.push(Line::from(vec![
+            Span::styled("Codex ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(assistant, assistant_style),
+        ]));
+    }
     lines.push(Line::from(""));
     lines.extend(codex_dashboard_shortcut_lines(prompt_width));
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "最後の送信",
-        Style::default().fg(COLOR_MUTED),
-    )));
-    lines.push(Line::from(Span::styled(prompt, prompt_style)));
+    if area.height >= 13 {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "最後の送信",
+            Style::default().fg(COLOR_MUTED),
+        )));
+        lines.push(Line::from(Span::styled(prompt, prompt_style)));
+    }
 
     let panel = Paragraph::new(lines)
         .block(
@@ -3936,17 +4606,24 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
 fn codex_dashboard_shortcut_lines(max_width: usize) -> Vec<Line<'static>> {
     vec![
         Line::from(Span::styled(
-            "操作一覧",
+            "次の操作",
             Style::default()
                 .fg(COLOR_TEXT_STRONG)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
-            ellipsize_width("  /goal:目標  Ctrl+?:全体", max_width),
+            ellipsize_width("  Enter:送信  F7:turn一覧  Ctrl-T:表示切替", max_width),
             Style::default().fg(COLOR_TEXT),
         )),
         Line::from(Span::styled(
-            ellipsize_width("  Ctrl-O:turn  ↑↓/PgUp:履歴", max_width),
+            ellipsize_width("  F6:差分  /organize:分解  /work next/all:着手", max_width),
+            Style::default().fg(COLOR_TEXT),
+        )),
+        Line::from(Span::styled(
+            ellipsize_width(
+                "  /remember /handoff:保存  Ctrl+?:全体ヘルプ  /settings",
+                max_width,
+            ),
             Style::default().fg(COLOR_MUTED),
         )),
     ]
@@ -4043,21 +4720,23 @@ fn ellipsize_width(text: &str, max_width: usize) -> String {
 mod tests {
     use super::{
         ActivePane, App, COLOR_DANGER, COLOR_EVENT, COLOR_SUCCESS, COLOR_WARN,
-        codex_activity_lines, codex_dashboard_shortcut_lines, codex_decision_choice_line,
-        codex_decision_input_lines, codex_decision_title_hint, codex_header_line,
-        codex_input_prompt_render, codex_log_entry_lines, codex_log_lines, codex_runtime_status,
-        codex_visible_log_lines, codex_work_label, draw_status_bar, ellipsize_width,
-        prompt_preview, summarize_tool_display_text,
+        codex_activity_lines, codex_child_goal_lines, codex_dashboard_shortcut_lines,
+        codex_decision_choice_line, codex_decision_input_lines, codex_decision_title_hint,
+        codex_diff_lines, codex_header_line, codex_header_lines, codex_input_prompt_render,
+        codex_log_entry_lines, codex_log_lines, codex_runtime_status, codex_visible_log_lines,
+        codex_work_label, draw_status_bar, ellipsize_width, prompt_preview,
+        summarize_tool_display_text,
     };
     use crate::api::ApiClient;
     use crate::tui::codex_pane::{
-        CODEX_LOG_PREFIX_WIDTH, CodexDecisionBanner, CodexDecisionKind, CodexLogKind, CodexLogLine,
-        CodexPane,
+        CODEX_LOG_PREFIX_WIDTH, ChildGoal, CodexDecisionBanner, CodexDecisionKind, CodexLogKind,
+        CodexLogLine, CodexPane,
     };
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::style::Modifier;
     use ratatui::text::Line;
     use ratatui::{Terminal, backend::TestBackend};
+    use std::time::Instant;
     use unicode_width::UnicodeWidthStr;
 
     fn line_text(line: &Line<'_>) -> String {
@@ -4116,7 +4795,7 @@ mod tests {
         let lines = codex_log_entry_lines(&entry, CODEX_LOG_PREFIX_WIDTH + 3);
 
         assert_eq!(lines.len(), 2);
-        assert_eq!(line_text(&lines[0].line), "CODEX| abc");
+        assert_eq!(line_text(&lines[0].line), "返答 | abc");
         assert_eq!(line_text(&lines[1].line), "     | def");
     }
 
@@ -4129,8 +4808,8 @@ mod tests {
 
         let lines = codex_log_entry_lines(&entry, 80);
 
-        assert_eq!(line_text(&lines[0].line), "FAIL | • Ran cargo test");
-        assert_eq!(line_text(&lines[1].line), "     |   └ tests: failed");
+        assert_eq!(line_text(&lines[0].line), "失敗 | • 実行: cargo test");
+        assert_eq!(line_text(&lines[1].line), "     |   └ テスト: 失敗");
         assert_eq!(lines[0].line.spans[1].content.as_ref(), "•");
         assert_eq!(lines[0].line.spans[1].style.fg, Some(COLOR_DANGER));
     }
@@ -4171,10 +4850,13 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(rendered.contains("OK   | • Ran curl https://example.test"));
-        assert!(rendered.contains("└ output: 1 line"));
+        assert!(rendered.contains("完了 | • 実行: curl"));
+        assert!(rendered.contains("└ 出力1行"));
         assert!(!rendered.contains("└ 0123456789"));
         assert!(!rendered.contains(&"0123456789 ".repeat(25)));
+        assert!(!rendered.contains("RUNNING"));
+        assert!(!rendered.contains("OK"));
+        assert!(!rendered.contains("FAIL"));
     }
 
     #[test]
@@ -4186,7 +4868,7 @@ mod tests {
 
         let lines = codex_log_entry_lines(&entry, 80);
 
-        assert_eq!(line_text(&lines[0].line), "EDIT | update: src/tui/ui.rs");
+        assert_eq!(line_text(&lines[0].line), "編集 | 更新: src/tui/ui.rs");
         assert_eq!(line_text(&lines[1].line), "     | @@");
         assert_eq!(line_text(&lines[2].line), "     | -old line");
         assert_eq!(line_text(&lines[3].line), "     | +new line");
@@ -4204,7 +4886,7 @@ mod tests {
     fn summarize_tool_display_text_highlights_cargo_test_result() {
         let text = summarize_tool_display_text("cargo test\ntest result: ok. 86 passed; 0 failed;");
 
-        assert_eq!(text, "• Ran cargo test\n  └ tests: ok");
+        assert_eq!(text, "• 実行: cargo test\n  └ テスト: 成功");
     }
 
     #[test]
@@ -4213,7 +4895,7 @@ mod tests {
             "cargo fmt -- --check\nDiff in /repo/src/tui/ui.rs:3163:\n-old\n+new",
         );
 
-        assert_eq!(text, "• Ran cargo fmt -- --check\n  └ output: 3 lines");
+        assert_eq!(text, "• 実行: cargo fmt\n  └ 出力3行");
     }
 
     #[test]
@@ -4223,10 +4905,24 @@ mod tests {
 {"id":"goal-1","title":"AddnessTUI改善"}"#,
         );
 
-        assert_eq!(
-            text,
-            "• Ran addness goal get goal-1 --json\n  └ addness: goal"
+        assert_eq!(text, "• 実行: addness\n  └ addness: ゴール");
+    }
+
+    #[test]
+    fn summarize_tool_display_text_highlights_codex_management_output() {
+        let text = summarize_tool_display_text("OK codex mcp list\nserver-a\nserver-b");
+
+        assert_eq!(text, "• 実行: codex mcp\n  └ mcp: 2行");
+    }
+
+    #[test]
+    fn summarize_tool_display_text_highlights_codex_management_json() {
+        let text = summarize_tool_display_text(
+            r#"OK codex cloud list
+[{"id":"task-1"},{"id":"task-2"}]"#,
         );
+
+        assert_eq!(text, "• 実行: codex cloud\n  └ cloud: 一覧2件");
     }
 
     #[test]
@@ -4238,9 +4934,43 @@ mod tests {
 
         let text = line_text(&codex_header_line(&pane, 200));
 
-        assert!(text.contains("filter:Talk"));
-        assert!(text.contains("search:c*"));
-        assert!(text.contains("履歴"));
+        assert!(text.contains("状態: 完了"));
+        assert!(text.contains("表示:実行"));
+        assert!(text.contains("検索:c*"));
+        assert!(text.contains("Ctrl-T:表示切替"));
+        assert!(!text.contains("filter:"));
+    }
+
+    #[test]
+    fn codex_header_lines_make_current_activity_primary() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.finished = false;
+        pane.action = Some("ファイルを確認中".to_string());
+
+        let lines = codex_header_lines(&pane, 120, 2)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("今"));
+        assert!(lines[0].contains("ファイルを確認中"));
+        assert!(lines[1].contains("状態: 入力待ち"));
+        assert!(lines[1].contains("表示:会話"));
+    }
+
+    #[test]
+    fn codex_diff_lines_color_additions_and_deletions() {
+        let lines = codex_diff_lines("@@\n-old\n+new", 80);
+        let rendered = lines
+            .iter()
+            .map(|line| line_text(&line.line))
+            .collect::<Vec<_>>();
+
+        assert!(rendered.contains(&"差分 | @@".to_string()));
+        assert!(!rendered.iter().any(|line| line.starts_with("DIFF | ")));
+        assert_eq!(lines[1].line.spans[1].style.fg, Some(COLOR_DANGER));
+        assert_eq!(lines[2].line.spans[1].style.fg, Some(COLOR_SUCCESS));
     }
 
     #[test]
@@ -4288,10 +5018,10 @@ mod tests {
             .map(|line| line_text(&line))
             .collect::<Vec<_>>();
 
-        assert_eq!(lines[0], "確認待ち 続行しますか?");
+        assert_eq!(lines[0], "確認待ち: Yes/No 続行しますか?");
         assert!(lines[1].contains("[Y] Yes"));
         assert!(lines[1].contains("[N] No"));
-        assert!(!lines[1].contains("常に許可"));
+        assert!(!lines[1].contains("これからずっと許可"));
     }
 
     #[test]
@@ -4315,7 +5045,7 @@ mod tests {
         assert!(rendered.contains("実行予定: cargo test --workspace"));
         assert!(rendered.contains("[A/Y] 承認"));
         assert!(rendered.contains("[D/N] 拒否"));
-        assert!(rendered.contains("[L] 常に許可"));
+        assert!(rendered.contains("[L] これからずっと許可"));
     }
 
     #[test]
@@ -4337,8 +5067,8 @@ mod tests {
             deny_label: "No",
         };
 
-        assert!(codex_decision_title_hint(&approval).contains("l:常に許可"));
-        assert!(!codex_decision_title_hint(&yes_no).contains("常に許可"));
+        assert!(codex_decision_title_hint(&approval).contains("l:ずっと許可"));
+        assert!(!codex_decision_title_hint(&yes_no).contains("ずっと許可"));
         assert!(codex_decision_title_hint(&yes_no).contains("y/n"));
         assert!(codex_decision_title_hint(&approval).contains("下の確認欄"));
         assert!(!codex_decision_title_hint(&approval).contains("上部で内容確認"));
@@ -4360,7 +5090,7 @@ mod tests {
         assert_eq!(line_text(&lines[0]), "確認待ち: 承認 Run cargo test?");
         assert!(line_text(&lines[1]).contains("[A/Y] 承認"));
         assert!(line_text(&lines[1]).contains("[D/N] 拒否"));
-        assert!(line_text(&lines[1]).contains("[L] 常に許可"));
+        assert!(line_text(&lines[1]).contains("[L] これからずっと許可"));
     }
 
     #[test]
@@ -4399,7 +5129,7 @@ mod tests {
         assert!(text.contains("確認待ち: 権限"));
         assert!(text.contains("[A/Y] 許可"));
         assert!(text.contains("[D/N] 拒否"));
-        assert!(text.contains("[L] 常に許可"));
+        assert!(text.contains("[L] これからずっと許可"));
         assert_eq!(lines[0].spans[0].style.fg, Some(COLOR_DANGER));
     }
 
@@ -4418,7 +5148,7 @@ mod tests {
 
         assert!(text.contains("[A/Y] 許可"));
         assert!(text.contains("[D/N] 拒否"));
-        assert!(!text.contains("常に許可"));
+        assert!(!text.contains("これからずっと許可"));
     }
 
     #[test]
@@ -4479,7 +5209,19 @@ mod tests {
     }
 
     #[test]
-    fn codex_log_lines_adds_turn_and_tool_separators() {
+    fn system_log_lines_use_unlabeled_muted_prefix() {
+        let entry = CodexLogLine {
+            kind: CodexLogKind::System,
+            text: "Codex セッションを開始しました".to_string(),
+        };
+        let lines = codex_log_entry_lines(&entry, 80);
+
+        assert!(line_text(&lines[0].line).starts_with("     | "));
+        assert!(!line_text(&lines[0].line).starts_with("INFO | "));
+    }
+
+    #[test]
+    fn codex_log_lines_adds_turn_separator_without_tool_separator() {
         let turn = CodexLogLine {
             kind: CodexLogKind::Turn,
             text: "Turn 1".to_string(),
@@ -4494,7 +5236,8 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(lines.iter().any(|line| line.starts_with("-----+ ")));
-        assert!(lines.iter().any(|line| line.starts_with(".....+ ")));
+        assert!(!lines.iter().any(|line| line.starts_with(".....+ ")));
+        assert!(lines.iter().any(|line| line.starts_with("作業 | ")));
     }
 
     #[test]
@@ -4530,6 +5273,68 @@ mod tests {
     }
 
     #[test]
+    fn codex_child_goal_lines_show_work_package_dod() {
+        let child = ChildGoal {
+            id: "goal-1".to_string(),
+            title: "承認UIを整理".to_string(),
+            description: Some("ユーザーが何を承認するか一目で分かる状態".to_string()),
+            icon: "[~]",
+            status_label: "進行中".to_string(),
+            is_completed: false,
+            new_until: None,
+        };
+
+        let lines = codex_child_goal_lines(&child, Instant::now(), 1, false)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], " 1. [~] 承認UIを整理  進行中");
+        assert!(lines[1].contains("DoD"));
+        assert!(lines[1].contains("ユーザーが何を承認するか"));
+    }
+
+    #[test]
+    fn codex_child_goal_lines_skip_empty_dod() {
+        let child = ChildGoal {
+            id: "goal-1".to_string(),
+            title: "小さい修正".to_string(),
+            description: Some("  ".to_string()),
+            icon: "[ ]",
+            status_label: "未着手".to_string(),
+            is_completed: false,
+            new_until: None,
+        };
+
+        assert_eq!(
+            codex_child_goal_lines(&child, Instant::now(), 1, false).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn codex_child_goal_lines_mark_active_work_package() {
+        let child = ChildGoal {
+            id: "goal-1".to_string(),
+            title: "子ゴール着手導線".to_string(),
+            description: Some("/work nextで着手できる状態".to_string()),
+            icon: "[ ]",
+            status_label: "未着手".to_string(),
+            is_completed: false,
+            new_until: None,
+        };
+
+        let lines = codex_child_goal_lines(&child, Instant::now(), 2, true)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+
+        assert_eq!(lines[0], "> 2. [ ] 子ゴール着手導線  未着手");
+        assert!(lines[1].contains("/work next"));
+    }
+
+    #[test]
     fn codex_runtime_status_shows_current_action() {
         let mut pane = CodexPane::test_with_output(8, 20, 0, "");
         pane.finished = false;
@@ -4537,8 +5342,25 @@ mod tests {
 
         let status = codex_runtime_status(&pane, 80);
 
-        assert!(status.contains("READY"));
+        assert!(status.contains("入力待ち"));
+        assert!(status.contains("表示:会話"));
         assert!(status.contains("ゴール文脈を読込中"));
+    }
+
+    #[test]
+    fn codex_command_activity_summary_groups_commands_for_main_view() {
+        let summary = super::codex_command_activity_summary(
+            "cargo test --workspace --all-features -- --nocapture very_long_filter",
+        );
+
+        assert_eq!(summary, "テストを実行中 (cargo test)");
+        assert!(!summary.contains("--workspace"));
+        assert_eq!(
+            super::codex_command_activity_summary(
+                "*** Begin Patch\n*** Update File: src/tui/ui.rs\n@@\n*** End Patch",
+            ),
+            "ファイルを編集中 (src/tui/ui.rs)"
+        );
     }
 
     #[test]
@@ -4612,9 +5434,17 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(text.contains("操作一覧"));
+        assert!(text.contains("次の操作"));
         assert!(text.contains("Ctrl+?"));
-        assert!(text.contains("/goal"));
-        assert!(text.contains("Ctrl-O"));
+        assert!(text.contains("F7:turn一覧"));
+        assert!(text.contains("/organize"));
+        assert!(text.contains("/work next"));
+        assert!(text.contains("/remember"));
+        assert!(text.contains("/handoff"));
+        assert!(text.contains("/settings"));
+        assert!(!text.contains("初回は子ゴール"));
+        assert!(!text.contains("/mcp"));
+        assert!(!text.contains("/cloud"));
+        assert!(!text.contains("Ctrl-O"));
     }
 }

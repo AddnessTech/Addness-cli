@@ -20,6 +20,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use super::agent::codex::CodexBackend;
+use super::agent::{AgentBackend, AgentEvent, PromptDelivery, first_text_field};
+
 pub const CODEX_LOG_PREFIX_WIDTH: usize = 7;
 const CODEX_SESSION_HISTORY_DIR: &str = "codex-sessions";
 const CODEX_SESSION_HISTORY_MAX_LOG_LINES: usize = 5_000;
@@ -45,125 +48,6 @@ pub fn codex_path() -> Option<PathBuf> {
         }
     }
     None
-}
-
-/// プロンプトを子プロセスへ渡す方式。backend ごとに異なる。
-/// codex は stdin へ書き込み、引数末尾に sentinel `-` を置く（`Stdin`）。
-/// 将来の backend（例: `claude -p "<prompt>"`）は引数として渡す（`Arg`）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PromptDelivery {
-    /// stdin へ書き込む（codex exec 方式）。
-    Stdin,
-    /// コマンドライン引数として渡す。まだ実装 backend が無いため未構築。
-    #[allow(dead_code)]
-    Arg,
-}
-
-/// backend 非依存に正規化したターンライフサイクルイベント。
-///
-/// codex の `thread.started` / `turn.*` / `error` といった型名の違いを
-/// この共通形へマップし、`CodexPane` 側は型名文字列ではなくこの enum で
-/// 分岐する。ツール実行やアシスタント本文など表層に近いイベントは、当面
-/// `handle_generic_json_event` 側で扱うため `Other` に集約する。
-enum AgentEvent {
-    /// セッション開始（codex: `thread.started`）。値はセッション/スレッド ID。
-    SessionStarted(Option<String>),
-    /// ターン開始（codex: `turn.started`）。
-    TurnStarted,
-    /// ターン完了（codex: `turn.completed` / `turn.finished`）。
-    TurnCompleted,
-    /// ターン失敗（codex: `turn.failed`）。値は表示用メッセージ。
-    TurnFailed(String),
-    /// エラー通知（codex: `error`）。値は表示用メッセージ。
-    Error(String),
-    /// 上記以外。ツール実行・本文など、backend 共通の表層処理へ委ねる。
-    Other,
-}
-
-/// TUI から起動できるコーディングエージェントの継ぎ目。
-///
-/// 同一 TUI から複数のエージェント（現状 codex、将来 Claude Code 等）を
-/// 呼べるようにするための抽象。CLI 引数生成・バイナリ解決・プロンプト受け渡し
-/// 方式など backend 固有の差分をこの trait に閉じ込め、`CodexPane` 側は
-/// backend 非依存のロジックだけを持つ形へ寄せていく。
-///
-/// 現状は `CodexBackend` のみが実装する。
-///
-/// 設定型は関連型 `Settings` に閉じ込め、ライフサイクルイベントの型名解釈
-/// （`parse_lifecycle_event` / `session_id_from_event`）を backend 側へ寄せる。
-/// バイナリ解決（`resolve_bin`）・resume 可否・ツール/本文イベントの正規化は、
-/// 呼び出し側（app.rs）の抽象化と Claude backend の追加に合わせ後続で加える。
-trait AgentBackend {
-    /// backend 固有の実行設定型。
-    type Settings;
-
-    /// 通常ターンの CLI 引数を生成する（新規 / resume を `session` で分岐）。
-    fn turn_args(&self, session: Option<&str>, cwd: &str, settings: &Self::Settings)
-    -> Vec<String>;
-
-    /// プロンプトの受け渡し方式。
-    fn prompt_delivery(&self) -> PromptDelivery;
-
-    /// JSON イベント 1 件を backend 非依存のライフサイクルイベントへ正規化する。
-    /// ツール/本文など表層イベントは `AgentEvent::Other` に集約する。
-    fn parse_lifecycle_event(&self, value: &Value) -> AgentEvent;
-
-    /// セッション開始イベントからセッション/スレッド ID を抽出する。
-    fn session_id_from_event(&self, value: &Value) -> Option<String>;
-
-    /// スラッシュコマンドのヘルプ本文。
-    fn help_text(&self) -> &'static str;
-}
-
-/// codex CLI（`codex exec --json`）を駆動する backend。
-struct CodexBackend;
-
-impl AgentBackend for CodexBackend {
-    type Settings = CodexExecSettings;
-
-    fn turn_args(
-        &self,
-        session: Option<&str>,
-        cwd: &str,
-        settings: &Self::Settings,
-    ) -> Vec<String> {
-        codex_exec_args(session, cwd, settings)
-    }
-
-    fn prompt_delivery(&self) -> PromptDelivery {
-        // codex exec は stdin から読み、引数末尾の `-` と対になる。
-        PromptDelivery::Stdin
-    }
-
-    fn session_id_from_event(&self, value: &Value) -> Option<String> {
-        string_at_any(value, &["thread_id", "threadId", "id"])
-    }
-
-    fn parse_lifecycle_event(&self, value: &Value) -> AgentEvent {
-        let event_type = value.get("type").and_then(Value::as_str).unwrap_or("event");
-        match event_type {
-            "thread.started" => AgentEvent::SessionStarted(self.session_id_from_event(value)),
-            "turn.started" => AgentEvent::TurnStarted,
-            "turn.completed" | "turn.finished" => AgentEvent::TurnCompleted,
-            "turn.failed" => {
-                let message = nested_error_message(value)
-                    .or_else(|| first_text_field(value))
-                    .unwrap_or_else(|| "Codex ターンが失敗しました".to_string());
-                AgentEvent::TurnFailed(message)
-            }
-            "error" => {
-                let message = nested_error_message(value)
-                    .or_else(|| first_text_field(value))
-                    .unwrap_or_else(|| "Codex エラー".to_string());
-                AgentEvent::Error(message)
-            }
-            _ => AgentEvent::Other,
-        }
-    }
-
-    fn help_text(&self) -> &'static str {
-        slash_help_text()
-    }
 }
 
 /// 作業ディレクトリの `git diff --stat`（HEAD 比較）を取得する。
@@ -6522,7 +6406,7 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
     }
 }
 
-fn slash_help_text() -> &'static str {
+pub(super) fn slash_help_text() -> &'static str {
     r#"Slash commands:
 Codex CLI commands:
   /codex <args> - arbitrary codex subcommand
@@ -7451,12 +7335,6 @@ fn summarize_remaining_work(log: &[CodexLogLine]) -> Vec<String> {
     out
 }
 
-fn string_at_any(value: &Value, keys: &[&str]) -> Option<String> {
-    keys.iter()
-        .find_map(|key| value.get(*key).and_then(Value::as_str))
-        .map(str::to_string)
-}
-
 fn token_usage_summary(value: &Value) -> Option<String> {
     let payload = value.get("payload").unwrap_or(value);
     let event_type = payload
@@ -7540,18 +7418,6 @@ fn format_count(value: u64) -> String {
         out.push(ch);
     }
     out.chars().rev().collect()
-}
-
-fn nested_error_message(value: &Value) -> Option<String> {
-    value
-        .get("error")
-        .and_then(|error| {
-            error
-                .get("message")
-                .and_then(Value::as_str)
-                .or_else(|| error.as_str())
-        })
-        .map(str::to_string)
 }
 
 fn decision_banner(event_type: &str, text: Option<&str>) -> Option<CodexDecisionBanner> {
@@ -8153,44 +8019,6 @@ fn tool_name(value: &Value) -> Option<String> {
             "functionName",
         ],
     )
-}
-
-fn first_text_field(value: &Value) -> Option<String> {
-    const TEXT_KEYS: &[&str] = &[
-        "message", "text", "content", "delta", "summary", "output", "stdout", "stderr",
-    ];
-
-    match value {
-        Value::String(s) => Some(s.clone()),
-        Value::Array(values) => values.iter().find_map(first_text_field),
-        Value::Object(map) => {
-            for key in TEXT_KEYS {
-                if let Some(found) = map.get(*key).and_then(first_text_field)
-                    && !found.is_empty()
-                {
-                    return Some(found);
-                }
-            }
-            for key in [
-                "payload",
-                "item",
-                "event",
-                "data",
-                "result",
-                "call",
-                "tool_call",
-                "toolCall",
-            ] {
-                if let Some(found) = map.get(key).and_then(first_text_field)
-                    && !found.is_empty()
-                {
-                    return Some(found);
-                }
-            }
-            None
-        }
-        _ => None,
-    }
 }
 
 fn command_text(value: &Value) -> Option<String> {
@@ -8946,7 +8774,7 @@ fn codex_exec_review_args(
     Ok(args)
 }
 
-fn codex_exec_args(
+pub(super) fn codex_exec_args(
     thread_id: Option<&str>,
     cwd: &str,
     settings: &CodexExecSettings,

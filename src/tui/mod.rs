@@ -1,3 +1,4 @@
+mod agent;
 mod app;
 mod codex_memory;
 mod codex_pane;

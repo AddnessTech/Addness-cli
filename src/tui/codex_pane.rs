@@ -1295,7 +1295,9 @@ fn short_session_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
 }
 
-enum CodexProcessEvent {
+/// エージェントプロセスの stdout/stderr を 1 行単位で運ぶ、backend 非依存の
+/// 行ストリームイベント。codex 固有情報は含まない。
+enum AgentProcessEvent {
     Stdout(String),
     Stderr(String),
 }
@@ -1601,8 +1603,8 @@ pub struct CodexPane {
     codex_bin: PathBuf,
     addness_bin: String,
     child: Option<Child>,
-    tx: Sender<CodexProcessEvent>,
-    rx: Receiver<CodexProcessEvent>,
+    tx: Sender<AgentProcessEvent>,
+    rx: Receiver<AgentProcessEvent>,
     /// Codex プロセスが終了済みか。通常のターン完了では true にせず、
     /// ユーザーが `/exit` した場合やペインを閉じる場合にだけ終了扱いにする。
     pub finished: bool,
@@ -1761,7 +1763,7 @@ impl CodexPane {
         } = options;
         let dod_items = split_dod_items(&dod);
         let dod_checks = vec![None; dod_items.len()];
-        let (tx, rx) = mpsc::channel::<CodexProcessEvent>();
+        let (tx, rx) = mpsc::channel::<AgentProcessEvent>();
         let loaded = session_log_path
             .as_deref()
             .map(load_codex_session)
@@ -3169,8 +3171,8 @@ impl CodexPane {
         while let Ok(event) = self.rx.try_recv() {
             changed = true;
             match event {
-                CodexProcessEvent::Stdout(line) => self.handle_stdout_line(&line),
-                CodexProcessEvent::Stderr(line) => self.handle_stderr_line(&line),
+                AgentProcessEvent::Stdout(line) => self.handle_stdout_line(&line),
+                AgentProcessEvent::Stderr(line) => self.handle_stderr_line(&line),
             }
         }
 
@@ -6220,17 +6222,10 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
         true
     }
 
-    fn spawn_exec_process(&self, prompt: &str) -> Result<Child> {
-        let mut cmd = Command::new(&self.codex_bin);
-        let exec_settings = self.exec_settings_for_spawn();
-        for arg in codex_exec_args(self.thread_id.as_deref(), &self.cwd, &exec_settings) {
-            cmd.arg(arg);
-        }
-
-        cmd.current_dir(&self.cwd);
-        cmd.stdin(Stdio::piped());
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
+    /// Addness ゴール文脈を子プロセスへ環境変数として注入する。
+    /// ターン実行・サブコマンド実行の双方で共通の 11 変数を 1 箇所に集約する。
+    /// `ADDNESS_TUI_CODEX` は現状 backend 固有の名前だが、挙動不変のため維持する。
+    fn inject_addness_env(&self, cmd: &mut Command) {
         cmd.env("ADDNESS_TUI_CODEX", "1");
         cmd.env("ADDNESS_GOAL_ID", &self.goal_id);
         cmd.env("ADDNESS_GOAL_TITLE", &self.goal_title);
@@ -6245,6 +6240,20 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
             git_branch_label(Path::new(&self.cwd)),
         );
         cmd.env("ADDNESS_BIN", &self.addness_bin);
+    }
+
+    fn spawn_exec_process(&self, prompt: &str) -> Result<Child> {
+        let mut cmd = Command::new(&self.codex_bin);
+        let exec_settings = self.exec_settings_for_spawn();
+        for arg in codex_exec_args(self.thread_id.as_deref(), &self.cwd, &exec_settings) {
+            cmd.arg(arg);
+        }
+
+        cmd.current_dir(&self.cwd);
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        self.inject_addness_env(&mut cmd);
 
         let mut child = cmd.spawn().context("Codex の起動に失敗しました")?;
 
@@ -6289,20 +6298,7 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
-        cmd.env("ADDNESS_TUI_CODEX", "1");
-        cmd.env("ADDNESS_GOAL_ID", &self.goal_id);
-        cmd.env("ADDNESS_GOAL_TITLE", &self.goal_title);
-        cmd.env("ADDNESS_GOAL_STATUS", &self.status_label);
-        cmd.env("ADDNESS_GOAL_DOD", &self.dod);
-        cmd.env("ADDNESS_TASK_GOAL_ID", &self.goal_id);
-        cmd.env("ADDNESS_TASK_GOAL_TITLE", &self.goal_title);
-        cmd.env("ADDNESS_PARENT_GOAL_ID", &self.parent_goal_id);
-        cmd.env("ADDNESS_PARENT_GOAL_TITLE", &self.parent_goal_title);
-        cmd.env(
-            "ADDNESS_WORKTREE_BRANCH",
-            git_branch_label(Path::new(&self.cwd)),
-        );
-        cmd.env("ADDNESS_BIN", &self.addness_bin);
+        self.inject_addness_env(&mut cmd);
 
         let mut child = cmd
             .spawn()
@@ -6684,7 +6680,7 @@ fn byte_index_for_width(text: &str, start: usize, end: usize, target_width: usiz
     candidate
 }
 
-fn spawn_line_reader<R>(reader: R, tx: Sender<CodexProcessEvent>, stderr: bool)
+fn spawn_line_reader<R>(reader: R, tx: Sender<AgentProcessEvent>, stderr: bool)
 where
     R: std::io::Read + Send + 'static,
 {
@@ -6695,9 +6691,9 @@ where
                 break;
             };
             let event = if stderr {
-                CodexProcessEvent::Stderr(line)
+                AgentProcessEvent::Stderr(line)
             } else {
-                CodexProcessEvent::Stdout(line)
+                AgentProcessEvent::Stdout(line)
             };
             if tx.send(event).is_err() {
                 break;

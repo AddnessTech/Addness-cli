@@ -47,6 +47,71 @@ pub fn codex_path() -> Option<PathBuf> {
     None
 }
 
+/// プロンプトを子プロセスへ渡す方式。backend ごとに異なる。
+/// codex は stdin へ書き込み、引数末尾に sentinel `-` を置く（`Stdin`）。
+/// 将来の backend（例: `claude -p "<prompt>"`）は引数として渡す（`Arg`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptDelivery {
+    /// stdin へ書き込む（codex exec 方式）。
+    Stdin,
+    /// コマンドライン引数として渡す。まだ実装 backend が無いため未構築。
+    #[allow(dead_code)]
+    Arg,
+}
+
+/// TUI から起動できるコーディングエージェントの継ぎ目。
+///
+/// 同一 TUI から複数のエージェント（現状 codex、将来 Claude Code 等）を
+/// 呼べるようにするための抽象。CLI 引数生成・バイナリ解決・プロンプト受け渡し
+/// 方式など backend 固有の差分をこの trait に閉じ込め、`CodexPane` 側は
+/// backend 非依存のロジックだけを持つ形へ寄せていく。
+///
+/// 現状は `CodexBackend` のみが実装する。
+///
+/// このステップでは呼び出し側が存在する継ぎ目（`turn_args` / `prompt_delivery` /
+/// `help_text`）のみを定義する。バイナリ解決（`resolve_bin`）・resume 可否
+/// （`supports_resume`）・イベント正規化（`parse_line` → 共通 `AgentEvent`）・
+/// `Settings` の関連型化は、呼び出し側（app.rs）の抽象化と Claude backend の
+/// 追加に合わせて後続ステップで加える。
+trait AgentBackend {
+    /// 通常ターンの CLI 引数を生成する（新規 / resume を `session` で分岐）。
+    fn turn_args(
+        &self,
+        session: Option<&str>,
+        cwd: &str,
+        settings: &CodexExecSettings,
+    ) -> Vec<String>;
+
+    /// プロンプトの受け渡し方式。
+    fn prompt_delivery(&self) -> PromptDelivery;
+
+    /// スラッシュコマンドのヘルプ本文。
+    fn help_text(&self) -> &'static str;
+}
+
+/// codex CLI（`codex exec --json`）を駆動する backend。
+struct CodexBackend;
+
+impl AgentBackend for CodexBackend {
+    fn turn_args(
+        &self,
+        session: Option<&str>,
+        cwd: &str,
+        settings: &CodexExecSettings,
+    ) -> Vec<String> {
+        codex_exec_args(session, cwd, settings)
+    }
+
+    fn prompt_delivery(&self) -> PromptDelivery {
+        // codex exec は stdin から読み、引数末尾の `-` と対になる。
+        PromptDelivery::Stdin
+    }
+
+    fn help_text(&self) -> &'static str {
+        slash_help_text()
+    }
+}
+
 /// 作業ディレクトリの `git diff --stat`（HEAD 比較）を取得する。
 /// 還流コメントのプリフィルに使う。取得できなければ空文字。
 pub fn git_diff_stat(cwd: &Path) -> String {
@@ -1600,6 +1665,9 @@ struct CodexSessionIndexRecord {
 
 /// 埋め込み codex セッションの状態。
 pub struct CodexPane {
+    /// このペインを駆動するエージェント backend。CLI 引数生成・バイナリ解決・
+    /// プロンプト受け渡し方式など backend 固有の差分をここへ委譲する。
+    backend: CodexBackend,
     codex_bin: PathBuf,
     addness_bin: String,
     child: Option<Child>,
@@ -1784,6 +1852,7 @@ impl CodexPane {
         let collapsed_turns = (1..turn_count).collect::<BTreeSet<_>>();
 
         let mut pane = Self {
+            backend: CodexBackend,
             codex_bin: codex_bin.to_path_buf(),
             addness_bin: addness_bin.to_string(),
             child: None,
@@ -5795,7 +5864,7 @@ impl CodexPane {
     }
 
     fn push_slash_help(&mut self) {
-        self.push_log(CodexLogKind::System, slash_help_text().to_string());
+        self.push_log(CodexLogKind::System, self.backend.help_text().to_string());
     }
 
     fn push_slash_status(&mut self) {
@@ -6245,7 +6314,10 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
     fn spawn_exec_process(&self, prompt: &str) -> Result<Child> {
         let mut cmd = Command::new(&self.codex_bin);
         let exec_settings = self.exec_settings_for_spawn();
-        for arg in codex_exec_args(self.thread_id.as_deref(), &self.cwd, &exec_settings) {
+        for arg in self
+            .backend
+            .turn_args(self.thread_id.as_deref(), &self.cwd, &exec_settings)
+        {
             cmd.arg(arg);
         }
 
@@ -6257,7 +6329,9 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
 
         let mut child = cmd.spawn().context("Codex の起動に失敗しました")?;
 
-        if let Some(mut stdin) = child.stdin.take()
+        // Stdin 方式の backend はプロンプトを stdin へ書き込む（引数末尾の `-` と対）。
+        if matches!(self.backend.prompt_delivery(), PromptDelivery::Stdin)
+            && let Some(mut stdin) = child.stdin.take()
             && let Err(e) = stdin.write_all(prompt.as_bytes())
         {
             let _ = child.kill();

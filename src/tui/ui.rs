@@ -93,15 +93,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     draw_title_bar(frame, main_layout[0], app);
 
-    if app.codex.is_some() {
+    if app.agent.is_some() {
         // codex 使用中は org/navigation を出さず（切り替えないため）、
         // 全幅を「Addnessの進行が見えるペイン + codex本体」に使う。
         draw_codex(frame, main_layout[1], app);
     } else {
-        app.codex_terminal_area = None;
-        app.codex_status_area = None;
-        app.codex_contract_area = None;
-        app.codex_activity_area = None;
+        app.agent_terminal_area = None;
+        app.agent_status_area = None;
+        app.agent_contract_area = None;
+        app.agent_activity_area = None;
         let content_layout = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(24), Constraint::Min(0)])
@@ -139,7 +139,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     // Help overlay sits above everything else.
     if app.show_help {
-        if app.codex.is_some() {
+        if app.agent.is_some() {
             draw_codex_help_overlay(frame);
         } else {
             draw_help_overlay(frame);
@@ -252,7 +252,7 @@ pub fn draw_loading(frame: &mut Frame, tick: u64) {
 
 fn draw_title_bar(frame: &mut Frame, area: Rect, app: &App) {
     // codex 使用中は、参照しているローカルフォルダ（cwd）を出して文脈を明示する。
-    let line = if let Some(pane) = app.codex.as_ref() {
+    let line = if let Some(pane) = app.agent.as_ref() {
         Line::from(vec![
             Span::styled(
                 " codex ",
@@ -277,7 +277,7 @@ fn draw_title_bar(frame: &mut Frame, area: Rect, app: &App) {
             ),
         ])
     };
-    let border = if app.codex.is_some() {
+    let border = if app.agent.is_some() {
         Color::Magenta
     } else {
         Color::Cyan
@@ -804,9 +804,9 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
 
     // codex フォーカス中は通常のキーが codex へ転送されるため、専用のヒントを出す。
     if app.active_pane == ActivePane::Codex {
-        let finished = app.codex.as_ref().map(|c| c.finished).unwrap_or(true);
+        let finished = app.agent.as_ref().map(|c| c.finished).unwrap_or(true);
         let running = app
-            .codex
+            .agent
             .as_ref()
             .map(|c| c.is_turn_running())
             .unwrap_or(false);
@@ -2411,8 +2411,8 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
     // 同期の鼓動（スピナー＋最終同期からの経過秒）。可変借用前に App から読む。
     let sync_label = {
         const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-        let s = SPIN[(app.codex_sync_tick as usize) % SPIN.len()];
-        match app.last_codex_sync {
+        let s = SPIN[(app.agent_sync_tick as usize) % SPIN.len()];
+        match app.last_agent_sync {
             Some(t) => format!(" Addness ゴール  {s} 同期{}s前 ", t.elapsed().as_secs()),
             None => " Addness ゴール  ⟳ 同期待ち ".to_string(),
         }
@@ -2420,7 +2420,7 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
 
     // --- Addness ペイン（参照中 + ゴール状態 + DoD + 子ゴール + 更新ログ）---
     // 上段=ゴール/DoD/子ゴール、下段=Addnessの更新ログ。不変借用のまま描いて clone を避ける。
-    if let Some(pane) = app.codex.as_ref() {
+    if let Some(pane) = app.agent.as_ref() {
         let now = Instant::now();
         let recently = |at: Option<Instant>| {
             at.is_some_and(|t| now.duration_since(t) < std::time::Duration::from_secs(4))
@@ -2441,9 +2441,9 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
                 Constraint::Length(8),
             ])
             .split(chunks[0]);
-        app.codex_status_area = Some(panes[0]);
-        app.codex_contract_area = Some(panes[1]);
-        app.codex_activity_area = Some(panes[2]);
+        app.agent_status_area = Some(panes[0]);
+        app.agent_contract_area = Some(panes[1]);
+        app.agent_activity_area = Some(panes[2]);
 
         draw_codex_status_panel(frame, panes[0], pane);
 
@@ -2596,7 +2596,7 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
         let contract_inner_w = panes[1].width.saturating_sub(2) as usize;
         let max_contract_scroll =
             rendered_lines_height(&lines, contract_inner_w).saturating_sub(contract_inner_h.max(1));
-        app.codex_contract_scroll = app.codex_contract_scroll.min(max_contract_scroll);
+        app.agent_contract_scroll = app.agent_contract_scroll.min(max_contract_scroll);
         let contract_title = sync_label;
         let contract = Paragraph::new(lines)
             .block(
@@ -2605,14 +2605,14 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
                     .border_style(Style::default().fg(COLOR_PANEL))
                     .title(contract_title),
             )
-            .scroll((app.codex_contract_scroll.min(u16::MAX as usize) as u16, 0))
+            .scroll((app.agent_contract_scroll.min(u16::MAX as usize) as u16, 0))
             .wrap(ratatui::widgets::Wrap { trim: true });
         frame.render_widget(contract, panes[1]);
 
         // 下段: Addness の更新ログ（新しいものほど下。最新行は強調）
         let log_inner_h = panes[2].height.saturating_sub(2) as usize;
         let mut log_lines: Vec<Line> = if pane.activity.is_empty() {
-            app.codex_activity_scroll = 0;
+            app.agent_activity_scroll = 0;
             vec![Line::from(Span::styled(
                 "body/DoD/子ゴール/通知の読込・書込がここに出ます",
                 Style::default().fg(COLOR_MUTED),
@@ -2623,8 +2623,8 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
             let all_activity_lines = codex_activity_lines(&pane.activity, log_inner_w);
             let n = all_activity_lines.len();
             let max_activity_scroll = n.saturating_sub(view_h);
-            app.codex_activity_scroll = app.codex_activity_scroll.min(max_activity_scroll);
-            let end = n.saturating_sub(app.codex_activity_scroll);
+            app.agent_activity_scroll = app.agent_activity_scroll.min(max_activity_scroll);
+            let end = n.saturating_sub(app.agent_activity_scroll);
             let start = end.saturating_sub(view_h);
             all_activity_lines[start..end].to_vec()
         };
@@ -2641,10 +2641,10 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
 
     // --- codex 会話ペイン ---
     let term_area = chunks[1];
-    app.codex_terminal_area = Some(term_area);
+    app.agent_terminal_area = Some(term_area);
     let rows = term_area.height.saturating_sub(2);
     let cols = term_area.width.saturating_sub(2);
-    if let Some(pane) = app.codex.as_mut() {
+    if let Some(pane) = app.agent.as_mut() {
         pane.resize(rows, cols);
         let (title, color) = if pane.finished {
             let t = if pane.scrollback > 0 {
@@ -5392,7 +5392,7 @@ mod tests {
         let client = ApiClient::new("t", "http://localhost").unwrap();
         let mut app = App::new(client, rt.handle().clone());
         app.active_pane = ActivePane::Codex;
-        app.codex_last_scroll_input = Some("mouse ScrollUp -> codex 0->3".to_string());
+        app.agent_last_scroll_input = Some("mouse ScrollUp -> codex 0->3".to_string());
 
         let text = render_status_text(&app, 80);
 
@@ -5416,7 +5416,7 @@ mod tests {
         let client = ApiClient::new("t", "http://localhost").unwrap();
         let mut app = App::new(client, rt.handle().clone());
         app.active_pane = ActivePane::Codex;
-        app.codex = Some(CodexPane::test_with_output(10, 80, 0, ""));
+        app.agent = Some(CodexPane::test_with_output(10, 80, 0, ""));
 
         let text = render_status_text(&app, 140);
 

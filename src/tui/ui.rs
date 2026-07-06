@@ -811,11 +811,11 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
             .map(|c| c.is_turn_running())
             .unwrap_or(false);
         let hint = if finished {
-            " [c]コメント  [s]状態  [d]成果物(PR/Release)  [v]DoD判定  Ctrl+?:操作一覧  Esc/q:閉じる "
+            " [c]コメント  [s]状態  [d]成果物(PR/Release)  [v]DoD判定  Ctrl+Q:操作一覧  Esc/q:閉じる "
         } else if running {
             " Codex 実行中  |  Ctrl-T:表示切替  |  F7:turn一覧  |  入力+Enter:次ターン予約  |  Ctrl-C:中断 "
         } else {
-            " 入力してEnterでCodexへ送信  |  Ctrl-T:表示切替  |  F7:turn一覧  |  F2-F6:設定/差分  |  Ctrl+?:操作一覧 "
+            " 入力してEnterでCodexへ送信  |  Ctrl-T:表示切替  |  F7:turn一覧  |  F2-F6:設定/差分  |  Ctrl+Q:操作一覧 "
         };
         let status = Paragraph::new(Line::from(Span::styled(
             hint,
@@ -1071,7 +1071,7 @@ fn draw_codex_help_overlay(frame: &mut Frame) {
 
     let lines: Vec<Line> = vec![
         section("Codex in Addness"),
-        kv("Ctrl+?", "この操作一覧を表示 / 閉じる"),
+        kv("Ctrl+Q", "この操作一覧を表示 / 閉じる"),
         kv("入力 + Enter", "Codexへ依頼を送信（必要ならAddnessを参照）"),
         kv("入力中 Enter", "実行中なら次ターンに予約"),
         kv("Ctrl-C", "実行中のCodexターンを中断"),
@@ -1306,7 +1306,7 @@ fn draw_codex_help_overlay(frame: &mut Frame) {
         .border_style(Style::default().fg(Color::Cyan))
         .title(" Codex in Addness ")
         .title_bottom(
-            Line::from(" Ctrl+? / Esc / q: Close ").style(Style::default().fg(Color::DarkGray)),
+            Line::from(" Ctrl+Q / Esc / q: Close ").style(Style::default().fg(Color::DarkGray)),
         );
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
@@ -4621,7 +4621,7 @@ fn codex_dashboard_shortcut_lines(max_width: usize) -> Vec<Line<'static>> {
         )),
         Line::from(Span::styled(
             ellipsize_width(
-                "  /remember /handoff:保存  Ctrl+?:全体ヘルプ  /settings",
+                "  /remember /handoff:保存  Ctrl+Q:全体ヘルプ  /settings",
                 max_width,
             ),
             Style::default().fg(COLOR_MUTED),
@@ -5421,7 +5421,7 @@ mod tests {
         let text = render_status_text(&app, 140);
 
         assert!(
-            text.contains("Ctrl+?"),
+            text.contains("Ctrl+Q"),
             "codex status should expose the help shortcut:\n{text}"
         );
     }
@@ -5435,7 +5435,7 @@ mod tests {
             .join("\n");
 
         assert!(text.contains("次の操作"));
-        assert!(text.contains("Ctrl+?"));
+        assert!(text.contains("Ctrl+Q"));
         assert!(text.contains("F7:turn一覧"));
         assert!(text.contains("/organize"));
         assert!(text.contains("/work next"));

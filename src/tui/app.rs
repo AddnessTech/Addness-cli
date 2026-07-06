@@ -2069,6 +2069,25 @@ impl App {
                     _ => return,
                 }
             }
+            // スラッシュコマンドパレット表示中は ↑↓ で候補選択・Tab で補完する。
+            // Esc / 文字入力はそのまま入力欄へ流し、既存挙動（入力クリア等）に委ねる。
+            if pane.slash_palette_active() && key.modifiers.is_empty() {
+                match key.code {
+                    KeyCode::Up => {
+                        pane.move_slash_palette_selection(-1);
+                        return;
+                    }
+                    KeyCode::Down => {
+                        pane.move_slash_palette_selection(1);
+                        return;
+                    }
+                    KeyCode::Tab => {
+                        pane.accept_slash_palette_selection();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
             if key.modifiers.is_empty() {
                 match key.code {
                     KeyCode::F(2) => {

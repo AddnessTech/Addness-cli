@@ -1112,6 +1112,10 @@ fn draw_codex_help_overlay(frame: &mut Frame) {
         ),
         blank(),
         section("codex commands"),
+        kv(
+            "/ 入力",
+            "コマンド候補を入力欄の上に表示（Tab補完 / ↑↓選択）",
+        ),
         kv("/sessions [N]", "Codex session候補を番号付きで表示"),
         kv(
             "/codex-resume <args>",
@@ -2908,6 +2912,93 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
             input_chunk.y + cursor_row.min(input_chunk.height.saturating_sub(1)),
         ));
     }
+
+    // 入力が `/xxx` のとき、入力欄の直上にスラッシュコマンドパレットを重ねる。
+    if pane.slash_palette_active() {
+        draw_codex_slash_palette(frame, input_chunk, history_chunk, pane);
+    }
+}
+
+/// 入力欄の直上に、現在の `/` 入力に一致するスラッシュコマンド候補を表示する。
+fn draw_codex_slash_palette(
+    frame: &mut Frame,
+    input_chunk: Rect,
+    history_chunk: Rect,
+    pane: &CodexPane,
+) {
+    let suggestions = pane.slash_palette_suggestions();
+    if suggestions.is_empty() {
+        return;
+    }
+    let total = suggestions.len();
+    let selected = pane.slash_palette_selected();
+
+    // 入力欄の上（履歴領域）に確保できる高さ内で行数を決める。枠に 2 行使う。
+    let avail = history_chunk.height as usize;
+    if avail < 3 {
+        return;
+    }
+    let rows = total.min(8).min(avail - 2);
+    if rows == 0 {
+        return;
+    }
+    // 選択中の候補が窓に入るようスクロール位置を決める。
+    let start = if selected >= rows {
+        selected + 1 - rows
+    } else {
+        0
+    };
+    let end = (start + rows).min(total);
+
+    let ph = (rows + 2) as u16;
+    let area = Rect {
+        x: input_chunk.x,
+        y: input_chunk.y.saturating_sub(ph),
+        width: input_chunk.width,
+        height: ph,
+    };
+
+    clear_modal_area(frame, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLOR_CODEX))
+        .style(Style::default().bg(COLOR_INPUT_BG))
+        .title(Span::styled(
+            format!(" / コマンド  {total}件 "),
+            Style::default().fg(COLOR_CODEX),
+        ))
+        .title_bottom(
+            Line::from(" Tab:補完  ↑↓:選択  Esc:消す ").style(Style::default().fg(COLOR_MUTED)),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let name_w = 16usize;
+    let lines: Vec<Line> = (start..end)
+        .map(|i| {
+            let (name, desc) = suggestions[i];
+            let is_sel = i == selected;
+            let (marker, name_style) = if is_sel {
+                (
+                    "▸ ",
+                    Style::default()
+                        .fg(COLOR_TEXT_STRONG)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                ("  ", Style::default().fg(COLOR_TEXT))
+            };
+            Line::from(vec![
+                Span::styled(format!("{marker}{name:<name_w$}"), name_style),
+                Span::styled(format!("  {desc}"), Style::default().fg(COLOR_MUTED)),
+            ])
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(COLOR_INPUT_BG)),
+        inner,
+    );
 }
 
 struct CodexInputPromptRender {

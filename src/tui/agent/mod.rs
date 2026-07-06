@@ -9227,16 +9227,18 @@ mod tests {
     #[test]
     fn claude_backend_turn_is_guarded_until_step3() {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let mut pane = CodexPane::spawn(
-            Path::new("claude"),
-            &cwd,
-            "addness",
-            "goal/claude".to_string(),
-            "Claude goal".to_string(),
-            String::new(),
-            "TEST".to_string(),
-            AgentKind::ClaudeCode,
-        )
+        // 実ホームの ~/.addness へ書き込まないよう session_log_path: None で生成する。
+        let mut pane = CodexPane::spawn_inner(CodexPaneSpawnOptions {
+            kind: AgentKind::ClaudeCode,
+            codex_bin: Path::new("claude"),
+            cwd: &cwd,
+            addness_bin: "addness",
+            session_log_path: None,
+            goal_id: "goal/claude".to_string(),
+            goal_title: "Claude goal".to_string(),
+            dod: String::new(),
+            status_label: "TEST".to_string(),
+        })
         .unwrap();
         assert_eq!(pane.kind(), AgentKind::ClaudeCode);
         pane.start_turn("何か作業して");

@@ -30,7 +30,17 @@ impl ApiClient {
             org_id, depth
         );
 
-        self.get(&path).await
+        // `include_completed=true` を付けるとサーバーが 5xx を返す不具合があるため、
+        // 失敗時は完了ゴールを除いた通常ツリーへフォールバックし、一覧が空に
+        // ならないようにする。サーバー復旧後は自動的に完了ゴールも再表示される。
+        // 通常ツリーも失敗した場合は本来のエラーを返す（認証切れ等の握り潰し回避）。
+        match self.get(&path).await {
+            Ok(resp) => Ok(resp),
+            Err(primary_err) => self
+                .get_goal_tree(org_id, depth)
+                .await
+                .map_err(|_| primary_err),
+        }
     }
 
     pub async fn get_goal(&self, goal_id: &str) -> Result<ApiResponse<Goal>> {
@@ -46,18 +56,6 @@ impl ApiClient {
     ) -> Result<ApiResponse<GoalChildrenData>> {
         let path = format!(
             "/api/v2/objectives/{goal_id}/children?include_owner=true&limit={limit}&offset={offset}"
-        );
-        self.get(&path).await
-    }
-
-    pub async fn get_goal_children_with_completed(
-        &self,
-        goal_id: &str,
-        limit: usize,
-        offset: usize,
-    ) -> Result<ApiResponse<GoalChildrenData>> {
-        let path = format!(
-            "/api/v2/objectives/{goal_id}/children?include_owner=true&include_completed=true&limit={limit}&offset={offset}"
         );
         self.get(&path).await
     }

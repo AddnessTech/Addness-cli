@@ -111,6 +111,125 @@ pub fn codex_path() -> Option<PathBuf> {
     None
 }
 
+/// プロンプトを子プロセスへ渡す方式。backend ごとに異なる。
+/// codex は stdin へ書き込み、引数末尾に sentinel `-` を置く（`Stdin`）。
+/// 将来の backend（例: `claude -p "<prompt>"`）は引数として渡す（`Arg`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptDelivery {
+    /// stdin へ書き込む（codex exec 方式）。
+    Stdin,
+    /// コマンドライン引数として渡す。まだ実装 backend が無いため未構築。
+    #[allow(dead_code)]
+    Arg,
+}
+
+/// backend 非依存に正規化したターンライフサイクルイベント。
+///
+/// codex の `thread.started` / `turn.*` / `error` といった型名の違いを
+/// この共通形へマップし、`CodexPane` 側は型名文字列ではなくこの enum で
+/// 分岐する。ツール実行やアシスタント本文など表層に近いイベントは、当面
+/// `handle_generic_json_event` 側で扱うため `Other` に集約する。
+enum AgentEvent {
+    /// セッション開始（codex: `thread.started`）。値はセッション/スレッド ID。
+    SessionStarted(Option<String>),
+    /// ターン開始（codex: `turn.started`）。
+    TurnStarted,
+    /// ターン完了（codex: `turn.completed` / `turn.finished`）。
+    TurnCompleted,
+    /// ターン失敗（codex: `turn.failed`）。値は表示用メッセージ。
+    TurnFailed(String),
+    /// エラー通知（codex: `error`）。値は表示用メッセージ。
+    Error(String),
+    /// 上記以外。ツール実行・本文など、backend 共通の表層処理へ委ねる。
+    Other,
+}
+
+/// TUI から起動できるコーディングエージェントの継ぎ目。
+///
+/// 同一 TUI から複数のエージェント（現状 codex、将来 Claude Code 等）を
+/// 呼べるようにするための抽象。CLI 引数生成・バイナリ解決・プロンプト受け渡し
+/// 方式など backend 固有の差分をこの trait に閉じ込め、`CodexPane` 側は
+/// backend 非依存のロジックだけを持つ形へ寄せていく。
+///
+/// 現状は `CodexBackend` のみが実装する。
+///
+/// 設定型は関連型 `Settings` に閉じ込め、ライフサイクルイベントの型名解釈
+/// （`parse_lifecycle_event` / `session_id_from_event`）を backend 側へ寄せる。
+/// バイナリ解決（`resolve_bin`）・resume 可否・ツール/本文イベントの正規化は、
+/// 呼び出し側（app.rs）の抽象化と Claude backend の追加に合わせ後続で加える。
+trait AgentBackend {
+    /// backend 固有の実行設定型。
+    type Settings;
+
+    /// 通常ターンの CLI 引数を生成する（新規 / resume を `session` で分岐）。
+    fn turn_args(&self, session: Option<&str>, cwd: &str, settings: &Self::Settings)
+    -> Vec<String>;
+
+    /// プロンプトの受け渡し方式。
+    fn prompt_delivery(&self) -> PromptDelivery;
+
+    /// JSON イベント 1 件を backend 非依存のライフサイクルイベントへ正規化する。
+    /// ツール/本文など表層イベントは `AgentEvent::Other` に集約する。
+    fn parse_lifecycle_event(&self, value: &Value) -> AgentEvent;
+
+    /// セッション開始イベントからセッション/スレッド ID を抽出する。
+    fn session_id_from_event(&self, value: &Value) -> Option<String>;
+
+    /// スラッシュコマンドのヘルプ本文。
+    fn help_text(&self) -> &'static str;
+}
+
+/// codex CLI（`codex exec --json`）を駆動する backend。
+struct CodexBackend;
+
+impl AgentBackend for CodexBackend {
+    type Settings = CodexExecSettings;
+
+    fn turn_args(
+        &self,
+        session: Option<&str>,
+        cwd: &str,
+        settings: &Self::Settings,
+    ) -> Vec<String> {
+        codex_exec_args(session, cwd, settings)
+    }
+
+    fn prompt_delivery(&self) -> PromptDelivery {
+        // codex exec は stdin から読み、引数末尾の `-` と対になる。
+        PromptDelivery::Stdin
+    }
+
+    fn session_id_from_event(&self, value: &Value) -> Option<String> {
+        string_at_any(value, &["thread_id", "threadId", "id"])
+    }
+
+    fn parse_lifecycle_event(&self, value: &Value) -> AgentEvent {
+        let event_type = value.get("type").and_then(Value::as_str).unwrap_or("event");
+        match event_type {
+            "thread.started" => AgentEvent::SessionStarted(self.session_id_from_event(value)),
+            "turn.started" => AgentEvent::TurnStarted,
+            "turn.completed" | "turn.finished" => AgentEvent::TurnCompleted,
+            "turn.failed" => {
+                let message = nested_error_message(value)
+                    .or_else(|| first_text_field(value))
+                    .unwrap_or_else(|| "Codex ターンが失敗しました".to_string());
+                AgentEvent::TurnFailed(message)
+            }
+            "error" => {
+                let message = nested_error_message(value)
+                    .or_else(|| first_text_field(value))
+                    .unwrap_or_else(|| "Codex エラー".to_string());
+                AgentEvent::Error(message)
+            }
+            _ => AgentEvent::Other,
+        }
+    }
+
+    fn help_text(&self) -> &'static str {
+        slash_help_text()
+    }
+}
+
 /// 作業ディレクトリの `git diff --stat`（HEAD 比較）を取得する。
 /// 還流コメントのプリフィルに使う。取得できなければ空文字。
 pub fn git_diff_stat(cwd: &Path) -> String {
@@ -1359,7 +1478,9 @@ fn short_session_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
 }
 
-enum CodexProcessEvent {
+/// エージェントプロセスの stdout/stderr を 1 行単位で運ぶ、backend 非依存の
+/// 行ストリームイベント。codex 固有情報は含まない。
+enum AgentProcessEvent {
     Stdout(String),
     Stderr(String),
 }
@@ -1662,11 +1783,14 @@ struct CodexSessionIndexRecord {
 
 /// 埋め込み codex セッションの状態。
 pub struct CodexPane {
+    /// このペインを駆動するエージェント backend。CLI 引数生成・バイナリ解決・
+    /// プロンプト受け渡し方式など backend 固有の差分をここへ委譲する。
+    backend: CodexBackend,
     codex_bin: PathBuf,
     addness_bin: String,
     child: Option<Child>,
-    tx: Sender<CodexProcessEvent>,
-    rx: Receiver<CodexProcessEvent>,
+    tx: Sender<AgentProcessEvent>,
+    rx: Receiver<AgentProcessEvent>,
     /// Codex プロセスが終了済みか。通常のターン完了では true にせず、
     /// ユーザーが `/exit` した場合やペインを閉じる場合にだけ終了扱いにする。
     pub finished: bool,
@@ -1827,7 +1951,7 @@ impl CodexPane {
         } = options;
         let dod_items = split_dod_items(&dod);
         let dod_checks = vec![None; dod_items.len()];
-        let (tx, rx) = mpsc::channel::<CodexProcessEvent>();
+        let (tx, rx) = mpsc::channel::<AgentProcessEvent>();
         let loaded = session_log_path
             .as_deref()
             .map(load_codex_session)
@@ -1848,6 +1972,7 @@ impl CodexPane {
         let collapsed_turns = (1..turn_count).collect::<BTreeSet<_>>();
 
         let mut pane = Self {
+            backend: CodexBackend,
             codex_bin: codex_bin.to_path_buf(),
             addness_bin: addness_bin.to_string(),
             child: None,
@@ -3296,8 +3421,8 @@ impl CodexPane {
         while let Ok(event) = self.rx.try_recv() {
             changed = true;
             match event {
-                CodexProcessEvent::Stdout(line) => self.handle_stdout_line(&line),
-                CodexProcessEvent::Stderr(line) => self.handle_stderr_line(&line),
+                AgentProcessEvent::Stdout(line) => self.handle_stdout_line(&line),
+                AgentProcessEvent::Stderr(line) => self.handle_stderr_line(&line),
             }
         }
 
@@ -3428,22 +3553,15 @@ impl CodexPane {
             self.last_token_usage_label = Some(summary);
         }
 
-        let event_type = value
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or("event")
-            .to_string();
-
-        match event_type.as_str() {
-            "thread.started" => {
-                if let Some(thread_id) = string_at_any(&value, &["thread_id", "threadId", "id"]) {
-                    self.thread_id = Some(thread_id.clone());
-                    self.push_log(CodexLogKind::System, "Codex セッションを開始しました");
-                } else {
-                    self.push_log(CodexLogKind::System, "Codex セッションを開始しました");
+        // 型名文字列の解釈は backend に委ね、pane 側は正規化イベントで分岐する。
+        match self.backend.parse_lifecycle_event(&value) {
+            AgentEvent::SessionStarted(session_id) => {
+                if let Some(session_id) = session_id {
+                    self.thread_id = Some(session_id);
                 }
+                self.push_log(CodexLogKind::System, "Codex セッションを開始しました");
             }
-            "turn.started" => {
+            AgentEvent::TurnStarted => {
                 self.turn_running = true;
                 self.turn_finished_by_event = false;
                 self.current_command = None;
@@ -3464,7 +3582,7 @@ impl CodexPane {
                     .unwrap_or_else(|| format!("Turn {}", self.turn_count));
                 self.push_log(CodexLogKind::Turn, label);
             }
-            "turn.completed" | "turn.finished" => {
+            AgentEvent::TurnCompleted => {
                 self.turn_running = false;
                 self.turn_finished_by_event = true;
                 self.current_command = None;
@@ -3477,29 +3595,26 @@ impl CodexPane {
                 self.push_log(CodexLogKind::System, "Codex の応答が完了しました");
                 self.push_terminal_notice("Codex 完了", "Codex の出力が完了しました");
             }
-            "turn.failed" => {
+            AgentEvent::TurnFailed(message) => {
                 self.turn_running = false;
                 self.turn_finished_by_event = true;
                 self.current_command = None;
                 self.current_command_started_at = None;
                 self.streaming_assistant_index = None;
                 self.pending_decision = None;
-                let message = nested_error_message(&value)
-                    .or_else(|| first_text_field(&value))
-                    .unwrap_or_else(|| "Codex ターンが失敗しました".to_string());
                 self.push_log(CodexLogKind::Error, message.clone());
                 self.refresh_current_turn_title();
                 self.queue_completed_turn_body_record();
                 self.push_terminal_notice("Codex 失敗", message);
             }
-            "error" => {
-                let message = nested_error_message(&value)
-                    .or_else(|| first_text_field(&value))
-                    .unwrap_or_else(|| "Codex エラー".to_string());
+            AgentEvent::Error(message) => {
                 self.push_log(CodexLogKind::Error, message.clone());
                 self.push_terminal_notice("Codex エラー", message);
             }
-            _ => self.handle_generic_json_event(&event_type, &value),
+            AgentEvent::Other => {
+                let event_type = value.get("type").and_then(Value::as_str).unwrap_or("event");
+                self.handle_generic_json_event(event_type, &value);
+            }
         }
     }
 
@@ -5923,7 +6038,7 @@ impl CodexPane {
     }
 
     fn push_slash_help(&mut self) {
-        self.push_log(CodexLogKind::System, slash_help_text().to_string());
+        self.push_log(CodexLogKind::System, self.backend.help_text().to_string());
     }
 
     fn push_slash_status(&mut self) {
@@ -6350,17 +6465,10 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
         true
     }
 
-    fn spawn_exec_process(&self, prompt: &str) -> Result<Child> {
-        let mut cmd = Command::new(&self.codex_bin);
-        let exec_settings = self.exec_settings_for_spawn();
-        for arg in codex_exec_args(self.thread_id.as_deref(), &self.cwd, &exec_settings) {
-            cmd.arg(arg);
-        }
-
-        cmd.current_dir(&self.cwd);
-        cmd.stdin(Stdio::piped());
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
+    /// Addness ゴール文脈を子プロセスへ環境変数として注入する。
+    /// ターン実行・サブコマンド実行の双方で共通の 11 変数を 1 箇所に集約する。
+    /// `ADDNESS_TUI_CODEX` は現状 backend 固有の名前だが、挙動不変のため維持する。
+    fn inject_addness_env(&self, cmd: &mut Command) {
         cmd.env("ADDNESS_TUI_CODEX", "1");
         cmd.env("ADDNESS_GOAL_ID", &self.goal_id);
         cmd.env("ADDNESS_GOAL_TITLE", &self.goal_title);
@@ -6375,10 +6483,29 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
             git_branch_label(Path::new(&self.cwd)),
         );
         cmd.env("ADDNESS_BIN", &self.addness_bin);
+    }
+
+    fn spawn_exec_process(&self, prompt: &str) -> Result<Child> {
+        let mut cmd = Command::new(&self.codex_bin);
+        let exec_settings = self.exec_settings_for_spawn();
+        for arg in self
+            .backend
+            .turn_args(self.thread_id.as_deref(), &self.cwd, &exec_settings)
+        {
+            cmd.arg(arg);
+        }
+
+        cmd.current_dir(&self.cwd);
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        self.inject_addness_env(&mut cmd);
 
         let mut child = cmd.spawn().context("Codex の起動に失敗しました")?;
 
-        if let Some(mut stdin) = child.stdin.take()
+        // Stdin 方式の backend はプロンプトを stdin へ書き込む（引数末尾の `-` と対）。
+        if matches!(self.backend.prompt_delivery(), PromptDelivery::Stdin)
+            && let Some(mut stdin) = child.stdin.take()
             && let Err(e) = stdin.write_all(prompt.as_bytes())
         {
             let _ = child.kill();
@@ -6419,20 +6546,7 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
-        cmd.env("ADDNESS_TUI_CODEX", "1");
-        cmd.env("ADDNESS_GOAL_ID", &self.goal_id);
-        cmd.env("ADDNESS_GOAL_TITLE", &self.goal_title);
-        cmd.env("ADDNESS_GOAL_STATUS", &self.status_label);
-        cmd.env("ADDNESS_GOAL_DOD", &self.dod);
-        cmd.env("ADDNESS_TASK_GOAL_ID", &self.goal_id);
-        cmd.env("ADDNESS_TASK_GOAL_TITLE", &self.goal_title);
-        cmd.env("ADDNESS_PARENT_GOAL_ID", &self.parent_goal_id);
-        cmd.env("ADDNESS_PARENT_GOAL_TITLE", &self.parent_goal_title);
-        cmd.env(
-            "ADDNESS_WORKTREE_BRANCH",
-            git_branch_label(Path::new(&self.cwd)),
-        );
-        cmd.env("ADDNESS_BIN", &self.addness_bin);
+        self.inject_addness_env(&mut cmd);
 
         let mut child = cmd
             .spawn()
@@ -6814,7 +6928,7 @@ fn byte_index_for_width(text: &str, start: usize, end: usize, target_width: usiz
     candidate
 }
 
-fn spawn_line_reader<R>(reader: R, tx: Sender<CodexProcessEvent>, stderr: bool)
+fn spawn_line_reader<R>(reader: R, tx: Sender<AgentProcessEvent>, stderr: bool)
 where
     R: std::io::Read + Send + 'static,
 {
@@ -6825,9 +6939,9 @@ where
                 break;
             };
             let event = if stderr {
-                CodexProcessEvent::Stderr(line)
+                AgentProcessEvent::Stderr(line)
             } else {
-                CodexProcessEvent::Stdout(line)
+                AgentProcessEvent::Stdout(line)
             };
             if tx.send(event).is_err() {
                 break;
@@ -10132,6 +10246,47 @@ mod tests {
         let line = pane.log.last().unwrap();
         assert_eq!(line.kind, CodexLogKind::Assistant);
         assert_eq!(line.text, "I would run cargo test next.");
+    }
+
+    #[test]
+    fn codex_backend_normalizes_lifecycle_events() {
+        let backend = CodexBackend;
+
+        let started = serde_json::json!({"type": "thread.started", "thread_id": "abc123"});
+        assert!(matches!(
+            backend.parse_lifecycle_event(&started),
+            AgentEvent::SessionStarted(Some(id)) if id == "abc123"
+        ));
+        assert_eq!(
+            backend.session_id_from_event(&started).as_deref(),
+            Some("abc123")
+        );
+
+        assert!(matches!(
+            backend.parse_lifecycle_event(&serde_json::json!({"type": "turn.started"})),
+            AgentEvent::TurnStarted
+        ));
+        assert!(matches!(
+            backend.parse_lifecycle_event(&serde_json::json!({"type": "turn.completed"})),
+            AgentEvent::TurnCompleted
+        ));
+        assert!(matches!(
+            backend.parse_lifecycle_event(&serde_json::json!({"type": "turn.finished"})),
+            AgentEvent::TurnCompleted
+        ));
+        assert!(matches!(
+            backend.parse_lifecycle_event(&serde_json::json!({"type": "turn.failed"})),
+            AgentEvent::TurnFailed(_)
+        ));
+        assert!(matches!(
+            backend.parse_lifecycle_event(&serde_json::json!({"type": "error"})),
+            AgentEvent::Error(_)
+        ));
+        // ツール/本文など表層イベントは Other に集約される。
+        assert!(matches!(
+            backend.parse_lifecycle_event(&serde_json::json!({"type": "item.completed"})),
+            AgentEvent::Other
+        ));
     }
 
     #[test]

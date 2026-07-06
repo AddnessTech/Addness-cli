@@ -1856,6 +1856,16 @@ pub struct CodexPane {
     /// Addness 独自UI上で `codex exec` に注入する永続目標。
     goal_mode: CodexGoalMode,
     pending_decision: Option<CodexDecisionBanner>,
+    /// ClaudeCode バックエンドの次ターン設定（codex の `exec_settings` と並置）。
+    /// codex 経路では未使用。
+    claude_settings: claude::ClaudeExecSettings,
+    /// 承認 Accept で「今回だけ」権限昇格する場合の一時上書き（claude 専用）。
+    /// codex の `one_shot_approval` に相当する claude 版。
+    claude_one_shot_permission: Option<claude::PermissionEscalation>,
+    /// 次ターンを `--fork-session` で開始するか（/fork-* で立てる。1 ターンで消費）。
+    claude_fork_next: bool,
+    /// 承認バナー表示中に、Accept/Always で適用する権限昇格レベル（claude 専用）。
+    claude_pending_escalation: Option<claude::PermissionEscalation>,
 }
 
 impl CodexPane {
@@ -1995,6 +2005,10 @@ impl CodexPane {
             pending_decision: None,
             goal_mode,
             dod,
+            claude_settings: claude::ClaudeExecSettings::default(),
+            claude_one_shot_permission: None,
+            claude_fork_next: false,
+            claude_pending_escalation: None,
         };
         let name = kind.display_name();
         if pane.loaded_history_count > 0 {
@@ -2049,6 +2063,10 @@ impl CodexPane {
         pane.search_editing = false;
         pane.exec_settings = CodexExecSettings::default();
         pane.one_shot_approval = None;
+        pane.claude_settings = claude::ClaudeExecSettings::default();
+        pane.claude_one_shot_permission = None;
+        pane.claude_fork_next = false;
+        pane.claude_pending_escalation = None;
         pane.diff_view = None;
         pane.addness_body_excerpt = None;
         pane.turn_picker = None;
@@ -2714,18 +2732,35 @@ impl CodexPane {
     }
 
     pub fn settings_label(&self) -> String {
-        self.exec_settings.label()
+        match self.kind {
+            AgentKind::Codex => self.exec_settings.label(),
+            AgentKind::ClaudeCode => self.claude_settings.label(),
+        }
     }
 
     pub fn memory_mode_label(&self) -> String {
-        self.exec_settings.memory_mode_label()
+        match self.kind {
+            AgentKind::Codex => self.exec_settings.memory_mode_label(),
+            // Claude Code はプロジェクト固有メモリを Addness に集約する（グローバルメモリ非使用）。
+            AgentKind::ClaudeCode => "Addness DB memory".to_string(),
+        }
     }
 
     pub fn memory_mode_is_addness_safe(&self) -> bool {
-        self.exec_settings.memory_mode_is_addness_safe()
+        match self.kind {
+            AgentKind::Codex => self.exec_settings.memory_mode_is_addness_safe(),
+            AgentKind::ClaudeCode => true,
+        }
     }
 
     pub fn cycle_model(&mut self) {
+        if self.kind == AgentKind::ClaudeCode {
+            let value = self.claude_settings.cycle_model();
+            self.action = Some(format!("model: {value}"));
+            self.push_activity(format!("Claude Code model を {value} に変更"));
+            self.push_log(CodexLogKind::System, format!("次回ターンの model: {value}"));
+            return;
+        }
         self.exec_settings.model_override = None;
         let value = self.exec_settings.cycle_model();
         self.action = Some(format!("model: {value}"));
@@ -2734,6 +2769,13 @@ impl CodexPane {
     }
 
     fn set_model(&mut self, value: &str) {
+        if self.kind == AgentKind::ClaudeCode {
+            let value = self.claude_settings.set_model(value);
+            self.action = Some(format!("model: {value}"));
+            self.push_activity(format!("Claude Code model を {value} に変更"));
+            self.push_log(CodexLogKind::System, format!("次回ターンの model: {value}"));
+            return;
+        }
         if let Some(model) = parse_builtin_model_choice(value) {
             self.exec_settings.model = model;
             self.exec_settings.model_override = None;
@@ -2753,12 +2795,33 @@ impl CodexPane {
     }
 
     pub fn cycle_reasoning(&mut self) {
+        if self.kind == AgentKind::ClaudeCode {
+            let value = self.claude_settings.cycle_effort();
+            self.action = Some(format!("effort: {value}"));
+            self.push_activity(format!("Claude Code effort を {value} に変更"));
+            self.push_log(
+                CodexLogKind::System,
+                format!("次回ターンの effort: {value}"),
+            );
+            return;
+        }
         let value = self.exec_settings.cycle_reasoning();
         self.action = Some(format!("reasoning: {value}"));
         self.push_activity(format!("Codex reasoning を {value} に変更"));
         self.push_log(
             CodexLogKind::System,
             format!("次回ターンの reasoning effort: {value}"),
+        );
+    }
+
+    /// ClaudeCode の `/effort` フリーテキスト設定。
+    fn set_claude_effort(&mut self, value: claude::ClaudeEffortChoice) {
+        let value = self.claude_settings.set_effort(value);
+        self.action = Some(format!("effort: {value}"));
+        self.push_activity(format!("Claude Code effort を {value} に変更"));
+        self.push_log(
+            CodexLogKind::System,
+            format!("次回ターンの effort: {value}"),
         );
     }
 
@@ -2774,12 +2837,33 @@ impl CodexPane {
     }
 
     pub fn cycle_approval(&mut self) {
+        if self.kind == AgentKind::ClaudeCode {
+            let value = self.claude_settings.cycle_permission_mode();
+            self.action = Some(format!("permission: {value}"));
+            self.push_activity(format!("Claude Code permission-mode を {value} に変更"));
+            self.push_log(
+                CodexLogKind::System,
+                format!("次回ターンの permission-mode: {value}"),
+            );
+            return;
+        }
         let value = self.exec_settings.cycle_approval();
         self.action = Some(format!("approval: {value}"));
         self.push_activity(format!("Codex approval を {value} に変更"));
         self.push_log(
             CodexLogKind::System,
             format!("次回ターンの approval: {value}"),
+        );
+    }
+
+    /// ClaudeCode の permission-mode 設定（`/permissions <mode>`）。
+    fn set_claude_permission_mode(&mut self, value: claude::ClaudePermissionMode) {
+        let value = self.claude_settings.set_permission_mode(value);
+        self.action = Some(format!("permission: {value}"));
+        self.push_activity(format!("Claude Code permission-mode を {value} に変更"));
+        self.push_log(
+            CodexLogKind::System,
+            format!("次回ターンの permission-mode: {value}"),
         );
     }
 
@@ -2795,6 +2879,13 @@ impl CodexPane {
     }
 
     pub fn cycle_sandbox(&mut self) {
+        if self.kind == AgentKind::ClaudeCode {
+            self.push_log(
+                CodexLogKind::System,
+                "Claude Code バックエンドではサンドボックス設定は未対応です",
+            );
+            return;
+        }
         let value = self.exec_settings.cycle_sandbox();
         self.action = Some(format!("sandbox: {value}"));
         self.push_activity(format!("Codex sandbox を {value} に変更"));
@@ -3392,7 +3483,12 @@ impl CodexPane {
                     self.current_command = None;
                     self.current_command_started_at = None;
                     self.streaming_assistant_index = None;
-                    self.pending_decision = None;
+                    // Claude は result イベント（turn_finished_by_event=true）で承認バナーを
+                    // 立ててからプロセス終了するため、ここでバナーを消さない。
+                    if self.kind == AgentKind::Codex {
+                        self.pending_decision = None;
+                    }
+                    let name = self.kind.display_name();
                     if let Some(label) = command_label {
                         self.flush_child_process_output(status.success(), &label);
                         if status.success() {
@@ -3410,14 +3506,20 @@ impl CodexPane {
                         if status.success() {
                             self.refresh_current_turn_title();
                             self.queue_completed_turn_body_record();
-                            self.push_log(CodexLogKind::System, "Codex ターンが完了しました");
-                            self.push_terminal_notice("Codex 完了", "Codex の出力が完了しました");
+                            self.push_log(
+                                CodexLogKind::System,
+                                format!("{name} ターンが完了しました"),
+                            );
+                            self.push_terminal_notice(
+                                format!("{name} 完了"),
+                                format!("{name} の出力が完了しました"),
+                            );
                         } else {
-                            let message = format!("Codex ターンが失敗しました: {status}");
+                            let message = format!("{name} ターンが失敗しました: {status}");
                             self.push_log(CodexLogKind::Error, message.clone());
                             self.refresh_current_turn_title();
                             self.queue_completed_turn_body_record();
-                            self.push_terminal_notice("Codex 失敗", message);
+                            self.push_terminal_notice(format!("{name} 失敗"), message);
                         }
                     }
                     self.turn_finished_by_event = false;
@@ -3506,6 +3608,11 @@ impl CodexPane {
     }
 
     fn handle_json_event(&mut self, value: Value) {
+        if self.kind == AgentKind::ClaudeCode {
+            self.handle_claude_json_event(&value);
+            return;
+        }
+
         if let Some(summary) = token_usage_summary(&value) {
             self.last_token_usage_label = Some(summary);
         }
@@ -3583,6 +3690,199 @@ impl CodexPane {
             }
             _ => self.handle_generic_json_event(&event_type, &value),
         }
+    }
+
+    /// Claude Code の stream-json イベントを処理する（codex 経路のヒューリスティックは使わない）。
+    fn handle_claude_json_event(&mut self, value: &Value) {
+        match claude::event_type(value) {
+            "system" => {
+                if claude::event_subtype(value) == Some("init") {
+                    if let Some(session_id) = claude::session_id(value) {
+                        // session_id は codex の thread_id フィールドを共用する。
+                        self.thread_id = Some(session_id);
+                    }
+                    self.begin_claude_turn();
+                }
+                // thinking_tokens など他の system サブタイプは無視する。
+            }
+            "assistant" => self.handle_claude_assistant(value),
+            "user" => self.handle_claude_tool_results(value),
+            "result" => {
+                let result = claude::parse_result(value);
+                self.handle_claude_result(result);
+            }
+            "error" => {
+                let message =
+                    first_text_field(value).unwrap_or_else(|| "Claude Code エラー".to_string());
+                self.push_log(CodexLogKind::Error, message.clone());
+                self.push_terminal_notice("Claude Code エラー", message);
+            }
+            // rate_limit_event / stream_event など未知・非表示イベントは無視する。
+            _ => {}
+        }
+    }
+
+    /// Claude のターン開始表示（codex の thread.started + turn.started 相当）。
+    fn begin_claude_turn(&mut self) {
+        if self.turn_count > 0 {
+            self.collapsed_turns.insert(self.turn_count);
+        }
+        self.turn_running = true;
+        self.turn_finished_by_event = false;
+        self.current_command = None;
+        self.current_command_started_at = None;
+        self.action = Some("依頼を確認中".to_string());
+        self.turn_count = self.turn_count.saturating_add(1);
+        let label = self
+            .current_turn_prompt
+            .as_deref()
+            .or_else(|| self.last_prompt())
+            .map(compact_turn_prompt)
+            .filter(|prompt| !prompt.is_empty())
+            .map(|prompt| format!("Turn {} - {prompt}", self.turn_count))
+            .unwrap_or_else(|| format!("Turn {}", self.turn_count));
+        self.push_log(CodexLogKind::Turn, label);
+    }
+
+    fn handle_claude_assistant(&mut self, value: &Value) {
+        for block in claude::assistant_blocks(value) {
+            match block {
+                claude::ClaudeBlock::Text(text) => {
+                    self.streaming_assistant_index = None;
+                    self.push_log(CodexLogKind::Assistant, text);
+                }
+                claude::ClaudeBlock::Thinking(text) => {
+                    // reasoning 相当。Event 種別（薄色）で控えめに出す。
+                    self.push_log(
+                        CodexLogKind::Event,
+                        format!("(思考) {}", compact_one_line(&text, 2_000)),
+                    );
+                }
+                claude::ClaudeBlock::ToolUse { name, summary } => {
+                    if let Some(summary) = &summary {
+                        self.current_command = Some(compact_tool_text(summary));
+                        self.current_command_started_at = Some(Instant::now());
+                    }
+                    self.action = Some(format!("ツール実行: {name}"));
+                    let label = match &summary {
+                        Some(summary) => format!("{name} {}", compact_tool_text(summary)),
+                        None => name.clone(),
+                    };
+                    self.push_log(CodexLogKind::Tool, label);
+                }
+            }
+        }
+    }
+
+    fn handle_claude_tool_results(&mut self, value: &Value) {
+        for result in claude::tool_results(value) {
+            self.current_command = None;
+            self.current_command_started_at = None;
+            if result.is_error {
+                let text = if result.text.is_empty() {
+                    "(エラー詳細なし)".to_string()
+                } else {
+                    compact_one_line(&result.text, 500)
+                };
+                self.push_log(CodexLogKind::Error, format!("ツール失敗: {text}"));
+            } else {
+                let summary = child_process_output_summary(&result.text);
+                self.push_log(CodexLogKind::Tool, format!("OUT {summary}"));
+            }
+        }
+    }
+
+    fn handle_claude_result(&mut self, result: claude::ClaudeResult) {
+        if let Some(usage) = result.usage_label {
+            self.last_token_usage_label = Some(usage);
+        }
+        self.turn_running = false;
+        self.turn_finished_by_event = true;
+        self.current_command = None;
+        self.current_command_started_at = None;
+        self.streaming_assistant_index = None;
+        self.refresh_current_turn_title();
+        self.queue_completed_turn_body_record();
+
+        if !result.denials.is_empty() {
+            self.set_claude_permission_decision(&result.denials);
+            return;
+        }
+
+        if result.is_error {
+            let message = result
+                .text
+                .unwrap_or_else(|| "Claude Code ターンが失敗しました".to_string());
+            self.push_log(CodexLogKind::Error, message.clone());
+            self.push_terminal_notice("Claude Code 失敗", message);
+        } else {
+            self.action = Some("応答完了".to_string());
+            self.push_log(CodexLogKind::System, "Claude Code の応答が完了しました");
+            self.push_terminal_notice("Claude Code 完了", "Claude Code の出力が完了しました");
+        }
+    }
+
+    fn set_claude_permission_decision(&mut self, denials: &[claude::ClaudeDenial]) {
+        self.claude_pending_escalation = Some(claude::escalation_for_denials(denials));
+        let summary = denials
+            .iter()
+            .map(|denial| match &denial.target {
+                Some(target) => {
+                    format!("{}（{}）", denial.tool_name, compact_one_line(target, 80))
+                }
+                None => denial.tool_name.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let message = format!("ツール実行権限が拒否されました: {summary}。許可して続行しますか？");
+        self.set_pending_decision(CodexDecisionBanner::new(
+            CodexDecisionKind::Permission,
+            message,
+        ));
+    }
+
+    /// 承認 Accept/Always 後に `--resume` で続行ターンを開始する。
+    fn resolve_claude_decision(&mut self, response: CodexDecisionResponse, response_label: &str) {
+        self.action = Some(format!("確認応答: {response_label}"));
+        self.push_activity(format!("確認待ちに {response_label} で応答"));
+        let escalation = self
+            .claude_pending_escalation
+            .take()
+            .unwrap_or(claude::PermissionEscalation::SkipPermissions);
+        match response {
+            CodexDecisionResponse::Accept => {
+                self.claude_one_shot_permission = Some(escalation);
+                self.start_claude_approval_retry("今回だけ許可");
+            }
+            CodexDecisionResponse::Always => {
+                self.claude_settings.apply_sticky_escalation(escalation);
+                self.start_claude_approval_retry("これからずっと許可");
+            }
+            CodexDecisionResponse::Deny => {
+                self.push_terminal_notice("Claude Code 確認応答", "拒否したため作業を中断します");
+                self.push_log(CodexLogKind::System, "拒否したため入力待ちに戻ります");
+                self.start_next_queued_turn_if_idle();
+            }
+        }
+    }
+
+    fn start_claude_approval_retry(&mut self, reason: &str) {
+        if self.thread_id.is_none() {
+            self.push_log(
+                CodexLogKind::Error,
+                "セッションIDが取得できていないため作業を続行できません",
+            );
+            return;
+        }
+        let prompt = "先ほど拒否されたツール実行を許可しました。同じ作業を続行してください。";
+        self.action = Some(format!("{reason}: 続行ターン"));
+        self.push_log(
+            CodexLogKind::System,
+            format!("{reason}の設定で作業を続行します"),
+        );
+        self.push_log(CodexLogKind::User, prompt.to_string());
+        self.input_state.record_submitted(prompt);
+        self.start_turn(prompt);
     }
 
     fn handle_generic_json_event(&mut self, event_type: &str, value: &Value) {
@@ -3694,6 +3994,11 @@ impl CodexPane {
                 "Codex 確認自動応答",
                 format!("{response_label} を自動選択しました"),
             );
+            return;
+        }
+
+        if self.kind == AgentKind::ClaudeCode {
+            self.resolve_claude_decision(response, response_label);
             return;
         }
 
@@ -3952,14 +4257,6 @@ impl CodexPane {
 
     fn start_turn_with_display_prompt(&mut self, prompt: &str, display_prompt: &str) {
         let name = self.kind.display_name();
-        // TODO(Step 3): Claude Code バックエンドのターン実行（agent/claude.rs）を実装したら外す。
-        if self.kind == AgentKind::ClaudeCode {
-            self.push_log(
-                CodexLogKind::Error,
-                "Claude Code バックエンドのターン実行は未実装です",
-            );
-            return;
-        }
         if self.is_turn_running() {
             self.push_log(
                 CodexLogKind::System,
@@ -3972,6 +4269,8 @@ impl CodexPane {
         let prompt = self.prompt_with_addness_context(prompt);
         let command_result = self.spawn_exec_process(&prompt);
         self.one_shot_approval = None;
+        self.claude_one_shot_permission = None;
+        self.claude_fork_next = false;
         match command_result {
             Ok(child) => {
                 self.child = Some(child);
@@ -4274,7 +4573,18 @@ impl CodexPane {
                 true
             }
             "reasoning" | "effort" => {
-                if args.is_empty() {
+                if self.kind == AgentKind::ClaudeCode {
+                    if args.is_empty() {
+                        self.cycle_reasoning();
+                    } else if let Some(choice) = claude::parse_effort_choice(args) {
+                        self.set_claude_effort(choice);
+                    } else {
+                        self.push_log(
+                            CodexLogKind::Error,
+                            "effort は config / low / medium / high / xhigh / max を指定してください",
+                        );
+                    }
+                } else if args.is_empty() {
                     self.cycle_reasoning();
                 } else if let Some(choice) = parse_reasoning_choice(args) {
                     self.set_reasoning(choice);
@@ -4287,7 +4597,18 @@ impl CodexPane {
                 true
             }
             "approval" | "approvals" => {
-                if args.is_empty() {
+                if self.kind == AgentKind::ClaudeCode {
+                    if args.is_empty() {
+                        self.cycle_approval();
+                    } else if let Some(mode) = claude::parse_permission_mode(args) {
+                        self.set_claude_permission_mode(mode);
+                    } else {
+                        self.push_log(
+                            CodexLogKind::Error,
+                            "permission-mode は config / plan / acceptEdits / dontAsk / bypassPermissions を指定してください",
+                        );
+                    }
+                } else if args.is_empty() {
                     self.cycle_approval();
                 } else if let Some(choice) = parse_approval_choice(args) {
                     self.set_approval(choice);
@@ -4344,7 +4665,7 @@ impl CodexPane {
                 true
             }
             "sandbox" => {
-                if args.is_empty() {
+                if self.kind == AgentKind::ClaudeCode || args.is_empty() {
                     self.cycle_sandbox();
                 } else if let Some(choice) = parse_sandbox_choice(args) {
                     self.set_sandbox(choice);
@@ -4921,6 +5242,13 @@ impl CodexPane {
     }
 
     fn start_codex_subcommand(&mut self, args: Vec<String>, label: String) {
+        if self.kind == AgentKind::ClaudeCode {
+            self.push_log(
+                CodexLogKind::System,
+                "これは codex 専用コマンドです。Claude Code では利用できません",
+            );
+            return;
+        }
         if self.is_turn_running() {
             self.push_log(
                 CodexLogKind::Error,
@@ -4957,6 +5285,73 @@ impl CodexPane {
         }
     }
 
+    /// ClaudeCode の cwd に対応するセッション候補を読み込む。
+    fn load_claude_session_candidates(&self, limit: usize) -> Vec<CodexSessionCandidate> {
+        match claude::config_dir() {
+            Some(dir) => claude::load_session_candidates_from(&dir, &self.cwd, limit),
+            None => Vec::new(),
+        }
+    }
+
+    /// ClaudeCode の resume/fork をペイン内ターンとして開始する。
+    fn start_claude_resume(&mut self, session_ref: Option<&str>, fork: bool, prompt_arg: &str) {
+        if self.is_turn_running() {
+            self.push_log(
+                CodexLogKind::Error,
+                "Claude Code 実行中です。完了後に再開してください",
+            );
+            return;
+        }
+        let session_id = match session_ref {
+            None => match self.load_claude_session_candidates(1).into_iter().next() {
+                Some(candidate) => candidate.id,
+                None => {
+                    self.push_log(
+                        CodexLogKind::Error,
+                        "このフォルダの Claude Code セッションが見つかりません",
+                    );
+                    return;
+                }
+            },
+            Some(session_ref) => match self.resolve_claude_session_ref(session_ref) {
+                Some(id) => id,
+                None => return,
+            },
+        };
+        self.thread_id = Some(session_id.clone());
+        self.claude_fork_next = fork;
+        let verb = if fork { "fork" } else { "resume" };
+        self.push_log(
+            CodexLogKind::System,
+            format!(
+                "Claude Code セッションを {verb} します: {}",
+                short_session_id(&session_id)
+            ),
+        );
+        let prompt = if prompt_arg.trim().is_empty() {
+            resume_prompt().to_string()
+        } else {
+            prompt_arg.trim().to_string()
+        };
+        self.record_and_run_user_line(prompt);
+    }
+
+    fn resolve_claude_session_ref(&mut self, session_ref: &str) -> Option<String> {
+        if let Some(index) = parse_one_based_index(session_ref) {
+            if self.indexed_sessions.is_empty() {
+                self.indexed_sessions = self.load_claude_session_candidates(12);
+            }
+            return match self.indexed_sessions.get(index) {
+                Some(session) => Some(session.id.clone()),
+                None => {
+                    self.push_log(CodexLogKind::Error, "session番号が範囲外です");
+                    None
+                }
+            };
+        }
+        Some(session_ref.to_string())
+    }
+
     fn handle_sessions_slash_command(&mut self, args: &str) {
         let limit = args
             .trim()
@@ -4965,6 +5360,11 @@ impl CodexPane {
             .filter(|n| *n > 0)
             .unwrap_or(12)
             .min(50);
+        if self.kind == AgentKind::ClaudeCode {
+            self.indexed_sessions = self.load_claude_session_candidates(limit);
+            self.push_codex_sessions_list();
+            return;
+        }
         match load_codex_session_candidates(limit) {
             Ok(sessions) => {
                 self.indexed_sessions = sessions;
@@ -4993,6 +5393,10 @@ impl CodexPane {
     }
 
     fn handle_resume_last_slash_command(&mut self, args: &str, include_all: bool) {
+        if self.kind == AgentKind::ClaudeCode {
+            self.start_claude_resume(None, false, args);
+            return;
+        }
         let prompt = if args.trim().is_empty() {
             resume_prompt().to_string()
         } else {
@@ -5011,6 +5415,10 @@ impl CodexPane {
             );
             return;
         };
+        if self.kind == AgentKind::ClaudeCode {
+            self.start_claude_resume(Some(&session_ref), false, &prompt);
+            return;
+        }
         let Some(session) = self.resolve_session_ref(&session_ref) else {
             return;
         };
@@ -5111,6 +5519,10 @@ impl CodexPane {
     }
 
     fn handle_fork_last_slash_command(&mut self, args: &str, include_all: bool) {
+        if self.kind == AgentKind::ClaudeCode {
+            self.start_claude_resume(None, true, args);
+            return;
+        }
         let command = codex_fork_args(
             None,
             true,
@@ -5131,6 +5543,10 @@ impl CodexPane {
             );
             return;
         };
+        if self.kind == AgentKind::ClaudeCode {
+            self.start_claude_resume(Some(&session_ref), true, &prompt);
+            return;
+        }
         let Some(session) = self.resolve_session_ref(&session_ref) else {
             return;
         };
@@ -5311,6 +5727,18 @@ impl CodexPane {
             return;
         }
 
+        if self.kind == AgentKind::ClaudeCode {
+            if let Some(mode) = claude::parse_permission_mode(args) {
+                self.set_claude_permission_mode(mode);
+            } else {
+                self.push_log(
+                    CodexLogKind::Error,
+                    "permissions は config / plan / acceptEdits / dontAsk / bypassPermissions を指定してください",
+                );
+            }
+            return;
+        }
+
         let Some((head, rest)) = split_first_arg(args) else {
             self.push_permissions_status();
             return;
@@ -5355,6 +5783,16 @@ impl CodexPane {
     }
 
     fn push_permissions_status(&mut self) {
+        if self.kind == AgentKind::ClaudeCode {
+            self.push_log(
+                CodexLogKind::System,
+                format!(
+                    "Permissions: permission-mode={}",
+                    self.claude_settings.permission_label()
+                ),
+            );
+            return;
+        }
         self.push_log(
             CodexLogKind::System,
             format!(
@@ -5791,6 +6229,23 @@ impl CodexPane {
     }
 
     fn handle_add_dir_slash_command(&mut self, args: &str) {
+        if self.kind == AgentKind::ClaudeCode {
+            let dir = args.trim();
+            if dir.is_empty() || dir == "list" {
+                self.push_log(
+                    CodexLogKind::System,
+                    "Claude Code: /add-dir <絶対パス> で次ターンの --add-dir を追加します",
+                );
+                return;
+            }
+            self.claude_settings.add_dir(dir.to_string());
+            self.action = Some(format!("add-dir: {dir}"));
+            self.push_log(
+                CodexLogKind::System,
+                format!("次回ターンに --add-dir {dir} を渡します"),
+            );
+            return;
+        }
         if args.is_empty() || args == "list" {
             let values = self.exec_settings.additional_dirs.clone();
             self.push_numbered_settings_list("Add dirs", &values);
@@ -6407,7 +6862,8 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
     }
 
     fn start_next_queued_turn_if_idle(&mut self) -> bool {
-        if self.finished || self.is_turn_running() {
+        // 承認バナー待ちの間は予約ターンを勝手に開始しない（ユーザー判断を待つ）。
+        if self.finished || self.is_turn_running() || self.pending_decision.is_some() {
             return false;
         }
         let Some(queued) = self.queued_prompts.pop_front() else {
@@ -6446,9 +6902,25 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
 
     fn spawn_exec_process(&self, prompt: &str) -> Result<Child> {
         let mut cmd = Command::new(&self.codex_bin);
-        let exec_settings = self.exec_settings_for_spawn();
-        for arg in codex_exec_args(self.thread_id.as_deref(), &self.cwd, &exec_settings) {
-            cmd.arg(arg);
+        match self.kind {
+            AgentKind::Codex => {
+                let exec_settings = self.exec_settings_for_spawn();
+                for arg in codex_exec_args(self.thread_id.as_deref(), &self.cwd, &exec_settings) {
+                    cmd.arg(arg);
+                }
+            }
+            AgentKind::ClaudeCode => {
+                // session_id は codex の thread_id を共用する（2 ターン目以降 --resume）。
+                for arg in claude::exec_args(
+                    self.thread_id.as_deref(),
+                    &self.claude_settings,
+                    self.claude_one_shot_permission,
+                    self.claude_fork_next,
+                    addness_tui_developer_instructions(),
+                ) {
+                    cmd.arg(arg);
+                }
+            }
         }
 
         cmd.current_dir(&self.cwd);
@@ -9224,13 +9696,13 @@ mod tests {
         assert_eq!(resolved.as_deref(), Some(tmp.as_path()));
     }
 
-    #[test]
-    fn claude_backend_turn_is_guarded_until_step3() {
+    /// Claude Code バックエンドのテスト用ペイン。実ホームへ書き込まず（session_log_path: None）、
+    /// 実在しないバイナリを使うので、ターン起動を試みても実プロセスは走らない。
+    fn claude_pane() -> CodexPane {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        // 実ホームの ~/.addness へ書き込まないよう session_log_path: None で生成する。
         let mut pane = CodexPane::spawn_inner(CodexPaneSpawnOptions {
             kind: AgentKind::ClaudeCode,
-            codex_bin: Path::new("claude"),
+            codex_bin: Path::new("/nonexistent/addness-claude-test-bin"),
             cwd: &cwd,
             addness_bin: "addness",
             session_log_path: None,
@@ -9240,17 +9712,142 @@ mod tests {
             status_label: "TEST".to_string(),
         })
         .unwrap();
-        assert_eq!(pane.kind(), AgentKind::ClaudeCode);
-        pane.start_turn("何か作業して");
-        // ターンは起動されず、未実装ガードのエラー行が積まれる。
-        assert!(!pane.is_turn_running());
+        pane.log.clear();
+        pane
+    }
+
+    #[test]
+    fn claude_init_event_sets_session_id_and_turn() {
+        let mut pane = claude_pane();
+        pane.handle_json_event(serde_json::json!({
+            "type": "system", "subtype": "init", "session_id": "sid-1", "model": "opus"
+        }));
+        assert_eq!(pane.thread_id.as_deref(), Some("sid-1"));
+        assert!(pane.log.iter().any(|line| line.kind == CodexLogKind::Turn));
+    }
+
+    #[test]
+    fn claude_assistant_text_is_logged() {
+        let mut pane = claude_pane();
+        pane.handle_json_event(serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "こんにちは"}]}
+        }));
         assert!(
-            pane.log.iter().any(|line| line
-                .text
-                .contains("Claude Code バックエンドのターン実行は未実装です")),
-            "guard log missing: {:?}",
-            pane.log.iter().map(|l| &l.text).collect::<Vec<_>>()
+            pane.log
+                .iter()
+                .any(|line| line.kind == CodexLogKind::Assistant && line.text == "こんにちは")
         );
+    }
+
+    #[test]
+    fn claude_tool_use_bash_and_write_are_logged() {
+        let mut pane = claude_pane();
+        pane.handle_json_event(serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [
+                {"type": "tool_use", "name": "Bash", "input": {"command": "cargo test"}},
+                {"type": "tool_use", "name": "Write", "input": {"file_path": "/tmp/x.rs"}}
+            ]}
+        }));
+        assert!(pane.log.iter().any(|line| line.kind == CodexLogKind::Tool
+            && line.text.contains("Bash")
+            && line.text.contains("cargo test")));
+        assert!(pane.log.iter().any(|line| line.kind == CodexLogKind::Tool
+            && line.text.contains("Write")
+            && line.text.contains("/tmp/x.rs")));
+    }
+
+    #[test]
+    fn claude_tool_result_error_is_logged_as_error() {
+        let mut pane = claude_pane();
+        pane.handle_json_event(serde_json::json!({
+            "type": "user",
+            "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "boom", "is_error": true}
+            ]}
+        }));
+        assert!(
+            pane.log
+                .iter()
+                .any(|line| line.kind == CodexLogKind::Error && line.text.contains("boom"))
+        );
+    }
+
+    #[test]
+    fn claude_result_denials_raise_permission_banner() {
+        let mut pane = claude_pane();
+        pane.thread_id = Some("sid-1".to_string());
+        pane.handle_json_event(serde_json::json!({
+            "type": "result", "subtype": "success", "is_error": false, "result": "done",
+            "session_id": "sid-1",
+            "permission_denials": [
+                {"tool_name": "Write", "tool_use_id": "t1", "tool_input": {"file_path": "/a.rs"}}
+            ]
+        }));
+        let banner = pane.pending_decision.as_ref().expect("banner");
+        assert_eq!(banner.kind, CodexDecisionKind::Permission);
+        assert!(banner.message.contains("Write"));
+        assert_eq!(
+            pane.claude_pending_escalation,
+            Some(claude::PermissionEscalation::AcceptEdits)
+        );
+    }
+
+    #[test]
+    fn claude_accept_starts_resume_turn_with_continue_prompt() {
+        let mut pane = claude_pane();
+        pane.thread_id = Some("sid-1".to_string());
+        pane.handle_json_event(serde_json::json!({
+            "type": "result", "subtype": "success", "is_error": false, "result": "done",
+            "session_id": "sid-1",
+            "permission_denials": [
+                {"tool_name": "Bash", "tool_use_id": "t1", "tool_input": {"command": "rm -rf x"}}
+            ]
+        }));
+        // Bash を含むので全許可へ昇格する。
+        assert_eq!(
+            pane.claude_pending_escalation,
+            Some(claude::PermissionEscalation::SkipPermissions)
+        );
+        pane.handle_decision_key(key(KeyCode::Char('a')));
+        // 続行プロンプトがユーザー表示として積まれ、resume 対象の session_id が保持される。
+        assert!(
+            pane.log
+                .iter()
+                .any(|line| line.kind == CodexLogKind::User && line.text.contains("許可しました"))
+        );
+        assert_eq!(pane.thread_id.as_deref(), Some("sid-1"));
+    }
+
+    #[test]
+    fn claude_f_keys_cycle_claude_settings() {
+        let mut pane = claude_pane();
+        pane.cycle_model();
+        assert!(pane.settings_label().contains("model:fable"));
+        pane.cycle_reasoning();
+        assert!(pane.settings_label().contains("effort:low"));
+        pane.cycle_approval();
+        assert!(pane.settings_label().contains("permission:plan"));
+        // F5（sandbox）は Claude では no-op で通知だけ。
+        pane.cycle_sandbox();
+        assert!(
+            pane.log
+                .iter()
+                .any(|line| line.text.contains("サンドボックス設定は未対応"))
+        );
+    }
+
+    #[test]
+    fn claude_codex_subcommand_is_rejected() {
+        let mut pane = claude_pane();
+        pane.start_codex_subcommand(vec!["doctor".to_string()], "codex doctor".to_string());
+        assert!(
+            pane.log
+                .iter()
+                .any(|line| line.text.contains("codex 専用コマンド"))
+        );
+        assert!(!pane.is_turn_running());
     }
 
     /// 入力受付状態（未終了）のテスト用ペインを作る。

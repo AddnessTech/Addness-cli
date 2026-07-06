@@ -2066,6 +2066,25 @@ impl App {
                     _ => return,
                 }
             }
+            // スラッシュコマンドパレット表示中は ↑↓ で候補選択・Tab で補完する。
+            // Esc / 文字入力はそのまま入力欄へ流し、既存挙動（入力クリア等）に委ねる。
+            if pane.slash_palette_active() && key.modifiers.is_empty() {
+                match key.code {
+                    KeyCode::Up => {
+                        pane.move_slash_palette_selection(-1);
+                        return;
+                    }
+                    KeyCode::Down => {
+                        pane.move_slash_palette_selection(1);
+                        return;
+                    }
+                    KeyCode::Tab => {
+                        pane.accept_slash_palette_selection();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
             if key.modifiers.is_empty() {
                 match key.code {
                     KeyCode::F(2) => {
@@ -2814,10 +2833,7 @@ impl App {
 
     fn is_ctrl_help_key(key: KeyEvent) -> bool {
         key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(
-                key.code,
-                KeyCode::Char('?') | KeyCode::Char('/') | KeyCode::Backspace | KeyCode::Delete
-            )
+            && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
     }
 
     fn handle_org_popup(&mut self, code: KeyCode) {
@@ -4786,34 +4802,29 @@ mod codex_help_key_tests {
     use super::*;
 
     #[test]
-    fn ctrl_help_key_accepts_common_terminal_encodings() {
+    fn ctrl_help_key_accepts_ctrl_q() {
         assert!(App::is_ctrl_help_key(KeyEvent::new(
-            KeyCode::Char('?'),
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL,
+        )));
+        // Ctrl+Shift+Q（大文字で届くケース）も許容する。
+        assert!(App::is_ctrl_help_key(KeyEvent::new(
+            KeyCode::Char('Q'),
             KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-        )));
-        assert!(App::is_ctrl_help_key(KeyEvent::new(
-            KeyCode::Char('/'),
-            KeyModifiers::CONTROL,
-        )));
-        assert!(App::is_ctrl_help_key(KeyEvent::new(
-            KeyCode::Backspace,
-            KeyModifiers::CONTROL,
-        )));
-        assert!(App::is_ctrl_help_key(KeyEvent::new(
-            KeyCode::Delete,
-            KeyModifiers::CONTROL,
         )));
     }
 
     #[test]
-    fn ctrl_help_key_does_not_steal_plain_backspace_or_slash() {
+    fn ctrl_help_key_does_not_steal_plain_q_or_other_ctrl_keys() {
+        // 素の q はアプリ終了などに使うため横取りしない。
         assert!(!App::is_ctrl_help_key(KeyEvent::new(
-            KeyCode::Backspace,
+            KeyCode::Char('q'),
             KeyModifiers::NONE,
         )));
+        // 旧割り当て（Ctrl+? / Ctrl+/）はもうヘルプを開かない。
         assert!(!App::is_ctrl_help_key(KeyEvent::new(
             KeyCode::Char('/'),
-            KeyModifiers::NONE,
+            KeyModifiers::CONTROL,
         )));
         assert!(!App::is_ctrl_help_key(KeyEvent::new(
             KeyCode::Char('f'),

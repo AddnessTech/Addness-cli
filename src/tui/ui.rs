@@ -811,11 +811,11 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
             .map(|c| c.is_turn_running())
             .unwrap_or(false);
         let hint = if finished {
-            " [c]コメント  [s]状態  [d]成果物(PR/Release)  [v]DoD判定  Ctrl+?:操作一覧  Esc/q:閉じる "
+            " [c]コメント  [s]状態  [d]成果物(PR/Release)  [v]DoD判定  Ctrl+Q:操作一覧  Esc/q:閉じる "
         } else if running {
             " Codex 実行中  |  Ctrl-T:表示切替  |  F7:turn一覧  |  入力+Enter:次ターン予約  |  Ctrl-C:中断 "
         } else {
-            " 入力してEnterでCodexへ送信  |  Ctrl-T:表示切替  |  F7:turn一覧  |  F2-F6:設定/差分  |  Ctrl+?:操作一覧 "
+            " 入力してEnterでCodexへ送信  |  Ctrl-T:表示切替  |  F7:turn一覧  |  F2-F6:設定/差分  |  Ctrl+Q:操作一覧 "
         };
         let status = Paragraph::new(Line::from(Span::styled(
             hint,
@@ -1071,7 +1071,7 @@ fn draw_codex_help_overlay(frame: &mut Frame) {
 
     let lines: Vec<Line> = vec![
         section("Codex in Addness"),
-        kv("Ctrl+?", "この操作一覧を表示 / 閉じる"),
+        kv("Ctrl+Q", "この操作一覧を表示 / 閉じる"),
         kv("入力 + Enter", "Codexへ依頼を送信（必要ならAddnessを参照）"),
         kv("入力中 Enter", "実行中なら次ターンに予約"),
         kv("Ctrl-C", "実行中のCodexターンを中断"),
@@ -1112,6 +1112,10 @@ fn draw_codex_help_overlay(frame: &mut Frame) {
         ),
         blank(),
         section("codex commands"),
+        kv(
+            "/ 入力",
+            "コマンド候補を入力欄の上に表示（Tab補完 / ↑↓選択）",
+        ),
         kv("/sessions [N]", "Codex session候補を番号付きで表示"),
         kv(
             "/codex-resume <args>",
@@ -1306,7 +1310,7 @@ fn draw_codex_help_overlay(frame: &mut Frame) {
         .border_style(Style::default().fg(Color::Cyan))
         .title(" Codex in Addness ")
         .title_bottom(
-            Line::from(" Ctrl+? / Esc / q: Close ").style(Style::default().fg(Color::DarkGray)),
+            Line::from(" Ctrl+Q / Esc / q: Close ").style(Style::default().fg(Color::DarkGray)),
         );
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
@@ -2908,6 +2912,93 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
             input_chunk.y + cursor_row.min(input_chunk.height.saturating_sub(1)),
         ));
     }
+
+    // 入力が `/xxx` のとき、入力欄の直上にスラッシュコマンドパレットを重ねる。
+    if pane.slash_palette_active() {
+        draw_codex_slash_palette(frame, input_chunk, history_chunk, pane);
+    }
+}
+
+/// 入力欄の直上に、現在の `/` 入力に一致するスラッシュコマンド候補を表示する。
+fn draw_codex_slash_palette(
+    frame: &mut Frame,
+    input_chunk: Rect,
+    history_chunk: Rect,
+    pane: &CodexPane,
+) {
+    let suggestions = pane.slash_palette_suggestions();
+    if suggestions.is_empty() {
+        return;
+    }
+    let total = suggestions.len();
+    let selected = pane.slash_palette_selected();
+
+    // 入力欄の上（履歴領域）に確保できる高さ内で行数を決める。枠に 2 行使う。
+    let avail = history_chunk.height as usize;
+    if avail < 3 {
+        return;
+    }
+    let rows = total.min(8).min(avail - 2);
+    if rows == 0 {
+        return;
+    }
+    // 選択中の候補が窓に入るようスクロール位置を決める。
+    let start = if selected >= rows {
+        selected + 1 - rows
+    } else {
+        0
+    };
+    let end = (start + rows).min(total);
+
+    let ph = (rows + 2) as u16;
+    let area = Rect {
+        x: input_chunk.x,
+        y: input_chunk.y.saturating_sub(ph),
+        width: input_chunk.width,
+        height: ph,
+    };
+
+    clear_modal_area(frame, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLOR_CODEX))
+        .style(Style::default().bg(COLOR_INPUT_BG))
+        .title(Span::styled(
+            format!(" / コマンド  {total}件 "),
+            Style::default().fg(COLOR_CODEX),
+        ))
+        .title_bottom(
+            Line::from(" Tab:補完  ↑↓:選択  Esc:消す ").style(Style::default().fg(COLOR_MUTED)),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let name_w = 16usize;
+    let lines: Vec<Line> = (start..end)
+        .map(|i| {
+            let (name, desc) = suggestions[i];
+            let is_sel = i == selected;
+            let (marker, name_style) = if is_sel {
+                (
+                    "▸ ",
+                    Style::default()
+                        .fg(COLOR_TEXT_STRONG)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                ("  ", Style::default().fg(COLOR_TEXT))
+            };
+            Line::from(vec![
+                Span::styled(format!("{marker}{name:<name_w$}"), name_style),
+                Span::styled(format!("  {desc}"), Style::default().fg(COLOR_MUTED)),
+            ])
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(COLOR_INPUT_BG)),
+        inner,
+    );
 }
 
 struct CodexInputPromptRender {
@@ -4621,7 +4712,7 @@ fn codex_dashboard_shortcut_lines(max_width: usize) -> Vec<Line<'static>> {
         )),
         Line::from(Span::styled(
             ellipsize_width(
-                "  /remember /handoff:保存  Ctrl+?:全体ヘルプ  /settings",
+                "  /remember /handoff:保存  Ctrl+Q:全体ヘルプ  /settings",
                 max_width,
             ),
             Style::default().fg(COLOR_MUTED),
@@ -5421,7 +5512,7 @@ mod tests {
         let text = render_status_text(&app, 140);
 
         assert!(
-            text.contains("Ctrl+?"),
+            text.contains("Ctrl+Q"),
             "codex status should expose the help shortcut:\n{text}"
         );
     }
@@ -5435,7 +5526,7 @@ mod tests {
             .join("\n");
 
         assert!(text.contains("次の操作"));
-        assert!(text.contains("Ctrl+?"));
+        assert!(text.contains("Ctrl+Q"));
         assert!(text.contains("F7:turn一覧"));
         assert!(text.contains("/organize"));
         assert!(text.contains("/work next"));

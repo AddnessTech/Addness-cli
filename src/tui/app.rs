@@ -441,7 +441,7 @@ async fn fetch_initial_data(mut client: ApiClient) -> InitialData {
     };
     client.set_org_id(Some(org_id.clone()));
 
-    let (goal_tree, error) = match client.get_goal_tree_with_completed(&org_id, 2).await {
+    let (goal_tree, error) = match client.get_goal_tree(&org_id, 2).await {
         Ok(resp) => (GoalTree::from_tree_items(resp.data.items), None),
         Err(e) => (
             GoalTree::empty(),
@@ -937,7 +937,7 @@ impl App {
 
         self.client.set_org_id(Some(org_id.clone()));
 
-        match self.api_call(self.client.get_goal_tree_with_completed(&org_id, 2)) {
+        match self.api_call(self.client.get_goal_tree(&org_id, 2)) {
             Ok(resp) => {
                 self.goal_tree = GoalTree::from_tree_items(resp.data.items);
                 self.members = HashMap::new();
@@ -961,7 +961,7 @@ impl App {
 
         self.client.set_org_id(Some(org_id.clone()));
 
-        match self.api_call(self.client.get_goal_tree_with_completed(&org_id, 2)) {
+        match self.api_call(self.client.get_goal_tree(&org_id, 2)) {
             Ok(resp) => {
                 self.goal_tree = GoalTree::from_tree_items(resp.data.items);
                 self.start_deferred_initial_load();
@@ -1223,10 +1223,7 @@ impl App {
             Err(_) => (String::new(), String::new(), None),
         };
         let initial_children = self
-            .api_call(
-                self.client
-                    .get_goal_children_with_completed(&goal_id, 50, 0),
-            )
+            .api_call(self.client.get_goal_children(&goal_id, 50, 0))
             .ok()
             .map(|resp| {
                 resp.data
@@ -1807,7 +1804,7 @@ impl App {
             // 子ゴール／コメントの取得は失敗しても本体があれば続行する。
             let (goal_res, children_res, comments_res, deliverables_res) = tokio::join!(
                 client.get_goal(&goal_id),
-                client.get_goal_children_with_completed(&goal_id, 50, 0),
+                client.get_goal_children(&goal_id, 50, 0),
                 client.list_comments(&goal_id),
                 client.get_goal_deliverables(&goal_id),
             );
@@ -3071,9 +3068,7 @@ impl App {
                     },
                     async {
                         if need_children {
-                            client
-                                .get_goal_children_with_completed(goal_id_ref, 100, 0)
-                                .await
+                            client.get_goal_children(goal_id_ref, 100, 0).await
                         } else {
                             Ok(crate::api::ApiResponse {
                                 data: crate::api::GoalChildrenData {

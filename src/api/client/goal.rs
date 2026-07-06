@@ -60,18 +60,6 @@ impl ApiClient {
         self.get(&path).await
     }
 
-    pub async fn get_goal_children_with_completed(
-        &self,
-        goal_id: &str,
-        limit: usize,
-        offset: usize,
-    ) -> Result<ApiResponse<GoalChildrenData>> {
-        let path = format!(
-            "/api/v2/objectives/{goal_id}/children?include_owner=true&include_completed=true&limit={limit}&offset={offset}"
-        );
-        self.get(&path).await
-    }
-
     pub async fn get_goal_subtree(&self, goal_id: &str) -> Result<ApiResponse<GoalTreeData>> {
         let path = format!("/api/v2/objectives/{goal_id}/subtree?include_owner=true");
         self.get(&path).await

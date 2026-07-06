@@ -22,7 +22,7 @@ use crate::api::{
 };
 use crate::dbg_log;
 
-use super::agent::{self, ChildGoalUpdate, CodexPane, CodexWorkSummary, TerminalNotice};
+use super::agent::{self, AgentKind, ChildGoalUpdate, CodexPane, CodexWorkSummary, TerminalNotice};
 use super::codex_memory::{codex_body_update_request, codex_trace_link_label, codex_work_memo};
 pub(super) use super::file_picker::PICKER_VISIBLE_ROWS;
 use super::file_picker::{
@@ -94,6 +94,7 @@ pub enum DeliverableFormField {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionMenuItem {
     WorkWithCodex,
+    WorkWithClaude,
     AddDeliverable,
     AddComment,
     CompleteGoal,
@@ -116,6 +117,7 @@ impl ActionMenuItem {
     pub fn label(&self) -> &'static str {
         match self {
             ActionMenuItem::WorkWithCodex => "codexで作業",
+            ActionMenuItem::WorkWithClaude => "claude codeで作業",
             ActionMenuItem::AddDeliverable => "add deliverable",
             ActionMenuItem::AddComment => "add comment",
             ActionMenuItem::CompleteGoal => "complete goal",
@@ -1183,6 +1185,7 @@ impl App {
                 title: goal_title,
                 items: vec![
                     ActionMenuItem::WorkWithCodex,
+                    ActionMenuItem::WorkWithClaude,
                     complete_item,
                     ActionMenuItem::AddComment,
                     ActionMenuItem::AddDeliverable,
@@ -1200,17 +1203,33 @@ impl App {
 
     /// 選択中ゴールの文脈を注入して、埋め込み codex セッションを起動する。
     fn start_codex(&mut self) {
+        self.start_agent(AgentKind::Codex);
+    }
+
+    fn start_agent(&mut self, kind: AgentKind) {
+        let name = kind.display_name();
+        let label = kind.label();
         let Some((goal_id, title)) = self.selected_goal_context() else {
-            self.error_message = Some("ゴールを選択してから codex を起動してください".to_string());
+            self.error_message = Some(format!("ゴールを選択してから {label} を起動してください"));
             return;
         };
 
-        // codex 未インストールでもクラッシュさせず、案内を出す。
-        let Some(codex_bin) = agent::codex_path() else {
-            self.error_message = Some(
-                "codex が見つかりません。`brew install codex` 等でインストールしてください"
-                    .to_string(),
-            );
+        // 未インストールでもクラッシュさせず、案内を出す。
+        let bin = match kind {
+            AgentKind::Codex => agent::codex_path(),
+            AgentKind::ClaudeCode => agent::claude_path(),
+        };
+        let Some(agent_bin) = bin else {
+            self.error_message = Some(match kind {
+                AgentKind::Codex => {
+                    "codex が見つかりません。`brew install codex` 等でインストールしてください"
+                        .to_string()
+                }
+                AgentKind::ClaudeCode => {
+                    "claude が見つかりません。`npm install -g @anthropic-ai/claude-code` 等でインストールしてください"
+                        .to_string()
+                }
+            });
             return;
         };
 
@@ -1247,17 +1266,18 @@ impl App {
         // 対象ゴールの軽量コンテキストは環境変数で伝える。起動直後は初期プロンプトを
         // 送らず、ユーザーがすぐ最初の指示を入力できる状態にする。
         match CodexPane::spawn(
-            &codex_bin,
+            &agent_bin,
             &cwd,
             &addness_bin,
             goal_id,
             title,
             dod,
             status_label,
+            kind,
         ) {
             Ok(mut pane) => {
                 let body_loaded = pane.set_addness_body_context(initial_body);
-                pane.push_activity(format!("{} codex を起動", Local::now().format("%H:%M")));
+                pane.push_activity(format!("{} {label} を起動", Local::now().format("%H:%M")));
                 if body_loaded {
                     pane.last_addness_read_at = Some(Instant::now());
                     pane.last_addness_read_label = Some("body".to_string());
@@ -1317,7 +1337,7 @@ impl App {
                 Self::set_mouse_capture(true);
             }
             Err(e) => {
-                self.error_message = Some(format!("codex の起動に失敗しました: {e}"));
+                self.error_message = Some(format!("{name} の起動に失敗しました: {e}"));
             }
         }
     }
@@ -4203,6 +4223,7 @@ impl App {
     fn run_action_menu_item(&mut self, item: ActionMenuItem) {
         match item {
             ActionMenuItem::WorkWithCodex => self.start_codex(),
+            ActionMenuItem::WorkWithClaude => self.start_agent(AgentKind::ClaudeCode),
             ActionMenuItem::AddDeliverable => self.start_add_deliverable_modal(),
             ActionMenuItem::AddComment => self.start_add_comment_modal(),
             ActionMenuItem::CompleteGoal => self.do_set_goal_completed(true),
@@ -4823,6 +4844,17 @@ mod picker_interaction_tests {
             app.modal_state,
             Some(ModalState::AddDeliverable { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod action_menu_tests {
+    use super::*;
+
+    #[test]
+    fn work_with_claude_item_has_label() {
+        assert_eq!(ActionMenuItem::WorkWithClaude.label(), "claude codeで作業");
+        assert_eq!(ActionMenuItem::WorkWithCodex.label(), "codexで作業");
     }
 }
 

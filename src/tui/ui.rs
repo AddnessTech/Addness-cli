@@ -12,7 +12,8 @@ use std::time::Instant;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::agent::{
-    CODEX_LOG_PREFIX_WIDTH, ChildGoal, CodexDecisionKind, CodexLogKind, CodexLogLine, CodexPane,
+    AgentKind, CODEX_LOG_PREFIX_WIDTH, ChildGoal, CodexDecisionKind, CodexLogKind, CodexLogLine,
+    CodexPane,
 };
 use super::app::{ActivePane, App, DeliverableFormField, FormField, ModalState};
 use super::goal_tree::{CommentView, TreeRow};
@@ -255,7 +256,7 @@ fn draw_title_bar(frame: &mut Frame, area: Rect, app: &App) {
     let line = if let Some(pane) = app.codex.as_ref() {
         Line::from(vec![
             Span::styled(
-                " codex ",
+                format!(" {} ", pane.kind().label()),
                 Style::default()
                     .fg(Color::Magenta)
                     .add_modifier(Modifier::BOLD),
@@ -804,6 +805,12 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
 
     // codex フォーカス中は通常のキーが codex へ転送されるため、専用のヒントを出す。
     if app.active_pane == ActivePane::Codex {
+        let kind = app
+            .codex
+            .as_ref()
+            .map(|c| c.kind())
+            .unwrap_or(AgentKind::Codex);
+        let name = kind.display_name();
         let finished = app.codex.as_ref().map(|c| c.finished).unwrap_or(true);
         let running = app
             .codex
@@ -811,11 +818,15 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
             .map(|c| c.is_turn_running())
             .unwrap_or(false);
         let hint = if finished {
-            " [c]コメント  [s]状態  [d]成果物(PR/Release)  [v]DoD判定  Ctrl+Q:操作一覧  Esc/q:閉じる "
+            " [c]コメント  [s]状態  [d]成果物(PR/Release)  [v]DoD判定  Ctrl+Q:操作一覧  Esc/q:閉じる ".to_string()
         } else if running {
-            " Codex 実行中  |  Ctrl-T:表示切替  |  F7:turn一覧  |  入力+Enter:次ターン予約  |  Ctrl-C:中断 "
+            format!(
+                " {name} 実行中  |  Ctrl-T:表示切替  |  F7:turn一覧  |  入力+Enter:次ターン予約  |  Ctrl-C:中断 "
+            )
         } else {
-            " 入力してEnterでCodexへ送信  |  Ctrl-T:表示切替  |  F7:turn一覧  |  F2-F6:設定/差分  |  Ctrl+Q:操作一覧 "
+            format!(
+                " 入力してEnterで{name}へ送信  |  Ctrl-T:表示切替  |  F7:turn一覧  |  F2-F6:設定/差分  |  Ctrl+Q:操作一覧 "
+            )
         };
         let status = Paragraph::new(Line::from(Span::styled(
             hint,
@@ -825,7 +836,7 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(COLOR_CODEX))
-                .title(" codex "),
+                .title(format!(" {} ", kind.label())),
         );
         frame.render_widget(status, area);
         return;
@@ -2579,7 +2590,7 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
         lines.push(Line::from(Span::styled(dod_header, dod_header_style)));
         if pane.dod_items.is_empty() {
             lines.push(Line::from(Span::styled(
-                "（未設定 — codexと決めよう）",
+                format!("（未設定 — {}と決めよう）", pane.kind().label()),
                 Style::default().fg(COLOR_WARN),
             )));
         } else {
@@ -2690,35 +2701,35 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
     let cols = term_area.width.saturating_sub(2);
     if let Some(pane) = app.codex.as_mut() {
         pane.resize(rows, cols);
+        let name = pane.kind().display_name();
         let (title, color) = if pane.finished {
             let t = if pane.scrollback > 0 {
-                " Codex 終了 — ↑↓/PgUp/PgDn/Home/End: 履歴  Esc/qで戻る ".to_string()
+                format!(" {name} 終了 — ↑↓/PgUp/PgDn/Home/End: 履歴  Esc/qで戻る ")
             } else {
-                " Codex 終了 — ↑↓: 履歴  [c]コメント [s]状態 [d]成果物 [v]DoD判定  Esc/q: 戻る "
-                    .to_string()
+                format!(
+                    " {name} 終了 — ↑↓: 履歴  [c]コメント [s]状態 [d]成果物 [v]DoD判定  Esc/q: 戻る "
+                )
             };
             (t, COLOR_PANEL)
         } else if let Some(decision) = pane.decision_banner() {
-            (codex_decision_title_hint(decision), COLOR_WARN)
+            (codex_decision_title_hint(pane.kind(), decision), COLOR_WARN)
         } else if pane.diff_view().is_some() {
             (
-                " Codex 差分表示 — F6:会話へ戻る  ↑↓/PgUp/PgDn/Home/End:差分 ".to_string(),
+                format!(" {name} 差分表示 — F6:会話へ戻る  ↑↓/PgUp/PgDn/Home/End:差分 "),
                 COLOR_CODEX,
             )
         } else if pane.is_turn_running() {
             (
-                " Codex 実行中 — F7:turn一覧  Ctrl-T:表示切替  F6:差分  Ctrl-C:中断 ".to_string(),
+                format!(" {name} 実行中 — F7:turn一覧  Ctrl-T:表示切替  F6:差分  Ctrl-C:中断 "),
                 COLOR_WARN,
             )
         } else if pane.scrollback > 0 {
-            (
-                " Codex 履歴表示 — Esc: 最新へ戻る ".to_string(),
-                COLOR_PANEL,
-            )
+            (format!(" {name} 履歴表示 — Esc: 最新へ戻る "), COLOR_PANEL)
         } else {
             (
-                " Codex 入力待ち — F7:turn一覧  Ctrl-T:表示切替  F2-F6:設定/差分  F9:再開 "
-                    .to_string(),
+                format!(
+                    " {name} 入力待ち — F7:turn一覧  Ctrl-T:表示切替  F2-F6:設定/差分  F9:再開 "
+                ),
                 COLOR_PANEL,
             )
         };
@@ -3331,7 +3342,10 @@ fn codex_decision_color(kind: &CodexDecisionKind) -> Color {
     }
 }
 
-fn codex_decision_title_hint(decision: &super::agent::CodexDecisionBanner) -> String {
+fn codex_decision_title_hint(
+    kind: AgentKind,
+    decision: &super::agent::CodexDecisionBanner,
+) -> String {
     let keys = match decision.kind {
         CodexDecisionKind::YesNo => "y/n",
         CodexDecisionKind::Dangerous => "a/y または d/n",
@@ -3343,7 +3357,10 @@ fn codex_decision_title_hint(decision: &super::agent::CodexDecisionBanner) -> St
             }
         }
     };
-    format!(" Codex 確認待ち — 下の確認欄で選択 / {keys} ")
+    format!(
+        " {} 確認待ち — 下の確認欄で選択 / {keys} ",
+        kind.display_name()
+    )
 }
 
 fn codex_decision_choice_line(
@@ -4373,7 +4390,7 @@ fn codex_current_activity_label(pane: &CodexPane, max_width: usize) -> String {
         } else if let Some(action) = pane.action.as_deref() {
             format!("作業中: {action}{input_hint}")
         } else {
-            format!("Codexが考えています{input_hint}")
+            format!("{}が考えています{input_hint}", pane.kind().display_name())
         }
     } else {
         codex_work_label(
@@ -4690,7 +4707,10 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
     }
     if area.height >= 11 {
         lines.push(Line::from(vec![
-            Span::styled("Codex ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(
+                format!("{} ", pane.kind().display_name()),
+                Style::default().fg(COLOR_MUTED),
+            ),
             Span::styled(assistant, assistant_style),
         ]));
     }
@@ -4716,12 +4736,15 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
                         COLOR_PANEL
                     },
                 ))
-                .title(if pane.decision_banner().is_some() {
-                    " Codex 作業ダッシュボード ▲確認待ち "
-                } else if pane.is_turn_running() {
-                    " Codex 作業ダッシュボード ●実行中 "
-                } else {
-                    " Codex 作業ダッシュボード "
+                .title({
+                    let name = pane.kind().display_name();
+                    if pane.decision_banner().is_some() {
+                        format!(" {name} 作業ダッシュボード ▲確認待ち ")
+                    } else if pane.is_turn_running() {
+                        format!(" {name} 作業ダッシュボード ●実行中 ")
+                    } else {
+                        format!(" {name} 作業ダッシュボード ")
+                    }
                 }),
         )
         .wrap(ratatui::widgets::Wrap { trim: true });
@@ -4854,8 +4877,8 @@ mod tests {
     };
     use crate::api::ApiClient;
     use crate::tui::agent::{
-        CODEX_LOG_PREFIX_WIDTH, ChildGoal, CodexDecisionBanner, CodexDecisionKind, CodexLogKind,
-        CodexLogLine, CodexPane,
+        AgentKind, CODEX_LOG_PREFIX_WIDTH, ChildGoal, CodexDecisionBanner, CodexDecisionKind,
+        CodexLogKind, CodexLogLine, CodexPane,
     };
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::style::Modifier;
@@ -5192,11 +5215,11 @@ mod tests {
             deny_label: "No",
         };
 
-        assert!(codex_decision_title_hint(&approval).contains("l:ずっと許可"));
-        assert!(!codex_decision_title_hint(&yes_no).contains("ずっと許可"));
-        assert!(codex_decision_title_hint(&yes_no).contains("y/n"));
-        assert!(codex_decision_title_hint(&approval).contains("下の確認欄"));
-        assert!(!codex_decision_title_hint(&approval).contains("上部で内容確認"));
+        assert!(codex_decision_title_hint(AgentKind::Codex, &approval).contains("l:ずっと許可"));
+        assert!(!codex_decision_title_hint(AgentKind::Codex, &yes_no).contains("ずっと許可"));
+        assert!(codex_decision_title_hint(AgentKind::Codex, &yes_no).contains("y/n"));
+        assert!(codex_decision_title_hint(AgentKind::Codex, &approval).contains("下の確認欄"));
+        assert!(!codex_decision_title_hint(AgentKind::Codex, &approval).contains("上部で内容確認"));
     }
 
     #[test]

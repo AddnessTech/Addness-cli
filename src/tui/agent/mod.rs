@@ -20,6 +20,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+mod claude;
+mod codex;
+
 pub const CODEX_LOG_PREFIX_WIDTH: usize = 7;
 
 /// スラッシュコマンドのパレット候補（コマンド名, 1 行説明）。
@@ -86,9 +89,73 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
 ];
 
 const CODEX_SESSION_HISTORY_DIR: &str = "codex-sessions";
+const CLAUDE_SESSION_HISTORY_DIR: &str = "claude-sessions";
 const CODEX_SESSION_HISTORY_MAX_LOG_LINES: usize = 5_000;
 const CODEX_SESSION_HISTORY_MAX_RECORDS: usize = 20_000;
 const CODEX_SESSION_HISTORY_MAX_BYTES: u64 = 20 * 1024 * 1024;
+
+/// TUI が起動するエージェントバックエンドの種別。
+/// バックエンド分岐（起動引数・イベントパース・セッション探索・表示名）で match する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentKind {
+    Codex,
+    ClaudeCode,
+}
+
+impl AgentKind {
+    /// 小文字ラベル（ステータス行・アクティビティログの文中で使う）。
+    pub fn label(self) -> &'static str {
+        match self {
+            AgentKind::Codex => "codex",
+            AgentKind::ClaudeCode => "claude code",
+        }
+    }
+
+    /// 表示名（見出し・パネルタイトル用）。
+    pub fn display_name(self) -> &'static str {
+        match self {
+            AgentKind::Codex => "Codex",
+            AgentKind::ClaudeCode => "Claude Code",
+        }
+    }
+
+    /// 子プロセスへ渡す `ADDNESS_TUI_BACKEND` の値。
+    fn backend_env_value(self) -> &'static str {
+        match self {
+            AgentKind::Codex => "codex",
+            AgentKind::ClaudeCode => "claude",
+        }
+    }
+
+    /// セッションログの保存先ディレクトリ名（`~/.addness/<dir>/`）。
+    fn session_history_dir(self) -> &'static str {
+        match self {
+            AgentKind::Codex => CODEX_SESSION_HISTORY_DIR,
+            AgentKind::ClaudeCode => CLAUDE_SESSION_HISTORY_DIR,
+        }
+    }
+}
+
+/// claude 実行ファイルのパスを解決する。
+/// 環境変数 `ADDNESS_CLAUDE_BIN` を最優先で見て、無ければ PATH 上を探す。
+/// 見つからなければ `None`。
+pub fn claude_path() -> Option<PathBuf> {
+    // 明示指定（別パスにインストールした場合や検証用の上書き）を最優先。
+    if let Some(bin) = std::env::var_os("ADDNESS_CLAUDE_BIN") {
+        let cand = PathBuf::from(bin);
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let cand = dir.join("claude");
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
+}
 
 /// codex 実行ファイルのパスを解決する。
 /// 環境変数 `ADDNESS_CODEX_BIN` を最優先で見て、無ければ PATH 上を探す。
@@ -1458,6 +1525,7 @@ struct LoadedCodexSession {
 }
 
 struct CodexPaneSpawnOptions<'a> {
+    kind: AgentKind,
     codex_bin: &'a Path,
     cwd: &'a Path,
     addness_bin: &'a str,
@@ -1662,6 +1730,8 @@ struct CodexSessionIndexRecord {
 
 /// 埋め込み codex セッションの状態。
 pub struct CodexPane {
+    /// このペインが起動するエージェントバックエンドの種別。
+    kind: AgentKind,
     codex_bin: PathBuf,
     addness_bin: String,
     child: Option<Child>,
@@ -1793,6 +1863,7 @@ impl CodexPane {
     ///
     /// 起動時点では Codex プロセスを走らせず、Addness 側の入力欄で最初の依頼を待つ。
     /// 最初の Enter で `codex exec --json` を起動し、以降は `codex exec resume` を使う。
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         codex_bin: &Path,
         cwd: &Path,
@@ -1801,12 +1872,14 @@ impl CodexPane {
         goal_title: String,
         dod: String,
         status_label: String,
+        kind: AgentKind,
     ) -> Result<Self> {
         Self::spawn_inner(CodexPaneSpawnOptions {
+            kind,
             codex_bin,
             cwd,
             addness_bin,
-            session_log_path: codex_session_log_path(&goal_id),
+            session_log_path: agent_session_log_path(kind, &goal_id),
             goal_id,
             goal_title,
             dod,
@@ -1816,6 +1889,7 @@ impl CodexPane {
 
     fn spawn_inner(options: CodexPaneSpawnOptions<'_>) -> Result<Self> {
         let CodexPaneSpawnOptions {
+            kind,
             codex_bin,
             cwd,
             addness_bin,
@@ -1848,6 +1922,7 @@ impl CodexPane {
         let collapsed_turns = (1..turn_count).collect::<BTreeSet<_>>();
 
         let mut pane = Self {
+            kind,
             codex_bin: codex_bin.to_path_buf(),
             addness_bin: addness_bin.to_string(),
             child: None,
@@ -1921,18 +1996,19 @@ impl CodexPane {
             goal_mode,
             dod,
         };
+        let name = kind.display_name();
         if pane.loaded_history_count > 0 {
             pane.push_log(
                 CodexLogKind::System,
                 format!(
-                    "前回のCodex履歴を {} 件読み込みました。続きは Enter で送信できます。",
+                    "前回の{name}履歴を {} 件読み込みました。続きは Enter で送信できます。",
                     pane.loaded_history_count
                 ),
             );
         }
         pane.push_log(
             CodexLogKind::System,
-            "Codex入力欄で待機中。入力して Enter で依頼を送信します。",
+            format!("{name}入力欄で待機中。入力して Enter で依頼を送信します。"),
         );
         Ok(pane)
     }
@@ -1953,6 +2029,7 @@ impl CodexPane {
             "Test goal".to_string(),
             String::new(),
             "TEST".to_string(),
+            AgentKind::Codex,
         )
         .unwrap();
         pane.rows = rows.max(1);
@@ -1998,6 +2075,11 @@ impl CodexPane {
         self.push_log(CodexLogKind::Turn, format!("Turn {}", self.turn_count));
         self.push_log(CodexLogKind::Assistant, assistant_text.to_string());
         self.queue_completed_turn_body_record();
+    }
+
+    /// このペインのエージェントバックエンド種別。
+    pub fn kind(&self) -> AgentKind {
+        self.kind
     }
 
     /// ログを delta 行スクロールする（正=過去へ、負=最新へ）。
@@ -3869,8 +3951,20 @@ impl CodexPane {
     }
 
     fn start_turn_with_display_prompt(&mut self, prompt: &str, display_prompt: &str) {
+        let name = self.kind.display_name();
+        // TODO(Step 3): Claude Code バックエンドのターン実行（agent/claude.rs）を実装したら外す。
+        if self.kind == AgentKind::ClaudeCode {
+            self.push_log(
+                CodexLogKind::Error,
+                "Claude Code バックエンドのターン実行は未実装です",
+            );
+            return;
+        }
         if self.is_turn_running() {
-            self.push_log(CodexLogKind::System, "前の Codex ターンがまだ実行中です");
+            self.push_log(
+                CodexLogKind::System,
+                format!("前の {name} ターンがまだ実行中です"),
+            );
             return;
         }
 
@@ -3891,9 +3985,9 @@ impl CodexPane {
                 self.scroll_to_live();
             }
             Err(e) => {
-                let message = format!("Codex の起動に失敗しました: {e}");
+                let message = format!("{name} の起動に失敗しました: {e}");
                 self.push_log(CodexLogKind::Error, message.clone());
-                self.push_terminal_notice("Codex 起動失敗", message);
+                self.push_terminal_notice(format!("{name} 起動失敗"), message);
             }
         }
     }
@@ -6361,7 +6455,11 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
-        cmd.env("ADDNESS_TUI_CODEX", "1");
+        // 後方互換: codex のときだけ従来の ADDNESS_TUI_CODEX を維持する。
+        if self.kind == AgentKind::Codex {
+            cmd.env("ADDNESS_TUI_CODEX", "1");
+        }
+        cmd.env("ADDNESS_TUI_BACKEND", self.kind.backend_env_value());
         cmd.env("ADDNESS_GOAL_ID", &self.goal_id);
         cmd.env("ADDNESS_GOAL_TITLE", &self.goal_title);
         cmd.env("ADDNESS_GOAL_STATUS", &self.status_label);
@@ -6419,7 +6517,11 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
-        cmd.env("ADDNESS_TUI_CODEX", "1");
+        // 後方互換: codex のときだけ従来の ADDNESS_TUI_CODEX を維持する。
+        if self.kind == AgentKind::Codex {
+            cmd.env("ADDNESS_TUI_CODEX", "1");
+        }
+        cmd.env("ADDNESS_TUI_BACKEND", self.kind.backend_env_value());
         cmd.env("ADDNESS_GOAL_ID", &self.goal_id);
         cmd.env("ADDNESS_GOAL_TITLE", &self.goal_title);
         cmd.env("ADDNESS_GOAL_STATUS", &self.status_label);
@@ -7029,10 +7131,10 @@ fn split_dod_items(dod: &str) -> Vec<String> {
         .collect()
 }
 
-fn codex_session_log_path(goal_id: &str) -> Option<PathBuf> {
+fn agent_session_log_path(kind: AgentKind, goal_id: &str) -> Option<PathBuf> {
     dirs::home_dir().map(|home| {
         home.join(".addness")
-            .join(CODEX_SESSION_HISTORY_DIR)
+            .join(kind.session_history_dir())
             .join(format!("{}.jsonl", safe_path_component(goal_id)))
     })
 }
@@ -9079,6 +9181,76 @@ mod tests {
         KeyEvent::new(code, modifiers)
     }
 
+    #[test]
+    fn agent_kind_labels_differ_per_backend() {
+        assert_eq!(AgentKind::Codex.label(), "codex");
+        assert_eq!(AgentKind::ClaudeCode.label(), "claude code");
+        assert_eq!(AgentKind::Codex.display_name(), "Codex");
+        assert_eq!(AgentKind::ClaudeCode.display_name(), "Claude Code");
+        assert_eq!(AgentKind::Codex.backend_env_value(), "codex");
+        assert_eq!(AgentKind::ClaudeCode.backend_env_value(), "claude");
+    }
+
+    #[test]
+    fn session_log_path_splits_by_kind() {
+        let codex = agent_session_log_path(AgentKind::Codex, "goal/x").unwrap();
+        let claude = agent_session_log_path(AgentKind::ClaudeCode, "goal/x").unwrap();
+        assert!(
+            codex.to_string_lossy().contains("codex-sessions"),
+            "{codex:?}"
+        );
+        assert!(
+            claude.to_string_lossy().contains("claude-sessions"),
+            "{claude:?}"
+        );
+        // ゴール ID 部分（ファイル名）は両バックエンドで同一の正規化になる。
+        assert_eq!(codex.file_name(), claude.file_name());
+    }
+
+    #[test]
+    fn claude_path_prefers_env_binary() {
+        // 実在するファイルを指す ADDNESS_CLAUDE_BIN を最優先で返す。
+        let tmp = std::env::temp_dir().join(format!("addness-claude-test-{}", std::process::id()));
+        std::fs::write(&tmp, b"#!/bin/sh\n").unwrap();
+        // SAFETY: テスト専用の一時的な環境変数操作。他テストは同変数を参照しない。
+        unsafe {
+            std::env::set_var("ADDNESS_CLAUDE_BIN", &tmp);
+        }
+        let resolved = claude_path();
+        unsafe {
+            std::env::remove_var("ADDNESS_CLAUDE_BIN");
+        }
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(resolved.as_deref(), Some(tmp.as_path()));
+    }
+
+    #[test]
+    fn claude_backend_turn_is_guarded_until_step3() {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let mut pane = CodexPane::spawn(
+            Path::new("claude"),
+            &cwd,
+            "addness",
+            "goal/claude".to_string(),
+            "Claude goal".to_string(),
+            String::new(),
+            "TEST".to_string(),
+            AgentKind::ClaudeCode,
+        )
+        .unwrap();
+        assert_eq!(pane.kind(), AgentKind::ClaudeCode);
+        pane.start_turn("何か作業して");
+        // ターンは起動されず、未実装ガードのエラー行が積まれる。
+        assert!(!pane.is_turn_running());
+        assert!(
+            pane.log.iter().any(|line| line
+                .text
+                .contains("Claude Code バックエンドのターン実行は未実装です")),
+            "guard log missing: {:?}",
+            pane.log.iter().map(|l| &l.text).collect::<Vec<_>>()
+        );
+    }
+
     /// 入力受付状態（未終了）のテスト用ペインを作る。
     fn live_pane() -> CodexPane {
         let mut pane = CodexPane::test_with_output(10, 80, 0, "");
@@ -9795,6 +9967,7 @@ mod tests {
         {
             let history_path = path.clone();
             let mut pane = CodexPane::spawn_inner(CodexPaneSpawnOptions {
+                kind: AgentKind::Codex,
                 codex_bin: Path::new("codex"),
                 cwd: &cwd,
                 addness_bin: "addness",
@@ -9815,6 +9988,7 @@ mod tests {
 
         let history_path = path.clone();
         let pane = CodexPane::spawn_inner(CodexPaneSpawnOptions {
+            kind: AgentKind::Codex,
             codex_bin: Path::new("codex"),
             cwd: &cwd,
             addness_bin: "addness",

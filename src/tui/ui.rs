@@ -140,9 +140,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Help overlay sits above everything else.
     if app.show_help {
         if app.codex.is_some() {
-            draw_codex_help_overlay(frame);
+            draw_codex_help_overlay(frame, app);
         } else {
-            draw_help_overlay(frame);
+            draw_help_overlay(frame, app);
         }
     }
 }
@@ -951,7 +951,7 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
 // Help overlay
 // ---------------------------------------------------------------------------
 
-fn draw_help_overlay(frame: &mut Frame) {
+fn draw_help_overlay(frame: &mut Frame, app: &mut App) {
     // (key, description) の行。section() は見出し。
     let section = |title: &str| {
         Line::from(Span::styled(
@@ -1033,21 +1033,17 @@ fn draw_help_overlay(frame: &mut Frame) {
         kv("Ctrl+F", "ファイラーを開いて選択"),
     ];
 
-    let height = (lines.len() as u16 + 2).min(frame.area().height);
-    let area = centered_rect(64, height, frame.area());
-    clear_modal_area(frame, area);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(" Keybindings ")
-        .title_bottom(
-            Line::from(" ? / Esc / q: Close ").style(Style::default().fg(Color::DarkGray)),
-        );
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    render_scrollable_overlay(
+        frame,
+        &mut app.help_scroll,
+        lines,
+        64,
+        " Keybindings ",
+        "? / Esc / q: Close",
+    );
 }
 
-fn draw_codex_help_overlay(frame: &mut Frame) {
+fn draw_codex_help_overlay(frame: &mut Frame, app: &mut App) {
     let section = |title: &str| {
         Line::from(Span::styled(
             title.to_string(),
@@ -1301,18 +1297,62 @@ fn draw_codex_help_overlay(frame: &mut Frame) {
         kv("Esc / q", "Codexペインを閉じる"),
     ];
 
-    let height = (lines.len() as u16 + 2).min(frame.area().height);
-    let area = centered_rect(72, height, frame.area());
+    render_scrollable_overlay(
+        frame,
+        &mut app.help_scroll,
+        lines,
+        72,
+        " Codex in Addness ",
+        "Ctrl+Q / Esc / q: Close",
+    );
+}
+
+/// スクロール可能なオーバーレイを画面中央に描く共通ヘルパー。
+/// `scroll` は実際の行数・枠内高さに応じてクランプし直し、呼び出し元の
+/// 状態（`App::help_scroll` 等）へ書き戻す。フッターにスクロール位置を表示する。
+fn render_scrollable_overlay(
+    frame: &mut Frame,
+    scroll: &mut usize,
+    lines: Vec<Line<'static>>,
+    percent_x: u16,
+    title: &str,
+    footer_hint: &str,
+) {
+    let total = lines.len();
+    let full = frame.area();
+    // 内容が少なければ内容に合わせて縮め、多ければ画面高（上下に少し余白）まで
+    // 広げてスクロールで見せる。
+    let max_height = full.height.saturating_sub(2).max(3);
+    let height = (total as u16 + 2).min(max_height);
+    let area = centered_rect(percent_x, height, full);
     clear_modal_area(frame, area);
+
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let max_scroll = total.saturating_sub(inner_height);
+    *scroll = (*scroll).min(max_scroll);
+
+    let footer = if max_scroll > 0 {
+        let shown_end = (*scroll + inner_height).min(total);
+        format!(
+            " {footer_hint}  |  ↑↓/PgUp/PgDn/Home/End:スクロール  {}-{}/{total} ",
+            scroll.saturating_add(1).min(total.max(1)),
+            shown_end
+        )
+    } else {
+        format!(" {footer_hint} ")
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
-        .title(" Codex in Addness ")
-        .title_bottom(
-            Line::from(" Ctrl+Q / Esc / q: Close ").style(Style::default().fg(Color::DarkGray)),
-        );
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+        .title(title.to_string())
+        .title_bottom(Line::from(footer).style(Style::default().fg(Color::DarkGray)));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .scroll((*scroll as u16, 0)),
+        area,
+    );
 }
 
 // ---------------------------------------------------------------------------

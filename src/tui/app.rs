@@ -632,6 +632,9 @@ pub struct App {
 
     /// キーバインド一覧のヘルプオーバーレイ表示中か（`?` で開く）
     pub show_help: bool,
+    /// ヘルプオーバーレイのスクロール位置（行数）。描画側が実際の行数に
+    /// クランプし直す。開くたびに 0 へ戻す。
+    pub help_scroll: usize,
 
     // Goal trees
     pub goal_tree: GoalTree,
@@ -708,6 +711,7 @@ impl App {
             show_org_popup: false,
             org_popup_index: 0,
             show_help: false,
+            help_scroll: 0,
             goal_tree: GoalTree::empty(),
             todays_goals_tree: GoalTree::empty(),
             todays_loaded: false,
@@ -2792,6 +2796,7 @@ impl App {
                 && Self::is_ctrl_help_key(key)
             {
                 self.show_help = !self.show_help;
+                self.help_scroll = 0;
                 return Ok(());
             }
             if Self::is_ctrl_help_key(key) {
@@ -2799,12 +2804,33 @@ impl App {
             }
 
             if self.show_help {
-                // ヘルプ表示中は閉じる操作のみ受け付ける。
-                if matches!(
-                    key.code,
-                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')
-                ) {
-                    self.show_help = false;
+                // ヘルプ表示中は閉じる操作とスクロールのみ受け付ける。
+                // 実際の最大スクロール量は描画側（行数・枠高さ）が知っているため、
+                // ここでは意図だけを反映し、描画側で毎フレームクランプし直す。
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => {
+                        self.show_help = false;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.help_scroll = self.help_scroll.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.help_scroll = self.help_scroll.saturating_add(1);
+                    }
+                    KeyCode::PageUp => {
+                        self.help_scroll = self.help_scroll.saturating_sub(10);
+                    }
+                    KeyCode::PageDown => {
+                        self.help_scroll = self.help_scroll.saturating_add(10);
+                    }
+                    KeyCode::Home => {
+                        self.help_scroll = 0;
+                    }
+                    KeyCode::End => {
+                        // 描画側で実際の最大値へクランプされる。
+                        self.help_scroll = usize::MAX / 2;
+                    }
+                    _ => {}
                 }
                 return Ok(());
             }
@@ -2866,7 +2892,10 @@ impl App {
 
     fn handle_normal(&mut self, code: KeyCode) {
         match code {
-            KeyCode::Char('?') => self.show_help = true,
+            KeyCode::Char('?') => {
+                self.show_help = true;
+                self.help_scroll = 0;
+            }
             KeyCode::Char('q') | KeyCode::Esc => self.running = false,
             KeyCode::Tab => {
                 self.active_pane = match self.active_pane {
@@ -4830,6 +4859,64 @@ mod codex_help_key_tests {
             KeyCode::Char('f'),
             KeyModifiers::CONTROL,
         )));
+    }
+
+    fn app_for_help_scroll() -> (tokio::runtime::Runtime, App) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = ApiClient::new("t", "http://localhost").unwrap();
+        let mut app = App::new(client, rt.handle().clone());
+        app.show_help = true;
+        app.help_scroll = 5;
+        (rt, app)
+    }
+
+    #[test]
+    fn help_scroll_moves_with_arrow_and_page_keys_while_open() {
+        let (_rt, mut app) = app_for_help_scroll();
+
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)))
+            .unwrap();
+        assert_eq!(app.help_scroll, 6);
+        assert!(app.show_help);
+
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)))
+            .unwrap();
+        assert_eq!(app.help_scroll, 5);
+
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::PageDown,
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+        assert_eq!(app.help_scroll, 15);
+
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)))
+            .unwrap();
+        assert_eq!(app.help_scroll, 0);
+    }
+
+    #[test]
+    fn help_scroll_does_not_underflow_at_top() {
+        let (_rt, mut app) = app_for_help_scroll();
+        app.help_scroll = 0;
+
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)))
+            .unwrap();
+        assert_eq!(app.help_scroll, 0);
+    }
+
+    #[test]
+    fn help_close_keys_still_close_overlay_and_scroll_resets_next_open() {
+        let (_rt, mut app) = app_for_help_scroll();
+
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+            .unwrap();
+        assert!(!app.show_help);
+
+        // 素の '?' で再度開くとスクロールは先頭へ戻る。
+        app.handle_normal(KeyCode::Char('?'));
+        assert!(app.show_help);
+        assert_eq!(app.help_scroll, 0);
     }
 }
 

@@ -662,26 +662,26 @@ pub struct App {
     pub success_message: Option<String>,
 
     /// 埋め込み codex セッション（起動中のみ Some）
-    pub codex: Option<CodexPane>,
+    pub agent: Option<CodexPane>,
     /// 直近に描画した codex 端末ペインの外枠領域。マウス座標のローカル変換に使う。
-    pub(super) codex_terminal_area: Option<Rect>,
+    pub(super) agent_terminal_area: Option<Rect>,
     /// 直近に描画した Codex 左ペインのスクロール対象領域。
-    pub(super) codex_status_area: Option<Rect>,
-    pub(super) codex_contract_area: Option<Rect>,
-    pub(super) codex_activity_area: Option<Rect>,
-    pub(super) codex_contract_scroll: usize,
-    pub(super) codex_activity_scroll: usize,
-    pub(super) codex_last_scroll_input: Option<String>,
+    pub(super) agent_status_area: Option<Rect>,
+    pub(super) agent_contract_area: Option<Rect>,
+    pub(super) agent_activity_area: Option<Rect>,
+    pub(super) agent_contract_scroll: usize,
+    pub(super) agent_activity_scroll: usize,
+    pub(super) agent_last_scroll_input: Option<String>,
 
     /// codex 実行中、対象ゴールを低頻度・非ブロッキングで再取得するための
     /// バックグラウンドタスク（進行中のみ Some）と、前回リフレッシュ時刻。
-    codex_refresh: Option<JoinHandle<Option<CodexSnapshot>>>,
-    last_codex_refresh: Option<Instant>,
+    agent_refresh: Option<JoinHandle<Option<CodexSnapshot>>>,
+    last_agent_refresh: Option<Instant>,
     /// 直近に Addness 同期が完了した時刻と回数（左ペインの鼓動表示に使う）。
-    pub(super) last_codex_sync: Option<Instant>,
-    pub(super) codex_sync_tick: u64,
+    pub(super) last_agent_sync: Option<Instant>,
+    pub(super) agent_sync_tick: u64,
     /// codex を閉じた直後、UI を即切替してからツリー再読込を遅延実行するためのフラグ。
-    pending_codex_tree_reload: bool,
+    pending_agent_tree_reload: bool,
     /// 次の描画前に画面を全クリアする（codex ⇄ 通常UI の構造遷移やリサイズで
     /// 前画面の残像が残らないようにするため）。
     needs_full_clear: bool,
@@ -722,19 +722,19 @@ impl App {
             allow_delete_deliverable_without_confirm: false,
             allow_delete_comment_without_confirm: false,
             success_message: None,
-            codex: None,
-            codex_terminal_area: None,
-            codex_status_area: None,
-            codex_contract_area: None,
-            codex_activity_area: None,
-            codex_contract_scroll: 0,
-            codex_activity_scroll: 0,
-            codex_last_scroll_input: None,
-            codex_refresh: None,
-            last_codex_refresh: None,
-            last_codex_sync: None,
-            codex_sync_tick: 0,
-            pending_codex_tree_reload: false,
+            agent: None,
+            agent_terminal_area: None,
+            agent_status_area: None,
+            agent_contract_area: None,
+            agent_activity_area: None,
+            agent_contract_scroll: 0,
+            agent_activity_scroll: 0,
+            agent_last_scroll_input: None,
+            agent_refresh: None,
+            last_agent_refresh: None,
+            last_agent_sync: None,
+            agent_sync_tick: 0,
+            pending_agent_tree_reload: false,
             needs_full_clear: false,
             codex_dod_job: None,
             codex_body_record_job: None,
@@ -813,8 +813,8 @@ impl App {
             }
 
             // codex を閉じた直後は、上の描画で UI を切り替えた後にツリーを再読込する。
-            if self.pending_codex_tree_reload {
-                self.pending_codex_tree_reload = false;
+            if self.pending_agent_tree_reload {
+                self.pending_agent_tree_reload = false;
                 self.load_goal_tree();
                 if self.todays_loaded {
                     self.load_todays_goals();
@@ -823,7 +823,7 @@ impl App {
                 continue;
             }
 
-            if self.codex.is_some() {
+            if self.agent.is_some() {
                 // codex は非同期に描画更新するので、キー入力が無くても一定間隔で
                 // JSONL 出力を取り込む（ブロッキング read は使わない）。変化があった
                 // フレームだけ再描画し、アイドル時の無駄な再描画を避ける。
@@ -1298,15 +1298,15 @@ impl App {
                     "{} body/DoD/子ゴール/通知をここに表示",
                     Local::now().format("%H:%M")
                 ));
-                self.codex = Some(pane);
+                self.agent = Some(pane);
                 self.active_pane = ActivePane::Codex;
-                self.codex_terminal_area = None;
-                self.codex_status_area = None;
-                self.codex_contract_area = None;
-                self.codex_activity_area = None;
-                self.codex_contract_scroll = 0;
-                self.codex_activity_scroll = 0;
-                self.codex_last_scroll_input = None;
+                self.agent_terminal_area = None;
+                self.agent_status_area = None;
+                self.agent_contract_area = None;
+                self.agent_activity_area = None;
+                self.agent_contract_scroll = 0;
+                self.agent_activity_scroll = 0;
+                self.agent_last_scroll_input = None;
                 // 通常UI → codex の構造遷移。前画面の残像を消すため全クリアする。
                 self.needs_full_clear = true;
                 // codex 画面上のトラックパッド/ホイール操作を受け取るため有効化（codex 中のみ）。
@@ -1384,7 +1384,7 @@ impl App {
         if self.codex_body_record_job.is_some() {
             return false;
         }
-        let Some((goal_id, cwd, prompt)) = self.codex.as_mut().and_then(|pane| {
+        let Some((goal_id, cwd, prompt)) = self.agent.as_mut().and_then(|pane| {
             if pane.finished {
                 return None;
             }
@@ -1428,7 +1428,7 @@ impl App {
                 }
             }
         }));
-        if let Some(pane) = self.codex.as_mut() {
+        if let Some(pane) = self.agent.as_mut() {
             let now = Local::now().format("%H:%M");
             pane.push_activity(format!("{now} 現状(body)の作業メモを予約"));
         }
@@ -1450,7 +1450,7 @@ impl App {
                 ok: false,
                 message: format!("Codex作業メモに失敗: {e}"),
             });
-        if let Some(pane) = self.codex.as_mut() {
+        if let Some(pane) = self.agent.as_mut() {
             let now = Local::now().format("%H:%M");
             if outcome.ok {
                 pane.last_addness_write_at = Some(Instant::now());
@@ -1464,7 +1464,7 @@ impl App {
         if self.codex_body_record_job.is_some() {
             return false;
         }
-        let Some((goal_id, cwd, prompt, summary, turn)) = self.codex.as_mut().and_then(|pane| {
+        let Some((goal_id, cwd, prompt, summary, turn)) = self.agent.as_mut().and_then(|pane| {
             let record = pane.take_completed_turn_body_record()?;
             Some((
                 pane.goal_id.clone(),
@@ -1509,7 +1509,7 @@ impl App {
                 }
             }
         }));
-        if let Some(pane) = self.codex.as_mut() {
+        if let Some(pane) = self.agent.as_mut() {
             let now = Local::now().format("%H:%M");
             pane.push_activity(format!("{now} turn {turn}完了メモを予約"));
         }
@@ -1522,7 +1522,7 @@ impl App {
         if self.codex_body_record_job.is_some() {
             return false;
         }
-        let Some((goal_id, cwd, last_prompt, summary)) = self.codex.as_mut().and_then(|pane| {
+        let Some((goal_id, cwd, last_prompt, summary)) = self.agent.as_mut().and_then(|pane| {
             if pane.finished && !pane.auto_record_attempted {
                 pane.auto_record_attempted = true;
                 let (last_prompt, summary) = pane.final_body_record_context();
@@ -1541,7 +1541,7 @@ impl App {
             last_prompt.as_deref(),
             Some(&summary),
         );
-        if let Some(pane) = self.codex.as_mut() {
+        if let Some(pane) = self.agent.as_mut() {
             let now = Local::now().format("%H:%M");
             match result {
                 CodexBodyRecordResult::Written => {
@@ -1564,18 +1564,18 @@ impl App {
     fn close_codex(&mut self) {
         // 通常画面に戻るのでマウスキャプチャを解除（テキスト選択を戻す）。
         Self::set_mouse_capture(false);
-        self.codex_terminal_area = None;
-        self.codex_status_area = None;
-        self.codex_contract_area = None;
-        self.codex_activity_area = None;
-        self.codex_contract_scroll = 0;
-        self.codex_activity_scroll = 0;
-        self.codex_last_scroll_input = None;
+        self.agent_terminal_area = None;
+        self.agent_status_area = None;
+        self.agent_contract_area = None;
+        self.agent_activity_area = None;
+        self.agent_contract_scroll = 0;
+        self.agent_activity_scroll = 0;
+        self.agent_last_scroll_input = None;
         // 進行中の非同期作業メモ記録を先に止め、この後の同期終了記録と body を奪い合わせない。
         if let Some(job) = self.codex_body_record_job.take() {
             job.abort();
         }
-        if let Some(mut pane) = self.codex.take() {
+        if let Some(mut pane) = self.agent.take() {
             if !pane.auto_record_attempted {
                 pane.auto_record_attempted = true;
                 let (last_prompt, summary) = pane.final_body_record_context();
@@ -1597,14 +1597,14 @@ impl App {
         if let Some(mut job) = self.codex_dod_job.take() {
             job.cleanup();
         }
-        self.codex_refresh = None;
-        self.last_codex_refresh = None;
+        self.agent_refresh = None;
+        self.last_agent_refresh = None;
         self.active_pane = ActivePane::Content;
         // codex → 通常UI の構造遷移。前画面の残像を消すため全クリアする。
         self.needs_full_clear = true;
         // ツリー再読込はブロッキングなので即時には行わず、UI を先に切り替えてから
         // 次フレームで実行する（F12 の体感を速くする）。
-        self.pending_codex_tree_reload = true;
+        self.pending_agent_tree_reload = true;
     }
 
     /// JSONL 出力の取り込みとプロセス終了検知。codex 起動中に毎フレーム呼ぶ。
@@ -1614,7 +1614,7 @@ impl App {
         let mut changed = false;
         let mut close_after_exit_command = false;
         let mut terminal_notice = None;
-        if let Some(pane) = self.codex.as_mut() {
+        if let Some(pane) = self.agent.as_mut() {
             changed |= pane.update();
             close_after_exit_command = pane.should_close_after_exit_command();
             terminal_notice = pane.take_terminal_notice();
@@ -1631,8 +1631,8 @@ impl App {
             self.close_codex();
             return true;
         }
-        changed |= self.poll_codex_refresh();
-        self.maybe_start_codex_refresh();
+        changed |= self.poll_agent_refresh();
+        self.maybe_start_agent_refresh();
         changed |= self.poll_dod_job();
         changed
     }
@@ -1643,7 +1643,7 @@ impl App {
         if self.codex_dod_job.is_some() {
             return;
         }
-        let Some(pane) = self.codex.as_ref() else {
+        let Some(pane) = self.agent.as_ref() else {
             return;
         };
         if pane.dod_items.is_empty() {
@@ -1695,7 +1695,7 @@ impl App {
                     item_count: items.len(),
                     started: Instant::now(),
                 });
-                if let Some(pane) = self.codex.as_mut() {
+                if let Some(pane) = self.agent.as_mut() {
                     pane.assessing = true;
                 }
                 self.success_message = Some("DoD 判定を実行中…".to_string());
@@ -1751,7 +1751,7 @@ impl App {
 
         match result {
             Some(results) if !results.is_empty() => {
-                if let Some(pane) = self.codex.as_mut() {
+                if let Some(pane) = self.agent.as_mut() {
                     pane.apply_dod_results(&results);
                     // 達成数・総数は実際の項目数とチェック状態から数える
                     // （codex が一部省略・重複しても表示が破綻しないように）。
@@ -1776,30 +1776,30 @@ impl App {
 
     /// 契約ペインの「判定中」フラグを設定する小ヘルパー。
     fn set_codex_assessing(&mut self, value: bool) {
-        if let Some(pane) = self.codex.as_mut() {
+        if let Some(pane) = self.agent.as_mut() {
             pane.assessing = value;
         }
     }
 
     /// 一定間隔（3秒）ごとに、対象ゴールの再取得をバックグラウンドで開始する。
     /// codex が CLI 経由で書き戻した DoD 更新を契約ペインに反映するため。
-    fn maybe_start_codex_refresh(&mut self) {
-        let Some(pane) = self.codex.as_ref() else {
+    fn maybe_start_agent_refresh(&mut self) {
+        let Some(pane) = self.agent.as_ref() else {
             return;
         };
         // 終了後は還流フェーズなので、ここでのポーリングは止める。
-        if pane.finished || self.codex_refresh.is_some() {
+        if pane.finished || self.agent_refresh.is_some() {
             return;
         }
         let due = self
-            .last_codex_refresh
+            .last_agent_refresh
             .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(3));
         if !due {
             return;
         }
         let goal_id = pane.goal_id.clone();
         let client = self.client.clone();
-        self.codex_refresh = Some(self.rt.spawn(async move {
+        self.agent_refresh = Some(self.rt.spawn(async move {
             // ゴール本体・子ゴール数・コメント数を 1 往復に畳んで取得する。
             // 子ゴール／コメントの取得は失敗しても本体があれば続行する。
             let (goal_res, children_res, comments_res, deliverables_res) = tokio::join!(
@@ -1839,22 +1839,22 @@ impl App {
                 children,
             })
         }));
-        self.last_codex_refresh = Some(Instant::now());
+        self.last_agent_refresh = Some(Instant::now());
     }
 
     /// 進行中の再取得タスクが完了していれば、契約ペインへ反映する（非ブロッキング）。
     /// 反映して画面が変わった場合は `true` を返す。
-    fn poll_codex_refresh(&mut self) -> bool {
-        let Some(handle) = self.codex_refresh.as_ref() else {
+    fn poll_agent_refresh(&mut self) -> bool {
+        let Some(handle) = self.agent_refresh.as_ref() else {
             return false;
         };
         if !handle.is_finished() {
             return false;
         }
-        let handle = self.codex_refresh.take().unwrap();
+        let handle = self.agent_refresh.take().unwrap();
         // is_finished が真なので block_on は即座に返る。
         let synced = if let Ok(Some(snap)) = self.rt.block_on(handle) {
-            if let Some(pane) = self.codex.as_mut() {
+            if let Some(pane) = self.agent.as_mut() {
                 let now = Local::now().format("%H:%M");
 
                 // ステータス変化を検知して更新ログに残す（Addness 側の進行を可視化）。
@@ -1933,8 +1933,8 @@ impl App {
         };
         if synced {
             // 同期完了自体を変化として扱い、鼓動表示（最終同期時刻＋スピナー）を更新させる。
-            self.last_codex_sync = Some(Instant::now());
-            self.codex_sync_tick = self.codex_sync_tick.wrapping_add(1);
+            self.last_agent_sync = Some(Instant::now());
+            self.agent_sync_tick = self.agent_sync_tick.wrapping_add(1);
         }
         synced
     }
@@ -2026,7 +2026,7 @@ impl App {
     /// 実行中は F12 で終了、trackpad/wheel でログをスクロールし、それ以外のキーは codex へ転送する。
     /// 終了後は還流バー（c/s/d）で成果を Addness に書き戻し、Esc/q で閉じる。
     fn handle_codex_key(&mut self, key: KeyEvent) {
-        if let Some(pane) = self.codex.as_mut() {
+        if let Some(pane) = self.agent.as_mut() {
             if pane.handle_search_key(key) {
                 return;
             }
@@ -2156,7 +2156,7 @@ impl App {
             }
         }
 
-        let finished = self.codex.as_ref().map(|c| c.finished).unwrap_or(true);
+        let finished = self.agent.as_ref().map(|c| c.finished).unwrap_or(true);
         if finished {
             // 還流アクションのキー操作時は、古いステータスメッセージを消して鮮度を保つ
             // （codex フォーカス中は通常のキー処理を通らずクリアされないため）。
@@ -2190,7 +2190,7 @@ impl App {
                 }
             }
             // 終了後は codex がキーを処理しないので、ログを遡れるようにする。
-            if let Some(pane) = self.codex.as_mut()
+            if let Some(pane) = self.agent.as_mut()
                 && Self::handle_codex_log_scroll(pane, key, true, true)
             {
                 return;
@@ -2205,7 +2205,7 @@ impl App {
             self.send_codex_resume_prompt();
             return;
         }
-        if let Some(pane) = self.codex.as_mut() {
+        if let Some(pane) = self.agent.as_mut() {
             if Self::is_codex_shift_navigation_key(key) {
                 return;
             }
@@ -2229,7 +2229,7 @@ impl App {
     }
 
     fn handle_codex_paste(&mut self, text: &str) {
-        if let Some(pane) = self.codex.as_mut() {
+        if let Some(pane) = self.agent.as_mut() {
             if pane.scrollback > 0 {
                 pane.scroll_to_live();
             }
@@ -2246,7 +2246,7 @@ impl App {
     }
 
     fn send_codex_resume_prompt(&mut self) {
-        if let Some(pane) = self.codex.as_mut() {
+        if let Some(pane) = self.agent.as_mut() {
             if pane.scrollback > 0 {
                 pane.scroll_to_live();
             }
@@ -2287,7 +2287,7 @@ impl App {
 
         if let Some(mut mouse) = latest_scroll {
             if delta == 0 {
-                self.codex_last_scroll_input = Some(format!(
+                self.agent_last_scroll_input = Some(format!(
                     "mouse {:?} x{event_count} -> coalesced",
                     mouse.kind
                 ));
@@ -2326,11 +2326,11 @@ impl App {
     }
 
     fn handle_codex_mouse_scroll(&mut self, mouse: MouseEvent, delta: isize, event_count: usize) {
-        if Self::point_in_area(self.codex_terminal_area, mouse.column, mouse.row) {
-            let Some(area) = self.codex_terminal_area else {
+        if Self::point_in_area(self.agent_terminal_area, mouse.column, mouse.row) {
+            let Some(area) = self.agent_terminal_area else {
                 return;
             };
-            if let Some(pane) = self.codex.as_mut() {
+            if let Some(pane) = self.agent.as_mut() {
                 let batch = Self::mouse_scroll_batch_label(event_count);
                 let terminal_point = Self::point_in_area(Some(area), mouse.column, mouse.row);
                 let before = pane.scrollback;
@@ -2338,14 +2338,14 @@ impl App {
                 let after = pane.scrollback;
                 match Self::codex_terminal_scroll_route(before, after, terminal_point) {
                     CodexTerminalScrollRoute::Scrollback => {
-                        self.codex_last_scroll_input = Some(format!(
+                        self.agent_last_scroll_input = Some(format!(
                             "mouse {:?}{batch} -> codex {before}->{after}",
                             mouse.kind
                         ));
                         return;
                     }
                     CodexTerminalScrollRoute::None => {
-                        self.codex_last_scroll_input = Some(format!(
+                        self.agent_last_scroll_input = Some(format!(
                             "mouse {:?}{batch} -> codex {before}->{after} no-scroll",
                             mouse.kind
                         ));
@@ -2356,25 +2356,25 @@ impl App {
             return;
         }
 
-        if Self::point_in_area(self.codex_status_area, mouse.column, mouse.row)
-            || Self::point_in_area(self.codex_contract_area, mouse.column, mouse.row)
+        if Self::point_in_area(self.agent_status_area, mouse.column, mouse.row)
+            || Self::point_in_area(self.agent_contract_area, mouse.column, mouse.row)
         {
-            Self::scroll_document_offset(&mut self.codex_contract_scroll, delta);
+            Self::scroll_document_offset(&mut self.agent_contract_scroll, delta);
             let batch = Self::mouse_scroll_batch_label(event_count);
-            self.codex_last_scroll_input =
+            self.agent_last_scroll_input =
                 Some(format!("mouse {:?}{batch} -> Addnessゴール", mouse.kind));
             return;
         }
 
-        if Self::point_in_area(self.codex_activity_area, mouse.column, mouse.row) {
-            Self::scroll_index(&mut self.codex_activity_scroll, delta);
+        if Self::point_in_area(self.agent_activity_area, mouse.column, mouse.row) {
+            Self::scroll_index(&mut self.agent_activity_scroll, delta);
             let batch = Self::mouse_scroll_batch_label(event_count);
-            self.codex_last_scroll_input =
+            self.agent_last_scroll_input =
                 Some(format!("mouse {:?}{batch} -> Addness更新", mouse.kind));
             return;
         }
 
-        self.codex_last_scroll_input = Some(format!(
+        self.agent_last_scroll_input = Some(format!(
             "mouse {:?}{} at {},{} -> outside",
             mouse.kind,
             Self::mouse_scroll_batch_label(event_count),
@@ -2458,7 +2458,7 @@ impl App {
     /// codex の作業差分（git diff --stat）をプリフィルして、対象ゴールへの
     /// 進捗コメントモーダルを開く（還流: コメント）。
     fn start_codex_reflow_comment(&mut self) {
-        let Some(pane) = self.codex.as_ref() else {
+        let Some(pane) = self.agent.as_ref() else {
             return;
         };
         let goal_id = pane.goal_id.clone();
@@ -2481,7 +2481,7 @@ impl App {
     /// ツリーのカーソルではなく `pane.goal_id` を対象にするため、ツリー再読込で
     /// カーソルがずれても正しいゴールを編集できる。
     fn start_codex_reflow_edit(&mut self) {
-        let Some(goal_id) = self.codex.as_ref().map(|c| c.goal_id.clone()) else {
+        let Some(goal_id) = self.agent.as_ref().map(|c| c.goal_id.clone()) else {
             return;
         };
         match self.api_call(self.client.get_goal(&goal_id)) {
@@ -2509,7 +2509,7 @@ impl App {
     /// codex 対象ゴールへの成果物追加モーダルを開く（還流: 成果物）。
     fn start_codex_reflow_deliverable(&mut self) {
         let Some((goal_id, goal_title)) = self
-            .codex
+            .agent
             .as_ref()
             .map(|c| (c.goal_id.clone(), c.goal_title.clone()))
         else {
@@ -4844,7 +4844,7 @@ mod codex_turn_key_tests {
         pane.test_add_completed_turn("second response");
         pane.scrollback = scrollback;
         app.active_pane = ActivePane::Codex;
-        app.codex = Some(pane);
+        app.agent = Some(pane);
         (rt, app)
     }
 
@@ -4862,7 +4862,7 @@ mod codex_turn_key_tests {
 
         app.handle_codex_key(key(KeyCode::Enter));
 
-        let pane = app.codex.as_ref().unwrap();
+        let pane = app.agent.as_ref().unwrap();
         assert_eq!(pane.input_line(), "");
         assert_eq!(pane.collapsed_turn_count(), 1);
     }
@@ -4873,7 +4873,7 @@ mod codex_turn_key_tests {
 
         app.handle_codex_key(key(KeyCode::Char('1')));
 
-        let pane = app.codex.as_ref().unwrap();
+        let pane = app.agent.as_ref().unwrap();
         assert_eq!(pane.input_line(), "1");
         assert_eq!(pane.collapsed_turn_count(), 0);
     }
@@ -4884,7 +4884,7 @@ mod codex_turn_key_tests {
 
         app.handle_codex_key(key(KeyCode::Enter));
 
-        let pane = app.codex.as_ref().unwrap();
+        let pane = app.agent.as_ref().unwrap();
         assert_eq!(pane.input_line(), "");
         assert_eq!(pane.collapsed_turn_count(), 1);
     }
@@ -4895,7 +4895,7 @@ mod codex_turn_key_tests {
 
         app.handle_codex_key(key(KeyCode::Char(' ')));
 
-        let pane = app.codex.as_ref().unwrap();
+        let pane = app.agent.as_ref().unwrap();
         assert_eq!(pane.input_line(), "");
         assert_eq!(pane.collapsed_turn_count(), 1);
     }
@@ -4906,7 +4906,7 @@ mod codex_turn_key_tests {
 
         app.handle_codex_key(modified_key(KeyCode::Char('o'), KeyModifiers::CONTROL));
 
-        let pane = app.codex.as_ref().unwrap();
+        let pane = app.agent.as_ref().unwrap();
         assert_eq!(pane.input_line(), "");
         assert_eq!(pane.collapsed_turn_count(), 1);
     }
@@ -4915,13 +4915,13 @@ mod codex_turn_key_tests {
     fn f7_turn_picker_opens_and_enter_expands_selected_turn() {
         let (_rt, mut app) = app_with_codex_live_input();
         {
-            let pane = app.codex.as_mut().unwrap();
+            let pane = app.agent.as_mut().unwrap();
             pane.toggle_old_turns_collapsed();
         }
 
         app.handle_codex_key(key(KeyCode::F(7)));
         {
-            let pane = app.codex.as_ref().unwrap();
+            let pane = app.agent.as_ref().unwrap();
             assert!(pane.turn_picker_open());
             assert_eq!(pane.turn_picker_selected_turn(), Some(1));
             assert_eq!(pane.collapsed_turn_count(), 2);
@@ -4929,7 +4929,7 @@ mod codex_turn_key_tests {
 
         app.handle_codex_key(key(KeyCode::Enter));
 
-        let pane = app.codex.as_ref().unwrap();
+        let pane = app.agent.as_ref().unwrap();
         assert!(pane.turn_picker_open());
         assert_eq!(pane.collapsed_turn_count(), 1);
         assert!(!pane.turn_picker_items()[0].collapsed);
@@ -4943,11 +4943,11 @@ mod codex_turn_key_tests {
         let mut pane = CodexPane::test_with_output(6, 80, 0, "");
         pane.finished = false;
         app.active_pane = ActivePane::Codex;
-        app.codex = Some(pane);
+        app.agent = Some(pane);
 
         app.handle_codex_key(key(KeyCode::Char('1')));
 
-        let pane = app.codex.as_ref().unwrap();
+        let pane = app.agent.as_ref().unwrap();
         assert_eq!(pane.input_line(), "1");
         assert_eq!(pane.collapsed_turn_count(), 0);
     }
@@ -5096,10 +5096,10 @@ mod codex_mouse_tests {
         for row in 1..=100 {
             output.push_str(&format!("row {row:03}\n"));
         }
-        app.codex = Some(CodexPane::test_with_output(100, 20, 0, &output));
-        app.codex.as_mut().unwrap().resize(4, 20);
+        app.agent = Some(CodexPane::test_with_output(100, 20, 0, &output));
+        app.agent.as_mut().unwrap().resize(4, 20);
         app.active_pane = ActivePane::Codex;
-        app.codex_terminal_area = Some(Rect {
+        app.agent_terminal_area = Some(Rect {
             x: 10,
             y: 5,
             width: 22,
@@ -5117,10 +5117,10 @@ mod codex_mouse_tests {
             1,
         );
 
-        let pane = app.codex.as_ref().unwrap();
+        let pane = app.agent.as_ref().unwrap();
         assert_eq!(pane.scrollback, CODEX_WHEEL_LINES as usize);
         assert_eq!(
-            app.codex_last_scroll_input.as_deref(),
+            app.agent_last_scroll_input.as_deref(),
             Some("mouse ScrollUp -> codex 0->6")
         );
     }
@@ -5134,10 +5134,10 @@ mod codex_mouse_tests {
         for row in 1..=100 {
             output.push_str(&format!("row {row:03}\n"));
         }
-        app.codex = Some(CodexPane::test_with_output(100, 20, 0, &output));
-        app.codex.as_mut().unwrap().resize(4, 20);
+        app.agent = Some(CodexPane::test_with_output(100, 20, 0, &output));
+        app.agent.as_mut().unwrap().resize(4, 20);
         app.active_pane = ActivePane::Codex;
-        app.codex_terminal_area = Some(Rect {
+        app.agent_terminal_area = Some(Rect {
             x: 10,
             y: 5,
             width: 22,
@@ -5155,10 +5155,10 @@ mod codex_mouse_tests {
             2,
         );
 
-        let pane = app.codex.as_ref().unwrap();
+        let pane = app.agent.as_ref().unwrap();
         assert_eq!(pane.scrollback, (CODEX_WHEEL_LINES * 2) as usize);
         assert_eq!(
-            app.codex_last_scroll_input.as_deref(),
+            app.agent_last_scroll_input.as_deref(),
             Some("mouse ScrollUp x2 -> codex 0->12")
         );
     }
@@ -5168,21 +5168,21 @@ mod codex_mouse_tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let client = ApiClient::new("t", "http://localhost").unwrap();
         let mut app = App::new(client, rt.handle().clone());
-        app.codex = Some(CodexPane::test_with_output(20, 20, 0, ""));
+        app.agent = Some(CodexPane::test_with_output(20, 20, 0, ""));
         app.active_pane = ActivePane::Codex;
-        app.codex_status_area = Some(Rect {
+        app.agent_status_area = Some(Rect {
             x: 0,
             y: 0,
             width: 20,
             height: 5,
         });
-        app.codex_contract_area = Some(Rect {
+        app.agent_contract_area = Some(Rect {
             x: 0,
             y: 5,
             width: 20,
             height: 10,
         });
-        app.codex_activity_area = Some(Rect {
+        app.agent_activity_area = Some(Rect {
             x: 0,
             y: 15,
             width: 20,
@@ -5199,9 +5199,9 @@ mod codex_mouse_tests {
             CODEX_WHEEL_LINES,
             1,
         );
-        assert_eq!(app.codex_contract_scroll, 0);
+        assert_eq!(app.agent_contract_scroll, 0);
         assert_eq!(
-            app.codex_last_scroll_input.as_deref(),
+            app.agent_last_scroll_input.as_deref(),
             Some("mouse ScrollUp -> Addnessゴール")
         );
 
@@ -5215,9 +5215,9 @@ mod codex_mouse_tests {
             -CODEX_WHEEL_LINES,
             1,
         );
-        assert_eq!(app.codex_contract_scroll, CODEX_WHEEL_LINES as usize);
+        assert_eq!(app.agent_contract_scroll, CODEX_WHEEL_LINES as usize);
         assert_eq!(
-            app.codex_last_scroll_input.as_deref(),
+            app.agent_last_scroll_input.as_deref(),
             Some("mouse ScrollDown -> Addnessゴール")
         );
 
@@ -5231,9 +5231,9 @@ mod codex_mouse_tests {
             CODEX_WHEEL_LINES,
             1,
         );
-        assert_eq!(app.codex_activity_scroll, CODEX_WHEEL_LINES as usize);
+        assert_eq!(app.agent_activity_scroll, CODEX_WHEEL_LINES as usize);
         assert_eq!(
-            app.codex_last_scroll_input.as_deref(),
+            app.agent_last_scroll_input.as_deref(),
             Some("mouse ScrollUp -> Addness更新")
         );
 
@@ -5247,7 +5247,7 @@ mod codex_mouse_tests {
             CODEX_WHEEL_LINES,
             1,
         );
-        assert_eq!(app.codex_contract_scroll, 0);
+        assert_eq!(app.agent_contract_scroll, 0);
     }
 
     #[test]

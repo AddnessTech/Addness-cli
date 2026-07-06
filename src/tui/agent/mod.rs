@@ -4353,6 +4353,15 @@ impl CodexPane {
         let mut parts = command_line.trim().splitn(2, char::is_whitespace);
         let command = parts.next().unwrap_or_default().to_ascii_lowercase();
         let args = parts.next().unwrap_or_default().trim();
+        // パレット非表示の codex 専用コマンドは、手入力でも実行させない
+        // （ClaudeCode のターンに反映されない設定を黙って変更しないため）。
+        if !slash_command_visible_for_kind(&format!("/{command}"), self.kind) {
+            self.push_log(
+                CodexLogKind::System,
+                format!("/{command} は codex 専用コマンドです。Claude Code では利用できません"),
+            );
+            return true;
+        }
         match command.as_str() {
             "goal" => {
                 self.handle_goal_slash_command(args);
@@ -11907,6 +11916,26 @@ mod tests {
                 "{excluded} should be hidden from the ClaudeCode palette"
             );
         }
+    }
+
+    #[test]
+    fn codex_only_slash_commands_are_rejected_at_runtime_for_claude_code() {
+        let mut pane = claude_pane();
+        assert!(pane.handle_local_slash_command("/theme dark"));
+        assert!(
+            pane.log
+                .iter()
+                .any(|line| line.text.contains("/theme は codex 専用コマンドです")),
+            "guard log missing: {:?}",
+            pane.log.iter().map(|l| &l.text).collect::<Vec<_>>()
+        );
+        // 設定サイクル等の claude 対応コマンドはガードされない。
+        assert!(pane.handle_local_slash_command("/model opus"));
+        assert!(
+            pane.log
+                .iter()
+                .any(|line| line.text.contains("次回ターンの model: opus"))
+        );
     }
 
     #[test]

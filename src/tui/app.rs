@@ -2506,12 +2506,13 @@ impl App {
         };
         let goal_id = pane.goal_id.clone();
         let goal_title = pane.goal_title.clone();
+        let name = pane.kind().label();
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let diff = agent::git_diff_stat(&cwd);
         let body = if diff.trim().is_empty() {
             String::new()
         } else {
-            format!("codexでの作業差分:\n{diff}\n\n")
+            format!("{name}での作業差分:\n{diff}\n\n")
         };
         self.modal_state = Some(ModalState::AddComment {
             goal_id,

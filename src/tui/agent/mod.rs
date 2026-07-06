@@ -88,6 +88,43 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "スラッシュコマンド一覧を表示"),
 ];
 
+/// `SLASH_COMMANDS` のうち ClaudeCode バックエンドでは候補に出さないコマンド名。
+///
+/// 判定基準は2つ（どちらかに該当する codex CLI 1:1 コマンド）:
+/// - `start_codex_subcommand` 経由で codex サブコマンドを起動するもの（ClaudeCode では
+///   ガードに引っかかり「codex専用コマンドです」とだけ表示される）
+/// - `CodexExecSettings`（codex専用の `-c key=value` オーバーライドや `codex_home` 上の
+///   セッション管理ファイル）にのみ作用し、ClaudeCode のターン起動引数
+///   （`claude::exec_args` / `ClaudeExecSettings`）には一切反映されないもの
+const CODEX_ONLY_SLASH_COMMANDS: &[&str] = &[
+    "/review",
+    "/apply",
+    "/cloud",
+    "/apps",
+    "/import",
+    "/hooks",
+    "/codex",
+    "/login",
+    "/logout",
+    "/profile",
+    "/mcp",
+    "/theme",
+    "/vim",
+    "/personality",
+    "/image",
+    "/attachments",
+    "/search",
+    "/config",
+    "/fork",
+    "/archive",
+    "/rename",
+];
+
+/// パレット候補・`/help` の一覧に `name` を出してよいかどうか。
+fn slash_command_visible_for_kind(name: &str, kind: AgentKind) -> bool {
+    kind != AgentKind::ClaudeCode || !CODEX_ONLY_SLASH_COMMANDS.contains(&name)
+}
+
 const CODEX_SESSION_HISTORY_DIR: &str = "codex-sessions";
 const CLAUDE_SESSION_HISTORY_DIR: &str = "claude-sessions";
 const CODEX_SESSION_HISTORY_MAX_LOG_LINES: usize = 5_000;
@@ -2258,9 +2295,11 @@ impl CodexPane {
             return Vec::new();
         }
         let prefix = line.to_ascii_lowercase();
+        let kind = self.kind;
         SLASH_COMMANDS
             .iter()
             .filter(|(name, _)| name.starts_with(prefix.as_str()))
+            .filter(|(name, _)| slash_command_visible_for_kind(name, kind))
             .copied()
             .collect()
     }
@@ -3495,12 +3534,12 @@ impl CodexPane {
                             self.refresh_current_turn_title();
                             let message = format!("{label} が完了しました");
                             self.push_log(CodexLogKind::System, message.clone());
-                            self.push_terminal_notice("Codex コマンド完了", message);
+                            self.push_terminal_notice(format!("{name} コマンド完了"), message);
                         } else {
                             let message = format!("{label} が失敗しました: {status}");
                             self.push_log(CodexLogKind::Error, message.clone());
                             self.refresh_current_turn_title();
-                            self.push_terminal_notice("Codex コマンド失敗", message);
+                            self.push_terminal_notice(format!("{name} コマンド失敗"), message);
                         }
                     } else if !self.turn_finished_by_event {
                         if status.success() {
@@ -3540,9 +3579,10 @@ impl CodexPane {
                     self.pending_decision = None;
                     self.current_turn_prompt = None;
                     self.current_turn_retry_prompt = None;
-                    let message = format!("Codex 状態確認に失敗: {e}");
+                    let name = self.kind.display_name();
+                    let message = format!("{name} 状態確認に失敗: {e}");
                     self.push_log(CodexLogKind::Error, message.clone());
-                    self.push_terminal_notice("Codex エラー", message);
+                    self.push_terminal_notice(format!("{name} エラー"), message);
                     self.start_next_queued_turn_if_idle();
                     changed = true;
                 }
@@ -3563,7 +3603,10 @@ impl CodexPane {
             Err(_) if self.child_process_label.is_some() => {
                 self.child_process_output.push(trimmed.to_string());
             }
-            Err(_) => self.push_log(CodexLogKind::Event, format!("Codex 出力: {trimmed}")),
+            Err(_) => {
+                let name = self.kind.display_name();
+                self.push_log(CodexLogKind::Event, format!("{name} 出力: {trimmed}"));
+            }
         }
     }
 
@@ -3584,7 +3627,8 @@ impl CodexPane {
             self.child_process_error_output.push(trimmed.to_string());
             return;
         }
-        self.push_log(CodexLogKind::Event, format!("Codex 通知: {trimmed}"));
+        let name = self.kind.display_name();
+        self.push_log(CodexLogKind::Event, format!("{name} 通知: {trimmed}"));
     }
 
     fn flush_child_process_output(&mut self, success: bool, label: &str) {
@@ -3976,7 +4020,8 @@ impl CodexPane {
     fn set_pending_decision(&mut self, decision: CodexDecisionBanner) {
         let message = decision.message.clone();
         self.pending_decision = Some(decision);
-        self.push_terminal_notice("Codex 確認待ち", message);
+        let name = self.kind.display_name();
+        self.push_terminal_notice(format!("{name} 確認待ち"), message);
     }
 
     fn resolve_pending_decision(
@@ -3990,8 +4035,9 @@ impl CodexPane {
         if auto {
             self.action = Some(format!("確認自動応答: {response_label}"));
             self.push_activity(format!("確認待ちに {response_label} で自動応答"));
+            let name = self.kind.display_name();
             self.push_terminal_notice(
-                "Codex 確認自動応答",
+                format!("{name} 確認自動応答"),
                 format!("{response_label} を自動選択しました"),
             );
             return;
@@ -4191,9 +4237,10 @@ impl CodexPane {
         if self.is_turn_running() {
             let count = self.queue_user_prompt(submitted);
             self.action = Some(format!("次ターン予約 {count}件"));
+            let name = self.kind.display_name();
             self.push_log(
                 CodexLogKind::System,
-                format!("Codex 実行中のため次のターンに予約しました（待ち{count}件）"),
+                format!("{name} 実行中のため次のターンに予約しました（待ち{count}件）"),
             );
             return;
         }
@@ -4248,7 +4295,11 @@ impl CodexPane {
         self.current_command_started_at = None;
         self.current_turn_prompt = None;
         self.current_turn_retry_prompt = None;
-        self.push_log(CodexLogKind::System, "Codex セッションを終了します");
+        let name = self.kind.display_name();
+        self.push_log(
+            CodexLogKind::System,
+            format!("{name} セッションを終了します"),
+        );
     }
 
     fn start_turn(&mut self, prompt: &str) {
@@ -4859,10 +4910,11 @@ impl CodexPane {
     }
 
     fn handle_new_thread_slash_command(&mut self) {
+        let name = self.kind.display_name();
         if self.is_turn_running() {
             self.push_log(
                 CodexLogKind::Error,
-                "Codex 実行中です。完了後に新しいセッションを開始してください",
+                format!("{name} 実行中です。完了後に新しいセッションを開始してください"),
             );
             return;
         }
@@ -4873,10 +4925,10 @@ impl CodexPane {
         self.current_command_started_at = None;
         self.streaming_assistant_index = None;
         self.pending_decision = None;
-        self.action = Some("新しいCodexセッション".to_string());
+        self.action = Some(format!("新しい{name}セッション"));
         self.push_log(
             CodexLogKind::System,
-            "新しい Codex セッションを開始します。次の入力は新規セッションへ送信します",
+            format!("新しい {name} セッションを開始します。次の入力は新規セッションへ送信します"),
         );
     }
 
@@ -4886,14 +4938,22 @@ impl CodexPane {
         self.scrollback = 0;
         self.streaming_assistant_index = None;
         self.invalidate_rendered_history_metrics();
-        self.push_log(CodexLogKind::System, "Codex 表示ログをクリアしました");
+        let name = self.kind.display_name();
+        self.push_log(
+            CodexLogKind::System,
+            format!("{name} 表示ログをクリアしました"),
+        );
     }
 
     fn handle_stop_slash_command(&mut self, args: &str) {
         if self.is_turn_running() {
             self.kill_current_turn();
         } else {
-            self.push_log(CodexLogKind::System, "停止中のCodexターンはありません");
+            let name = self.kind.display_name();
+            self.push_log(
+                CodexLogKind::System,
+                format!("停止中の{name}ターンはありません"),
+            );
         }
         if args == "all" || args == "queued" {
             let cleared = self.queued_prompts.len();
@@ -5086,8 +5146,9 @@ impl CodexPane {
             );
             return;
         }
+        let name = self.kind.display_name();
         self.submit_system_line(&format!(
-            "Use the Codex skill named `{args}` for the next response if it is available and relevant."
+            "Use the {name} skill named `{args}` for the next response if it is available and relevant."
         ));
     }
 
@@ -5378,8 +5439,9 @@ impl CodexPane {
     }
 
     fn push_codex_sessions_list(&mut self) {
+        let name = self.kind.display_name();
         if self.indexed_sessions.is_empty() {
-            self.push_log(CodexLogKind::System, "Codex sessions: none");
+            self.push_log(CodexLogKind::System, format!("{name} sessions: none"));
             return;
         }
         let lines = self
@@ -5389,7 +5451,7 @@ impl CodexPane {
             .map(|(idx, session)| session_list_line(idx + 1, session))
             .collect::<Vec<_>>()
             .join("\n");
-        self.push_log(CodexLogKind::System, format!("Codex sessions:\n{lines}"));
+        self.push_log(CodexLogKind::System, format!("{name} sessions:\n{lines}"));
     }
 
     fn handle_resume_last_slash_command(&mut self, args: &str, include_all: bool) {
@@ -6158,9 +6220,10 @@ impl CodexPane {
             format!("次回ターンの cwd: {}", self.cwd),
         );
         if self.thread_id.is_some() {
+            let name = self.kind.display_name();
             self.push_log(
                 CodexLogKind::System,
-                "既存Codexセッションの再開にはcwd変更は反映されません。新規セッションで有効です。",
+                format!("既存{name}セッションの再開にはcwd変更は反映されません。新規セッションで有効です。"),
             );
         }
     }
@@ -6472,7 +6535,7 @@ impl CodexPane {
     }
 
     fn push_slash_help(&mut self) {
-        self.push_log(CodexLogKind::System, slash_help_text().to_string());
+        self.push_log(CodexLogKind::System, slash_help_text(self.kind).to_string());
     }
 
     fn push_slash_status(&mut self) {
@@ -6490,10 +6553,10 @@ impl CodexPane {
     }
 
     fn push_slash_usage(&mut self) {
-        let usage = self
-            .last_token_usage_label
-            .as_deref()
-            .unwrap_or("まだ取得できていません。Codex turn 実行後に表示されます。");
+        let name = self.kind.display_name();
+        let usage = self.last_token_usage_label.clone().unwrap_or_else(|| {
+            format!("まだ取得できていません。{name} turn 実行後に表示されます。")
+        });
         self.push_log(CodexLogKind::System, format!("トークン: {usage}"));
     }
 
@@ -6946,24 +7009,27 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
         );
         cmd.env("ADDNESS_BIN", &self.addness_bin);
 
-        let mut child = cmd.spawn().context("Codex の起動に失敗しました")?;
+        let name = self.kind.display_name();
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("{name} の起動に失敗しました"))?;
 
         if let Some(mut stdin) = child.stdin.take()
             && let Err(e) = stdin.write_all(prompt.as_bytes())
         {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(e).context("Codex へのプロンプト送信に失敗しました");
+            return Err(e).context(format!("{name} へのプロンプト送信に失敗しました"));
         }
 
         let stdout = child
             .stdout
             .take()
-            .context("Codex stdout の取得に失敗しました")?;
+            .with_context(|| format!("{name} stdout の取得に失敗しました"))?;
         let stderr = child
             .stderr
             .take()
-            .context("Codex stderr の取得に失敗しました")?;
+            .with_context(|| format!("{name} stderr の取得に失敗しました"))?;
 
         spawn_line_reader(stdout, self.tx.clone(), false);
         spawn_line_reader(stderr, self.tx.clone(), true);
@@ -7112,7 +7178,42 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
     }
 }
 
-fn slash_help_text() -> &'static str {
+fn slash_help_text(kind: AgentKind) -> &'static str {
+    if kind == AgentKind::ClaudeCode {
+        return claude_slash_help_text();
+    }
+    codex_slash_help_text()
+}
+
+fn claude_slash_help_text() -> &'static str {
+    r#"Slash commands:
+Claude Code CLI commands:
+  /new - start the next prompt in a new Claude Code session
+  /clear - clear the visible log
+  /init [notes] - create or update AGENTS.md for future sessions
+  /ide - show IDE context availability in this TUI
+  /exec|/e <prompt> - send directly to Claude Code without Goal mode wrapping
+  /skills [list|name] - local skill discovery
+Claude Code sessions:
+  /sessions [N] - list local Claude Code sessions for this cwd
+  /resume-last [prompt], /resume-session <N|id> [prompt] - resume a session directly
+  /fork-last [prompt], /fork-session <N|id> [prompt] - fork a session directly
+Claude Code options for next turn:
+  /settings, /cd <dir>, /model [name|config], /reasoning|/effort [level]
+  /permissions|/approval [mode] - permission-mode: config/plan/acceptEdits/dontAsk/bypassPermissions
+  /add-dir <path|list|clear>
+TUI helpers:
+  /goal <目標>, /goal pause, /goal resume, /goal clear
+  /organize|/team [task] - Addness子ゴールへ分解し、最初の実装単位へ進む
+  /work [next|all|N|id|title] - 子ゴールを実装ワークパッケージとして着手/キュー化
+  /remember|/memo <内容> - Addness bodyの作業メモへ保存
+  /handoff [メモ] - 現在の会話をAddness bodyへ再開用に保存
+  /diff, /history, /turn [picker|N|all|old|close N|toggle N], /rollout, /debug-config, /ps, /stop [all], /btw
+  /feedback [message], /test-approval [message], /compact [notes], /plan [task]
+  /resume, /status, /usage, /help, /exit"#
+}
+
+fn codex_slash_help_text() -> &'static str {
     r#"Slash commands:
 Codex CLI commands:
   /codex <args> - arbitrary codex subcommand
@@ -11711,7 +11812,7 @@ mod tests {
 
     #[test]
     fn slash_help_text_groups_codex_commands_and_tui_helpers() {
-        let text = slash_help_text();
+        let text = slash_help_text(AgentKind::Codex);
 
         assert!(text.contains("Codex CLI commands:"));
         assert!(text.contains("/codex-help [command]"));
@@ -11756,6 +11857,69 @@ mod tests {
         assert!(text.contains("/feedback [message]"));
         assert!(text.contains("/test-approval [message]"));
         assert!(text.contains("/usage"));
+    }
+
+    #[test]
+    fn slash_help_text_for_claude_code_omits_codex_only_commands() {
+        let text = slash_help_text(AgentKind::ClaudeCode);
+
+        assert!(text.contains("Claude Code CLI commands:"));
+        assert!(text.contains("/model [name|config]"));
+        assert!(text.contains("/reasoning|/effort [level]"));
+        assert!(text.contains("/permissions|/approval [mode]"));
+        assert!(text.contains("/resume-last [prompt]"));
+        assert!(text.contains("/resume-session <N|id> [prompt]"));
+        assert!(text.contains("/fork-last [prompt]"));
+        assert!(text.contains("/fork-session <N|id> [prompt]"));
+        assert!(text.contains("/add-dir <path|list|clear>"));
+        assert!(text.contains("/organize|/team [task]"));
+        assert!(text.contains("/remember|/memo <内容>"));
+        assert!(!text.contains("/review"));
+        assert!(!text.contains("/apply"));
+        assert!(!text.contains("/cloud"));
+        assert!(!text.contains("codex apply"));
+        assert!(!text.contains("/hooks"));
+        assert!(!text.contains("/mcp"));
+        assert!(!text.contains("/login"));
+        assert!(!text.contains("/profile"));
+    }
+
+    #[test]
+    fn slash_palette_hides_codex_only_commands_for_claude_code() {
+        let mut pane = claude_pane();
+        pane.input_state.line = "/".to_string();
+        pane.input_state.cursor = pane.input_state.line.len();
+        let names: Vec<&str> = pane
+            .slash_palette_suggestions()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+
+        assert!(names.contains(&"/model"));
+        assert!(names.contains(&"/reasoning"));
+        assert!(names.contains(&"/permissions"));
+        assert!(names.contains(&"/sessions"));
+        assert!(names.contains(&"/resume-last"));
+        assert!(names.contains(&"/add-dir"));
+        for excluded in CODEX_ONLY_SLASH_COMMANDS {
+            assert!(
+                !names.contains(excluded),
+                "{excluded} should be hidden from the ClaudeCode palette"
+            );
+        }
+    }
+
+    #[test]
+    fn slash_palette_keeps_codex_only_commands_for_codex() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.input_state.line = "/review".to_string();
+        pane.input_state.cursor = pane.input_state.line.len();
+        let names: Vec<&str> = pane
+            .slash_palette_suggestions()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, vec!["/review"]);
     }
 
     #[test]

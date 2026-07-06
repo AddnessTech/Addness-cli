@@ -1009,7 +1009,7 @@ fn draw_help_overlay(frame: &mut Frame, app: &mut App) {
         section("アクションメニュー (o) の内容"),
         kv(
             "ゴール上",
-            "codexで作業 / 完了・再開 / コメント追加 / 成果物追加 / 編集 / 削除",
+            "codexで作業 / claude codeで作業 / 完了・再開 / コメント追加 / 成果物追加 / 編集 / 削除",
         ),
         kv(
             "コメント上",
@@ -1018,6 +1018,10 @@ fn draw_help_overlay(frame: &mut Frame, app: &mut App) {
         blank(),
         section("codex連携 (o →「codexで作業」)"),
         kv("起動", "選択ゴールの文脈付きでcodexをペイン起動"),
+        kv(
+            "claude code連携",
+            "o →「claude codeで作業」で同様にペイン起動（F4=permission-mode、F5は未対応）",
+        ),
         kv("F2 / F3", "モデル / 推論強度を切替"),
         kv("F4 / F5", "承認モード / sandboxを切替"),
         kv("F6", "作業ツリーのdiffビューを表示 / 戻る"),
@@ -1055,6 +1059,14 @@ fn draw_help_overlay(frame: &mut Frame, app: &mut App) {
 }
 
 fn draw_codex_help_overlay(frame: &mut Frame, app: &mut App) {
+    let kind = app
+        .codex
+        .as_ref()
+        .map(|c| c.kind())
+        .unwrap_or(AgentKind::Codex);
+    let name = kind.display_name();
+    let is_claude = kind == AgentKind::ClaudeCode;
+
     let section = |title: &str| {
         Line::from(Span::styled(
             title.to_string(),
@@ -1076,25 +1088,35 @@ fn draw_codex_help_overlay(frame: &mut Frame, app: &mut App) {
     };
     let blank = || Line::from("");
 
-    let lines: Vec<Line> = vec![
-        section("Codex in Addness"),
+    let mut lines: Vec<Line> = vec![
+        section(&format!("{name} in Addness")),
         kv("Ctrl+Q", "この操作一覧を表示 / 閉じる"),
-        kv("入力 + Enter", "Codexへ依頼を送信（必要ならAddnessを参照）"),
+        kv(
+            "入力 + Enter",
+            &format!("{name}へ依頼を送信（必要ならAddnessを参照）"),
+        ),
         kv("入力中 Enter", "実行中なら次ターンに予約"),
-        kv("Ctrl-C", "実行中のCodexターンを中断"),
-        kv("F2 / F3", "次ターンのモデル / 推論強度を切替"),
-        kv("F4 / F5", "承認モード / sandboxを切替"),
+        kv("Ctrl-C", &format!("実行中の{name}ターンを中断")),
+    ];
+    if is_claude {
+        lines.push(kv("F2 / F3", "次ターンのモデル / effortを切替"));
+        lines.push(kv("F4", "次ターンのpermission-modeを切替（F5は未対応）"));
+    } else {
+        lines.push(kv("F2 / F3", "次ターンのモデル / 推論強度を切替"));
+        lines.push(kv("F4 / F5", "承認モード / sandboxを切替"));
+    }
+    lines.extend([
         kv("F6", "ファイル編集diffビューを表示 / ログへ戻る"),
         kv("F7", "turn一覧パネルを開く"),
         kv("F9", "Addnessの作業メモ・決定ログから再開"),
-        kv("F12", "Codexペインを終了して戻る"),
+        kv("F12", &format!("{name}ペインを終了して戻る")),
         blank(),
         section("履歴 / 検索"),
         kv(
             "Trackpad/ホイール",
-            "ポインタ下のCodex履歴 / Addness枠をスクロール",
+            &format!("ポインタ下の{name}履歴 / Addness枠をスクロール"),
         ),
-        kv("↑↓ / PgUp/PgDn", "Codex履歴をスクロール"),
+        kv("↑↓ / PgUp/PgDn", &format!("{name}履歴をスクロール")),
         kv("Home / End", "履歴先頭 / 最新へ移動"),
         kv("Ctrl-T", "表示を 会話 / 実行 / 失敗 / 全部 で切替"),
         kv("Ctrl-F", "履歴検索を開始"),
@@ -1118,89 +1140,128 @@ fn draw_codex_help_overlay(frame: &mut Frame, app: &mut App) {
             "Enter/o=展開 c=格納 Space=開閉 a=全展開 Esc=閉じる",
         ),
         blank(),
-        section("codex commands"),
-        kv(
-            "/ 入力",
-            "コマンド候補を入力欄の上に表示（Tab補完 / ↑↓選択）",
-        ),
-        kv("/sessions [N]", "Codex session候補を番号付きで表示"),
-        kv(
-            "/codex-resume <args>",
-            "root codex resumeをno-alt-screenで実行",
-        ),
-        kv(
-            "/resume-last",
-            "最新Codex sessionをexec resume --lastで継続",
-        ),
-        kv("/resume-last-all", "cwd外も含めて最新Codexセッションを継続"),
-        kv("/resume-session <N>", "番号またはidのCodexセッションを継続"),
-        kv(
-            "/resume-session-all",
-            "cwd外も含めて番号またはidのセッションを継続",
-        ),
-        kv(
-            "/resume-interactive-*",
-            "root codex resumeをno-alt-screenで実行",
-        ),
-        kv("/side [prompt]", "現在セッションから別会話を開始"),
-        kv("/fork <args>", "root codex forkをno-alt-screenで実行"),
-        kv(
-            "/fork-last / /fork-session",
-            "最新または指定セッションをfork",
-        ),
-        kv("/fork-last-all", "cwd外も含めて最新Codexセッションをfork"),
-        kv(
-            "/fork-session-all",
-            "cwd外も含めて番号またはidのセッションをfork",
-        ),
-        kv("/rename <title>", "現在のCodexセッション名を変更"),
-        kv(
-            "/archive/unarchive/delete",
-            "番号またはidのセッションを管理",
-        ),
-        kv(
-            "/codex <args>",
-            "任意のCodexサブコマンドをTUIログに実行表示",
-        ),
-        kv(
-            "/new / /clear",
-            "新しいCodexセッション開始 / 表示ログをクリア",
-        ),
-        kv("/init", "AGENTS.md を作成 / 更新する初期化依頼を送信"),
-        kv("/ide", "IDE連携コンテキストの利用可否を表示"),
-        kv("/compact / /plan", "会話圧縮 / 実装前計画をCodexへ送信"),
-        kv("/import", "Claude Code等の設定候補を検出 / AGENTS化依頼"),
-        kv("/hooks", "Codex hook設定のoverrideを表示・設定"),
-        kv("/skills", "ローカルCodex skill一覧 / skill使用依頼"),
-        kv("/exec|/e <prompt>", "Goal modeを通さずCodexへ直接送信"),
-        kv(
-            "/interactive [prompt]",
-            "root codex [PROMPT]をno-alt-screenで実行",
-        ),
-        kv(
-            "/doctor / /features",
-            "codex doctor / features list等を実行",
-        ),
-        kv("/mcp / /plugin", "MCP / plugin の一覧・管理コマンドを実行"),
-        kv(
-            "/apps",
-            "Codex Desktop/app-server/remote controlの入口を表示",
-        ),
-        kv("/cloud", "Codex Cloud taskのlist/status/apply/diff等を実行"),
-        kv("/login / /logout", "ログイン状態確認 / ログアウト"),
-        kv("/version / /update", "codex --version / update を実行"),
-        kv("/app / /app-server", "Codex Desktop起動 / app-server管理"),
-        kv("/remote-control", "app-server remote control をstart/stop"),
-        kv("/debug / /completion", "debug出力 / shell completion生成"),
-        kv(
-            "/mcp-server / /exec-server",
-            "server系コマンド（空ならhelp表示）",
-        ),
-        kv("/sandbox-run", "Codex sandbox command を実行"),
-        kv("/review <args>", "codex review を実行"),
-        kv("/exec-review", "Codex reviewを機械判定向けに実行"),
-        kv("/apply|/a <task_id>", "codex apply <task_id> を実行"),
-        blank(),
+    ]);
+
+    if is_claude {
+        lines.extend([
+            section("claude code commands"),
+            kv(
+                "/ 入力",
+                "コマンド候補を入力欄の上に表示（Tab補完 / ↑↓選択）",
+            ),
+            kv("/sessions [N]", "Claude Codeセッション候補を番号付きで表示"),
+            kv("/resume-last [prompt]", "最新セッションを --resume で継続"),
+            kv("/resume-last-all", "cwd外も含めて最新セッションを継続"),
+            kv(
+                "/resume-session <N|id> [prompt]",
+                "番号またはidのセッションを継続",
+            ),
+            kv(
+                "/resume-session-all",
+                "cwd外も含めて番号またはidのセッションを継続",
+            ),
+            kv("/fork-last [prompt]", "最新セッションをforkして継続"),
+            kv(
+                "/fork-session <N|id> [prompt]",
+                "番号またはidのセッションをfork",
+            ),
+            kv("/new / /clear", "新しいセッション開始 / 表示ログをクリア"),
+            kv("/init", "AGENTS.md を作成 / 更新する初期化依頼を送信"),
+            kv("/ide", "IDE連携コンテキストの利用可否を表示"),
+            kv("/compact / /plan", "会話圧縮 / 実装前計画を送信"),
+            kv("/skills", "ローカルskill一覧 / skill使用依頼"),
+            kv("/exec|/e <prompt>", "Goal modeを通さず直接送信"),
+            blank(),
+        ]);
+    } else {
+        lines.extend([
+            section("codex commands"),
+            kv(
+                "/ 入力",
+                "コマンド候補を入力欄の上に表示（Tab補完 / ↑↓選択）",
+            ),
+            kv("/sessions [N]", "Codex session候補を番号付きで表示"),
+            kv(
+                "/codex-resume <args>",
+                "root codex resumeをno-alt-screenで実行",
+            ),
+            kv(
+                "/resume-last",
+                "最新Codex sessionをexec resume --lastで継続",
+            ),
+            kv("/resume-last-all", "cwd外も含めて最新Codexセッションを継続"),
+            kv("/resume-session <N>", "番号またはidのCodexセッションを継続"),
+            kv(
+                "/resume-session-all",
+                "cwd外も含めて番号またはidのセッションを継続",
+            ),
+            kv(
+                "/resume-interactive-*",
+                "root codex resumeをno-alt-screenで実行",
+            ),
+            kv("/side [prompt]", "現在セッションから別会話を開始"),
+            kv("/fork <args>", "root codex forkをno-alt-screenで実行"),
+            kv(
+                "/fork-last / /fork-session",
+                "最新または指定セッションをfork",
+            ),
+            kv("/fork-last-all", "cwd外も含めて最新Codexセッションをfork"),
+            kv(
+                "/fork-session-all",
+                "cwd外も含めて番号またはidのセッションをfork",
+            ),
+            kv("/rename <title>", "現在のCodexセッション名を変更"),
+            kv(
+                "/archive/unarchive/delete",
+                "番号またはidのセッションを管理",
+            ),
+            kv(
+                "/codex <args>",
+                "任意のCodexサブコマンドをTUIログに実行表示",
+            ),
+            kv(
+                "/new / /clear",
+                "新しいCodexセッション開始 / 表示ログをクリア",
+            ),
+            kv("/init", "AGENTS.md を作成 / 更新する初期化依頼を送信"),
+            kv("/ide", "IDE連携コンテキストの利用可否を表示"),
+            kv("/compact / /plan", "会話圧縮 / 実装前計画をCodexへ送信"),
+            kv("/import", "Claude Code等の設定候補を検出 / AGENTS化依頼"),
+            kv("/hooks", "Codex hook設定のoverrideを表示・設定"),
+            kv("/skills", "ローカルCodex skill一覧 / skill使用依頼"),
+            kv("/exec|/e <prompt>", "Goal modeを通さずCodexへ直接送信"),
+            kv(
+                "/interactive [prompt]",
+                "root codex [PROMPT]をno-alt-screenで実行",
+            ),
+            kv(
+                "/doctor / /features",
+                "codex doctor / features list等を実行",
+            ),
+            kv("/mcp / /plugin", "MCP / plugin の一覧・管理コマンドを実行"),
+            kv(
+                "/apps",
+                "Codex Desktop/app-server/remote controlの入口を表示",
+            ),
+            kv("/cloud", "Codex Cloud taskのlist/status/apply/diff等を実行"),
+            kv("/login / /logout", "ログイン状態確認 / ログアウト"),
+            kv("/version / /update", "codex --version / update を実行"),
+            kv("/app / /app-server", "Codex Desktop起動 / app-server管理"),
+            kv("/remote-control", "app-server remote control をstart/stop"),
+            kv("/debug / /completion", "debug出力 / shell completion生成"),
+            kv(
+                "/mcp-server / /exec-server",
+                "server系コマンド（空ならhelp表示）",
+            ),
+            kv("/sandbox-run", "Codex sandbox command を実行"),
+            kv("/review <args>", "codex review を実行"),
+            kv("/exec-review", "Codex reviewを機械判定向けに実行"),
+            kv("/apply|/a <task_id>", "codex apply <task_id> を実行"),
+            blank(),
+        ]);
+    }
+
+    lines.extend([
         section("goal helpers"),
         kv("/goal <目標>", "Goal modeを開始 / 更新"),
         kv("/goal pause/resume", "Goal modeを一時停止 / 再開"),
@@ -1215,81 +1276,106 @@ fn draw_codex_help_overlay(frame: &mut Frame, app: &mut App) {
         ),
         kv("/handoff [メモ]", "現在の会話をAddnessへ再開用に保存"),
         blank(),
-        section("codex options for next turn"),
-        kv("/settings", "モデル・推論・承認・sandbox設定を表示"),
-        kv("/cd <dir>", "次の新規Codexセッションの作業ルートを変更"),
-        kv("/model [name]", "モデルを切替 / 任意のmodel名を直接指定"),
-        kv(
-            "/reasoning [effort]",
-            "推論強度を切替 / low, medium等を直接指定",
-        ),
-        kv(
-            "/approval|/approvals / /sandbox",
-            "承認モード / sandboxを切替または直接指定",
-        ),
-        kv("/permissions", "承認/sandbox権限を表示・変更"),
-        kv(
-            "/personality",
-            "friendly / pragmatic の通信スタイルを次ターンへ適用",
-        ),
-        kv(
-            "/statusline",
-            "通常Codexのstatus line項目・色設定を次ターンへ適用",
-        ),
-        kv(
-            "/theme / /pets",
-            "通常Codexのtheme / pet設定を次ターンへ適用",
-        ),
-        kv(
-            "/vim / /raw",
-            "Vim composer / raw output設定を次ターンへ適用",
-        ),
-        kv("/keymap", "通常Codex keymap overrideを次ターンへ適用"),
-        kv("/memories", "Addness DB固定。作業メモは/rememberで保存"),
-        kv("/color", "Codex実行の色設定を never / auto / always に変更"),
-        kv("/search / /oss", "web search / OSS provider modeを切替"),
-        kv("/remote", "remote app server接続先を指定 / clear"),
-        kv(
-            "/remote-auth-token-env",
-            "remote認証tokenの環境変数名を指定 / clear",
-        ),
-        kv("/no-alt-screen", "Codexのno-alt-screenを切替"),
-        kv("/local-provider", "config / lmstudio / ollama を切替・指定"),
-        kv("/profile <name>", "Codex profileを次ターンへ適用"),
-        kv(
-            "/image <path>",
-            "画像を次ターンへ添付（list/clear/remove N）",
-        ),
-        kv("/add-dir <path>", "追加の書込許可ディレクトリを渡す"),
-        kv("/attachments", "画像添付と追加dirを一覧・追加・クリア"),
-        kv(
-            "/sandbox-add-read-dir",
-            "通常Codexのread-dir指定を--add-dirとして渡す",
-        ),
-        kv(
-            "/setup-default-sandbox",
-            "workspace-write/on-requestのsandboxプリセット",
-        ),
-        kv("/config key=value", "任意のCodex config overrideを追加"),
-        kv("/enable / /disable", "feature flagを有効化 / 無効化"),
-        kv("/strict-config", "未知のconfig項目をCodexエラーとして扱う"),
-        kv(
-            "/ignore-* / /ephemeral",
-            "user config・rules・git check・履歴保存を切替",
-        ),
-        kv(
-            "/bypass / /bypass-hook-trust",
-            "承認/sandbox回避・hook trust回避を切替",
-        ),
-        kv(
-            "/output-schema",
-            "最終応答JSON Schemaファイルを指定 / clear",
-        ),
-        kv(
-            "/output-last-message",
-            "最終メッセージ出力先ファイルを指定 / clear",
-        ),
-        blank(),
+    ]);
+
+    if is_claude {
+        lines.extend([
+            section("claude code options for next turn"),
+            kv("/settings", "モデル・effort・permission-mode設定を表示"),
+            kv("/cd <dir>", "次の新規セッションの作業ルートを変更"),
+            kv("/model [name]", "モデルを切替 / 任意のmodel名を直接指定"),
+            kv(
+                "/reasoning|/effort [level]",
+                "effortを切替 / low, medium等を直接指定",
+            ),
+            kv(
+                "/permissions|/approval [mode]",
+                "permission-modeを切替または直接指定",
+            ),
+            kv("/add-dir <path>", "追加の書込許可ディレクトリを渡す"),
+            blank(),
+        ]);
+    } else {
+        lines.extend([
+            section("codex options for next turn"),
+            kv("/settings", "モデル・推論・承認・sandbox設定を表示"),
+            kv("/cd <dir>", "次の新規Codexセッションの作業ルートを変更"),
+            kv("/model [name]", "モデルを切替 / 任意のmodel名を直接指定"),
+            kv(
+                "/reasoning [effort]",
+                "推論強度を切替 / low, medium等を直接指定",
+            ),
+            kv(
+                "/approval|/approvals / /sandbox",
+                "承認モード / sandboxを切替または直接指定",
+            ),
+            kv("/permissions", "承認/sandbox権限を表示・変更"),
+            kv(
+                "/personality",
+                "friendly / pragmatic の通信スタイルを次ターンへ適用",
+            ),
+            kv(
+                "/statusline",
+                "通常Codexのstatus line項目・色設定を次ターンへ適用",
+            ),
+            kv(
+                "/theme / /pets",
+                "通常Codexのtheme / pet設定を次ターンへ適用",
+            ),
+            kv(
+                "/vim / /raw",
+                "Vim composer / raw output設定を次ターンへ適用",
+            ),
+            kv("/keymap", "通常Codex keymap overrideを次ターンへ適用"),
+            kv("/memories", "Addness DB固定。作業メモは/rememberで保存"),
+            kv("/color", "Codex実行の色設定を never / auto / always に変更"),
+            kv("/search / /oss", "web search / OSS provider modeを切替"),
+            kv("/remote", "remote app server接続先を指定 / clear"),
+            kv(
+                "/remote-auth-token-env",
+                "remote認証tokenの環境変数名を指定 / clear",
+            ),
+            kv("/no-alt-screen", "Codexのno-alt-screenを切替"),
+            kv("/local-provider", "config / lmstudio / ollama を切替・指定"),
+            kv("/profile <name>", "Codex profileを次ターンへ適用"),
+            kv(
+                "/image <path>",
+                "画像を次ターンへ添付（list/clear/remove N）",
+            ),
+            kv("/add-dir <path>", "追加の書込許可ディレクトリを渡す"),
+            kv("/attachments", "画像添付と追加dirを一覧・追加・クリア"),
+            kv(
+                "/sandbox-add-read-dir",
+                "通常Codexのread-dir指定を--add-dirとして渡す",
+            ),
+            kv(
+                "/setup-default-sandbox",
+                "workspace-write/on-requestのsandboxプリセット",
+            ),
+            kv("/config key=value", "任意のCodex config overrideを追加"),
+            kv("/enable / /disable", "feature flagを有効化 / 無効化"),
+            kv("/strict-config", "未知のconfig項目をCodexエラーとして扱う"),
+            kv(
+                "/ignore-* / /ephemeral",
+                "user config・rules・git check・履歴保存を切替",
+            ),
+            kv(
+                "/bypass / /bypass-hook-trust",
+                "承認/sandbox回避・hook trust回避を切替",
+            ),
+            kv(
+                "/output-schema",
+                "最終応答JSON Schemaファイルを指定 / clear",
+            ),
+            kv(
+                "/output-last-message",
+                "最終メッセージ出力先ファイルを指定 / clear",
+            ),
+            blank(),
+        ]);
+    }
+
+    lines.extend([
         section("tui helpers"),
         kv("/diff / /history", "diffビュー / セッション履歴を表示"),
         kv(
@@ -1305,15 +1391,16 @@ fn draw_codex_help_overlay(frame: &mut Frame, app: &mut App) {
         blank(),
         section("終了後の還流"),
         kv("c / s / d / v", "コメント / 状態 / 成果物 / DoD判定"),
-        kv("Esc / q", "Codexペインを閉じる"),
-    ];
+        kv("Esc / q", &format!("{name}ペインを閉じる")),
+    ]);
 
+    let title = format!(" {name} in Addness ");
     render_scrollable_overlay(
         frame,
         &mut app.help_scroll,
         lines,
         72,
-        " Codex in Addness ",
+        &title,
         "Ctrl+Q / Esc / q: Close",
     );
 }

@@ -140,9 +140,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Help overlay sits above everything else.
     if app.show_help {
         if app.agent.is_some() {
-            draw_codex_help_overlay(frame);
+            draw_codex_help_overlay(frame, app);
         } else {
-            draw_help_overlay(frame);
+            draw_help_overlay(frame, app);
         }
     }
 }
@@ -811,11 +811,11 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
             .map(|c| c.is_turn_running())
             .unwrap_or(false);
         let hint = if finished {
-            " [c]コメント  [s]状態  [d]成果物(PR/Release)  [v]DoD判定  Ctrl+?:操作一覧  Esc/q:閉じる "
+            " [c]コメント  [s]状態  [d]成果物(PR/Release)  [v]DoD判定  Ctrl+Q:操作一覧  Esc/q:閉じる "
         } else if running {
             " Codex 実行中  |  Ctrl-T:表示切替  |  F7:turn一覧  |  入力+Enter:次ターン予約  |  Ctrl-C:中断 "
         } else {
-            " 入力してEnterでCodexへ送信  |  Ctrl-T:表示切替  |  F7:turn一覧  |  F2-F6:設定/差分  |  Ctrl+?:操作一覧 "
+            " 入力してEnterでCodexへ送信  |  Ctrl-T:表示切替  |  F7:turn一覧  |  F2-F6:設定/差分  |  Ctrl+Q:操作一覧 "
         };
         let status = Paragraph::new(Line::from(Span::styled(
             hint,
@@ -951,7 +951,7 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
 // Help overlay
 // ---------------------------------------------------------------------------
 
-fn draw_help_overlay(frame: &mut Frame) {
+fn draw_help_overlay(frame: &mut Frame, app: &mut App) {
     // (key, description) の行。section() は見出し。
     let section = |title: &str| {
         Line::from(Span::styled(
@@ -1033,21 +1033,17 @@ fn draw_help_overlay(frame: &mut Frame) {
         kv("Ctrl+F", "ファイラーを開いて選択"),
     ];
 
-    let height = (lines.len() as u16 + 2).min(frame.area().height);
-    let area = centered_rect(64, height, frame.area());
-    clear_modal_area(frame, area);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(" Keybindings ")
-        .title_bottom(
-            Line::from(" ? / Esc / q: Close ").style(Style::default().fg(Color::DarkGray)),
-        );
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    render_scrollable_overlay(
+        frame,
+        &mut app.help_scroll,
+        lines,
+        64,
+        " Keybindings ",
+        "? / Esc / q: Close",
+    );
 }
 
-fn draw_codex_help_overlay(frame: &mut Frame) {
+fn draw_codex_help_overlay(frame: &mut Frame, app: &mut App) {
     let section = |title: &str| {
         Line::from(Span::styled(
             title.to_string(),
@@ -1071,7 +1067,7 @@ fn draw_codex_help_overlay(frame: &mut Frame) {
 
     let lines: Vec<Line> = vec![
         section("Codex in Addness"),
-        kv("Ctrl+?", "この操作一覧を表示 / 閉じる"),
+        kv("Ctrl+Q", "この操作一覧を表示 / 閉じる"),
         kv("入力 + Enter", "Codexへ依頼を送信（必要ならAddnessを参照）"),
         kv("入力中 Enter", "実行中なら次ターンに予約"),
         kv("Ctrl-C", "実行中のCodexターンを中断"),
@@ -1112,6 +1108,10 @@ fn draw_codex_help_overlay(frame: &mut Frame) {
         ),
         blank(),
         section("codex commands"),
+        kv(
+            "/ 入力",
+            "コマンド候補を入力欄の上に表示（Tab補完 / ↑↓選択）",
+        ),
         kv("/sessions [N]", "Codex session候補を番号付きで表示"),
         kv(
             "/codex-resume <args>",
@@ -1297,18 +1297,62 @@ fn draw_codex_help_overlay(frame: &mut Frame) {
         kv("Esc / q", "Codexペインを閉じる"),
     ];
 
-    let height = (lines.len() as u16 + 2).min(frame.area().height);
-    let area = centered_rect(72, height, frame.area());
+    render_scrollable_overlay(
+        frame,
+        &mut app.help_scroll,
+        lines,
+        72,
+        " Codex in Addness ",
+        "Ctrl+Q / Esc / q: Close",
+    );
+}
+
+/// スクロール可能なオーバーレイを画面中央に描く共通ヘルパー。
+/// `scroll` は実際の行数・枠内高さに応じてクランプし直し、呼び出し元の
+/// 状態（`App::help_scroll` 等）へ書き戻す。フッターにスクロール位置を表示する。
+fn render_scrollable_overlay(
+    frame: &mut Frame,
+    scroll: &mut usize,
+    lines: Vec<Line<'static>>,
+    percent_x: u16,
+    title: &str,
+    footer_hint: &str,
+) {
+    let total = lines.len();
+    let full = frame.area();
+    // 内容が少なければ内容に合わせて縮め、多ければ画面高（上下に少し余白）まで
+    // 広げてスクロールで見せる。
+    let max_height = full.height.saturating_sub(2).max(3);
+    let height = (total as u16 + 2).min(max_height);
+    let area = centered_rect(percent_x, height, full);
     clear_modal_area(frame, area);
+
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let max_scroll = total.saturating_sub(inner_height);
+    *scroll = (*scroll).min(max_scroll);
+
+    let footer = if max_scroll > 0 {
+        let shown_end = (*scroll + inner_height).min(total);
+        format!(
+            " {footer_hint}  |  ↑↓/PgUp/PgDn/Home/End:スクロール  {}-{}/{total} ",
+            scroll.saturating_add(1).min(total.max(1)),
+            shown_end
+        )
+    } else {
+        format!(" {footer_hint} ")
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
-        .title(" Codex in Addness ")
-        .title_bottom(
-            Line::from(" Ctrl+? / Esc / q: Close ").style(Style::default().fg(Color::DarkGray)),
-        );
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+        .title(title.to_string())
+        .title_bottom(Line::from(footer).style(Style::default().fg(Color::DarkGray)));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .scroll((*scroll as u16, 0)),
+        area,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2908,6 +2952,93 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
             input_chunk.y + cursor_row.min(input_chunk.height.saturating_sub(1)),
         ));
     }
+
+    // 入力が `/xxx` のとき、入力欄の直上にスラッシュコマンドパレットを重ねる。
+    if pane.slash_palette_active() {
+        draw_codex_slash_palette(frame, input_chunk, history_chunk, pane);
+    }
+}
+
+/// 入力欄の直上に、現在の `/` 入力に一致するスラッシュコマンド候補を表示する。
+fn draw_codex_slash_palette(
+    frame: &mut Frame,
+    input_chunk: Rect,
+    history_chunk: Rect,
+    pane: &CodexPane,
+) {
+    let suggestions = pane.slash_palette_suggestions();
+    if suggestions.is_empty() {
+        return;
+    }
+    let total = suggestions.len();
+    let selected = pane.slash_palette_selected();
+
+    // 入力欄の上（履歴領域）に確保できる高さ内で行数を決める。枠に 2 行使う。
+    let avail = history_chunk.height as usize;
+    if avail < 3 {
+        return;
+    }
+    let rows = total.min(8).min(avail - 2);
+    if rows == 0 {
+        return;
+    }
+    // 選択中の候補が窓に入るようスクロール位置を決める。
+    let start = if selected >= rows {
+        selected + 1 - rows
+    } else {
+        0
+    };
+    let end = (start + rows).min(total);
+
+    let ph = (rows + 2) as u16;
+    let area = Rect {
+        x: input_chunk.x,
+        y: input_chunk.y.saturating_sub(ph),
+        width: input_chunk.width,
+        height: ph,
+    };
+
+    clear_modal_area(frame, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLOR_CODEX))
+        .style(Style::default().bg(COLOR_INPUT_BG))
+        .title(Span::styled(
+            format!(" / コマンド  {total}件 "),
+            Style::default().fg(COLOR_CODEX),
+        ))
+        .title_bottom(
+            Line::from(" Tab:補完  ↑↓:選択  Esc:消す ").style(Style::default().fg(COLOR_MUTED)),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let name_w = 16usize;
+    let lines: Vec<Line> = (start..end)
+        .map(|i| {
+            let (name, desc) = suggestions[i];
+            let is_sel = i == selected;
+            let (marker, name_style) = if is_sel {
+                (
+                    "▸ ",
+                    Style::default()
+                        .fg(COLOR_TEXT_STRONG)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                ("  ", Style::default().fg(COLOR_TEXT))
+            };
+            Line::from(vec![
+                Span::styled(format!("{marker}{name:<name_w$}"), name_style),
+                Span::styled(format!("  {desc}"), Style::default().fg(COLOR_MUTED)),
+            ])
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(COLOR_INPUT_BG)),
+        inner,
+    );
 }
 
 struct CodexInputPromptRender {
@@ -4621,7 +4752,7 @@ fn codex_dashboard_shortcut_lines(max_width: usize) -> Vec<Line<'static>> {
         )),
         Line::from(Span::styled(
             ellipsize_width(
-                "  /remember /handoff:保存  Ctrl+?:全体ヘルプ  /settings",
+                "  /remember /handoff:保存  Ctrl+Q:全体ヘルプ  /settings",
                 max_width,
             ),
             Style::default().fg(COLOR_MUTED),
@@ -5421,7 +5552,7 @@ mod tests {
         let text = render_status_text(&app, 140);
 
         assert!(
-            text.contains("Ctrl+?"),
+            text.contains("Ctrl+Q"),
             "codex status should expose the help shortcut:\n{text}"
         );
     }
@@ -5435,7 +5566,7 @@ mod tests {
             .join("\n");
 
         assert!(text.contains("次の操作"));
-        assert!(text.contains("Ctrl+?"));
+        assert!(text.contains("Ctrl+Q"));
         assert!(text.contains("F7:turn一覧"));
         assert!(text.contains("/organize"));
         assert!(text.contains("/work next"));

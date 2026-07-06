@@ -21,6 +21,70 @@ use serde_json::Value;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub const CODEX_LOG_PREFIX_WIDTH: usize = 7;
+
+/// スラッシュコマンドのパレット候補（コマンド名, 1 行説明）。
+/// `handle_local_slash_command` が受け付ける主要コマンドの正本。よく使う
+/// Addness 連携・セッション操作を上に、codex 委譲・設定系を下に並べる。
+/// 表示はコマンド名の先頭一致で絞り込む。
+const SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("/goal", "Goal モードを開始 / 更新"),
+    ("/work", "子ゴールの作業単位へ進む"),
+    ("/organize", "子ゴールに分解する"),
+    ("/remember", "メモを Addness の body へ保存"),
+    ("/handoff", "会話コンテキストを Addness へ保存"),
+    ("/exec", "Goal モードを通さず直接送信"),
+    ("/init", "AGENTS.md を作成 / 更新"),
+    ("/plan", "実装前の計画を依頼"),
+    ("/compact", "会話を圧縮する"),
+    ("/skills", "ローカル skill 一覧 / 使用依頼"),
+    ("/new", "新しいセッションを開始"),
+    ("/clear", "表示ログをクリア"),
+    ("/stop", "実行中のターンを中断"),
+    ("/sessions", "セッション候補を番号付きで表示"),
+    ("/resume", "作業メモ・決定ログから再開"),
+    ("/resume-last", "最新セッションを継続"),
+    ("/resume-session", "番号 / id のセッションを継続"),
+    ("/fork", "セッションを fork"),
+    ("/fork-last", "最新セッションを fork"),
+    ("/fork-session", "番号 / id のセッションを fork"),
+    ("/rename", "現在のセッション名を変更"),
+    ("/archive", "セッションをアーカイブ"),
+    ("/history", "セッション履歴を表示"),
+    ("/turn", "指定 turn を展開 / 格納"),
+    ("/diff", "ファイル編集の diff を表示"),
+    ("/ps", "実行中 turn / 予約を表示"),
+    ("/btw", "最後の応答を Markdown で表示"),
+    ("/model", "次ターンのモデルを切替 / 指定"),
+    ("/reasoning", "推論強度を切替 / 指定"),
+    ("/approval", "承認モードを切替"),
+    ("/sandbox", "sandbox を切替 / 指定"),
+    ("/permissions", "承認 / sandbox 権限を設定"),
+    ("/personality", "通信スタイルを切替"),
+    ("/settings", "モデル・推論・承認・sandbox 設定を表示"),
+    ("/cd", "次セッションの作業ルートを変更"),
+    ("/add-dir", "書込許可ディレクトリを追加"),
+    ("/image", "画像を添付する"),
+    ("/attachments", "添付の一覧・追加・クリア"),
+    ("/theme", "テーマを設定"),
+    ("/vim", "Vim composer を切替"),
+    ("/profile", "codex profile を適用"),
+    ("/search", "web search を切替"),
+    ("/config", "codex config override を追加"),
+    ("/mcp", "MCP の一覧・管理"),
+    ("/review", "codex review を実行"),
+    ("/apply", "codex apply <task_id> を実行"),
+    ("/cloud", "Codex Cloud task を操作"),
+    ("/apps", "Desktop / app-server / remote 入口"),
+    ("/import", "他ツール設定を検出 / AGENTS 化"),
+    ("/hooks", "hook 設定の override を表示 / 設定"),
+    ("/codex", "任意の codex サブコマンドを実行"),
+    ("/login", "ログイン状態を確認"),
+    ("/logout", "ログアウトする"),
+    ("/status", "現在の状態を表示"),
+    ("/usage", "token 使用量を表示"),
+    ("/help", "スラッシュコマンド一覧を表示"),
+];
+
 const CODEX_SESSION_HISTORY_DIR: &str = "codex-sessions";
 const CODEX_SESSION_HISTORY_MAX_LOG_LINES: usize = 5_000;
 const CODEX_SESSION_HISTORY_MAX_RECORDS: usize = 20_000;
@@ -1793,6 +1857,8 @@ pub struct CodexPane {
     /// 最初の実依頼の body 自動記録を済み（再試行しない）とするフラグ。
     body_record_done: bool,
     input_state: CodexInputState,
+    /// スラッシュコマンドパレットで選択中の候補インデックス。入力が変わると 0 に戻す。
+    slash_palette_selected: usize,
     queued_prompts: VecDeque<QueuedPrompt>,
     /// `codex exec --json` が返した Codex thread id。2ターン目以降の resume に使う。
     thread_id: Option<String>,
@@ -1950,6 +2016,7 @@ impl CodexPane {
             auto_record_attempted: false,
             body_record_done: false,
             input_state: CodexInputState::default(),
+            slash_palette_selected: 0,
             queued_prompts: VecDeque::new(),
             thread_id: None,
             current_turn_prompt: None,
@@ -2202,6 +2269,66 @@ impl CodexPane {
 
     pub fn input_cursor(&self) -> usize {
         self.input_state.cursor
+    }
+
+    /// 現在の入力に対するスラッシュコマンド候補（コマンド名, 説明）。
+    /// 入力が `/xxx` でコマンド名を入力中（空白・改行を含まない）のときのみ返す。
+    /// 空の `/` は全コマンドを返す。
+    pub fn slash_palette_suggestions(&self) -> Vec<(&'static str, &'static str)> {
+        let line = self.input_state.line.as_str();
+        let Some(rest) = line.strip_prefix('/') else {
+            return Vec::new();
+        };
+        if rest.chars().any(char::is_whitespace) {
+            return Vec::new();
+        }
+        let prefix = line.to_ascii_lowercase();
+        SLASH_COMMANDS
+            .iter()
+            .filter(|(name, _)| name.starts_with(prefix.as_str()))
+            .copied()
+            .collect()
+    }
+
+    /// スラッシュコマンドパレットを表示 / 操作すべき状態か。
+    pub fn slash_palette_active(&self) -> bool {
+        !self.finished
+            && !self.is_search_editing()
+            && self.pending_decision.is_none()
+            && !self.slash_palette_suggestions().is_empty()
+    }
+
+    /// パレットで選択中の候補インデックス（候補数でクランプ済み）。
+    pub fn slash_palette_selected(&self) -> usize {
+        let n = self.slash_palette_suggestions().len();
+        if n == 0 {
+            0
+        } else {
+            self.slash_palette_selected.min(n - 1)
+        }
+    }
+
+    /// パレットの選択を上下に移動する（端で反対側へラップ）。
+    pub fn move_slash_palette_selection(&mut self, delta: isize) {
+        let n = self.slash_palette_suggestions().len();
+        if n == 0 {
+            return;
+        }
+        let cur = self.slash_palette_selected.min(n - 1) as isize;
+        self.slash_palette_selected = (cur + delta).rem_euclid(n as isize) as usize;
+    }
+
+    /// 選択中の候補で入力行を補完する（`/command ` に置き換え、引数入力へ移る）。
+    pub fn accept_slash_palette_selection(&mut self) {
+        let suggestions = self.slash_palette_suggestions();
+        if suggestions.is_empty() {
+            return;
+        }
+        let idx = self.slash_palette_selected.min(suggestions.len() - 1);
+        let name = suggestions[idx].0;
+        self.input_state.clear();
+        self.input_state.insert_text(&format!("{name} "));
+        self.slash_palette_selected = 0;
     }
 
     pub fn captures_input_key(&self, key: KeyEvent) -> bool {
@@ -3740,7 +3867,10 @@ impl CodexPane {
             return;
         }
 
-        let Some(submitted) = self.input_state.observe_key(key) else {
+        let observed = self.input_state.observe_key(key);
+        // 入力が変わったらパレットの選択を先頭へ戻す（↑↓/Tab は app 側で消費済み）。
+        self.slash_palette_selected = 0;
+        let Some(submitted) = observed else {
             return;
         };
         self.submit_user_line(&submitted);
@@ -9061,6 +9191,79 @@ mod tests {
 
     fn modified_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
+    }
+
+    /// 入力受付状態（未終了）のテスト用ペインを作る。
+    fn live_pane() -> CodexPane {
+        let mut pane = CodexPane::test_with_output(10, 80, 0, "");
+        pane.finished = false;
+        pane
+    }
+
+    fn type_input(pane: &mut CodexPane, text: &str) {
+        for ch in text.chars() {
+            pane.input(key(KeyCode::Char(ch)));
+        }
+    }
+
+    #[test]
+    fn slash_palette_filters_by_prefix() {
+        let mut pane = live_pane();
+        type_input(&mut pane, "/re");
+        let names: Vec<&str> = pane
+            .slash_palette_suggestions()
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(pane.slash_palette_active());
+        assert!(names.contains(&"/remember"));
+        assert!(names.contains(&"/reasoning"));
+        assert!(names.iter().all(|name| name.starts_with("/re")));
+        assert!(!names.contains(&"/goal"));
+    }
+
+    #[test]
+    fn slash_palette_hidden_once_args_typed() {
+        let mut pane = live_pane();
+        type_input(&mut pane, "/exec ");
+        assert!(pane.slash_palette_suggestions().is_empty());
+        assert!(!pane.slash_palette_active());
+    }
+
+    #[test]
+    fn slash_palette_hidden_for_plain_text() {
+        let mut pane = live_pane();
+        type_input(&mut pane, "hello");
+        assert!(pane.slash_palette_suggestions().is_empty());
+    }
+
+    #[test]
+    fn slash_palette_tab_completes_selected_command() {
+        let mut pane = live_pane();
+        type_input(&mut pane, "/rem");
+        assert_eq!(pane.slash_palette_suggestions().len(), 1);
+        pane.accept_slash_palette_selection();
+        assert_eq!(pane.input_line(), "/remember ");
+        // 補完で空白が入るためパレットは閉じる。
+        assert!(pane.slash_palette_suggestions().is_empty());
+    }
+
+    #[test]
+    fn slash_palette_selection_moves_wraps_and_resets_on_input() {
+        let mut pane = live_pane();
+        type_input(&mut pane, "/re");
+        let n = pane.slash_palette_suggestions().len();
+        assert!(n >= 2);
+        assert_eq!(pane.slash_palette_selected(), 0);
+        pane.move_slash_palette_selection(1);
+        assert_eq!(pane.slash_palette_selected(), 1);
+        // 先頭で -1 すると末尾へラップする。
+        pane.move_slash_palette_selection(-1);
+        pane.move_slash_palette_selection(-1);
+        assert_eq!(pane.slash_palette_selected(), n - 1);
+        // 文字入力で選択は先頭へ戻る。
+        type_input(&mut pane, "s");
+        assert_eq!(pane.slash_palette_selected(), 0);
     }
 
     fn has_addness_developer_instructions(args: &[String]) -> bool {

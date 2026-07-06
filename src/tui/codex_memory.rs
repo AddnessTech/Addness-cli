@@ -4,7 +4,7 @@ use chrono::Local;
 
 use crate::api::UpdateGoalRequest;
 
-use super::codex_pane::{self, CodexWorkSummary};
+use super::agent::{self, CodexWorkSummary};
 
 pub(super) const CODEX_AUTO_RECORD_START: &str = "<!-- addness:codex:auto-record:start -->";
 pub(super) const CODEX_AUTO_RECORD_END: &str = "<!-- addness:codex:auto-record:end -->";
@@ -130,7 +130,7 @@ pub(super) fn codex_work_memo(
     summary: Option<&CodexWorkSummary>,
 ) -> String {
     let cwd_path = PathBuf::from(cwd);
-    let diff = codex_pane::git_diff_stat(&cwd_path);
+    let diff = agent::git_diff_stat(&cwd_path);
     let status = git_status_short(cwd);
     let branch = git_branch_name(cwd);
     let touched_files = git_changed_files(cwd);
@@ -281,7 +281,7 @@ pub(super) fn codex_trace_link_label(name: &str, url: Option<&str>) -> Option<St
 #[cfg(test)]
 mod tests {
     use super::{codex_work_memo, resume_hint};
-    use crate::tui::codex_pane::CodexWorkSummary;
+    use crate::tui::agent::CodexWorkSummary;
 
     #[test]
     fn resume_hint_prefers_remaining_work() {

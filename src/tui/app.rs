@@ -22,8 +22,8 @@ use crate::api::{
 };
 use crate::dbg_log;
 
+use super::agent::{self, ChildGoalUpdate, CodexPane, CodexWorkSummary, TerminalNotice};
 use super::codex_memory::{codex_body_update_request, codex_trace_link_label, codex_work_memo};
-use super::codex_pane::{self, ChildGoalUpdate, CodexPane, CodexWorkSummary, TerminalNotice};
 pub(super) use super::file_picker::PICKER_VISIBLE_ROWS;
 use super::file_picker::{
     FileEntry, FilePickerReturn, complete_path, initial_picker_dir, read_dir_entries,
@@ -1206,7 +1206,7 @@ impl App {
         };
 
         // codex 未インストールでもクラッシュさせず、案内を出す。
-        let Some(codex_bin) = codex_pane::codex_path() else {
+        let Some(codex_bin) = agent::codex_path() else {
             self.error_message = Some(
                 "codex が見つかりません。`brew install codex` 等でインストールしてください"
                     .to_string(),
@@ -1654,7 +1654,7 @@ impl App {
             self.error_message = Some("DoD が未設定のため判定できません".to_string());
             return;
         }
-        let Some(codex_bin) = codex_pane::codex_path() else {
+        let Some(codex_bin) = agent::codex_path() else {
             self.error_message = Some("codex が見つかりません".to_string());
             return;
         };
@@ -1668,13 +1668,13 @@ impl App {
         let schema_path = tmp.join(format!("addness-dod-schema-{goal_id}-{pid}.json"));
         let out_path = tmp.join(format!("addness-dod-out-{goal_id}-{pid}.json"));
 
-        if std::fs::write(&schema_path, codex_pane::dod_assessment_schema()).is_err() {
+        if std::fs::write(&schema_path, agent::dod_assessment_schema()).is_err() {
             self.error_message = Some("一時ファイルの書き込みに失敗しました".to_string());
             return;
         }
         let _ = std::fs::remove_file(&out_path);
 
-        let prompt = codex_pane::build_dod_assessment_prompt(&items);
+        let prompt = agent::build_dod_assessment_prompt(&items);
         let child = std::process::Command::new(&codex_bin)
             .arg("exec")
             .args(["-s", "read-only", "--color", "never"])
@@ -2273,7 +2273,7 @@ impl App {
             if pane.scrollback > 0 {
                 pane.scroll_to_live();
             }
-            pane.submit_system_line(codex_pane::resume_prompt());
+            pane.submit_system_line(agent::resume_prompt());
             let now = Local::now().format("%H:%M");
             pane.push_activity(format!("{now} F9 再開プロンプトを送信"));
             self.success_message = Some("Addnessから再開するプロンプトを送信しました".to_string());
@@ -2487,7 +2487,7 @@ impl App {
         let goal_id = pane.goal_id.clone();
         let goal_title = pane.goal_title.clone();
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let diff = codex_pane::git_diff_stat(&cwd);
+        let diff = agent::git_diff_stat(&cwd);
         let body = if diff.trim().is_empty() {
             String::new()
         } else {

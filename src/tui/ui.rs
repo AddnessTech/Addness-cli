@@ -11,10 +11,10 @@ use std::collections::HashMap;
 use std::time::Instant;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::app::{ActivePane, App, DeliverableFormField, FormField, ModalState};
-use super::codex_pane::{
+use super::agent::{
     CODEX_LOG_PREFIX_WIDTH, ChildGoal, CodexDecisionKind, CodexLogKind, CodexLogLine, CodexPane,
 };
+use super::app::{ActivePane, App, DeliverableFormField, FormField, ModalState};
 use super::goal_tree::{CommentView, TreeRow};
 use crate::api::{DeliverableType, GoalStatus, Member, MemberId};
 
@@ -3188,7 +3188,7 @@ fn codex_input_text_width(text: &str) -> usize {
 }
 
 fn codex_decision_input_lines(
-    decision: &super::codex_pane::CodexDecisionBanner,
+    decision: &super::agent::CodexDecisionBanner,
     max_width: usize,
     input_height: u16,
 ) -> Vec<Line<'static>> {
@@ -3268,7 +3268,7 @@ fn codex_decision_input_lines(
 }
 
 fn codex_decision_message_lines(
-    decision: &super::codex_pane::CodexDecisionBanner,
+    decision: &super::agent::CodexDecisionBanner,
     max_width: usize,
     max_lines: usize,
     color: Color,
@@ -3331,7 +3331,7 @@ fn codex_decision_color(kind: &CodexDecisionKind) -> Color {
     }
 }
 
-fn codex_decision_title_hint(decision: &super::codex_pane::CodexDecisionBanner) -> String {
+fn codex_decision_title_hint(decision: &super::agent::CodexDecisionBanner) -> String {
     let keys = match decision.kind {
         CodexDecisionKind::YesNo => "y/n",
         CodexDecisionKind::Dangerous => "a/y または d/n",
@@ -3347,7 +3347,7 @@ fn codex_decision_title_hint(decision: &super::codex_pane::CodexDecisionBanner) 
 }
 
 fn codex_decision_choice_line(
-    decision: &super::codex_pane::CodexDecisionBanner,
+    decision: &super::agent::CodexDecisionBanner,
     max_width: usize,
 ) -> Line<'static> {
     let accept = decision_choice_text(decision, true);
@@ -3401,10 +3401,7 @@ fn codex_decision_choice_line(
     Line::from(spans)
 }
 
-fn decision_choice_text(
-    decision: &super::codex_pane::CodexDecisionBanner,
-    is_accept: bool,
-) -> String {
+fn decision_choice_text(decision: &super::agent::CodexDecisionBanner, is_accept: bool) -> String {
     let (key, label) = if is_accept {
         (decision.accept_key, decision.accept_label)
     } else {
@@ -3418,9 +3415,7 @@ fn decision_choice_text(
     format!("[{keys}] {label}")
 }
 
-fn decision_always_choice_text(
-    decision: &super::codex_pane::CodexDecisionBanner,
-) -> Option<String> {
+fn decision_always_choice_text(decision: &super::agent::CodexDecisionBanner) -> Option<String> {
     decision
         .always_choice()
         .map(|(key, label)| format!("[{}] {label}", key.to_ascii_uppercase()))
@@ -4553,17 +4548,16 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
 
     let run_state = pane.run_state();
     let state_style = match run_state {
-        super::codex_pane::CodexRunState::Completed => {
+        super::agent::CodexRunState::Completed => {
             Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD)
         }
-        super::codex_pane::CodexRunState::Confirming => {
+        super::agent::CodexRunState::Confirming => {
             Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD)
         }
-        super::codex_pane::CodexRunState::CommandRunning
-        | super::codex_pane::CodexRunState::Thinking => {
+        super::agent::CodexRunState::CommandRunning | super::agent::CodexRunState::Thinking => {
             Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD)
         }
-        super::codex_pane::CodexRunState::InputWaiting => {
+        super::agent::CodexRunState::InputWaiting => {
             Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD)
         }
     };
@@ -4859,7 +4853,7 @@ mod tests {
         summarize_tool_display_text,
     };
     use crate::api::ApiClient;
-    use crate::tui::codex_pane::{
+    use crate::tui::agent::{
         CODEX_LOG_PREFIX_WIDTH, ChildGoal, CodexDecisionBanner, CodexDecisionKind, CodexLogKind,
         CodexLogLine, CodexPane,
     };

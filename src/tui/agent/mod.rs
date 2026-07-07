@@ -7119,7 +7119,10 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
             self.flush_child_process_output(false, &label);
             self.push_log(CodexLogKind::System, format!("{label} を中断しました"));
         } else {
-            self.push_log(CodexLogKind::System, "Codex ターンを中断しました");
+            self.push_log(
+                CodexLogKind::System,
+                format!("{} ターンを中断しました", self.kind.display_name()),
+            );
         }
     }
 

@@ -130,6 +130,10 @@ const CLAUDE_SESSION_HISTORY_DIR: &str = "claude-sessions";
 const CODEX_SESSION_HISTORY_MAX_LOG_LINES: usize = 5_000;
 const CODEX_SESSION_HISTORY_MAX_RECORDS: usize = 20_000;
 const CODEX_SESSION_HISTORY_MAX_BYTES: u64 = 20 * 1024 * 1024;
+/// 入力履歴（↑↓で呼び戻す過去プロンプト）の保持上限。
+const INPUT_HISTORY_MAX: usize = 200;
+/// @メンションのファイル候補を一度に表示する最大件数。
+const MENTION_PALETTE_MAX: usize = 10;
 
 /// TUI が起動するエージェントバックエンドの種別。
 /// バックエンド分岐（起動引数・イベントパース・セッション探索・表示名）で match する。
@@ -1571,6 +1575,7 @@ struct CodexPaneSpawnOptions<'a> {
     dod: String,
     status_label: String,
     session_log_path: Option<PathBuf>,
+    input_history_path: Option<PathBuf>,
 }
 
 /// 子ゴール 1 件の表示用情報。
@@ -1842,6 +1847,14 @@ pub struct CodexPane {
     input_state: CodexInputState,
     /// スラッシュコマンドパレットで選択中の候補インデックス。入力が変わると 0 に戻す。
     slash_palette_selected: usize,
+    /// `@` メンションのファイル候補パレットで選択中のインデックス。入力が変わると 0 に戻す。
+    mention_palette_selected: usize,
+    /// Esc でメンションパレットを閉じた状態。次の入力で解除する。
+    mention_palette_dismissed: bool,
+    /// 入力履歴の保存先（`~/.addness/input-history.jsonl`）。テストでは None。
+    input_history_path: Option<PathBuf>,
+    /// Esc 中断の 1 回目押下（アーム済み）状態。次の Esc で中断する。
+    esc_interrupt_armed: bool,
     queued_prompts: VecDeque<QueuedPrompt>,
     /// `codex exec --json` が返した Codex thread id。2ターン目以降の resume に使う。
     thread_id: Option<String>,
@@ -1927,6 +1940,7 @@ impl CodexPane {
             cwd,
             addness_bin,
             session_log_path: agent_session_log_path(kind, &goal_id),
+            input_history_path: input_history_file_path(),
             goal_id,
             goal_title,
             dod,
@@ -1945,6 +1959,7 @@ impl CodexPane {
             dod,
             status_label,
             session_log_path,
+            input_history_path,
         } = options;
         let dod_items = split_dod_items(&dod);
         let dod_checks = vec![None; dod_items.len()];
@@ -1967,6 +1982,11 @@ impl CodexPane {
             .filter(|line| line.kind == CodexLogKind::Turn)
             .count();
         let collapsed_turns = (1..turn_count).collect::<BTreeSet<_>>();
+
+        let mut input_state = CodexInputState::default();
+        if let Some(path) = input_history_path.as_deref() {
+            input_state.history = load_input_history(path);
+        }
 
         let mut pane = Self {
             kind,
@@ -2012,8 +2032,12 @@ impl CodexPane {
             activity: Vec::new(),
             auto_record_attempted: false,
             body_record_done: false,
-            input_state: CodexInputState::default(),
+            input_state,
             slash_palette_selected: 0,
+            mention_palette_selected: 0,
+            mention_palette_dismissed: false,
+            input_history_path,
+            esc_interrupt_armed: false,
             queued_prompts: VecDeque::new(),
             thread_id: None,
             current_turn_prompt: None,
@@ -2087,6 +2111,11 @@ impl CodexPane {
         pane.cols = cols.max(1);
         pane.log.clear();
         pane.session_log_path = None;
+        pane.input_history_path = None;
+        pane.input_state.history.clear();
+        pane.mention_palette_selected = 0;
+        pane.mention_palette_dismissed = false;
+        pane.esc_interrupt_armed = false;
         pane.session_record_count = 0;
         pane.loaded_history_count = 0;
         pane.turn_count = 0;
@@ -2343,6 +2372,100 @@ impl CodexPane {
         self.input_state.clear();
         self.input_state.insert_text(&format!("{name} "));
         self.slash_palette_selected = 0;
+    }
+
+    /// 現在の入力に対する `@` メンションのファイル候補（ペインの cwd 基準の相対パス）。
+    pub fn mention_palette_suggestions(&self) -> Vec<MentionCandidate> {
+        let Some((_, query)) = active_mention(&self.input_state.line, self.input_state.cursor)
+        else {
+            return Vec::new();
+        };
+        mention_candidates(Path::new(&self.cwd), &query)
+    }
+
+    /// `@` メンションのファイル候補パレットを表示 / 操作すべき状態か。
+    pub fn mention_palette_active(&self) -> bool {
+        !self.finished
+            && !self.mention_palette_dismissed
+            && !self.is_search_editing()
+            && self.pending_decision.is_none()
+            && !self.slash_palette_active()
+            && !self.mention_palette_suggestions().is_empty()
+    }
+
+    /// メンションパレットで選択中の候補インデックス（候補数でクランプ済み）。
+    pub fn mention_palette_selected(&self) -> usize {
+        let n = self.mention_palette_suggestions().len();
+        if n == 0 {
+            0
+        } else {
+            self.mention_palette_selected.min(n - 1)
+        }
+    }
+
+    /// メンションパレットの選択を上下に移動する（端で反対側へラップ）。
+    pub fn move_mention_palette_selection(&mut self, delta: isize) {
+        let n = self.mention_palette_suggestions().len();
+        if n == 0 {
+            return;
+        }
+        let cur = self.mention_palette_selected.min(n - 1) as isize;
+        self.mention_palette_selected = (cur + delta).rem_euclid(n as isize) as usize;
+    }
+
+    /// 選択中の候補で `@` 以降を相対パスに置換して確定する。
+    /// ディレクトリならそのまま潜って絞り込みを続け、ファイルなら末尾に空白を付けて確定する。
+    pub fn accept_mention_palette_selection(&mut self) {
+        let candidates = self.mention_palette_suggestions();
+        if candidates.is_empty() {
+            return;
+        }
+        let idx = self.mention_palette_selected.min(candidates.len() - 1);
+        let candidate = candidates[idx].clone();
+        let Some((at, _)) = active_mention(&self.input_state.line, self.input_state.cursor) else {
+            return;
+        };
+        let replacement = if candidate.is_dir {
+            candidate.insert
+        } else {
+            format!("{} ", candidate.insert)
+        };
+        self.input_state
+            .replace_to_cursor(at + '@'.len_utf8(), &replacement);
+        self.mention_palette_selected = 0;
+    }
+
+    /// Esc でメンションパレットだけを閉じる（入力は消さない）。
+    pub fn dismiss_mention_palette(&mut self) {
+        self.mention_palette_dismissed = true;
+    }
+
+    /// Esc 中断の 1 回目押下（アーム）。次の Esc で中断する旨を表示する。
+    pub fn arm_esc_interrupt(&mut self) {
+        self.esc_interrupt_armed = true;
+        self.push_log(
+            CodexLogKind::System,
+            "もう一度 Esc でターンを中断します".to_string(),
+        );
+    }
+
+    /// Esc 中断がアーム済みなら true を返してアームを解除する。
+    pub fn take_esc_interrupt_armed(&mut self) -> bool {
+        std::mem::take(&mut self.esc_interrupt_armed)
+    }
+
+    /// Esc でターンを中断する。実行中でなければ何もしない。
+    pub fn interrupt_turn_by_esc(&mut self) -> bool {
+        if !self.is_turn_running() {
+            return false;
+        }
+        self.kill_current_turn();
+        self.push_log(
+            CodexLogKind::System,
+            "Esc でターンを中断しました".to_string(),
+        );
+        self.start_next_queued_turn_if_idle();
+        true
     }
 
     pub fn captures_input_key(&self, key: KeyEvent) -> bool {
@@ -4215,9 +4338,14 @@ impl CodexPane {
             return;
         }
 
+        // 通常の入力キーが来たら Esc 中断のアームは解除する。
+        self.esc_interrupt_armed = false;
         let observed = self.input_state.observe_key(key);
         // 入力が変わったらパレットの選択を先頭へ戻す（↑↓/Tab は app 側で消費済み）。
         self.slash_palette_selected = 0;
+        self.mention_palette_selected = 0;
+        // 入力が動いたらメンションパレットの一時非表示（Esc）を解除して再表示できるようにする。
+        self.mention_palette_dismissed = false;
         let Some(submitted) = observed else {
             return;
         };
@@ -4242,11 +4370,26 @@ impl CodexPane {
         self.start_turn(&submitted);
     }
 
+    /// 送信されたユーザー入力を入力履歴（メモリ＋ファイル）へ記録する。
+    /// 直前と同一・空・`/exit` は記録しない。
+    fn record_input_history(&mut self, submitted: &str) {
+        if submitted == "/exit" {
+            return;
+        }
+        if self.input_state.push_history(submitted.to_string())
+            && let Some(path) = self.input_history_path.clone()
+        {
+            let _ = append_input_history(&path, submitted);
+        }
+    }
+
     fn submit_user_line(&mut self, submitted: &str) {
         let submitted = normalize_submitted_line(submitted);
         if submitted.is_empty() {
             return;
         }
+
+        self.record_input_history(&submitted);
 
         if self.handle_local_slash_command(&submitted) {
             return;
@@ -4337,6 +4480,8 @@ impl CodexPane {
     }
 
     fn start_turn_with_display_prompt(&mut self, prompt: &str, display_prompt: &str) {
+        // 新しいターンでは前ターンの Esc 中断アームを持ち越さない。
+        self.esc_interrupt_armed = false;
         let name = self.kind.display_name();
         if self.is_turn_running() {
             self.push_log(
@@ -7321,6 +7466,12 @@ struct CodexInputState {
     cursor: usize,
     exit_command_sent: bool,
     last_prompt: Option<String>,
+    /// 送信済みプロンプトの履歴（古い順。末尾が最新）。↑↓で呼び戻す。
+    history: Vec<String>,
+    /// 履歴の閲覧位置。None=閲覧していない（下書き編集中）。Some(i)=history[i]を表示中。
+    history_pos: Option<usize>,
+    /// 履歴閲覧に入る前の編集中テキスト。閲覧を最新より先へ抜けたときに復元する。
+    history_draft: Option<String>,
 }
 
 impl CodexInputState {
@@ -7351,7 +7502,10 @@ impl CodexInputState {
             | KeyCode::Right
             | KeyCode::Home
             | KeyCode::End => true,
-            KeyCode::Up | KeyCode::Down => self.line.contains('\n'),
+            // 複数行入力中は行間移動、単一行でも履歴があれば↑で呼び戻せるよう捕捉する。
+            KeyCode::Up => self.line.contains('\n') || !self.history.is_empty(),
+            // ↓は複数行の行間移動か、履歴閲覧中の前進（新しい方/下書きへ）のときだけ捕捉する。
+            KeyCode::Down => self.line.contains('\n') || self.history_pos.is_some(),
             _ => false,
         }
     }
@@ -7374,8 +7528,8 @@ impl CodexInputState {
             KeyCode::Delete => self.delete_at_cursor(),
             KeyCode::Left => self.move_prev_char(),
             KeyCode::Right => self.move_next_char(),
-            KeyCode::Up => self.move_vertical(true),
-            KeyCode::Down => self.move_vertical(false),
+            KeyCode::Up => self.move_up(),
+            KeyCode::Down => self.move_down(),
             KeyCode::Home => self.move_line_start(),
             KeyCode::End => self.move_line_end(),
             KeyCode::Enter => {
@@ -7397,12 +7551,14 @@ impl CodexInputState {
     }
 
     fn insert_text(&mut self, text: &str) {
+        self.detach_history();
         let normalized = normalize_input_text(text);
         self.line.insert_str(self.cursor, &normalized);
         self.cursor += normalized.len();
     }
 
     fn insert_char(&mut self, ch: char) {
+        self.detach_history();
         self.line.insert(self.cursor, ch);
         self.cursor += ch.len_utf8();
     }
@@ -7411,6 +7567,7 @@ impl CodexInputState {
         let Some(prev) = prev_char_boundary(&self.line, self.cursor) else {
             return;
         };
+        self.detach_history();
         self.line.drain(prev..self.cursor);
         self.cursor = prev;
     }
@@ -7419,7 +7576,102 @@ impl CodexInputState {
         let Some(next) = next_char_boundary(&self.line, self.cursor) else {
             return;
         };
+        self.detach_history();
         self.line.drain(self.cursor..next);
+    }
+
+    /// カーソル手前の `from` からカーソルまでを `replacement` で置き換える（@メンション確定に使う）。
+    fn replace_to_cursor(&mut self, from: usize, replacement: &str) {
+        if from > self.cursor || !self.line.is_char_boundary(from) {
+            return;
+        }
+        self.detach_history();
+        self.line.replace_range(from..self.cursor, replacement);
+        self.cursor = from + replacement.len();
+    }
+
+    /// 履歴閲覧を終了し、下書き退避を破棄する（編集で下書きが確定したとき）。
+    fn detach_history(&mut self) {
+        self.history_pos = None;
+        self.history_draft = None;
+    }
+
+    /// 送信済みプロンプトを履歴末尾へ追加する。直前と同一なら追加しない。
+    /// 追加したら true。上限を超えた古い分は捨てる。
+    fn push_history(&mut self, entry: String) -> bool {
+        if entry.is_empty() {
+            return false;
+        }
+        if self.history.last().is_some_and(|last| last == &entry) {
+            return false;
+        }
+        self.history.push(entry);
+        if self.history.len() > INPUT_HISTORY_MAX {
+            let overflow = self.history.len() - INPUT_HISTORY_MAX;
+            self.history.drain(0..overflow);
+        }
+        true
+    }
+
+    /// ↑: 先頭行なら履歴を遡り、そうでなければ行間を上へ移動する。
+    fn move_up(&mut self) {
+        let (start, _) = self.current_line_bounds();
+        if start == 0 {
+            self.recall_history_prev();
+        } else {
+            self.move_vertical(true);
+        }
+    }
+
+    /// ↓: 末尾行なら履歴を進め（最新の先で下書きへ）、そうでなければ行間を下へ移動する。
+    fn move_down(&mut self) {
+        let (_, end) = self.current_line_bounds();
+        if end == self.line.len() {
+            self.recall_history_next();
+        } else {
+            self.move_vertical(false);
+        }
+    }
+
+    /// 履歴を 1 件古い方へ辿る。閲覧開始時は現在の入力を下書きへ退避する。
+    fn recall_history_prev(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        let idx = match self.history_pos {
+            None => {
+                self.history_draft = Some(self.line.clone());
+                self.history.len() - 1
+            }
+            Some(0) => return,
+            Some(pos) => pos - 1,
+        };
+        self.history_pos = Some(idx);
+        self.set_line_from_history(idx);
+    }
+
+    /// 履歴を 1 件新しい方へ辿る。最新の先へ進むと退避した下書きへ戻る。
+    fn recall_history_next(&mut self) {
+        match self.history_pos {
+            None => {}
+            Some(pos) if pos + 1 < self.history.len() => {
+                self.history_pos = Some(pos + 1);
+                self.set_line_from_history(pos + 1);
+            }
+            Some(_) => {
+                let draft = self.history_draft.take().unwrap_or_default();
+                self.line = draft;
+                self.cursor = self.line.len();
+                self.history_pos = None;
+            }
+        }
+    }
+
+    fn set_line_from_history(&mut self, idx: usize) {
+        if let Some(entry) = self.history.get(idx) {
+            self.line = entry.clone();
+            self.cursor = self.line.len();
+        }
     }
 
     fn move_prev_char(&mut self) {
@@ -7483,6 +7735,8 @@ impl CodexInputState {
     fn clear(&mut self) {
         self.line.clear();
         self.cursor = 0;
+        self.history_pos = None;
+        self.history_draft = None;
     }
 }
 
@@ -7758,6 +8012,115 @@ fn agent_session_log_path(kind: AgentKind, goal_id: &str) -> Option<PathBuf> {
             .join(kind.session_history_dir())
             .join(format!("{}.jsonl", safe_path_component(goal_id)))
     })
+}
+
+/// 入力履歴の保存先（全ゴール共通。シェル履歴に相当）。
+fn input_history_file_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".addness").join("input-history.jsonl"))
+}
+
+/// 入力履歴ファイルを読み込む（古い順。末尾が最新）。上限を超える古い分は捨てる。
+fn load_input_history(path: &Path) -> Vec<String> {
+    let Ok(file) = File::open(path) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_str::<String>(trimmed) {
+            out.push(entry);
+        }
+    }
+    if out.len() > INPUT_HISTORY_MAX {
+        let overflow = out.len() - INPUT_HISTORY_MAX;
+        out.drain(0..overflow);
+    }
+    out
+}
+
+/// 入力履歴を 1 件追記する（改行を含むプロンプトも JSON エスケープで 1 行に収まる）。
+fn append_input_history(path: &Path, entry: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!("入力履歴ディレクトリを作成できません: {}", parent.display())
+        })?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("入力履歴ファイルを開けません: {}", path.display()))?;
+    serde_json::to_writer(&mut file, entry).context("入力履歴のJSON化に失敗しました")?;
+    writeln!(file).context("入力履歴の書き込みに失敗しました")?;
+    Ok(())
+}
+
+/// 入力欄の `@` メンション候補 1 件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MentionCandidate {
+    /// 入力欄へ挿入する相対パス（ディレクトリは末尾 `/`）。
+    insert: String,
+    /// パレット表示に使う文字列（現状は insert と同じ）。
+    pub display: String,
+    pub is_dir: bool,
+}
+
+/// カーソル手前で入力中の `@` メンションを検出する。
+/// 返り値は (`@` のバイト位置, `@` 以降の入力文字列)。
+/// `@` の直前が英数字（メールアドレス等）の場合や、`@` 以降に空白を含む場合は None。
+fn active_mention(line: &str, cursor: usize) -> Option<(usize, String)> {
+    let before = line.get(..cursor)?;
+    let at = before.rfind('@')?;
+    let query = &before[at + '@'.len_utf8()..];
+    if query.chars().any(char::is_whitespace) {
+        return None;
+    }
+    if at > 0
+        && let Some(prev) = before[..at].chars().next_back()
+        && prev.is_alphanumeric()
+    {
+        return None;
+    }
+    Some((at, query.to_string()))
+}
+
+/// `@` メンションのクエリからファイル候補を作る。
+/// `cwd` 基準で、クエリの末尾 `/` までをディレクトリ、残りを絞り込み接頭辞として扱う。
+/// 前方一致を優先し、続けて部分一致を最大件数まで並べる。
+fn mention_candidates(cwd: &Path, query: &str) -> Vec<MentionCandidate> {
+    let (sub, prefix) = match query.rfind('/') {
+        Some(idx) => (&query[..=idx], &query[idx + 1..]),
+        None => ("", query),
+    };
+    let dir = if sub.is_empty() {
+        cwd.to_path_buf()
+    } else {
+        cwd.join(sub)
+    };
+    let prefix_lower = prefix.to_lowercase();
+    let mut prefix_hits = Vec::new();
+    let mut substr_hits = Vec::new();
+    for entry in super::file_picker::read_dir_entries(&dir) {
+        let name_lower = entry.name.to_lowercase();
+        let rel = format!("{sub}{}", entry.name);
+        let insert = if entry.is_dir { format!("{rel}/") } else { rel };
+        let candidate = MentionCandidate {
+            display: insert.clone(),
+            insert,
+            is_dir: entry.is_dir,
+        };
+        if prefix_lower.is_empty() || name_lower.starts_with(&prefix_lower) {
+            prefix_hits.push(candidate);
+        } else if name_lower.contains(&prefix_lower) {
+            substr_hits.push(candidate);
+        }
+    }
+    prefix_hits.extend(substr_hits);
+    prefix_hits.truncate(MENTION_PALETTE_MAX);
+    prefix_hits
 }
 
 fn safe_path_component(value: &str) -> String {
@@ -9855,6 +10218,7 @@ mod tests {
             cwd: &cwd,
             addness_bin: "addness",
             session_log_path: None,
+            input_history_path: None,
             goal_id: "goal/claude".to_string(),
             goal_title: "Claude goal".to_string(),
             dod: String::new(),
@@ -10217,6 +10581,227 @@ mod tests {
         assert!(state.observe_key(key(KeyCode::Char('X'))).is_none());
 
         assert_eq!(state.line, "abcX\ndef");
+    }
+
+    #[test]
+    fn input_history_dedupes_consecutive_and_caps_length() {
+        let mut state = CodexInputState::default();
+        assert!(state.push_history("a".to_string()));
+        assert!(!state.push_history("a".to_string()));
+        assert!(state.push_history("b".to_string()));
+        assert!(!state.push_history(String::new()));
+        assert_eq!(state.history, vec!["a".to_string(), "b".to_string()]);
+
+        let mut capped = CodexInputState::default();
+        for i in 0..(INPUT_HISTORY_MAX + 20) {
+            capped.push_history(format!("cmd{i}"));
+        }
+        assert_eq!(capped.history.len(), INPUT_HISTORY_MAX);
+        assert_eq!(capped.history.first().unwrap(), "cmd20");
+        assert_eq!(
+            capped.history.last().unwrap(),
+            &format!("cmd{}", INPUT_HISTORY_MAX + 19)
+        );
+    }
+
+    #[test]
+    fn input_history_up_recalls_saving_draft_and_down_restores_it() {
+        let mut state = CodexInputState::default();
+        state.push_history("first".to_string());
+        state.push_history("second".to_string());
+        // 下書きを入力してから履歴を遡る。
+        state.insert_text("draft");
+        state.observe_key(key(KeyCode::Up));
+        assert_eq!(state.line, "second");
+        assert_eq!(state.cursor, "second".len());
+        state.observe_key(key(KeyCode::Up));
+        assert_eq!(state.line, "first");
+        // 最古より先へは遡れない。
+        state.observe_key(key(KeyCode::Up));
+        assert_eq!(state.line, "first");
+        // 下方向で新しい方へ戻り、最後に下書きへ復帰する。
+        state.observe_key(key(KeyCode::Down));
+        assert_eq!(state.line, "second");
+        state.observe_key(key(KeyCode::Down));
+        assert_eq!(state.line, "draft");
+        assert!(state.history_pos.is_none());
+    }
+
+    #[test]
+    fn input_history_edit_while_browsing_detaches() {
+        let mut state = CodexInputState::default();
+        state.push_history("recalled".to_string());
+        state.observe_key(key(KeyCode::Up));
+        assert_eq!(state.line, "recalled");
+        assert!(state.history_pos.is_some());
+        // 閲覧中に編集すると、その内容が新たな編集対象になる（履歴閲覧から離脱）。
+        state.observe_key(key(KeyCode::Char('!')));
+        assert_eq!(state.line, "recalled!");
+        assert!(state.history_pos.is_none());
+        assert!(state.history_draft.is_none());
+    }
+
+    #[test]
+    fn input_history_multiline_moves_between_lines_before_recall() {
+        let mut state = CodexInputState::default();
+        state.push_history("older".to_string());
+        state.insert_text("top\nbottom");
+        // カーソルは末尾（bottom 行）。↑ はまず行間移動する。
+        state.observe_key(key(KeyCode::Up));
+        assert_eq!(state.line, "top\nbottom");
+        assert!(state.history_pos.is_none());
+        // 先頭行から更に↑で履歴へ。
+        state.observe_key(key(KeyCode::Up));
+        assert_eq!(state.line, "older");
+    }
+
+    #[test]
+    fn active_mention_detects_and_rejects_email_like() {
+        assert_eq!(
+            active_mention("見て @src/ma", "見て @src/ma".len()),
+            Some(("見て ".len(), "src/ma".to_string()))
+        );
+        // 行頭の @ も有効。
+        assert_eq!(
+            active_mention("@main", "@main".len()),
+            Some((0, "main".to_string()))
+        );
+        // 直前が英数字（メールアドレス等）は候補を出さない。
+        assert_eq!(active_mention("user@host", "user@host".len()), None);
+        // @ 以降に空白があれば確定済みとみなす。
+        assert_eq!(active_mention("@src file", "@src file".len()), None);
+        // @ が無ければ None。
+        assert_eq!(active_mention("plain", "plain".len()), None);
+    }
+
+    #[test]
+    fn mention_candidates_prefix_before_substring_and_dir_marker() {
+        let dir = std::env::temp_dir().join(format!(
+            "addness-mention-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(dir.join("srcbin")).unwrap();
+        std::fs::write(dir.join("main.rs"), "").unwrap();
+        std::fs::write(dir.join("mainframe.txt"), "").unwrap();
+        std::fs::write(dir.join("README.md"), "").unwrap();
+        std::fs::write(dir.join(".hidden"), "").unwrap();
+
+        let cands = mention_candidates(&dir, "main");
+        let inserts: Vec<&str> = cands.iter().map(|c| c.insert.as_str()).collect();
+        // 前方一致（main.rs / mainframe.txt）が並ぶ。隠しファイルは出ない。
+        assert!(inserts.contains(&"main.rs"));
+        assert!(inserts.contains(&"mainframe.txt"));
+        assert!(!inserts.iter().any(|i| i.contains(".hidden")));
+
+        // 空クエリはディレクトリ優先。ディレクトリは末尾 '/'。
+        let all = mention_candidates(&dir, "");
+        assert_eq!(all.first().unwrap().insert, "srcbin/");
+        assert!(all.first().unwrap().is_dir);
+
+        // サブディレクトリへ潜る場合は相対パスを保つ。
+        std::fs::write(dir.join("srcbin").join("lib.rs"), "").unwrap();
+        let sub = mention_candidates(&dir, "srcbin/li");
+        assert_eq!(sub.first().unwrap().insert, "srcbin/lib.rs");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mention_palette_accepts_file_and_descends_into_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "addness-mention-pane-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        std::fs::write(dir.join("docs").join("guide.md"), "").unwrap();
+
+        let mut pane = CodexPane::test_with_output(8, 40, 0, "");
+        pane.finished = false;
+        pane.cwd = dir.display().to_string();
+
+        for ch in "見て @do".chars() {
+            pane.input(key(KeyCode::Char(ch)));
+        }
+        assert!(pane.mention_palette_active());
+        // ディレクトリ確定は潜って絞り込みを続ける（末尾 '/'）。
+        pane.accept_mention_palette_selection();
+        assert_eq!(pane.input_line(), "見て @docs/");
+        assert!(pane.mention_palette_active());
+        // ファイル確定は末尾に空白を付けてパレットを閉じる。
+        pane.accept_mention_palette_selection();
+        assert_eq!(pane.input_line(), "見て @docs/guide.md ");
+        assert!(!pane.mention_palette_active());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mention_palette_esc_dismisses_until_next_input() {
+        let dir = std::env::temp_dir().join(format!(
+            "addness-mention-esc-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("alpha.txt"), "").unwrap();
+
+        let mut pane = CodexPane::test_with_output(8, 40, 0, "");
+        pane.finished = false;
+        pane.cwd = dir.display().to_string();
+        for ch in "@al".chars() {
+            pane.input(key(KeyCode::Char(ch)));
+        }
+        assert!(pane.mention_palette_active());
+        pane.dismiss_mention_palette();
+        assert!(!pane.mention_palette_active());
+        // 追加入力で再表示される。
+        pane.input(key(KeyCode::Char('p')));
+        assert!(pane.mention_palette_active());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn esc_interrupt_requires_two_presses() {
+        let mut pane = CodexPane::test_with_output(8, 40, 0, "");
+        pane.finished = false;
+        pane.turn_running = true;
+
+        assert!(!pane.take_esc_interrupt_armed());
+        pane.arm_esc_interrupt();
+        assert!(pane.log.iter().any(|l| l.text.contains("もう一度 Esc")));
+        assert!(pane.take_esc_interrupt_armed());
+        assert!(!pane.take_esc_interrupt_armed());
+
+        assert!(pane.interrupt_turn_by_esc());
+        assert!(!pane.is_turn_running());
+        assert!(
+            pane.log
+                .iter()
+                .any(|l| l.text.contains("Esc でターンを中断しました"))
+        );
+    }
+
+    #[test]
+    fn input_history_persists_to_file_and_reloads() {
+        let path = std::env::temp_dir().join(format!(
+            "addness-input-history-{}-{}.jsonl",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        append_input_history(&path, "最初の依頼").unwrap();
+        append_input_history(&path, "複数行\n依頼").unwrap();
+        let loaded = load_input_history(&path);
+        assert_eq!(
+            loaded,
+            vec!["最初の依頼".to_string(), "複数行\n依頼".to_string()]
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -10772,6 +11357,7 @@ mod tests {
                 dod: String::new(),
                 status_label: "TEST".to_string(),
                 session_log_path: Some(history_path),
+                input_history_path: None,
             })
             .unwrap();
             pane.handle_stdout_line(r#"{"type":"agent_message.delta","delta":"hel"}"#);
@@ -10793,6 +11379,7 @@ mod tests {
             dod: String::new(),
             status_label: "TEST".to_string(),
             session_log_path: Some(history_path),
+            input_history_path: None,
         })
         .unwrap();
 

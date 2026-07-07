@@ -33,6 +33,8 @@ const COLOR_EVENT: Color = Color::Rgb(142, 150, 160);
 const COLOR_PANEL: Color = Color::Rgb(76, 84, 96);
 const COLOR_INPUT_BG: Color = Color::Rgb(27, 30, 36);
 const CODEX_TOOL_COMMAND_PREVIEW_WIDTH: usize = 56;
+/// @メンションのファイル候補パレットで一度に表示する最大行数。
+const MENTION_PALETTE_VISIBLE_ROWS: usize = 10;
 const CODEX_EDIT_DIFF_PREVIEW_LINES: usize = 3;
 
 /// Replace @uuid mentions in text with @member_name
@@ -3054,10 +3056,95 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
         ));
     }
 
-    // 入力が `/xxx` のとき、入力欄の直上にスラッシュコマンドパレットを重ねる。
+    // 入力が `/xxx` のときはスラッシュコマンドパレット、`@xxx` のときは
+    // ファイル候補パレットを入力欄の直上に重ねる（両立しない）。
     if pane.slash_palette_active() {
         draw_codex_slash_palette(frame, input_chunk, history_chunk, pane);
+    } else if pane.mention_palette_active() {
+        draw_codex_mention_palette(frame, input_chunk, history_chunk, pane);
     }
+}
+
+/// 入力欄の直上に、現在の `@` 入力に一致するファイル候補を表示する。
+fn draw_codex_mention_palette(
+    frame: &mut Frame,
+    input_chunk: Rect,
+    history_chunk: Rect,
+    pane: &CodexPane,
+) {
+    let suggestions = pane.mention_palette_suggestions();
+    if suggestions.is_empty() {
+        return;
+    }
+    let total = suggestions.len();
+    let selected = pane.mention_palette_selected();
+
+    let avail = history_chunk.height as usize;
+    if avail < 3 {
+        return;
+    }
+    let rows = total.min(MENTION_PALETTE_VISIBLE_ROWS).min(avail - 2);
+    if rows == 0 {
+        return;
+    }
+    let start = if selected >= rows {
+        selected + 1 - rows
+    } else {
+        0
+    };
+    let end = (start + rows).min(total);
+
+    let ph = (rows + 2) as u16;
+    let area = Rect {
+        x: input_chunk.x,
+        y: input_chunk.y.saturating_sub(ph),
+        width: input_chunk.width,
+        height: ph,
+    };
+
+    clear_modal_area(frame, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLOR_CODEX))
+        .style(Style::default().bg(COLOR_INPUT_BG))
+        .title(Span::styled(
+            format!(" @ ファイル  {total}件 "),
+            Style::default().fg(COLOR_CODEX),
+        ))
+        .title_bottom(
+            Line::from(" Tab/Enter:確定  ↑↓:選択  Esc:消す ")
+                .style(Style::default().fg(COLOR_MUTED)),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let lines: Vec<Line> = (start..end)
+        .map(|i| {
+            let candidate = &suggestions[i];
+            let is_sel = i == selected;
+            let (marker, name_style) = if is_sel {
+                (
+                    "▸ ",
+                    Style::default()
+                        .fg(COLOR_TEXT_STRONG)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                ("  ", Style::default().fg(COLOR_TEXT))
+            };
+            let icon = if candidate.is_dir { "📁 " } else { "📄 " };
+            Line::from(vec![
+                Span::styled(marker, name_style),
+                Span::styled(icon, Style::default().fg(COLOR_MUTED)),
+                Span::styled(candidate.display.clone(), name_style),
+            ])
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(COLOR_INPUT_BG)),
+        inner,
+    );
 }
 
 /// 入力欄の直上に、現在の `/` 入力に一致するスラッシュコマンド候補を表示する。

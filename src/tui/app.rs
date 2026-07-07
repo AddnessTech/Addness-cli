@@ -2109,6 +2109,29 @@ impl App {
                     _ => {}
                 }
             }
+            // @メンションのファイル候補パレット表示中は ↑↓ で選択、Tab/Enter で確定、Esc で閉じる。
+            // ディレクトリ確定時は潜って絞り込みを続け、ファイル確定でパスを挿入する。
+            if pane.mention_palette_active() && key.modifiers.is_empty() {
+                match key.code {
+                    KeyCode::Up => {
+                        pane.move_mention_palette_selection(-1);
+                        return;
+                    }
+                    KeyCode::Down => {
+                        pane.move_mention_palette_selection(1);
+                        return;
+                    }
+                    KeyCode::Tab | KeyCode::Enter => {
+                        pane.accept_mention_palette_selection();
+                        return;
+                    }
+                    KeyCode::Esc => {
+                        pane.dismiss_mention_palette();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
             if key.modifiers.is_empty() {
                 match key.code {
                     KeyCode::F(2) => {
@@ -2254,6 +2277,25 @@ impl App {
             }
             if pane.scrollback > 0 && key.code == KeyCode::Esc {
                 pane.scroll_to_live();
+                return;
+            }
+            // ターン実行中は Esc 2回でターンを中断する（誤爆防止に 1回目は警告表示）。
+            // 入力欄が空・スクロール中でない・各種パレット非表示のときだけ拾い、
+            // それ以外（入力途中の Esc など）は既存の入力クリア挙動へ委ねる。
+            if pane.is_turn_running()
+                && pane.decision_banner().is_none()
+                && !pane.slash_palette_active()
+                && !pane.mention_palette_active()
+                && pane.scrollback == 0
+                && pane.input_line().is_empty()
+                && key.code == KeyCode::Esc
+                && key.modifiers.is_empty()
+            {
+                if pane.take_esc_interrupt_armed() {
+                    pane.interrupt_turn_by_esc();
+                } else {
+                    pane.arm_esc_interrupt();
+                }
                 return;
             }
             if pane.scrollback == 0 && pane.captures_input_key(key) {

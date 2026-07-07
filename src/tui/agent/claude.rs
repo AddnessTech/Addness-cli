@@ -351,7 +351,18 @@ pub(super) fn exec_args(
         args.push(OsString::from(effort));
     }
 
-    if let Some(mode) = settings.permission_mode.cli_arg() {
+    // 承認直後の続行ターン（one-shot allowedTools を消費）で permission_mode が Plan の場合は、
+    // plan が実行を抑止して承認済みでも再拒否ループに陥るのを避けるため、このターンだけ
+    // --permission-mode を default（フラグ省略）へ落とす。sticky 許可のみのターンでは通常どおり
+    // settings の permission_mode を尊重する。
+    let effective_mode = if !one_shot_allowed_tools.is_empty()
+        && settings.permission_mode == ClaudePermissionMode::Plan
+    {
+        ClaudePermissionMode::Config
+    } else {
+        settings.permission_mode
+    };
+    if let Some(mode) = effective_mode.cli_arg() {
         args.push(OsString::from("--permission-mode"));
         args.push(OsString::from(mode));
     }
@@ -611,10 +622,10 @@ fn parse_denial(value: &Value) -> ClaudeDenial {
     ClaudeDenial { tool_name, target }
 }
 
-/// Bash コマンドから `--allowedTools` のプレフィックスルールを作る。
+/// 単一（複合でない）Bash コマンドから `--allowedTools` のプレフィックスルールを 1 件作る。
 /// 先頭のプログラム名と、`-` で始まらない次のサブコマンドまでを対象にする。
 /// 例: `git push origin main` → `Bash(git push:*)` / `rm -rf x` → `Bash(rm:*)`。
-fn bash_prefix_rule(command: &str) -> String {
+fn bash_single_prefix_rule(command: &str) -> String {
     let mut tokens = command.split_whitespace();
     let Some(prog) = tokens.next() else {
         return "Bash".to_string();
@@ -626,15 +637,88 @@ fn bash_prefix_rule(command: &str) -> String {
     format!("Bash({prefix}:*)")
 }
 
-/// 拒否 1 件から `--allowedTools` ルール文字列を生成する。
-/// Bash はコマンド先頭語ベースのプレフィックスルール、それ以外はツール名そのもの。
-pub(super) fn allowed_tool_rule(denial: &ClaudeDenial) -> String {
+/// シェルコマンドを演算子 `&&` `||` `;` `|` で分割する。引用符（`'` `"`）内の演算子は
+/// 分割対象にしない。引用符が閉じられていない場合は分割不能とみなし空 Vec を返す。
+fn split_shell_subcommands(command: &str) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = command.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if let Some(q) = quote {
+            current.push(ch);
+            if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => {
+                quote = Some(ch);
+                current.push(ch);
+            }
+            '&' | '|' => {
+                // `&&` `||` は 2 文字演算子、`|` はパイプ。単独 `&`（バックグラウンド）は
+                // サブコマンドの区切りとしては扱わずそのまま残す。
+                if chars.peek() == Some(&ch) {
+                    chars.next();
+                    parts.push(std::mem::take(&mut current));
+                } else if ch == '|' {
+                    parts.push(std::mem::take(&mut current));
+                } else {
+                    current.push(ch);
+                }
+            }
+            ';' => parts.push(std::mem::take(&mut current)),
+            _ => current.push(ch),
+        }
+    }
+    if quote.is_some() {
+        // 引用符が閉じていない → 分割を諦める。
+        return Vec::new();
+    }
+    parts.push(current);
+    parts
+}
+
+/// 複合 Bash コマンドをサブコマンドごとに分割し、それぞれのプレフィックスルールを生成する。
+/// Claude Code は `&&`/`||`/`;`/`|` で分割して各サブコマンドを個別照合するため、
+/// `cd sub && rm -rf x` のような複合コマンドは先頭語だけのルールでは通らない。
+/// 分割できない（引用符が閉じていない等）場合はコマンド全体を 1 サブコマンドとして扱う。
+fn bash_prefix_rules(command: &str) -> Vec<String> {
+    let subs = split_shell_subcommands(command);
+    let subs = if subs.is_empty() {
+        vec![command.to_string()]
+    } else {
+        subs
+    };
+    let mut rules: Vec<String> = Vec::new();
+    for sub in subs {
+        let sub = sub.trim();
+        if sub.is_empty() {
+            continue;
+        }
+        let rule = bash_single_prefix_rule(sub);
+        if !rules.contains(&rule) {
+            rules.push(rule);
+        }
+    }
+    if rules.is_empty() {
+        rules.push("Bash".to_string());
+    }
+    rules
+}
+
+/// 拒否 1 件から `--allowedTools` ルール一覧を生成する。
+/// Bash は複合コマンドをサブコマンドごとに分割したプレフィックスルール群、
+/// それ以外はツール名そのもの 1 件。
+pub(super) fn allowed_tool_rules_for_denial(denial: &ClaudeDenial) -> Vec<String> {
     match denial.tool_name.as_str() {
         "Bash" | "BashOutput" => match denial.target.as_deref() {
-            Some(command) if !command.trim().is_empty() => bash_prefix_rule(command),
-            _ => "Bash".to_string(),
+            Some(command) if !command.trim().is_empty() => bash_prefix_rules(command),
+            _ => vec!["Bash".to_string()],
         },
-        other => other.to_string(),
+        other => vec![other.to_string()],
     }
 }
 
@@ -642,9 +726,10 @@ pub(super) fn allowed_tool_rule(denial: &ClaudeDenial) -> String {
 pub(super) fn allowed_tool_rules(denials: &[ClaudeDenial]) -> Vec<String> {
     let mut rules: Vec<String> = Vec::new();
     for denial in denials {
-        let rule = allowed_tool_rule(denial);
-        if !rules.contains(&rule) {
-            rules.push(rule);
+        for rule in allowed_tool_rules_for_denial(denial) {
+            if !rules.contains(&rule) {
+                rules.push(rule);
+            }
         }
     }
     rules
@@ -1024,17 +1109,72 @@ mod tests {
             tool_name: "Bash".to_string(),
             target: Some("git push origin main".to_string()),
         };
-        assert_eq!(allowed_tool_rule(&git), "Bash(git push:*)");
+        assert_eq!(
+            allowed_tool_rules_for_denial(&git),
+            vec!["Bash(git push:*)"]
+        );
         let rm = ClaudeDenial {
             tool_name: "Bash".to_string(),
             target: Some("rm -rf x".to_string()),
         };
-        assert_eq!(allowed_tool_rule(&rm), "Bash(rm:*)");
+        assert_eq!(allowed_tool_rules_for_denial(&rm), vec!["Bash(rm:*)"]);
         let write = ClaudeDenial {
             tool_name: "Write".to_string(),
             target: Some("/a.rs".to_string()),
         };
-        assert_eq!(allowed_tool_rule(&write), "Write");
+        assert_eq!(allowed_tool_rules_for_denial(&write), vec!["Write"]);
+    }
+
+    #[test]
+    fn allowed_tool_rules_split_compound_bash_command() {
+        // 複合コマンドはサブコマンドごとにルール化する。
+        let denial = ClaudeDenial {
+            tool_name: "Bash".to_string(),
+            target: Some("cd sub && rm -rf x".to_string()),
+        };
+        assert_eq!(
+            allowed_tool_rules_for_denial(&denial),
+            vec!["Bash(cd sub:*)", "Bash(rm:*)"]
+        );
+
+        // パイプ・セミコロンも分割対象。
+        let piped = ClaudeDenial {
+            tool_name: "Bash".to_string(),
+            target: Some("cat a.txt | grep foo; echo done".to_string()),
+        };
+        assert_eq!(
+            allowed_tool_rules_for_denial(&piped),
+            vec!["Bash(cat a.txt:*)", "Bash(grep foo:*)", "Bash(echo done:*)"]
+        );
+
+        // 引用符内の演算子では分割しない。
+        let quoted = ClaudeDenial {
+            tool_name: "Bash".to_string(),
+            target: Some("echo \"a && b\"".to_string()),
+        };
+        assert_eq!(
+            allowed_tool_rules_for_denial(&quoted),
+            vec!["Bash(echo \"a:*)"]
+        );
+    }
+
+    #[test]
+    fn exec_args_plan_mode_dropped_on_approval_retry() {
+        let mut settings = ClaudeExecSettings::default();
+        settings.set_permission_mode(ClaudePermissionMode::Plan);
+        // sticky 許可のみ（one-shot 空）なら plan を維持する。
+        let sticky = exec_args(Some("s1"), &settings, &[], false, "instr");
+        assert!(sticky.iter().any(|a| a == "plan"));
+        // 承認直後の続行ターン（one-shot allowedTools あり）では plan を落とす。
+        let retry = exec_args(
+            Some("s1"),
+            &settings,
+            &["Bash(rm:*)".to_string()],
+            false,
+            "instr",
+        );
+        assert!(!retry.iter().any(|a| a == "--permission-mode"));
+        assert!(!retry.iter().any(|a| a == "plan"));
     }
 
     #[test]

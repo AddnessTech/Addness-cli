@@ -7,6 +7,7 @@ use ratatui::{
 };
 
 use serde_json::Value;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::Instant;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -1123,6 +1124,10 @@ fn draw_codex_help_overlay(frame: &mut Frame, app: &mut App) {
             &format!("ポインタ下の{name}履歴 / Addness枠をスクロール"),
         ),
         kv("↑↓ / PgUp/PgDn", &format!("{name}履歴をスクロール")),
+        kv(
+            "Ctrl+↑ / Ctrl+↓",
+            &format!("入力中でも{name}履歴を1行スクロール（↑は履歴呼び戻し）"),
+        ),
         kv("Home / End", "履歴先頭 / 最新へ移動"),
         kv("Ctrl-T", "表示を 会話 / 実行 / 失敗 / 全部 で切替"),
         kv("Ctrl-F", "履歴検索を開始"),
@@ -2813,7 +2818,9 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
             )
         } else if pane.is_turn_running() {
             (
-                format!(" {name} 実行中 — F7:turn一覧  Ctrl-T:表示切替  F6:差分  Ctrl-C:中断 "),
+                format!(
+                    " {name} 実行中 — F7:turn一覧  Ctrl-T:表示切替  F6:差分  Ctrl+↑↓:スクロール  Ctrl-C:中断 "
+                ),
                 COLOR_WARN,
             )
         } else if pane.scrollback > 0 {
@@ -2821,7 +2828,7 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
         } else {
             (
                 format!(
-                    " {name} 入力待ち — F7:turn一覧  Ctrl-T:表示切替  F2-F6:設定/差分  F9:再開 "
+                    " {name} 入力待ち — F7:turn一覧  Ctrl-T:表示切替  Ctrl+↑↓:スクロール  F2-F6:設定/差分  F9:再開 "
                 ),
                 COLOR_PANEL,
             )
@@ -3940,6 +3947,60 @@ fn codex_diff_line_style(line: &str) -> Style {
     }
 }
 
+/// 完成済み assistant 行の Markdown 描画結果キャッシュ。
+/// キーは（テキスト内容のハッシュ, 折り返し幅）。ストリーミング中は 20ms ごとに全画面を
+/// 再描画するため、完成済み行を毎フレーム再パースすると CPU を浪費する。行数カウントと
+/// 実描画が同一のキャッシュ結果を参照することで「カウント＝描画行数」不変条件も保たれる。
+/// 幅変更（リサイズ）時はキー不一致となり自然に再計算される。
+const ASSISTANT_MD_CACHE_MAX: usize = 4096;
+
+/// 1 メッセージ分の Markdown 描画結果（視覚行ごとのスパン列）。
+type RenderedMarkdown = Vec<Vec<Span<'static>>>;
+
+thread_local! {
+    static ASSISTANT_MD_CACHE: RefCell<HashMap<(u64, usize), RenderedMarkdown>> =
+        RefCell::new(HashMap::new());
+}
+
+fn hash_markdown_text(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// 完成済み assistant テキストの Markdown 描画結果をキャッシュ経由で得て、`f` に渡す。
+/// 未キャッシュならレンダリングして格納する（サイズ上限超過時は一括クリア）。
+fn with_cached_assistant_markdown<R>(
+    text: &str,
+    content_width: usize,
+    f: impl FnOnce(&[Vec<Span<'static>>]) -> R,
+) -> R {
+    let key = (hash_markdown_text(text), content_width);
+    ASSISTANT_MD_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if !cache.contains_key(&key) {
+            let rendered =
+                markdown::render_assistant_markdown(text, content_width, &codex_markdown_styles());
+            if cache.len() >= ASSISTANT_MD_CACHE_MAX {
+                cache.clear();
+            }
+            cache.insert(key, rendered);
+        }
+        f(cache.get(&key).expect("just inserted"))
+    })
+}
+
+/// 完成済み assistant 行の描画行数（キャッシュ利用）。返り値は必ず 1 以上。
+fn cached_assistant_markdown_count(text: &str, content_width: usize) -> usize {
+    with_cached_assistant_markdown(text, content_width, |lines| lines.len().max(1))
+}
+
+/// 完成済み assistant 行の描画スパン列（キャッシュ利用）。呼び出し側で所有権が必要なので複製する。
+fn cached_assistant_markdown_lines(text: &str, content_width: usize) -> Vec<Vec<Span<'static>>> {
+    with_cached_assistant_markdown(text, content_width, |lines| lines.to_vec())
+}
+
 fn codex_log_line_rendered_count(
     line: &CodexLogLine,
     max_width: usize,
@@ -3948,15 +4009,8 @@ fn codex_log_line_rendered_count(
     let separator = usize::from(line.kind == CodexLogKind::Turn);
     let content_width = max_width.saturating_sub(CODEX_LOG_PREFIX_WIDTH).max(1);
     if is_completed_assistant(line, streaming) {
-        // 描画（codex_log_entry_lines）と同じ経路で行数を数え、整合させる。
-        let count = markdown::render_assistant_markdown(
-            &line.text,
-            content_width,
-            &codex_markdown_styles(),
-        )
-        .len()
-        .max(1);
-        return separator + count;
+        // 描画（codex_log_entry_lines）と同じキャッシュ結果を参照して行数を数え、整合させる。
+        return separator + cached_assistant_markdown_count(&line.text, content_width);
     }
     separator + wrapped_log_line_count(&codex_log_display_text(line), content_width)
 }
@@ -4060,8 +4114,7 @@ fn codex_assistant_markdown_lines(
     prefix_style: Style,
 ) -> Vec<RenderedCodexLine> {
     let continuation = "     | ";
-    let content_lines =
-        markdown::render_assistant_markdown(text, content_width, &codex_markdown_styles());
+    let content_lines = cached_assistant_markdown_lines(text, content_width);
     let mut lines = Vec::with_capacity(content_lines.len().max(1));
     for (idx, mut spans) in content_lines.into_iter().enumerate() {
         let (prefix_text, marker_style) = if idx == 0 {
@@ -5139,12 +5192,12 @@ fn ellipsize_width(text: &str, max_width: usize) -> String {
 mod tests {
     use super::{
         ActivePane, App, COLOR_DANGER, COLOR_EVENT, COLOR_SUCCESS, COLOR_WARN,
-        codex_activity_lines, codex_child_goal_lines, codex_dashboard_shortcut_lines,
-        codex_decision_choice_line, codex_decision_input_lines, codex_decision_title_hint,
-        codex_diff_lines, codex_header_line, codex_header_lines, codex_input_prompt_render,
-        codex_log_entry_lines, codex_log_lines, codex_runtime_status, codex_visible_log_lines,
-        codex_work_label, draw_status_bar, ellipsize_width, prompt_preview,
-        summarize_tool_display_text,
+        cached_assistant_markdown_count, cached_assistant_markdown_lines, codex_activity_lines,
+        codex_child_goal_lines, codex_dashboard_shortcut_lines, codex_decision_choice_line,
+        codex_decision_input_lines, codex_decision_title_hint, codex_diff_lines, codex_header_line,
+        codex_header_lines, codex_input_prompt_render, codex_log_entry_lines, codex_log_lines,
+        codex_markdown_styles, codex_runtime_status, codex_visible_log_lines, codex_work_label,
+        draw_status_bar, ellipsize_width, markdown, prompt_preview, summarize_tool_display_text,
     };
     use crate::api::ApiClient;
     use crate::tui::agent::{
@@ -5153,7 +5206,7 @@ mod tests {
     };
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::style::Modifier;
-    use ratatui::text::Line;
+    use ratatui::text::{Line, Span};
     use ratatui::{Terminal, backend::TestBackend};
     use std::time::Instant;
     use unicode_width::UnicodeWidthStr;
@@ -5681,6 +5734,39 @@ mod tests {
             .map(|line| line_text(&line.line))
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn assistant_markdown_cache_returns_same_result_on_hit() {
+        let text = "# 見出し\n\nこれは **強調** を含む段落です。\n\n- 項目1\n- 項目2";
+        let width = 24;
+        let plain = |lines: &[Vec<Span<'static>>]| {
+            lines
+                .iter()
+                .map(|spans: &Vec<Span<'static>>| {
+                    spans
+                        .iter()
+                        .map(|s| s.content.to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // 2 回呼んでも同一結果（キャッシュヒット）。
+        let first = cached_assistant_markdown_lines(text, width);
+        let second = cached_assistant_markdown_lines(text, width);
+        assert_eq!(plain(&first), plain(&second));
+
+        // カウントと描画行数が一致する（「カウント＝描画行数」不変条件）。
+        assert_eq!(cached_assistant_markdown_count(text, width), first.len());
+
+        // 直接レンダリングした結果とも行数が一致する。
+        let direct = markdown::render_assistant_markdown(text, width, &codex_markdown_styles());
+        assert_eq!(first.len(), direct.len());
+
+        // 幅が変わればキーが変わり、行数も再計算される（折り返しが変わる）。
+        let narrow = cached_assistant_markdown_lines(text, 8);
+        assert_eq!(cached_assistant_markdown_count(text, 8), narrow.len());
     }
 
     #[test]

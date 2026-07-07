@@ -1916,6 +1916,11 @@ pub struct CodexPane {
     claude_fork_next: bool,
     /// 承認バナー表示中に、Accept/Always で適用する `--allowedTools` ルール（claude 専用）。
     claude_pending_allowed_tools: Vec<String>,
+    /// 承認バナー表示中の拒否内容そのもの（ループガード用、claude 専用）。
+    claude_pending_denials: Vec<claude::ClaudeDenial>,
+    /// 直前の承認リトライで許可した拒否内容（claude 専用）。
+    /// リトライ結果で同一の拒否が再発したらループとみなしてエラー表示する。
+    claude_approved_denials: Vec<claude::ClaudeDenial>,
 }
 
 impl CodexPane {
@@ -2070,6 +2075,8 @@ impl CodexPane {
             claude_one_shot_allowed_tools: Vec::new(),
             claude_fork_next: false,
             claude_pending_allowed_tools: Vec::new(),
+            claude_pending_denials: Vec::new(),
+            claude_approved_denials: Vec::new(),
         };
         let name = kind.display_name();
         if pane.loaded_history_count > 0 {
@@ -2133,6 +2140,8 @@ impl CodexPane {
         pane.claude_one_shot_allowed_tools = Vec::new();
         pane.claude_fork_next = false;
         pane.claude_pending_allowed_tools = Vec::new();
+        pane.claude_pending_denials = Vec::new();
+        pane.claude_approved_denials = Vec::new();
         pane.diff_view = None;
         pane.addness_body_excerpt = None;
         pane.turn_picker = None;
@@ -2171,6 +2180,15 @@ impl CodexPane {
         let max = self.max_view_scrollback();
         let target = (self.scrollback as isize + delta).max(0) as usize;
         self.scrollback = target.min(max);
+    }
+
+    /// テスト用: 会話ログに Assistant 行を積み、ライブ位置へ戻す（スクロール余地を作る）。
+    #[cfg(test)]
+    pub(crate) fn seed_assistant_log_for_test(&mut self, lines: usize) {
+        for i in 0..lines {
+            self.push_log(CodexLogKind::Assistant, format!("行 {i}"));
+        }
+        self.scroll_to_live();
     }
 
     /// 1 ページ分の行数（スクロール量）。
@@ -2464,7 +2482,15 @@ impl CodexPane {
             CodexLogKind::System,
             "Esc でターンを中断しました".to_string(),
         );
-        self.start_next_queued_turn_if_idle();
+        // /stop と同様、中断時は予約ターンを自動開始しない。予約が残っていれば保留中である
+        // ことを知らせる。
+        let queued = self.queued_prompts.len();
+        if queued > 0 {
+            self.push_log(
+                CodexLogKind::System,
+                format!("予約{queued}件は保留中（/stop queued で破棄可）"),
+            );
+        }
         true
     }
 
@@ -3926,17 +3952,20 @@ impl CodexPane {
     }
 
     fn handle_claude_assistant(&mut self, value: &Value) {
-        // text ブロックを stream_event で逐次表示済みなら、完成形の text は二重表示しない。
-        // （streaming_assistant_index が張られている＝直前にトークンを流している）
-        let streamed_text = self.streaming_assistant_index.take().is_some();
+        // 逐次表示していたストリーミング行のインデックス（あれば）。
+        // 最初の Text ブロックはこの行を完成形テキストで上書き（置換）し、2 番目以降の
+        // Text ブロックは新しい Assistant 行として push する。単一 Text ブロック（現行 CLI の
+        // 実挙動）では従来どおり逐次表示行がそのまま活きる見た目になり、複数 Text ブロックが
+        // 1 イベントに同梱されても欠落・連結が起きない。
+        let mut streaming_index = self.streaming_assistant_index.take();
         for block in claude::assistant_blocks(value) {
             match block {
                 claude::ClaudeBlock::Text(text) => {
-                    if streamed_text {
-                        // 逐次表示済みの行をそのまま活かす（push しない）。
-                        continue;
+                    if let Some(index) = streaming_index.take() {
+                        self.overwrite_assistant_line(index, text);
+                    } else {
+                        self.push_log(CodexLogKind::Assistant, text);
                     }
-                    self.push_log(CodexLogKind::Assistant, text);
                 }
                 claude::ClaudeBlock::Thinking(text) => {
                     // reasoning 相当。Event 種別（薄色）で控えめに出す。
@@ -3958,6 +3987,31 @@ impl CodexPane {
                     self.push_log(CodexLogKind::Tool, label);
                 }
             }
+        }
+    }
+
+    /// ストリーミング済みの Assistant 行を完成形テキストで置換する。
+    /// 行が既に trim 等で消えていれば新しい行として push する。
+    fn overwrite_assistant_line(&mut self, index: usize, text: String) {
+        let current = match self.log.get(index) {
+            Some(line) => line.text.clone(),
+            None => {
+                self.push_log(CodexLogKind::Assistant, text);
+                return;
+            }
+        };
+        if current == text {
+            return;
+        }
+        // ストリーミング済みテキストの続き（差分サフィックス）なら delta として永続化して
+        // 再読込時の整合を保つ。前方一致しない場合はメモリ上のみ置換する。
+        let suffix = text.strip_prefix(current.as_str()).map(str::to_string);
+        if let Some(line) = self.log.get_mut(index) {
+            line.text = text;
+        }
+        self.invalidate_rendered_history_metrics();
+        if let Some(suffix) = suffix {
+            self.persist_session_record(CodexSessionRecord::AssistantDelta { text: suffix });
         }
     }
 
@@ -3996,6 +4050,9 @@ impl CodexPane {
             return;
         }
 
+        // 拒否なく完了 → ループガードの承認控えをクリアする。
+        self.claude_approved_denials.clear();
+
         if result.is_error {
             let message = result
                 .text
@@ -4010,9 +4067,6 @@ impl CodexPane {
     }
 
     fn set_claude_permission_decision(&mut self, denials: &[claude::ClaudeDenial]) {
-        // 拒否された具体的なツールだけを許可するルールを生成する。
-        let rules = claude::allowed_tool_rules(denials);
-        self.claude_pending_allowed_tools = rules.clone();
         let summary = denials
             .iter()
             .map(|denial| match &denial.target {
@@ -4023,6 +4077,30 @@ impl CodexPane {
             })
             .collect::<Vec<_>>()
             .join(", ");
+
+        // ループガード: 直前の承認リトライで許可したのと同じ拒否だけが再発した場合、
+        // 生成した許可ルールでは通せていない。バナーを再表示せずエラーで知らせる。
+        let approved = std::mem::take(&mut self.claude_approved_denials);
+        if !approved.is_empty() && denials.iter().all(|d| approved.contains(d)) {
+            self.claude_pending_allowed_tools.clear();
+            self.claude_pending_denials.clear();
+            self.push_log(
+                CodexLogKind::Error,
+                format!(
+                    "許可ルールでは通せませんでした: {summary}。F4 で permission-mode の変更を検討してください"
+                ),
+            );
+            self.push_terminal_notice(
+                "Claude Code 権限エラー",
+                "許可ルールでは通せませんでした。F4 で permission-mode の変更を検討してください",
+            );
+            return;
+        }
+
+        // 拒否された具体的なツールだけを許可するルールを生成する。
+        let rules = claude::allowed_tool_rules(denials);
+        self.claude_pending_allowed_tools = rules.clone();
+        self.claude_pending_denials = denials.to_vec();
         let allow = if rules.is_empty() {
             String::new()
         } else {
@@ -4041,6 +4119,7 @@ impl CodexPane {
         self.action = Some(format!("確認応答: {response_label}"));
         self.push_activity(format!("確認待ちに {response_label} で応答"));
         let rules = std::mem::take(&mut self.claude_pending_allowed_tools);
+        let denials = std::mem::take(&mut self.claude_pending_denials);
         let rules_label = if rules.is_empty() {
             String::new()
         } else {
@@ -4048,14 +4127,18 @@ impl CodexPane {
         };
         match response {
             CodexDecisionResponse::Accept => {
+                // リトライ結果で同一の拒否が再発したらループとみなすため許可内容を控える。
+                self.claude_approved_denials = denials;
                 self.claude_one_shot_allowed_tools = rules;
                 self.start_claude_approval_retry(&format!("今回だけ許可{rules_label}"));
             }
             CodexDecisionResponse::Always => {
+                self.claude_approved_denials = denials;
                 self.claude_settings.add_allowed_tools(&rules);
                 self.start_claude_approval_retry(&format!("これからずっと許可{rules_label}"));
             }
             CodexDecisionResponse::Deny => {
+                self.claude_approved_denials.clear();
                 self.push_terminal_notice("Claude Code 確認応答", "拒否したため作業を中断します");
                 self.push_log(CodexLogKind::System, "拒否したため入力待ちに戻ります");
                 self.start_next_queued_turn_if_idle();
@@ -8078,9 +8161,12 @@ fn active_mention(line: &str, cursor: usize) -> Option<(usize, String)> {
     if query.chars().any(char::is_whitespace) {
         return None;
     }
+    // メールアドレス（foo@bar）の誤爆だけをガードしたいので、直前文字は ASCII 英数字と
+    // ローカルパートで使われる記号に限定する。CJK など非 ASCII 直後（例:「見て@src」）は
+    // メンションとして扱いパレットを出す。
     if at > 0
         && let Some(prev) = before[..at].chars().next_back()
-        && prev.is_alphanumeric()
+        && (prev.is_ascii_alphanumeric() || matches!(prev, '.' | '_' | '-' | '+'))
     {
         return None;
     }
@@ -8091,6 +8177,11 @@ fn active_mention(line: &str, cursor: usize) -> Option<(usize, String)> {
 /// `cwd` 基準で、クエリの末尾 `/` までをディレクトリ、残りを絞り込み接頭辞として扱う。
 /// 前方一致を優先し、続けて部分一致を最大件数まで並べる。
 fn mention_candidates(cwd: &Path, query: &str) -> Vec<MentionCandidate> {
+    // cwd 基準の相対パスだけを列挙する。絶対パス（`/etc/...`）や `..` を含むクエリは
+    // cwd 外へ出てしまうため候補を空にし、パレットを出さない。
+    if query.starts_with('/') || query.split('/').any(|component| component == "..") {
+        return Vec::new();
+    }
     let (sub, prefix) = match query.rfind('/') {
         Some(idx) => (&query[..=idx], &query[idx + 1..]),
         None => ("", query),
@@ -10382,6 +10473,60 @@ mod tests {
     }
 
     #[test]
+    fn claude_assistant_multiple_text_blocks_are_not_merged() {
+        let mut pane = claude_pane();
+        // まず 1 ブロック目をストリーミング表示する。
+        pane.handle_json_event(serde_json::json!({
+            "type": "stream_event",
+            "event": {"type": "content_block_delta", "index": 0,
+                      "delta": {"type": "text_delta", "text": "最初のブロック"}}
+        }));
+        // 1 イベントに Text ブロックが 2 つ同梱される（防御ケース）。
+        pane.handle_json_event(serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [
+                {"type": "text", "text": "最初のブロック"},
+                {"type": "text", "text": "二番目のブロック"}
+            ]}
+        }));
+        let assistant_lines: Vec<_> = pane
+            .log
+            .iter()
+            .filter(|line| line.kind == CodexLogKind::Assistant)
+            .collect();
+        // 1 ブロック目はストリーミング行を上書き、2 ブロック目は別行に。連結・欠落しない。
+        assert_eq!(assistant_lines.len(), 2);
+        assert_eq!(assistant_lines[0].text, "最初のブロック");
+        assert_eq!(assistant_lines[1].text, "二番目のブロック");
+    }
+
+    #[test]
+    fn claude_repeated_denial_after_approval_shows_error_not_banner() {
+        let mut pane = claude_pane();
+        pane.thread_id = Some("sid-1".to_string());
+        let denial_event = serde_json::json!({
+            "type": "result", "subtype": "success", "is_error": false, "result": "done",
+            "session_id": "sid-1",
+            "permission_denials": [
+                {"tool_name": "Bash", "tool_use_id": "t1", "tool_input": {"command": "rm -rf x"}}
+            ]
+        });
+        // 1 回目: バナーが出るので Accept で承認しリトライする。
+        pane.handle_json_event(denial_event.clone());
+        assert!(pane.pending_decision.is_some());
+        pane.handle_decision_key(key(KeyCode::Char('a')));
+        assert!(pane.pending_decision.is_none());
+
+        // リトライ結果で同一の拒否が再発 → バナーを再表示せずエラーで知らせる（ループ回避）。
+        pane.handle_json_event(denial_event);
+        assert!(pane.pending_decision.is_none());
+        assert!(
+            pane.log.iter().any(|l| l.kind == CodexLogKind::Error
+                && l.text.contains("許可ルールでは通せませんでした"))
+        );
+    }
+
+    #[test]
     fn claude_f_keys_cycle_claude_settings() {
         let mut pane = claude_pane();
         pane.cycle_model();
@@ -10666,8 +10811,15 @@ mod tests {
             active_mention("@main", "@main".len()),
             Some((0, "main".to_string()))
         );
-        // 直前が英数字（メールアドレス等）は候補を出さない。
+        // CJK 直後の @（メールアドレスではない）は候補を出す。
+        assert_eq!(
+            active_mention("見て@src", "見て@src".len()),
+            Some(("見て".len(), "src".to_string()))
+        );
+        // 直前が ASCII 英数字（メールアドレス等）は候補を出さない。
         assert_eq!(active_mention("user@host", "user@host".len()), None);
+        // 直前がローカルパート記号（.）でも候補を出さない。
+        assert_eq!(active_mention("foo.bar@host", "foo.bar@host".len()), None);
         // @ 以降に空白があれば確定済みとみなす。
         assert_eq!(active_mention("@src file", "@src file".len()), None);
         // @ が無ければ None。
@@ -10703,6 +10855,12 @@ mod tests {
         std::fs::write(dir.join("srcbin").join("lib.rs"), "").unwrap();
         let sub = mention_candidates(&dir, "srcbin/li");
         assert_eq!(sub.first().unwrap().insert, "srcbin/lib.rs");
+
+        // 絶対パス（/ 始まり）や `..` を含むクエリは cwd 外に出るため候補を空にする。
+        assert!(mention_candidates(&dir, "/etc/pas").is_empty());
+        assert!(mention_candidates(&dir, "..").is_empty());
+        assert!(mention_candidates(&dir, "../").is_empty());
+        assert!(mention_candidates(&dir, "srcbin/../..").is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -10782,6 +10940,22 @@ mod tests {
                 .iter()
                 .any(|l| l.text.contains("Esc でターンを中断しました"))
         );
+    }
+
+    #[test]
+    fn esc_interrupt_does_not_auto_start_queued_turn() {
+        let mut pane = CodexPane::test_with_output(8, 40, 0, "");
+        pane.finished = false;
+        pane.turn_running = true;
+        // 予約ターンを 1 件積んでおく。
+        pane.queued_prompts
+            .push_back(QueuedPrompt::user("次の依頼".to_string()));
+
+        assert!(pane.interrupt_turn_by_esc());
+        assert!(!pane.is_turn_running());
+        // /stop と同様、予約ターンは自動開始されず保留される。
+        assert_eq!(pane.queued_prompts.len(), 1);
+        assert!(pane.log.iter().any(|l| l.text.contains("予約1件は保留中")));
     }
 
     #[test]

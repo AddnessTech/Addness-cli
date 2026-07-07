@@ -700,10 +700,9 @@ pub struct App {
 
     /// ステータスメッセージ（error/success）の自動クリア期限。
     /// キー入力では消さず、表示から一定時間で期限切れとしてクリアする。
+    /// メッセージ設定は `set_error_message` / `set_success_message` 経由で行い、
+    /// 設定と同時に期限を張り直す（同一内容の再設定でも期限が延びる）。
     status_deadline: Option<Instant>,
-    /// 直近に自動クリア期限を張ったときのメッセージ内容。新しいメッセージが
-    /// 来たら期限を張り直すための比較用スナップショット。
-    status_snapshot: (Option<String>, Option<String>),
 }
 
 impl App {
@@ -753,28 +752,24 @@ impl App {
             codex_body_record_job: None,
             deferred_initial_load: None,
             status_deadline: None,
-            status_snapshot: (None, None),
         }
     }
 
     /// ステータスメッセージ（error/success）の自動クリアTTL。
     const STATUS_MESSAGE_TTL: Duration = Duration::from_secs(5);
 
-    /// 表示中のメッセージが前回から変化していれば、自動クリア期限を張り直す。
-    /// 88箇所ある `error_message = Some(..)` 等の代入を毎回置き換えず、ループ側で
-    /// 内容の変化を検知して一元的に期限を管理する。
-    fn refresh_status_deadline(&mut self) {
-        if self.error_message == self.status_snapshot.0
-            && self.success_message == self.status_snapshot.1
-        {
-            return;
-        }
-        self.status_snapshot = (self.error_message.clone(), self.success_message.clone());
-        self.status_deadline = if self.error_message.is_some() || self.success_message.is_some() {
-            Some(Instant::now() + Self::STATUS_MESSAGE_TTL)
-        } else {
-            None
-        };
+    /// エラーメッセージを設定し、同時に自動クリア期限を張り直す。
+    /// 同一内容を再設定した場合でも期限が延びる。
+    pub(super) fn set_error_message(&mut self, msg: String) {
+        self.error_message = Some(msg);
+        self.status_deadline = Some(Instant::now() + Self::STATUS_MESSAGE_TTL);
+    }
+
+    /// 成功メッセージを設定し、同時に自動クリア期限を張り直す。
+    /// 同一内容を再設定した場合でも期限が延びる。
+    pub(super) fn set_success_message(&mut self, msg: String) {
+        self.success_message = Some(msg);
+        self.status_deadline = Some(Instant::now() + Self::STATUS_MESSAGE_TTL);
     }
 
     /// 自動クリア期限が過ぎていればメッセージを消す。消したら true を返す（要再描画）。
@@ -784,7 +779,6 @@ impl App {
                 self.error_message = None;
                 self.success_message = None;
                 self.status_deadline = None;
-                self.status_snapshot = (None, None);
                 true
             }
             _ => false,
@@ -899,8 +893,7 @@ impl App {
                 }
             }
 
-            // 表示中メッセージが変わっていれば期限を張り直し、期限切れなら消す。
-            self.refresh_status_deadline();
+            // 期限切れのステータスメッセージを消す（設定時に期限を張る方式）。
             if self.expire_status_messages() {
                 needs_redraw = true;
             }
@@ -920,7 +913,7 @@ impl App {
         }
         self.goal_tree = data.goal_tree;
         if let Some(err) = data.error {
-            self.error_message = Some(err);
+            self.set_error_message(err);
         }
     }
 
@@ -948,16 +941,16 @@ impl App {
         }
         let handle = self.deferred_initial_load.take().unwrap();
         let Ok(data) = self.rt.block_on(handle) else {
-            self.error_message = Some("Failed to load goal details".to_string());
+            self.set_error_message("Failed to load goal details".to_string());
             return true;
         };
         self.set_members(data.members_list);
         let failed = apply_root_goal_details(&mut self.goal_tree, data.root_details);
         self.goal_tree.clamp_cursor();
         if failed > 0 {
-            self.error_message = Some(format!("Failed to load details for {failed} goal(s)"));
+            self.set_error_message(format!("Failed to load details for {failed} goal(s)"));
         } else if let Some(err) = data.error {
-            self.error_message = Some(err);
+            self.set_error_message(err);
         }
         true
     }
@@ -1014,7 +1007,7 @@ impl App {
                 self.goal_tree = GoalTree::empty();
                 self.members = HashMap::new();
                 self.members_list = vec![];
-                self.error_message = Some(format!("Failed to load goals: {e}"));
+                self.set_error_message(format!("Failed to load goals: {e}"));
             }
         }
     }
@@ -1034,7 +1027,7 @@ impl App {
             }
             Err(e) => {
                 self.goal_tree = GoalTree::empty();
-                self.error_message = Some(format!("Failed to load goals: {e}"));
+                self.set_error_message(format!("Failed to load goals: {e}"));
             }
         }
     }
@@ -1078,7 +1071,7 @@ impl App {
             }
             Err(e) => {
                 self.todays_goals_tree = GoalTree::empty();
-                self.error_message = Some(format!("Failed to load today's goals: {e}"));
+                self.set_error_message(format!("Failed to load today's goals: {e}"));
             }
         }
     }
@@ -1257,8 +1250,7 @@ impl App {
             return;
         }
 
-        self.error_message =
-            Some("Select a goal, deliverable or comment to open actions".to_string());
+        self.set_error_message("Select a goal, deliverable or comment to open actions".to_string());
     }
 
     /// 選択中ゴールの文脈を注入して、埋め込み codex セッションを起動する。
@@ -1270,7 +1262,7 @@ impl App {
         let name = kind.display_name();
         let label = kind.label();
         let Some((goal_id, title)) = self.selected_goal_context() else {
-            self.error_message = Some(format!("ゴールを選択してから {label} を起動してください"));
+            self.set_error_message(format!("ゴールを選択してから {label} を起動してください"));
             return;
         };
 
@@ -1280,7 +1272,7 @@ impl App {
             AgentKind::ClaudeCode => agent::claude_path(),
         };
         let Some(agent_bin) = bin else {
-            self.error_message = Some(match kind {
+            self.set_error_message(match kind {
                 AgentKind::Codex => {
                     "codex が見つかりません。`brew install codex` 等でインストールしてください"
                         .to_string()
@@ -1397,7 +1389,7 @@ impl App {
                 Self::set_mouse_capture(true);
             }
             Err(e) => {
-                self.error_message = Some(format!("{name} の起動に失敗しました: {e}"));
+                self.set_error_message(format!("{name} の起動に失敗しました: {e}"));
             }
         }
     }
@@ -1430,11 +1422,12 @@ impl App {
             Err(e) => {
                 let message = format!("{e}");
                 if is_permission_denied_error_text(&message) {
-                    self.success_message =
-                        Some("権限がないためCodex作業メモの自動記録をスキップしました".to_string());
+                    self.set_success_message(
+                        "権限がないためCodex作業メモの自動記録をスキップしました".to_string(),
+                    );
                     return CodexBodyRecordResult::SkippedPermission;
                 }
-                self.error_message = Some(format!("Codex自動記録の取得に失敗しました: {message}"));
+                self.set_error_message(format!("Codex自動記録の取得に失敗しました: {message}"));
                 return CodexBodyRecordResult::Failed;
             }
         };
@@ -1442,20 +1435,21 @@ impl App {
 
         match self.api_call(self.client.update_goal(goal_id, &req)) {
             Ok(_) => {
-                self.success_message =
-                    Some("Codex作業メモをAddnessの現状(body)に書き込みました".to_string());
+                self.set_success_message(
+                    "Codex作業メモをAddnessの現状(body)に書き込みました".to_string(),
+                );
                 CodexBodyRecordResult::Written
             }
             Err(e) => {
                 let message = format!("{e}");
                 if is_permission_denied_error_text(&message) {
-                    self.success_message = Some(
+                    self.set_success_message(
                         "書き込み権限がないためCodex作業メモの自動記録をスキップしました"
                             .to_string(),
                     );
                     CodexBodyRecordResult::SkippedPermission
                 } else {
-                    self.error_message = Some(format!(
+                    self.set_error_message(format!(
                         "Codex作業メモの現状(body)書き込みに失敗しました: {message}"
                     ));
                     CodexBodyRecordResult::Failed
@@ -1731,11 +1725,11 @@ impl App {
             return;
         };
         if pane.dod_items.is_empty() {
-            self.error_message = Some("DoD が未設定のため判定できません".to_string());
+            self.set_error_message("DoD が未設定のため判定できません".to_string());
             return;
         }
         let Some(codex_bin) = agent::codex_path() else {
-            self.error_message = Some("codex が見つかりません".to_string());
+            self.set_error_message("codex が見つかりません".to_string());
             return;
         };
 
@@ -1749,7 +1743,7 @@ impl App {
         let out_path = tmp.join(format!("addness-dod-out-{goal_id}-{pid}.json"));
 
         if std::fs::write(&schema_path, agent::dod_assessment_schema()).is_err() {
-            self.error_message = Some("一時ファイルの書き込みに失敗しました".to_string());
+            self.set_error_message("一時ファイルの書き込みに失敗しました".to_string());
             return;
         }
         let _ = std::fs::remove_file(&out_path);
@@ -1782,12 +1776,12 @@ impl App {
                 if let Some(pane) = self.codex.as_mut() {
                     pane.assessing = true;
                 }
-                self.success_message = Some("DoD 判定を実行中…".to_string());
+                self.set_success_message("DoD 判定を実行中…".to_string());
             }
             Err(e) => {
                 // 起動失敗時は書き込んだスキーマファイルを残さない。
                 let _ = std::fs::remove_file(&schema_path);
-                self.error_message = Some(format!("DoD 判定の起動に失敗しました: {e}"));
+                self.set_error_message(format!("DoD 判定の起動に失敗しました: {e}"));
             }
         }
     }
@@ -1807,7 +1801,7 @@ impl App {
                     let mut job = self.codex_dod_job.take().unwrap();
                     job.cleanup();
                     self.set_codex_assessing(false);
-                    self.error_message = Some("DoD 判定がタイムアウトしました".to_string());
+                    self.set_error_message("DoD 判定がタイムアウトしました".to_string());
                     return true;
                 }
                 return false;
@@ -1841,18 +1835,18 @@ impl App {
                     // （codex が一部省略・重複しても表示が破綻しないように）。
                     let met = pane.dod_checks.iter().filter(|c| **c == Some(true)).count();
                     let total = pane.dod_items.len();
-                    self.success_message = Some(format!("DoD 判定完了: {met}/{total} 達成"));
+                    self.set_success_message(format!("DoD 判定完了: {met}/{total} 達成"));
                 }
             }
             Some(_) => {
                 // 空の results。judge が判定できなかったとみなす。
-                self.error_message = Some("DoD 判定結果が空でした".to_string());
+                self.set_error_message("DoD 判定結果が空でした".to_string());
             }
             None if status.success() => {
-                self.error_message = Some("DoD 判定結果の解析に失敗しました".to_string());
+                self.set_error_message("DoD 判定結果の解析に失敗しました".to_string());
             }
             None => {
-                self.error_message = Some("DoD 判定に失敗しました".to_string());
+                self.set_error_message("DoD 判定に失敗しました".to_string());
             }
         }
         true
@@ -2234,6 +2228,15 @@ impl App {
             }
             if key.modifiers.contains(KeyModifiers::CONTROL) {
                 match key.code {
+                    // ↑ は履歴呼び戻しに使うため、ログの 1 行スクロールは Ctrl+↑/↓ に割り当てる。
+                    KeyCode::Up => {
+                        pane.scroll_lines(1);
+                        return;
+                    }
+                    KeyCode::Down => {
+                        pane.scroll_lines(-1);
+                        return;
+                    }
                     KeyCode::Char('t' | 'T') => {
                         pane.cycle_log_filter();
                         return;
@@ -2296,6 +2299,7 @@ impl App {
             if let KeyCode::Char('c' | 's' | 'd' | 'v') = key.code {
                 self.error_message = None;
                 self.success_message = None;
+                self.status_deadline = None;
             }
             if key.modifiers.is_empty() {
                 match key.code {
@@ -2423,7 +2427,7 @@ impl App {
             pane.submit_system_line(agent::resume_prompt());
             let now = Local::now().format("%H:%M");
             pane.push_activity(format!("{now} F9 再開プロンプトを送信"));
-            self.success_message = Some("Addnessから再開するプロンプトを送信しました".to_string());
+            self.set_success_message("Addnessから再開するプロンプトを送信しました".to_string());
         }
     }
 
@@ -2672,7 +2676,7 @@ impl App {
                 });
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to load goal: {e}"));
+                self.set_error_message(format!("Failed to load goal: {e}"));
             }
         }
     }
@@ -2706,7 +2710,7 @@ impl App {
                     .set_deliverables_for_goal_id(goal_id, deliverables);
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to reload deliverables: {e}"));
+                self.set_error_message(format!("Failed to reload deliverables: {e}"));
             }
         }
     }
@@ -2724,7 +2728,7 @@ impl App {
                 self.todays_goals_tree.clamp_cursor();
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to reload comments: {e}"));
+                self.set_error_message(format!("Failed to reload comments: {e}"));
             }
         }
     }
@@ -2735,7 +2739,7 @@ impl App {
 
     fn start_add_comment_modal(&mut self) {
         let Some((goal_id, goal_title)) = self.selected_goal_context() else {
-            self.error_message = Some("Please select a goal to add a comment".to_string());
+            self.set_error_message("Please select a goal to add a comment".to_string());
             return;
         };
         self.modal_state = Some(ModalState::AddComment {
@@ -2747,7 +2751,7 @@ impl App {
 
     fn start_reply_comment_modal(&mut self) {
         let Some((goal_id, comment_id, content, _)) = self.selected_comment_context() else {
-            self.error_message = Some("Please select a comment to reply to".to_string());
+            self.set_error_message("Please select a comment to reply to".to_string());
             return;
         };
         self.modal_state = Some(ModalState::ReplyComment {
@@ -2760,7 +2764,7 @@ impl App {
 
     fn start_edit_comment_modal(&mut self) {
         let Some((goal_id, comment_id, content, _)) = self.selected_comment_context() else {
-            self.error_message = Some("Please select a comment to edit".to_string());
+            self.set_error_message("Please select a comment to edit".to_string());
             return;
         };
         self.modal_state = Some(ModalState::EditComment {
@@ -2772,7 +2776,7 @@ impl App {
 
     fn start_delete_comment_modal(&mut self) {
         let Some((goal_id, comment_id, content, _)) = self.selected_comment_context() else {
-            self.error_message = Some("Please select a comment to delete".to_string());
+            self.set_error_message("Please select a comment to delete".to_string());
             return;
         };
         if self.allow_delete_comment_without_confirm {
@@ -2789,7 +2793,7 @@ impl App {
 
     fn start_react_comment_modal(&mut self) {
         let Some((goal_id, comment_id, _, _)) = self.selected_comment_context() else {
-            self.error_message = Some("Please select a comment to react to".to_string());
+            self.set_error_message("Please select a comment to react to".to_string());
             return;
         };
         self.modal_state = Some(ModalState::ReactComment {
@@ -2802,7 +2806,7 @@ impl App {
 
     fn do_set_comment_resolved(&mut self, resolved: bool) {
         let Some((goal_id, comment_id, _, _)) = self.selected_comment_context() else {
-            self.error_message = Some("Please select a comment".to_string());
+            self.set_error_message("Please select a comment".to_string());
             return;
         };
         let result = if resolved {
@@ -2814,7 +2818,7 @@ impl App {
         };
         match result {
             Ok(()) => {
-                self.success_message = Some(
+                self.set_success_message(
                     if resolved {
                         "Comment resolved"
                     } else {
@@ -2825,7 +2829,7 @@ impl App {
                 self.reload_comments_for_goal(&goal_id);
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to update comment: {e}"));
+                self.set_error_message(format!("Failed to update comment: {e}"));
             }
         }
     }
@@ -2838,7 +2842,7 @@ impl App {
     ) {
         let body = body.trim();
         if body.is_empty() {
-            self.error_message = Some("Comment body is required".to_string());
+            self.set_error_message("Comment body is required".to_string());
             return;
         }
         // AIではなく人間の操作だが、CLI経由と区別できるよう本文はそのまま送る。
@@ -2850,11 +2854,11 @@ impl App {
         ));
         match result {
             Ok(_) => {
-                self.success_message = Some("Comment posted".to_string());
+                self.set_success_message("Comment posted".to_string());
                 self.reload_comments_for_goal(&goal_id);
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to post comment: {e}"));
+                self.set_error_message(format!("Failed to post comment: {e}"));
             }
         }
     }
@@ -2862,16 +2866,16 @@ impl App {
     fn modal_submit_edit_comment(&mut self, goal_id: String, comment_id: String, body: String) {
         let body = body.trim();
         if body.is_empty() {
-            self.error_message = Some("Comment body is required".to_string());
+            self.set_error_message("Comment body is required".to_string());
             return;
         }
         match self.api_call(self.client.update_comment(&comment_id, body, Vec::new())) {
             Ok(_) => {
-                self.success_message = Some("Comment updated".to_string());
+                self.set_success_message("Comment updated".to_string());
                 self.reload_comments_for_goal(&goal_id);
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to update comment: {e}"));
+                self.set_error_message(format!("Failed to update comment: {e}"));
             }
         }
     }
@@ -2879,11 +2883,11 @@ impl App {
     fn modal_submit_delete_comment(&mut self, goal_id: String, comment_id: String) {
         match self.api_call(self.client.delete_comment(&comment_id)) {
             Ok(()) => {
-                self.success_message = Some("Comment deleted".to_string());
+                self.set_success_message("Comment deleted".to_string());
                 self.reload_comments_for_goal(&goal_id);
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to delete comment: {e}"));
+                self.set_error_message(format!("Failed to delete comment: {e}"));
             }
         }
     }
@@ -2891,11 +2895,11 @@ impl App {
     fn modal_submit_react_comment(&mut self, goal_id: String, comment_id: String, emoji: &str) {
         match self.api_call(self.client.add_reaction(&comment_id, emoji)) {
             Ok(()) => {
-                self.success_message = Some(format!("Reacted {emoji}"));
+                self.set_success_message(format!("Reacted {emoji}"));
                 self.reload_comments_for_goal(&goal_id);
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to react: {e}"));
+                self.set_error_message(format!("Failed to react: {e}"));
             }
         }
     }
@@ -3129,7 +3133,7 @@ impl App {
             {
                 self.active_goal_tree_mut().cycle_comment_view();
                 let mode = self.active_goal_tree().comment_view.label();
-                self.success_message = Some(format!("Comments: {mode}"));
+                self.set_success_message(format!("Comments: {mode}"));
             }
             KeyCode::Char('e')
                 if self.active_pane == ActivePane::Content
@@ -3288,7 +3292,7 @@ impl App {
                     }
                 }
                 Err(e) => {
-                    self.error_message = Some(format!("Failed to load data: {e}"));
+                    self.set_error_message(format!("Failed to load data: {e}"));
                     return;
                 }
             }
@@ -3356,11 +3360,11 @@ impl App {
                     });
                 }
                 Err(e) => {
-                    self.error_message = Some(format!("Failed to load goal: {e}"));
+                    self.set_error_message(format!("Failed to load goal: {e}"));
                 }
             }
         } else {
-            self.error_message = Some("Please select a goal to edit".to_string());
+            self.set_error_message("Please select a goal to edit".to_string());
         }
     }
 
@@ -3386,13 +3390,13 @@ impl App {
                 confirm_index: CONFIRM_CANCEL,
             });
         } else {
-            self.error_message = Some("Please select a goal to delete".to_string());
+            self.set_error_message("Please select a goal to delete".to_string());
         }
     }
 
     fn start_add_deliverable_modal(&mut self) {
         let Some((goal_id, goal_title)) = self.selected_goal_context() else {
-            self.error_message = Some("Please select a goal to add a deliverable".to_string());
+            self.set_error_message("Please select a goal to add a deliverable".to_string());
             return;
         };
 
@@ -3410,11 +3414,11 @@ impl App {
         let Some((goal_id, deliverable_id, deliverable_name, _, node_type)) =
             self.selected_deliverable_context()
         else {
-            self.error_message = Some("Please select a document deliverable to update".to_string());
+            self.set_error_message("Please select a document deliverable to update".to_string());
             return;
         };
         if node_type != DeliverableType::Document {
-            self.error_message = Some("Only document deliverables can be updated".to_string());
+            self.set_error_message("Only document deliverables can be updated".to_string());
             return;
         }
 
@@ -3430,7 +3434,7 @@ impl App {
         let Some((goal_id, deliverable_id, deliverable_name, _, _)) =
             self.selected_deliverable_context()
         else {
-            self.error_message = Some("Please select a deliverable to rename".to_string());
+            self.set_error_message("Please select a deliverable to rename".to_string());
             return;
         };
 
@@ -3446,7 +3450,7 @@ impl App {
         let Some((goal_id, deliverable_id, deliverable_name, _, _)) =
             self.selected_deliverable_context()
         else {
-            self.error_message = Some("Please select a deliverable to move".to_string());
+            self.set_error_message("Please select a deliverable to move".to_string());
             return;
         };
         let targets = self.deliverable_folder_targets_for_goal(&goal_id, &deliverable_id);
@@ -3464,7 +3468,7 @@ impl App {
         let Some((goal_id, deliverable_id, deliverable_name, _, _)) =
             self.selected_deliverable_context()
         else {
-            self.error_message = Some("Please select a deliverable to delete".to_string());
+            self.set_error_message("Please select a deliverable to delete".to_string());
             return;
         };
 
@@ -4201,12 +4205,12 @@ impl App {
     ) {
         // Validate
         if title.trim().is_empty() {
-            self.error_message = Some("Title is required".to_string());
+            self.set_error_message("Title is required".to_string());
             return;
         }
 
         let Some(org_id) = self.current_org_id().map(|s| s.to_string()) else {
-            self.error_message = Some("No organization selected".to_string());
+            self.set_error_message("No organization selected".to_string());
             return;
         };
 
@@ -4223,12 +4227,12 @@ impl App {
 
         match self.api_call(self.client.create_goal(&req)) {
             Ok(_) => {
-                self.success_message = Some("Goal created successfully".to_string());
+                self.set_success_message("Goal created successfully".to_string());
                 self.load_goal_tree();
                 self.load_todays_goals();
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to create goal: {e}"));
+                self.set_error_message(format!("Failed to create goal: {e}"));
             }
         }
     }
@@ -4242,12 +4246,12 @@ impl App {
     ) {
         // Validate
         if title.trim().is_empty() {
-            self.error_message = Some("Title is required".to_string());
+            self.set_error_message("Title is required".to_string());
             return;
         }
 
         let Some(_org_id) = self.current_org_id().map(|s| s.to_string()) else {
-            self.error_message = Some("No organization selected".to_string());
+            self.set_error_message("No organization selected".to_string());
             return;
         };
 
@@ -4274,12 +4278,12 @@ impl App {
 
         match self.api_call(self.client.update_goal(&goal_id, &req)) {
             Ok(_) => {
-                self.success_message = Some("Goal updated successfully".to_string());
+                self.set_success_message("Goal updated successfully".to_string());
                 self.load_goal_tree();
                 self.load_todays_goals();
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to update goal: {e}"));
+                self.set_error_message(format!("Failed to update goal: {e}"));
             }
         }
     }
@@ -4287,12 +4291,12 @@ impl App {
     fn modal_submit_delete(&mut self, goal_id: String) {
         match self.api_call(self.client.delete_goal(&goal_id)) {
             Ok(_) => {
-                self.success_message = Some("Goal deleted successfully".to_string());
+                self.set_success_message("Goal deleted successfully".to_string());
                 self.load_goal_tree();
                 self.load_todays_goals();
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to delete goal: {e}"));
+                self.set_error_message(format!("Failed to delete goal: {e}"));
             }
         }
     }
@@ -4302,7 +4306,7 @@ impl App {
     /// （title/description は送らず最小更新）。
     fn do_set_goal_completed(&mut self, completed: bool) {
         let Some((goal_id, _title, _)) = self.selected_goal_row_context() else {
-            self.error_message = Some("Please select a goal to complete".to_string());
+            self.set_error_message("Please select a goal to complete".to_string());
             return;
         };
 
@@ -4328,7 +4332,7 @@ impl App {
 
         match self.api_call(self.client.update_goal(&goal_id, &req)) {
             Ok(_) => {
-                self.success_message = Some(
+                self.set_success_message(
                     if completed {
                         "Goal completed"
                     } else {
@@ -4343,7 +4347,7 @@ impl App {
                 }
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to update goal: {e}"));
+                self.set_error_message(format!("Failed to update goal: {e}"));
             }
         }
     }
@@ -4384,7 +4388,7 @@ impl App {
         let result = match kind {
             DeliverableKind::File => {
                 if value.is_empty() {
-                    self.error_message = Some("File path is required".to_string());
+                    self.set_error_message("File path is required".to_string());
                     return;
                 }
                 let path = PathBuf::from(value);
@@ -4401,14 +4405,14 @@ impl App {
             }
             DeliverableKind::Document => {
                 if value.is_empty() {
-                    self.error_message = Some("Content file path is required".to_string());
+                    self.set_error_message("Content file path is required".to_string());
                     return;
                 }
                 let path = PathBuf::from(value);
                 let content = match std::fs::read_to_string(&path) {
                     Ok(content) => content,
                     Err(e) => {
-                        self.error_message = Some(format!(
+                        self.set_error_message(format!(
                             "Failed to read content file {}: {e}",
                             path.display()
                         ));
@@ -4419,7 +4423,7 @@ impl App {
                     match path.file_name().and_then(|s| s.to_str()) {
                         Some(file_name) => file_name.to_string(),
                         None => {
-                            self.error_message = Some("Name is required".to_string());
+                            self.set_error_message("Name is required".to_string());
                             return;
                         }
                     }
@@ -4434,7 +4438,7 @@ impl App {
             }
             DeliverableKind::Link => {
                 if display_name.is_empty() || value.is_empty() {
-                    self.error_message = Some("Name and URL are required".to_string());
+                    self.set_error_message("Name and URL are required".to_string());
                     return;
                 }
                 self.api_call(
@@ -4445,7 +4449,7 @@ impl App {
             }
             DeliverableKind::Folder => {
                 if display_name.is_empty() {
-                    self.error_message = Some("Name is required".to_string());
+                    self.set_error_message("Name is required".to_string());
                     return;
                 }
                 self.api_call(
@@ -4458,11 +4462,11 @@ impl App {
 
         match result {
             Ok(id) => {
-                self.success_message = Some(format!("Deliverable added: {id}"));
+                self.set_success_message(format!("Deliverable added: {id}"));
                 self.reload_deliverables_for_goal(&goal_id);
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to add deliverable: {e}"));
+                self.set_error_message(format!("Failed to add deliverable: {e}"));
             }
         }
     }
@@ -4475,13 +4479,13 @@ impl App {
     ) {
         let path = PathBuf::from(content_file.trim());
         if path.as_os_str().is_empty() {
-            self.error_message = Some("Content file path is required".to_string());
+            self.set_error_message("Content file path is required".to_string());
             return;
         }
         let content = match std::fs::read_to_string(&path) {
             Ok(content) => content,
             Err(e) => {
-                self.error_message = Some(format!(
+                self.set_error_message(format!(
                     "Failed to read content file {}: {e}",
                     path.display()
                 ));
@@ -4496,11 +4500,11 @@ impl App {
             vec![],
         )) {
             Ok(_) => {
-                self.success_message = Some("Deliverable updated".to_string());
+                self.set_success_message("Deliverable updated".to_string());
                 self.reload_deliverables_for_goal(&goal_id);
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to update deliverable: {e}"));
+                self.set_error_message(format!("Failed to update deliverable: {e}"));
             }
         }
     }
@@ -4513,7 +4517,7 @@ impl App {
     ) {
         let name = name.trim();
         if name.is_empty() {
-            self.error_message = Some("Name is required".to_string());
+            self.set_error_message("Name is required".to_string());
             return;
         }
 
@@ -4522,11 +4526,11 @@ impl App {
                 .rename_deliverable(&goal_id, &deliverable_id, name),
         ) {
             Ok(_) => {
-                self.success_message = Some("Deliverable renamed".to_string());
+                self.set_success_message("Deliverable renamed".to_string());
                 self.reload_deliverables_for_goal(&goal_id);
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to rename deliverable: {e}"));
+                self.set_error_message(format!("Failed to rename deliverable: {e}"));
             }
         }
     }
@@ -4542,11 +4546,11 @@ impl App {
                 .move_deliverable(&goal_id, &deliverable_id, parent, 0.0),
         ) {
             Ok(_) => {
-                self.success_message = Some("Deliverable moved".to_string());
+                self.set_success_message("Deliverable moved".to_string());
                 self.reload_deliverables_for_goal(&goal_id);
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to move deliverable: {e}"));
+                self.set_error_message(format!("Failed to move deliverable: {e}"));
             }
         }
     }
@@ -4554,11 +4558,11 @@ impl App {
     fn modal_submit_delete_deliverable(&mut self, goal_id: String, deliverable_id: String) {
         match self.api_call(self.client.delete_deliverable(&goal_id, &deliverable_id)) {
             Ok(_) => {
-                self.success_message = Some("Deliverable deleted".to_string());
+                self.set_success_message("Deliverable deleted".to_string());
                 self.reload_deliverables_for_goal(&goal_id);
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to delete deliverable: {e}"));
+                self.set_error_message(format!("Failed to delete deliverable: {e}"));
             }
         }
     }
@@ -5170,6 +5174,28 @@ mod codex_turn_key_tests {
     }
 
     #[test]
+    fn ctrl_up_down_scrolls_log_one_line() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = ApiClient::new("t", "http://localhost").unwrap();
+        let mut app = App::new(client, rt.handle().clone());
+        let mut pane = CodexPane::test_with_output(6, 80, 0, "");
+        pane.finished = false;
+        // スクロール余地を作るため会話ログを十分に積む。
+        pane.seed_assistant_log_for_test(40);
+        app.active_pane = ActivePane::Codex;
+        app.codex = Some(pane);
+
+        // ↑ 単体は履歴呼び戻し。ログの 1 行スクロールは Ctrl+↑/↓ で行う。
+        assert_eq!(app.codex.as_ref().unwrap().scrollback, 0);
+        app.handle_codex_key(modified_key(KeyCode::Up, KeyModifiers::CONTROL));
+        assert_eq!(app.codex.as_ref().unwrap().scrollback, 1);
+        app.handle_codex_key(modified_key(KeyCode::Up, KeyModifiers::CONTROL));
+        assert_eq!(app.codex.as_ref().unwrap().scrollback, 2);
+        app.handle_codex_key(modified_key(KeyCode::Down, KeyModifiers::CONTROL));
+        assert_eq!(app.codex.as_ref().unwrap().scrollback, 1);
+    }
+
+    #[test]
     fn f7_turn_picker_opens_and_enter_expands_selected_turn() {
         let (_rt, mut app) = app_with_codex_live_input();
         {
@@ -5259,8 +5285,7 @@ mod status_message_tests {
         let (_rt, mut app) = app();
         assert!(app.status_deadline.is_none());
 
-        app.success_message = Some("done".to_string());
-        app.refresh_status_deadline();
+        app.set_success_message("done".to_string());
 
         assert!(app.status_deadline.is_some());
         // 期限内なので消えない。
@@ -5271,8 +5296,7 @@ mod status_message_tests {
     #[test]
     fn expired_message_is_cleared() {
         let (_rt, mut app) = app();
-        app.error_message = Some("boom".to_string());
-        app.refresh_status_deadline();
+        app.set_error_message("boom".to_string());
 
         // 期限を過去にして期限切れを再現する。
         app.status_deadline = Some(Instant::now() - Duration::from_millis(1));
@@ -5285,18 +5309,31 @@ mod status_message_tests {
     #[test]
     fn newer_message_rearms_deadline() {
         let (_rt, mut app) = app();
-        app.success_message = Some("first".to_string());
-        app.refresh_status_deadline();
+        app.set_success_message("first".to_string());
         // 期限切れ寸前に設定。
         app.status_deadline = Some(Instant::now() - Duration::from_millis(1));
 
         // 新しいメッセージが上書きされたら期限を張り直す。
-        app.success_message = Some("second".to_string());
-        app.refresh_status_deadline();
+        app.set_success_message("second".to_string());
 
         assert!(app.status_deadline.is_some());
         assert!(!app.expire_status_messages());
         assert_eq!(app.success_message.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn same_message_reset_extends_deadline() {
+        let (_rt, mut app) = app();
+        app.set_error_message("same".to_string());
+        // 期限を過去にする（内容は同じ）。
+        app.status_deadline = Some(Instant::now() - Duration::from_millis(1));
+
+        // 同一内容を再設定しても期限が延びる。
+        app.set_error_message("same".to_string());
+
+        assert!(app.status_deadline.is_some());
+        assert!(!app.expire_status_messages());
+        assert_eq!(app.error_message.as_deref(), Some("same"));
     }
 }
 

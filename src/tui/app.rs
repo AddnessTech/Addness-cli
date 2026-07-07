@@ -697,6 +697,13 @@ pub struct App {
     codex_body_record_job: Option<JoinHandle<CodexBodyRecordOutcome>>,
     /// 初回表示後にメンバー・ルートゴール詳細を埋める遅延ロードジョブ。
     deferred_initial_load: Option<JoinHandle<DeferredInitialData>>,
+
+    /// ステータスメッセージ（error/success）の自動クリア期限。
+    /// キー入力では消さず、表示から一定時間で期限切れとしてクリアする。
+    status_deadline: Option<Instant>,
+    /// 直近に自動クリア期限を張ったときのメッセージ内容。新しいメッセージが
+    /// 来たら期限を張り直すための比較用スナップショット。
+    status_snapshot: (Option<String>, Option<String>),
 }
 
 impl App {
@@ -745,6 +752,42 @@ impl App {
             codex_dod_job: None,
             codex_body_record_job: None,
             deferred_initial_load: None,
+            status_deadline: None,
+            status_snapshot: (None, None),
+        }
+    }
+
+    /// ステータスメッセージ（error/success）の自動クリアTTL。
+    const STATUS_MESSAGE_TTL: Duration = Duration::from_secs(5);
+
+    /// 表示中のメッセージが前回から変化していれば、自動クリア期限を張り直す。
+    /// 88箇所ある `error_message = Some(..)` 等の代入を毎回置き換えず、ループ側で
+    /// 内容の変化を検知して一元的に期限を管理する。
+    fn refresh_status_deadline(&mut self) {
+        if self.error_message == self.status_snapshot.0
+            && self.success_message == self.status_snapshot.1
+        {
+            return;
+        }
+        self.status_snapshot = (self.error_message.clone(), self.success_message.clone());
+        self.status_deadline = if self.error_message.is_some() || self.success_message.is_some() {
+            Some(Instant::now() + Self::STATUS_MESSAGE_TTL)
+        } else {
+            None
+        };
+    }
+
+    /// 自動クリア期限が過ぎていればメッセージを消す。消したら true を返す（要再描画）。
+    fn expire_status_messages(&mut self) -> bool {
+        match self.status_deadline {
+            Some(deadline) if Instant::now() >= deadline => {
+                self.error_message = None;
+                self.success_message = None;
+                self.status_deadline = None;
+                self.status_snapshot = (None, None);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -833,7 +876,7 @@ impl App {
                 // codex は非同期に描画更新するので、キー入力が無くても一定間隔で
                 // JSONL 出力を取り込む（ブロッキング read は使わない）。変化があった
                 // フレームだけ再描画し、アイドル時の無駄な再描画を避ける。
-                if event::poll(std::time::Duration::from_millis(20))? {
+                if event::poll(Duration::from_millis(20))? {
                     self.handle_events()?;
                     needs_redraw = true;
                 }
@@ -841,7 +884,24 @@ impl App {
                     needs_redraw = true;
                 }
             } else {
-                self.handle_events()?;
+                // ステータスメッセージは時間ベースで自動クリアするため、ブロッキング
+                // read ではなく poll でタイムアウトさせ、時間経過を進める。メッセージ
+                // 表示中のみ短い間隔でポーリングし、非表示（アイドル）時は長めにして
+                // CPU 負荷を抑える。
+                let timeout = if self.status_deadline.is_some() {
+                    Duration::from_millis(100)
+                } else {
+                    Duration::from_millis(500)
+                };
+                if event::poll(timeout)? {
+                    self.handle_events()?;
+                    needs_redraw = true;
+                }
+            }
+
+            // 表示中メッセージが変わっていれば期限を張り直し、期限切れなら消す。
+            self.refresh_status_deadline();
+            if self.expire_status_messages() {
                 needs_redraw = true;
             }
         }
@@ -2050,6 +2110,13 @@ impl App {
     /// 実行中は F12 で終了、trackpad/wheel でログをスクロールし、それ以外のキーは codex へ転送する。
     /// 終了後は還流バー（c/s/d）で成果を Addness に書き戻し、Esc/q で閉じる。
     fn handle_codex_key(&mut self, key: KeyEvent) {
+        // codex フォーカス中でも、入力欄が空で各種パレット・検索・ピッカー非表示なら
+        // `?` でヘルプオーバーレイを開けるようにする。入力途中の `?` は文字入力のまま。
+        if self.codex_help_key_eligible(key) {
+            self.show_help = true;
+            self.help_scroll = 0;
+            return;
+        }
         if let Some(pane) = self.codex.as_mut() {
             if pane.handle_search_key(key) {
                 return;
@@ -2311,6 +2378,24 @@ impl App {
             }
             pane.input(key);
         }
+    }
+
+    /// codex フォーカス中に `?` でヘルプを開いてよいか。パレット・検索・ターンピッカー・
+    /// 判定バナー表示中やスクロール中、入力欄に文字がある場合は対象外（従来どおり文字入力）。
+    fn codex_help_key_eligible(&self, key: KeyEvent) -> bool {
+        if key.code != KeyCode::Char('?') || !key.modifiers.is_empty() {
+            return false;
+        }
+        let Some(pane) = self.codex.as_ref() else {
+            return false;
+        };
+        !pane.is_search_editing()
+            && !pane.slash_palette_active()
+            && !pane.mention_palette_active()
+            && !pane.turn_picker_open()
+            && pane.decision_banner().is_none()
+            && pane.scrollback == 0
+            && pane.input_line().is_empty()
     }
 
     fn handle_codex_paste(&mut self, text: &str) {
@@ -2905,9 +2990,9 @@ impl App {
                 return Ok(());
             }
 
-            // Clear error and success messages on any key press
-            self.error_message = None;
-            self.success_message = None;
+            // ステータスメッセージはキー入力では消さず、時間経過で自動クリアする
+            // （run ループの expire_status_messages が担当）。新しいメッセージが
+            // 来れば下の各ハンドラが上書きし、期限も張り直される。
 
             if self.modal_state.is_some() {
                 self.handle_modal_input(key);
@@ -5123,6 +5208,95 @@ mod codex_turn_key_tests {
         let pane = app.codex.as_ref().unwrap();
         assert_eq!(pane.input_line(), "1");
         assert_eq!(pane.collapsed_turn_count(), 0);
+    }
+
+    #[test]
+    fn question_mark_opens_help_when_input_empty() {
+        let (_rt, mut app) = app_with_codex_live_input();
+
+        app.handle_codex_key(key(KeyCode::Char('?')));
+
+        assert!(app.show_help);
+        assert_eq!(app.help_scroll, 0);
+        assert_eq!(app.codex.as_ref().unwrap().input_line(), "");
+    }
+
+    #[test]
+    fn question_mark_types_into_prompt_when_input_nonempty() {
+        let (_rt, mut app) = app_with_codex_live_input();
+
+        app.handle_codex_key(key(KeyCode::Char('a')));
+        app.handle_codex_key(key(KeyCode::Char('?')));
+
+        assert!(!app.show_help);
+        assert_eq!(app.codex.as_ref().unwrap().input_line(), "a?");
+    }
+
+    #[test]
+    fn question_mark_ignored_during_scrollback() {
+        let (_rt, mut app) = app_with_codex_history();
+
+        app.handle_codex_key(key(KeyCode::Char('?')));
+
+        // スクロール中は `?` でヘルプを開かず、従来どおりの経路に委ねる。
+        assert!(!app.show_help);
+    }
+}
+
+#[cfg(test)]
+mod status_message_tests {
+    use super::*;
+
+    fn app() -> (tokio::runtime::Runtime, App) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = ApiClient::new("t", "http://localhost").unwrap();
+        let app = App::new(client, rt.handle().clone());
+        (rt, app)
+    }
+
+    #[test]
+    fn new_message_arms_deadline() {
+        let (_rt, mut app) = app();
+        assert!(app.status_deadline.is_none());
+
+        app.success_message = Some("done".to_string());
+        app.refresh_status_deadline();
+
+        assert!(app.status_deadline.is_some());
+        // 期限内なので消えない。
+        assert!(!app.expire_status_messages());
+        assert_eq!(app.success_message.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn expired_message_is_cleared() {
+        let (_rt, mut app) = app();
+        app.error_message = Some("boom".to_string());
+        app.refresh_status_deadline();
+
+        // 期限を過去にして期限切れを再現する。
+        app.status_deadline = Some(Instant::now() - Duration::from_millis(1));
+
+        assert!(app.expire_status_messages());
+        assert!(app.error_message.is_none());
+        assert!(app.status_deadline.is_none());
+    }
+
+    #[test]
+    fn newer_message_rearms_deadline() {
+        let (_rt, mut app) = app();
+        app.success_message = Some("first".to_string());
+        app.refresh_status_deadline();
+        // 期限切れ寸前に設定。
+        app.status_deadline = Some(Instant::now() - Duration::from_millis(1));
+
+        // 新しいメッセージが上書きされたら期限を張り直す。
+        app.success_message = Some("second".to_string());
+        app.refresh_status_deadline();
+
+        assert!(app.status_deadline.is_some());
+        assert!(!app.expire_status_messages());
+        assert_eq!(app.success_message.as_deref(), Some("second"));
     }
 }
 

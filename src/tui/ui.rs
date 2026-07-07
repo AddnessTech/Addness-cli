@@ -821,14 +821,14 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
             .map(|c| c.is_turn_running())
             .unwrap_or(false);
         let hint = if finished {
-            " [c]コメント  [s]状態  [d]成果物(PR/Release)  [v]DoD判定  Ctrl+Q:操作一覧  Esc/q:閉じる ".to_string()
+            " [c]コメント  [s]状態  [d]成果物(PR/Release)  [v]DoD判定  ?/Ctrl+Q:操作一覧  Esc/q:閉じる ".to_string()
         } else if running {
             format!(
                 " {name} 実行中  |  Ctrl-T:表示切替  |  F7:turn一覧  |  入力+Enter:次ターン予約  |  Ctrl-C:中断 "
             )
         } else {
             format!(
-                " 入力してEnterで{name}へ送信  |  Ctrl-T:表示切替  |  F7:turn一覧  |  F2-F6:設定/差分  |  Ctrl+Q:操作一覧 "
+                " 入力してEnterで{name}へ送信  |  Ctrl-T:表示切替  |  F7:turn一覧  |  F2-F6:設定/差分  |  ?/Ctrl+Q:操作一覧 "
             )
         };
         let status = Paragraph::new(Line::from(Span::styled(
@@ -1093,7 +1093,10 @@ fn draw_codex_help_overlay(frame: &mut Frame, app: &mut App) {
 
     let mut lines: Vec<Line> = vec![
         section(&format!("{name} in Addness")),
-        kv("Ctrl+Q", "この操作一覧を表示 / 閉じる"),
+        kv(
+            "? / Ctrl+Q",
+            "この操作一覧を表示 / 閉じる（? は入力欄が空のとき）",
+        ),
         kv(
             "入力 + Enter",
             &format!("{name}へ依頼を送信（必要ならAddnessを参照）"),

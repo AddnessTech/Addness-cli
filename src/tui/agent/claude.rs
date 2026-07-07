@@ -188,14 +188,6 @@ pub(super) fn parse_permission_mode(value: &str) -> Option<ClaudePermissionMode>
     }
 }
 
-/// 承認拒否からの権限昇格レベル。Edit/Write 系だけなら acceptEdits で足りるが、
-/// Bash 等を含むなら全許可（--dangerously-skip-permissions）へ昇格する。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PermissionEscalation {
-    AcceptEdits,
-    SkipPermissions,
-}
-
 /// 次回 `claude -p` 起動時に使う設定。codex の `CodexExecSettings` と並置する。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ClaudeExecSettings {
@@ -204,9 +196,9 @@ pub(super) struct ClaudeExecSettings {
     model_override: Option<String>,
     effort: ClaudeEffortChoice,
     permission_mode: ClaudePermissionMode,
-    /// Always（sticky）で全許可を選んだ場合、以後のターンで常に
-    /// `--dangerously-skip-permissions` を付ける。
-    skip_permissions: bool,
+    /// 承認バナーで「これからずっと許可」を選んだツールルール（`--allowedTools`）。
+    /// 以後の全ターンに付与する（セッションレベルの sticky 許可リスト）。
+    sticky_allowed_tools: Vec<String>,
     additional_dirs: Vec<String>,
 }
 
@@ -217,7 +209,7 @@ impl Default for ClaudeExecSettings {
             model_override: None,
             effort: ClaudeEffortChoice::Config,
             permission_mode: ClaudePermissionMode::Config,
-            skip_permissions: false,
+            sticky_allowed_tools: Vec::new(),
             additional_dirs: Vec::new(),
         }
     }
@@ -229,16 +221,14 @@ impl ClaudeExecSettings {
             .model_override
             .as_deref()
             .unwrap_or_else(|| self.model.label());
-        let permission = if self.skip_permissions {
-            "skip-permissions".to_string()
-        } else {
-            self.permission_mode.label().to_string()
-        };
         let mut parts = vec![
             format!("model:{model}"),
             format!("effort:{}", self.effort.label()),
-            format!("permission:{permission}"),
+            format!("permission:{}", self.permission_mode.label()),
         ];
+        if !self.sticky_allowed_tools.is_empty() {
+            parts.push(format!("allow:{}", self.sticky_allowed_tools.len()));
+        }
         if !self.additional_dirs.is_empty() {
             parts.push(format!("add-dir:{}", self.additional_dirs.len()));
         }
@@ -246,11 +236,12 @@ impl ClaudeExecSettings {
     }
 
     pub(super) fn permission_label(&self) -> String {
-        if self.skip_permissions {
-            "skip-permissions".to_string()
-        } else {
-            self.permission_mode.label().to_string()
-        }
+        self.permission_mode.label().to_string()
+    }
+
+    /// sticky 許可リストを一覧表示用に返す。
+    pub(super) fn sticky_allowed_tools(&self) -> &[String] {
+        &self.sticky_allowed_tools
     }
 
     pub(super) fn cycle_model(&mut self) -> &'static str {
@@ -285,26 +276,21 @@ impl ClaudeExecSettings {
     }
 
     pub(super) fn cycle_permission_mode(&mut self) -> String {
-        self.skip_permissions = false;
         self.permission_mode = self.permission_mode.next();
         self.permission_mode.label().to_string()
     }
 
     pub(super) fn set_permission_mode(&mut self, value: ClaudePermissionMode) -> String {
-        self.skip_permissions = false;
         self.permission_mode = value;
         self.permission_mode.label().to_string()
     }
 
-    /// Always（sticky）承認の適用。edit 系だけなら acceptEdits、それ以外は全許可。
-    pub(super) fn apply_sticky_escalation(&mut self, escalation: PermissionEscalation) {
-        match escalation {
-            PermissionEscalation::AcceptEdits => {
-                self.skip_permissions = false;
-                self.permission_mode = ClaudePermissionMode::AcceptEdits;
-            }
-            PermissionEscalation::SkipPermissions => {
-                self.skip_permissions = true;
+    /// Always（sticky）承認の適用。拒否ツールごとの `--allowedTools` ルールを
+    /// セッションレベルの許可リストへ追加する（重複は無視）。
+    pub(super) fn add_allowed_tools(&mut self, rules: &[String]) {
+        for rule in rules {
+            if !self.sticky_allowed_tools.iter().any(|r| r == rule) {
+                self.sticky_allowed_tools.push(rule.clone());
             }
         }
     }
@@ -323,13 +309,14 @@ impl ClaudeExecSettings {
 /// `claude -p` の起動引数を組み立てる。プロンプトは stdin へ渡すので引数には含めない。
 ///
 /// * `session_id` — 2 ターン目以降の `--resume <id>`（初回ターンは None）。
-/// * `one_shot` — 承認 Accept 時の今回だけの権限昇格。sticky 設定より優先する。
+/// * `one_shot_allowed_tools` — 承認「今回だけ許可」で付与する `--allowedTools` ルール。
+///   sticky 許可リストと合わせて 1 回だけ有効。
 /// * `fork` — resume 時にセッションを複製する（`--fork-session`）。
 /// * `developer_instructions` — 毎ターン `--append-system-prompt` で注入する Addness 手順。
 pub(super) fn exec_args(
     session_id: Option<&str>,
     settings: &ClaudeExecSettings,
-    one_shot: Option<PermissionEscalation>,
+    one_shot_allowed_tools: &[String],
     fork: bool,
     developer_instructions: &str,
 ) -> Vec<OsString> {
@@ -338,6 +325,8 @@ pub(super) fn exec_args(
         OsString::from("--output-format"),
         OsString::from("stream-json"),
         OsString::from("--verbose"),
+        // トークン単位のストリーミング表示のため部分メッセージを受け取る。
+        OsString::from("--include-partial-messages"),
     ];
 
     if let Some(session_id) = session_id {
@@ -362,22 +351,26 @@ pub(super) fn exec_args(
         args.push(OsString::from(effort));
     }
 
-    // 権限: 今回だけの昇格 → sticky 全許可 → 通常の permission-mode の順で決める。
-    match one_shot {
-        Some(PermissionEscalation::SkipPermissions) => {
-            args.push(OsString::from("--dangerously-skip-permissions"));
+    if let Some(mode) = settings.permission_mode.cli_arg() {
+        args.push(OsString::from("--permission-mode"));
+        args.push(OsString::from(mode));
+    }
+
+    // 権限: sticky 許可リスト + 今回だけの許可ルールを `--allowedTools` へ（重複除去）。
+    let mut allowed: Vec<&str> = Vec::new();
+    for rule in settings
+        .sticky_allowed_tools
+        .iter()
+        .chain(one_shot_allowed_tools.iter())
+    {
+        if !allowed.contains(&rule.as_str()) {
+            allowed.push(rule.as_str());
         }
-        Some(PermissionEscalation::AcceptEdits) => {
-            args.push(OsString::from("--permission-mode"));
-            args.push(OsString::from("acceptEdits"));
-        }
-        None => {
-            if settings.skip_permissions {
-                args.push(OsString::from("--dangerously-skip-permissions"));
-            } else if let Some(mode) = settings.permission_mode.cli_arg() {
-                args.push(OsString::from("--permission-mode"));
-                args.push(OsString::from(mode));
-            }
+    }
+    if !allowed.is_empty() {
+        args.push(OsString::from("--allowedTools"));
+        for rule in allowed {
+            args.push(OsString::from(rule));
         }
     }
 
@@ -403,6 +396,23 @@ pub(super) fn event_type(value: &Value) -> &str {
 
 pub(super) fn event_subtype(value: &Value) -> Option<&str> {
     value.get("subtype").and_then(Value::as_str)
+}
+
+/// `--include-partial-messages` の `stream_event` から text_delta のテキストを取り出す。
+/// content_block_delta 以外・thinking_delta / input_json_delta 等は逐次表示しないので None。
+pub(super) fn stream_text_delta(value: &Value) -> Option<&str> {
+    if event_type(value) != "stream_event" {
+        return None;
+    }
+    let event = value.get("event")?;
+    if event.get("type").and_then(Value::as_str) != Some("content_block_delta") {
+        return None;
+    }
+    let delta = event.get("delta")?;
+    if delta.get("type").and_then(Value::as_str) != Some("text_delta") {
+        return None;
+    }
+    delta.get("text").and_then(Value::as_str)
 }
 
 /// system/init の session_id を取り出す。stream-json は snake_case、
@@ -601,20 +611,43 @@ fn parse_denial(value: &Value) -> ClaudeDenial {
     ClaudeDenial { tool_name, target }
 }
 
-/// 拒否されたツール群から必要な昇格レベルを決める。
-/// Edit/Write/NotebookEdit だけなら acceptEdits、それ以外を含むなら全許可。
-pub(super) fn escalation_for_denials(denials: &[ClaudeDenial]) -> PermissionEscalation {
-    let edit_only = denials.iter().all(|d| {
-        matches!(
-            d.tool_name.as_str(),
-            "Edit" | "Write" | "MultiEdit" | "NotebookEdit"
-        )
-    });
-    if edit_only && !denials.is_empty() {
-        PermissionEscalation::AcceptEdits
-    } else {
-        PermissionEscalation::SkipPermissions
+/// Bash コマンドから `--allowedTools` のプレフィックスルールを作る。
+/// 先頭のプログラム名と、`-` で始まらない次のサブコマンドまでを対象にする。
+/// 例: `git push origin main` → `Bash(git push:*)` / `rm -rf x` → `Bash(rm:*)`。
+fn bash_prefix_rule(command: &str) -> String {
+    let mut tokens = command.split_whitespace();
+    let Some(prog) = tokens.next() else {
+        return "Bash".to_string();
+    };
+    let prefix = match tokens.next() {
+        Some(sub) if !sub.starts_with('-') => format!("{prog} {sub}"),
+        _ => prog.to_string(),
+    };
+    format!("Bash({prefix}:*)")
+}
+
+/// 拒否 1 件から `--allowedTools` ルール文字列を生成する。
+/// Bash はコマンド先頭語ベースのプレフィックスルール、それ以外はツール名そのもの。
+pub(super) fn allowed_tool_rule(denial: &ClaudeDenial) -> String {
+    match denial.tool_name.as_str() {
+        "Bash" | "BashOutput" => match denial.target.as_deref() {
+            Some(command) if !command.trim().is_empty() => bash_prefix_rule(command),
+            _ => "Bash".to_string(),
+        },
+        other => other.to_string(),
     }
+}
+
+/// 拒否群から重複を除いた `--allowedTools` ルール一覧を生成する。
+pub(super) fn allowed_tool_rules(denials: &[ClaudeDenial]) -> Vec<String> {
+    let mut rules: Vec<String> = Vec::new();
+    for denial in denials {
+        let rule = allowed_tool_rule(denial);
+        if !rules.contains(&rule) {
+            rules.push(rule);
+        }
+    }
+    rules
 }
 
 /// result / assistant の usage からトークン・コスト要約を作る。
@@ -774,10 +807,16 @@ mod tests {
     #[test]
     fn exec_args_first_turn_has_stream_json_and_system_prompt() {
         let settings = ClaudeExecSettings::default();
-        let args = os(&exec_args(None, &settings, None, false, "INSTRUCTIONS"));
+        let args = os(&exec_args(None, &settings, &[], false, "INSTRUCTIONS"));
         assert_eq!(
-            &args[0..4],
-            &["-p", "--output-format", "stream-json", "--verbose"]
+            &args[0..5],
+            &[
+                "-p",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--include-partial-messages"
+            ]
         );
         assert!(!args.iter().any(|a| a == "--resume"));
         // config 既定なのでモデル・effort・permission は付かない。
@@ -794,7 +833,7 @@ mod tests {
     #[test]
     fn exec_args_resume_adds_session_id() {
         let settings = ClaudeExecSettings::default();
-        let args = os(&exec_args(Some("sess-123"), &settings, None, false, "x"));
+        let args = os(&exec_args(Some("sess-123"), &settings, &[], false, "x"));
         let idx = args.iter().position(|a| a == "--resume").unwrap();
         assert_eq!(args[idx + 1], "sess-123");
         assert!(!args.iter().any(|a| a == "--fork-session"));
@@ -803,7 +842,7 @@ mod tests {
     #[test]
     fn exec_args_fork_adds_fork_flag() {
         let settings = ClaudeExecSettings::default();
-        let args = os(&exec_args(Some("sess-123"), &settings, None, true, "x"));
+        let args = os(&exec_args(Some("sess-123"), &settings, &[], true, "x"));
         assert!(args.iter().any(|a| a == "--fork-session"));
     }
 
@@ -813,7 +852,7 @@ mod tests {
         settings.set_model("opus");
         settings.set_effort(ClaudeEffortChoice::High);
         settings.set_permission_mode(ClaudePermissionMode::AcceptEdits);
-        let args = os(&exec_args(None, &settings, None, false, "x"));
+        let args = os(&exec_args(None, &settings, &[], false, "x"));
         let m = args.iter().position(|a| a == "--model").unwrap();
         assert_eq!(args[m + 1], "opus");
         let e = args.iter().position(|a| a == "--effort").unwrap();
@@ -826,46 +865,39 @@ mod tests {
     fn exec_args_model_override_takes_precedence() {
         let mut settings = ClaudeExecSettings::default();
         settings.set_model("claude-opus-4-8");
-        let args = os(&exec_args(None, &settings, None, false, "x"));
+        let args = os(&exec_args(None, &settings, &[], false, "x"));
         let m = args.iter().position(|a| a == "--model").unwrap();
         assert_eq!(args[m + 1], "claude-opus-4-8");
     }
 
     #[test]
-    fn exec_args_one_shot_skip_permissions_wins() {
-        let mut settings = ClaudeExecSettings::default();
-        settings.set_permission_mode(ClaudePermissionMode::Plan);
-        let args = os(&exec_args(
-            None,
-            &settings,
-            Some(PermissionEscalation::SkipPermissions),
-            false,
-            "x",
-        ));
-        assert!(args.iter().any(|a| a == "--dangerously-skip-permissions"));
-        assert!(!args.iter().any(|a| a == "--permission-mode"));
-    }
-
-    #[test]
-    fn exec_args_one_shot_accept_edits() {
+    fn exec_args_one_shot_allowed_tools_added_after_flag() {
         let settings = ClaudeExecSettings::default();
-        let args = os(&exec_args(
-            Some("s"),
-            &settings,
-            Some(PermissionEscalation::AcceptEdits),
-            false,
-            "x",
-        ));
-        let p = args.iter().position(|a| a == "--permission-mode").unwrap();
-        assert_eq!(args[p + 1], "acceptEdits");
+        let one_shot = vec!["Bash(git push:*)".to_string(), "Edit".to_string()];
+        let args = os(&exec_args(Some("s"), &settings, &one_shot, false, "x"));
+        let idx = args.iter().position(|a| a == "--allowedTools").unwrap();
+        assert_eq!(args[idx + 1], "Bash(git push:*)");
+        assert_eq!(args[idx + 2], "Edit");
+        // 自動での全許可昇格は廃止済み。
+        assert!(!args.iter().any(|a| a == "--dangerously-skip-permissions"));
     }
 
     #[test]
-    fn exec_args_sticky_skip_permissions() {
+    fn exec_args_sticky_and_one_shot_allowed_tools_dedup() {
         let mut settings = ClaudeExecSettings::default();
-        settings.apply_sticky_escalation(PermissionEscalation::SkipPermissions);
-        let args = os(&exec_args(None, &settings, None, false, "x"));
-        assert!(args.iter().any(|a| a == "--dangerously-skip-permissions"));
+        settings.add_allowed_tools(&["Edit".to_string()]);
+        let one_shot = vec!["Edit".to_string(), "Bash(cargo test:*)".to_string()];
+        let args = os(&exec_args(None, &settings, &one_shot, false, "x"));
+        // sticky の Edit と one-shot の Edit は 1 つに統合される。
+        assert_eq!(args.iter().filter(|a| *a == "Edit").count(), 1);
+        assert!(args.iter().any(|a| a == "Bash(cargo test:*)"));
+    }
+
+    #[test]
+    fn exec_args_no_allowed_tools_flag_when_empty() {
+        let settings = ClaudeExecSettings::default();
+        let args = os(&exec_args(None, &settings, &[], false, "x"));
+        assert!(!args.iter().any(|a| a == "--allowedTools"));
     }
 
     #[test]
@@ -873,7 +905,7 @@ mod tests {
         let mut settings = ClaudeExecSettings::default();
         settings.add_dir("/a".to_string());
         settings.add_dir("/b".to_string());
-        let args = os(&exec_args(None, &settings, None, false, "x"));
+        let args = os(&exec_args(None, &settings, &[], false, "x"));
         assert_eq!(args.iter().filter(|a| *a == "--add-dir").count(), 2);
     }
 
@@ -987,23 +1019,69 @@ mod tests {
     }
 
     #[test]
-    fn escalation_edit_only_vs_bash() {
-        let edits = vec![ClaudeDenial {
-            tool_name: "Write".to_string(),
-            target: None,
-        }];
-        assert_eq!(
-            escalation_for_denials(&edits),
-            PermissionEscalation::AcceptEdits
-        );
-        let with_bash = vec![ClaudeDenial {
+    fn allowed_tool_rule_bash_prefix_and_edit() {
+        let git = ClaudeDenial {
             tool_name: "Bash".to_string(),
-            target: None,
-        }];
+            target: Some("git push origin main".to_string()),
+        };
+        assert_eq!(allowed_tool_rule(&git), "Bash(git push:*)");
+        let rm = ClaudeDenial {
+            tool_name: "Bash".to_string(),
+            target: Some("rm -rf x".to_string()),
+        };
+        assert_eq!(allowed_tool_rule(&rm), "Bash(rm:*)");
+        let write = ClaudeDenial {
+            tool_name: "Write".to_string(),
+            target: Some("/a.rs".to_string()),
+        };
+        assert_eq!(allowed_tool_rule(&write), "Write");
+    }
+
+    #[test]
+    fn allowed_tool_rules_dedup() {
+        let denials = vec![
+            ClaudeDenial {
+                tool_name: "Bash".to_string(),
+                target: Some("git push origin main".to_string()),
+            },
+            ClaudeDenial {
+                tool_name: "Bash".to_string(),
+                target: Some("git push --force".to_string()),
+            },
+            ClaudeDenial {
+                tool_name: "Write".to_string(),
+                target: None,
+            },
+        ];
+        // 同じ git push プレフィックスは 1 つに畳まれる。
         assert_eq!(
-            escalation_for_denials(&with_bash),
-            PermissionEscalation::SkipPermissions
+            allowed_tool_rules(&denials),
+            vec!["Bash(git push:*)".to_string(), "Write".to_string()]
         );
+    }
+
+    #[test]
+    fn stream_text_delta_extracts_only_text_delta() {
+        let text = json!({
+            "type": "stream_event",
+            "event": {"type": "content_block_delta", "index": 0,
+                      "delta": {"type": "text_delta", "text": "こん"}}
+        });
+        assert_eq!(stream_text_delta(&text), Some("こん"));
+        let thinking = json!({
+            "type": "stream_event",
+            "event": {"type": "content_block_delta", "index": 0,
+                      "delta": {"type": "thinking_delta", "thinking": "考える"}}
+        });
+        assert_eq!(stream_text_delta(&thinking), None);
+        let start = json!({
+            "type": "stream_event",
+            "event": {"type": "content_block_start", "index": 0,
+                      "content_block": {"type": "text", "text": ""}}
+        });
+        assert_eq!(stream_text_delta(&start), None);
+        let assistant = json!({"type": "assistant", "message": {"content": []}});
+        assert_eq!(stream_text_delta(&assistant), None);
     }
 
     #[test]

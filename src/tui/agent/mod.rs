@@ -1896,13 +1896,13 @@ pub struct CodexPane {
     /// ClaudeCode バックエンドの次ターン設定（codex の `exec_settings` と並置）。
     /// codex 経路では未使用。
     claude_settings: claude::ClaudeExecSettings,
-    /// 承認 Accept で「今回だけ」権限昇格する場合の一時上書き（claude 専用）。
-    /// codex の `one_shot_approval` に相当する claude 版。
-    claude_one_shot_permission: Option<claude::PermissionEscalation>,
+    /// 承認 Accept で「今回だけ」許可するツールルール（`--allowedTools`、claude 専用）。
+    /// 次ターン起動時に消費して空へ戻す。codex の `one_shot_approval` に相当。
+    claude_one_shot_allowed_tools: Vec<String>,
     /// 次ターンを `--fork-session` で開始するか（/fork-* で立てる。1 ターンで消費）。
     claude_fork_next: bool,
-    /// 承認バナー表示中に、Accept/Always で適用する権限昇格レベル（claude 専用）。
-    claude_pending_escalation: Option<claude::PermissionEscalation>,
+    /// 承認バナー表示中に、Accept/Always で適用する `--allowedTools` ルール（claude 専用）。
+    claude_pending_allowed_tools: Vec<String>,
 }
 
 impl CodexPane {
@@ -2043,9 +2043,9 @@ impl CodexPane {
             goal_mode,
             dod,
             claude_settings: claude::ClaudeExecSettings::default(),
-            claude_one_shot_permission: None,
+            claude_one_shot_allowed_tools: Vec::new(),
             claude_fork_next: false,
-            claude_pending_escalation: None,
+            claude_pending_allowed_tools: Vec::new(),
         };
         let name = kind.display_name();
         if pane.loaded_history_count > 0 {
@@ -2101,9 +2101,9 @@ impl CodexPane {
         pane.exec_settings = CodexExecSettings::default();
         pane.one_shot_approval = None;
         pane.claude_settings = claude::ClaudeExecSettings::default();
-        pane.claude_one_shot_permission = None;
+        pane.claude_one_shot_allowed_tools = Vec::new();
         pane.claude_fork_next = false;
-        pane.claude_pending_escalation = None;
+        pane.claude_pending_allowed_tools = Vec::new();
         pane.diff_view = None;
         pane.addness_body_excerpt = None;
         pane.turn_picker = None;
@@ -2417,6 +2417,13 @@ impl CodexPane {
             }
         }
         visible
+    }
+
+    /// ストリーミング中（未完成）の assistant ログ行への参照を返す。
+    /// 描画側で「Markdown 整形せずプレーン表示する行」を識別するために使う。
+    pub fn streaming_assistant_line(&self) -> Option<&CodexLogLine> {
+        self.streaming_assistant_index
+            .and_then(|index| self.log.get(index))
     }
 
     pub fn toggle_visible_turn_collapsed(&mut self) -> bool {
@@ -2921,7 +2928,7 @@ impl CodexPane {
         if self.kind == AgentKind::ClaudeCode {
             self.push_log(
                 CodexLogKind::System,
-                "Claude Code バックエンドではサンドボックス設定は未対応です",
+                "Claude Code では権限は F4（permission-mode: config/plan/acceptEdits/dontAsk/bypassPermissions）で切り替えます。F5 のサンドボックス設定は使いません",
             );
             return;
         }
@@ -3755,13 +3762,20 @@ impl CodexPane {
                 let result = claude::parse_result(value);
                 self.handle_claude_result(result);
             }
+            "stream_event" => {
+                // `--include-partial-messages` の text_delta をトークン単位で逐次表示する。
+                // thinking_delta / input_json_delta 等はここでは表示しない（完成形で出す）。
+                if let Some(delta) = claude::stream_text_delta(value) {
+                    self.append_assistant_delta(delta);
+                }
+            }
             "error" => {
                 let message =
                     first_text_field(value).unwrap_or_else(|| "Claude Code エラー".to_string());
                 self.push_log(CodexLogKind::Error, message.clone());
                 self.push_terminal_notice("Claude Code エラー", message);
             }
-            // rate_limit_event / stream_event など未知・非表示イベントは無視する。
+            // rate_limit_event など未知・非表示イベントは無視する。
             _ => {}
         }
     }
@@ -3789,10 +3803,16 @@ impl CodexPane {
     }
 
     fn handle_claude_assistant(&mut self, value: &Value) {
+        // text ブロックを stream_event で逐次表示済みなら、完成形の text は二重表示しない。
+        // （streaming_assistant_index が張られている＝直前にトークンを流している）
+        let streamed_text = self.streaming_assistant_index.take().is_some();
         for block in claude::assistant_blocks(value) {
             match block {
                 claude::ClaudeBlock::Text(text) => {
-                    self.streaming_assistant_index = None;
+                    if streamed_text {
+                        // 逐次表示済みの行をそのまま活かす（push しない）。
+                        continue;
+                    }
                     self.push_log(CodexLogKind::Assistant, text);
                 }
                 claude::ClaudeBlock::Thinking(text) => {
@@ -3867,7 +3887,9 @@ impl CodexPane {
     }
 
     fn set_claude_permission_decision(&mut self, denials: &[claude::ClaudeDenial]) {
-        self.claude_pending_escalation = Some(claude::escalation_for_denials(denials));
+        // 拒否された具体的なツールだけを許可するルールを生成する。
+        let rules = claude::allowed_tool_rules(denials);
+        self.claude_pending_allowed_tools = rules.clone();
         let summary = denials
             .iter()
             .map(|denial| match &denial.target {
@@ -3878,7 +3900,13 @@ impl CodexPane {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        let message = format!("ツール実行権限が拒否されました: {summary}。許可して続行しますか？");
+        let allow = if rules.is_empty() {
+            String::new()
+        } else {
+            format!(" 許可: {}", rules.join(", "))
+        };
+        let message =
+            format!("ツール実行権限が拒否されました: {summary}。{allow} を許可して続行しますか？");
         self.set_pending_decision(CodexDecisionBanner::new(
             CodexDecisionKind::Permission,
             message,
@@ -3889,18 +3917,20 @@ impl CodexPane {
     fn resolve_claude_decision(&mut self, response: CodexDecisionResponse, response_label: &str) {
         self.action = Some(format!("確認応答: {response_label}"));
         self.push_activity(format!("確認待ちに {response_label} で応答"));
-        let escalation = self
-            .claude_pending_escalation
-            .take()
-            .unwrap_or(claude::PermissionEscalation::SkipPermissions);
+        let rules = std::mem::take(&mut self.claude_pending_allowed_tools);
+        let rules_label = if rules.is_empty() {
+            String::new()
+        } else {
+            format!("（{}）", rules.join(", "))
+        };
         match response {
             CodexDecisionResponse::Accept => {
-                self.claude_one_shot_permission = Some(escalation);
-                self.start_claude_approval_retry("今回だけ許可");
+                self.claude_one_shot_allowed_tools = rules;
+                self.start_claude_approval_retry(&format!("今回だけ許可{rules_label}"));
             }
             CodexDecisionResponse::Always => {
-                self.claude_settings.apply_sticky_escalation(escalation);
-                self.start_claude_approval_retry("これからずっと許可");
+                self.claude_settings.add_allowed_tools(&rules);
+                self.start_claude_approval_retry(&format!("これからずっと許可{rules_label}"));
             }
             CodexDecisionResponse::Deny => {
                 self.push_terminal_notice("Claude Code 確認応答", "拒否したため作業を中断します");
@@ -4320,7 +4350,7 @@ impl CodexPane {
         let prompt = self.prompt_with_addness_context(prompt);
         let command_result = self.spawn_exec_process(&prompt);
         self.one_shot_approval = None;
-        self.claude_one_shot_permission = None;
+        self.claude_one_shot_allowed_tools = Vec::new();
         self.claude_fork_next = false;
         match command_result {
             Ok(child) => {
@@ -5855,10 +5885,16 @@ impl CodexPane {
 
     fn push_permissions_status(&mut self) {
         if self.kind == AgentKind::ClaudeCode {
+            let allow = self.claude_settings.sticky_allowed_tools();
+            let allow_label = if allow.is_empty() {
+                "なし".to_string()
+            } else {
+                allow.join(", ")
+            };
             self.push_log(
                 CodexLogKind::System,
                 format!(
-                    "Permissions: permission-mode={}",
+                    "Permissions: permission-mode={} / 常に許可={allow_label}",
                     self.claude_settings.permission_label()
                 ),
             );
@@ -6986,7 +7022,7 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
                 for arg in claude::exec_args(
                     self.thread_id.as_deref(),
                     &self.claude_settings,
-                    self.claude_one_shot_permission,
+                    &self.claude_one_shot_allowed_tools,
                     self.claude_fork_next,
                     addness_tui_developer_instructions(),
                 ) {
@@ -9901,10 +9937,9 @@ mod tests {
         let banner = pane.pending_decision.as_ref().expect("banner");
         assert_eq!(banner.kind, CodexDecisionKind::Permission);
         assert!(banner.message.contains("Write"));
-        assert_eq!(
-            pane.claude_pending_escalation,
-            Some(claude::PermissionEscalation::AcceptEdits)
-        );
+        // 拒否された Write ツールだけを許可するルールが用意される。
+        assert_eq!(pane.claude_pending_allowed_tools, vec!["Write".to_string()]);
+        assert!(banner.message.contains("許可: Write"));
     }
 
     #[test]
@@ -9915,15 +9950,17 @@ mod tests {
             "type": "result", "subtype": "success", "is_error": false, "result": "done",
             "session_id": "sid-1",
             "permission_denials": [
-                {"tool_name": "Bash", "tool_use_id": "t1", "tool_input": {"command": "rm -rf x"}}
+                {"tool_name": "Bash", "tool_use_id": "t1", "tool_input": {"command": "git push origin main"}}
             ]
         }));
-        // Bash を含むので全許可へ昇格する。
+        // Bash はコマンド先頭語のプレフィックスルールとして許可候補になる。
         assert_eq!(
-            pane.claude_pending_escalation,
-            Some(claude::PermissionEscalation::SkipPermissions)
+            pane.claude_pending_allowed_tools,
+            vec!["Bash(git push:*)".to_string()]
         );
         pane.handle_decision_key(key(KeyCode::Char('a')));
+        // Accept で今回だけのルールが確定し、pending は消費される。
+        assert!(pane.claude_pending_allowed_tools.is_empty());
         // 続行プロンプトがユーザー表示として積まれ、resume 対象の session_id が保持される。
         assert!(
             pane.log
@@ -9931,6 +9968,53 @@ mod tests {
                 .any(|line| line.kind == CodexLogKind::User && line.text.contains("許可しました"))
         );
         assert_eq!(pane.thread_id.as_deref(), Some("sid-1"));
+    }
+
+    #[test]
+    fn claude_always_adds_sticky_allowed_tool() {
+        let mut pane = claude_pane();
+        pane.thread_id = Some("sid-1".to_string());
+        pane.handle_json_event(serde_json::json!({
+            "type": "result", "subtype": "success", "is_error": false, "result": "done",
+            "session_id": "sid-1",
+            "permission_denials": [
+                {"tool_name": "Write", "tool_use_id": "t1", "tool_input": {"file_path": "/a.rs"}}
+            ]
+        }));
+        // l（これからずっと許可）で sticky 許可リストへ入る。
+        pane.handle_decision_key(key(KeyCode::Char('l')));
+        assert!(pane.settings_label().contains("allow:1"));
+        // 今回だけの一時ルールには入らない。
+        assert!(pane.claude_one_shot_allowed_tools.is_empty());
+    }
+
+    #[test]
+    fn claude_stream_text_delta_shown_once() {
+        let mut pane = claude_pane();
+        // 部分メッセージのトークンを 2 つ流す。
+        pane.handle_json_event(serde_json::json!({
+            "type": "stream_event",
+            "event": {"type": "content_block_delta", "index": 0,
+                      "delta": {"type": "text_delta", "text": "こん"}}
+        }));
+        pane.handle_json_event(serde_json::json!({
+            "type": "stream_event",
+            "event": {"type": "content_block_delta", "index": 0,
+                      "delta": {"type": "text_delta", "text": "にちは"}}
+        }));
+        // 完成形の assistant イベントが後から来る。
+        pane.handle_json_event(serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "こんにちは"}]}
+        }));
+        let assistant_lines: Vec<_> = pane
+            .log
+            .iter()
+            .filter(|line| line.kind == CodexLogKind::Assistant)
+            .collect();
+        // 逐次表示した 1 行だけが残り、二重表示されない。
+        assert_eq!(assistant_lines.len(), 1);
+        assert_eq!(assistant_lines[0].text, "こんにちは");
     }
 
     #[test]
@@ -9942,12 +10026,12 @@ mod tests {
         assert!(pane.settings_label().contains("effort:low"));
         pane.cycle_approval();
         assert!(pane.settings_label().contains("permission:plan"));
-        // F5（sandbox）は Claude では no-op で通知だけ。
+        // F5（sandbox）は Claude では F4 へ案内する通知だけ。
         pane.cycle_sandbox();
         assert!(
             pane.log
                 .iter()
-                .any(|line| line.text.contains("サンドボックス設定は未対応"))
+                .any(|line| line.text.contains("F4") && line.text.contains("permission-mode"))
         );
     }
 

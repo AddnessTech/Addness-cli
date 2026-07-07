@@ -17,6 +17,7 @@ use super::agent::{
 };
 use super::app::{ActivePane, App, DeliverableFormField, FormField, ModalState};
 use super::goal_tree::{CommentView, TreeRow};
+use super::markdown::{self, MarkdownStyles};
 use crate::api::{DeliverableType, GoalStatus, Member, MemberId};
 
 const COLOR_TEXT: Color = Color::Rgb(220, 224, 230);
@@ -1020,7 +1021,7 @@ fn draw_help_overlay(frame: &mut Frame, app: &mut App) {
         kv("起動", "選択ゴールの文脈付きでcodexをペイン起動"),
         kv(
             "claude code連携",
-            "o →「claude codeで作業」で同様にペイン起動（F4=permission-mode、F5は未対応）",
+            "o →「claude codeで作業」で同様にペイン起動（権限はF4=permission-modeで切替。F5のsandboxは使わない）",
         ),
         kv("F2 / F3", "モデル / 推論強度を切替"),
         kv("F4 / F5", "承認モード / sandboxを切替"),
@@ -2939,12 +2940,14 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
     let (history_lines, total_history_lines) = if let Some(diff) = diff_view.as_deref() {
         codex_visible_diff_lines(diff, history_width, pane.scrollback, history_height)
     } else {
+        let streaming_line = pane.streaming_assistant_line();
         let filtered_log = pane.filtered_log_lines();
         codex_visible_log_lines(
             &filtered_log,
             history_width,
             pane.scrollback,
             history_height,
+            streaming_line,
         )
     };
     pane.sync_rendered_history_metrics(total_history_lines, history_height);
@@ -3702,7 +3705,11 @@ struct RenderedCodexLine {
     line: Line<'static>,
 }
 
-fn codex_log_lines(lines: &[&CodexLogLine], max_width: usize) -> Vec<RenderedCodexLine> {
+fn codex_log_lines(
+    lines: &[&CodexLogLine],
+    max_width: usize,
+    streaming: Option<&CodexLogLine>,
+) -> Vec<RenderedCodexLine> {
     lines
         .iter()
         .flat_map(|line| {
@@ -3710,10 +3717,17 @@ fn codex_log_lines(lines: &[&CodexLogLine], max_width: usize) -> Vec<RenderedCod
             if line.kind == CodexLogKind::Turn {
                 rendered.push(codex_separator_line(line.kind, max_width));
             }
-            rendered.extend(codex_log_entry_lines(line, max_width));
+            rendered.extend(codex_log_entry_lines(line, max_width, streaming));
             rendered
         })
         .collect()
+}
+
+/// assistant 行を Markdown 整形して描画すべきか判定する。
+/// ストリーミング中（未完成）の行はプレーン表示のままとする。
+fn is_completed_assistant(line: &CodexLogLine, streaming: Option<&CodexLogLine>) -> bool {
+    line.kind == CodexLogKind::Assistant
+        && !streaming.is_some_and(|current| std::ptr::eq(current, line))
 }
 
 fn codex_visible_log_lines(
@@ -3721,6 +3735,7 @@ fn codex_visible_log_lines(
     max_width: usize,
     scrollback: usize,
     viewport_height: usize,
+    streaming: Option<&CodexLogLine>,
 ) -> (Vec<RenderedCodexLine>, usize) {
     if lines.is_empty() || viewport_height == 0 {
         return (Vec::new(), 0);
@@ -3728,7 +3743,7 @@ fn codex_visible_log_lines(
 
     let counts = lines
         .iter()
-        .map(|line| codex_log_line_rendered_count(line, max_width))
+        .map(|line| codex_log_line_rendered_count(line, max_width, streaming))
         .collect::<Vec<_>>();
     let total = counts.iter().sum::<usize>();
     let max_scrollback = total.saturating_sub(viewport_height);
@@ -3751,7 +3766,7 @@ fn codex_visible_log_lines(
     let selected_start = selected_start.unwrap_or(view_start);
     let skip = view_start.saturating_sub(selected_start);
     let take = view_end.saturating_sub(view_start);
-    let visible = codex_log_lines(&selected, max_width)
+    let visible = codex_log_lines(&selected, max_width, streaming)
         .into_iter()
         .skip(skip)
         .take(take)
@@ -3835,9 +3850,24 @@ fn codex_diff_line_style(line: &str) -> Style {
     }
 }
 
-fn codex_log_line_rendered_count(line: &CodexLogLine, max_width: usize) -> usize {
+fn codex_log_line_rendered_count(
+    line: &CodexLogLine,
+    max_width: usize,
+    streaming: Option<&CodexLogLine>,
+) -> usize {
     let separator = usize::from(line.kind == CodexLogKind::Turn);
     let content_width = max_width.saturating_sub(CODEX_LOG_PREFIX_WIDTH).max(1);
+    if is_completed_assistant(line, streaming) {
+        // 描画（codex_log_entry_lines）と同じ経路で行数を数え、整合させる。
+        let count = markdown::render_assistant_markdown(
+            &line.text,
+            content_width,
+            &codex_markdown_styles(),
+        )
+        .len()
+        .max(1);
+        return separator + count;
+    }
     separator + wrapped_log_line_count(&codex_log_display_text(line), content_width)
 }
 
@@ -3860,10 +3890,17 @@ fn codex_separator_line(kind: CodexLogKind, max_width: usize) -> RenderedCodexLi
     }
 }
 
-fn codex_log_entry_lines(line: &CodexLogLine, max_width: usize) -> Vec<RenderedCodexLine> {
+fn codex_log_entry_lines(
+    line: &CodexLogLine,
+    max_width: usize,
+    streaming: Option<&CodexLogLine>,
+) -> Vec<RenderedCodexLine> {
     let (prefix, prefix_style, text_style) = codex_log_prefix(line);
     let continuation = "     | ";
     let content_width = max_width.saturating_sub(CODEX_LOG_PREFIX_WIDTH).max(1);
+    if is_completed_assistant(line, streaming) {
+        return codex_assistant_markdown_lines(&line.text, content_width, prefix, prefix_style);
+    }
     let text = codex_log_display_text(line);
     let is_edit_tool = matches!(line.kind, CodexLogKind::Tool) && line.text.starts_with("EDIT ");
     let wrapped = wrap_log_text(&text, content_width);
@@ -3889,6 +3926,63 @@ fn codex_log_entry_lines(line: &CodexLogLine, max_width: usize) -> Vec<RenderedC
         ));
         lines.push(RenderedCodexLine {
             line: Line::from(spans),
+        });
+    }
+    lines
+}
+
+/// assistant メッセージのテーマ配色。
+fn codex_markdown_styles() -> MarkdownStyles {
+    MarkdownStyles {
+        text: Style::default().fg(COLOR_TEXT),
+        heading: Style::default()
+            .fg(COLOR_ADDNESS)
+            .add_modifier(Modifier::BOLD),
+        strong: Style::default()
+            .fg(COLOR_TEXT_STRONG)
+            .add_modifier(Modifier::BOLD),
+        emphasis: Style::default()
+            .fg(COLOR_TEXT)
+            .add_modifier(Modifier::ITALIC),
+        inline_code: Style::default().fg(COLOR_WARN).bg(COLOR_INPUT_BG),
+        code_block: Style::default().fg(COLOR_TEXT).bg(COLOR_INPUT_BG),
+        code_label: Style::default().fg(COLOR_MUTED),
+        quote: Style::default()
+            .fg(COLOR_MUTED)
+            .add_modifier(Modifier::ITALIC),
+        quote_marker: Style::default().fg(COLOR_PANEL),
+        list_marker: Style::default()
+            .fg(COLOR_ADDNESS)
+            .add_modifier(Modifier::BOLD),
+        rule: Style::default().fg(COLOR_PANEL),
+        link: Style::default()
+            .fg(COLOR_ADDNESS)
+            .add_modifier(Modifier::UNDERLINED),
+    }
+}
+
+/// 完成済み assistant メッセージを Markdown 整形し、プレフィックス列付きの
+/// 描画行に変換する。折り返しは `render_assistant_markdown` 側で実施済み。
+fn codex_assistant_markdown_lines(
+    text: &str,
+    content_width: usize,
+    prefix: &'static str,
+    prefix_style: Style,
+) -> Vec<RenderedCodexLine> {
+    let continuation = "     | ";
+    let content_lines =
+        markdown::render_assistant_markdown(text, content_width, &codex_markdown_styles());
+    let mut lines = Vec::with_capacity(content_lines.len().max(1));
+    for (idx, mut spans) in content_lines.into_iter().enumerate() {
+        let (prefix_text, marker_style) = if idx == 0 {
+            (prefix, prefix_style)
+        } else {
+            (continuation, Style::default().fg(COLOR_PANEL))
+        };
+        let mut line_spans = vec![Span::styled(prefix_text, marker_style)];
+        line_spans.append(&mut spans);
+        lines.push(RenderedCodexLine {
+            line: Line::from(line_spans),
         });
     }
     lines
@@ -5027,7 +5121,7 @@ mod tests {
             text: "abcdef".to_string(),
         };
 
-        let lines = codex_log_entry_lines(&entry, CODEX_LOG_PREFIX_WIDTH + 3);
+        let lines = codex_log_entry_lines(&entry, CODEX_LOG_PREFIX_WIDTH + 3, None);
 
         assert_eq!(lines.len(), 2);
         assert_eq!(line_text(&lines[0].line), "返答 | abc");
@@ -5041,7 +5135,7 @@ mod tests {
             text: "exec_command_end (exit 1): cargo test\nfailed".to_string(),
         };
 
-        let lines = codex_log_entry_lines(&entry, 80);
+        let lines = codex_log_entry_lines(&entry, 80, None);
 
         assert_eq!(line_text(&lines[0].line), "失敗 | • 実行: cargo test");
         assert_eq!(line_text(&lines[1].line), "     |   └ テスト: 失敗");
@@ -5055,7 +5149,7 @@ mod tests {
             kind: CodexLogKind::Tool,
             text: "RUNNING cargo test".to_string(),
         };
-        let running_lines = codex_log_entry_lines(&running, 80);
+        let running_lines = codex_log_entry_lines(&running, 80, None);
         assert_eq!(running_lines[0].line.spans[1].content.as_ref(), "•");
         assert_eq!(running_lines[0].line.spans[1].style.fg, Some(COLOR_WARN));
 
@@ -5063,7 +5157,7 @@ mod tests {
             kind: CodexLogKind::Tool,
             text: "exec_command_end (exit 0): cargo test\nok".to_string(),
         };
-        let ok_lines = codex_log_entry_lines(&ok, 80);
+        let ok_lines = codex_log_entry_lines(&ok, 80, None);
         assert_eq!(ok_lines[0].line.spans[1].content.as_ref(), "•");
         assert_eq!(ok_lines[0].line.spans[1].style.fg, Some(COLOR_SUCCESS));
     }
@@ -5078,7 +5172,7 @@ mod tests {
             ),
         };
 
-        let lines = codex_log_entry_lines(&entry, 240);
+        let lines = codex_log_entry_lines(&entry, 240, None);
         let rendered = lines
             .iter()
             .map(|line| line_text(&line.line))
@@ -5101,7 +5195,7 @@ mod tests {
             text: "EDIT *** Begin Patch\n*** Update File: src/tui/ui.rs\n@@\n-old line\n+new line\n*** End Patch".to_string(),
         };
 
-        let lines = codex_log_entry_lines(&entry, 80);
+        let lines = codex_log_entry_lines(&entry, 80, None);
 
         assert_eq!(line_text(&lines[0].line), "編集 | 更新: src/tui/ui.rs");
         assert_eq!(line_text(&lines[1].line), "     | @@");
@@ -5392,7 +5486,7 @@ mod tests {
             kind: CodexLogKind::Tool,
             text: "exec_command_end (exit 0): cargo test\nok".to_string(),
         };
-        let lines = codex_log_entry_lines(&entry, 80);
+        let lines = codex_log_entry_lines(&entry, 80, None);
 
         assert!(
             !lines[0].line.spans[0]
@@ -5414,7 +5508,7 @@ mod tests {
             kind: CodexLogKind::Event,
             text: "waiting for approval".to_string(),
         };
-        let lines = codex_log_entry_lines(&entry, 80);
+        let lines = codex_log_entry_lines(&entry, 80, None);
 
         assert!(
             !lines[0].line.spans[0]
@@ -5430,7 +5524,7 @@ mod tests {
             kind: CodexLogKind::Event,
             text: "waiting for approval".to_string(),
         };
-        let lines = codex_log_entry_lines(&entry, 80);
+        let lines = codex_log_entry_lines(&entry, 80, None);
         let spans = &lines[0].line.spans;
 
         assert!(line_text(&lines[0].line).starts_with("     | "));
@@ -5449,7 +5543,7 @@ mod tests {
             kind: CodexLogKind::System,
             text: "Codex セッションを開始しました".to_string(),
         };
-        let lines = codex_log_entry_lines(&entry, 80);
+        let lines = codex_log_entry_lines(&entry, 80, None);
 
         assert!(line_text(&lines[0].line).starts_with("     | "));
         assert!(!line_text(&lines[0].line).starts_with("INFO | "));
@@ -5465,7 +5559,7 @@ mod tests {
             kind: CodexLogKind::Tool,
             text: "exec_command_begin: cargo test".to_string(),
         };
-        let lines = codex_log_lines(&[&turn, &tool], 24)
+        let lines = codex_log_lines(&[&turn, &tool], 24, None)
             .into_iter()
             .map(|line| line_text(&line.line))
             .collect::<Vec<_>>();
@@ -5484,8 +5578,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let refs = entries.iter().collect::<Vec<_>>();
-        let full = codex_log_lines(&refs, 40);
-        let (visible, total) = codex_visible_log_lines(&refs, 40, 3, 5);
+        let full = codex_log_lines(&refs, 40, None);
+        let (visible, total) = codex_visible_log_lines(&refs, 40, 3, 5, None);
 
         assert_eq!(total, full.len());
         let expected = full[full.len() - 8..full.len() - 3]

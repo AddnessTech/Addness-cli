@@ -3,6 +3,7 @@ mod app;
 mod codex_memory;
 mod file_picker;
 mod goal_tree;
+mod markdown;
 mod ui;
 
 use anyhow::Result;

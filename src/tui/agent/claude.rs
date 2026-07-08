@@ -870,6 +870,17 @@ fn usage_summary(value: &Value) -> Option<String> {
     }
 }
 
+/// result の usage からコンテキストを占めるトークン数（input + cache_read + cache_creation）を返す。
+/// output_tokens は含めない（次リクエストのコンテキストには input として積まれるため二重計上しない）。
+pub(super) fn context_tokens(value: &Value) -> Option<u64> {
+    let usage = value.get("usage")?;
+    let field = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let total = field("input_tokens")
+        + field("cache_read_input_tokens")
+        + field("cache_creation_input_tokens");
+    (total > 0).then_some(total)
+}
+
 // ---------------------------------------------------------------------------
 // セッション候補探索（~/.claude/projects/<cwd スラッグ>/*.jsonl）
 // ---------------------------------------------------------------------------

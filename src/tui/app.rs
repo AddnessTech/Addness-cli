@@ -22,7 +22,10 @@ use crate::api::{
 };
 use crate::dbg_log;
 
-use super::agent::{self, AgentKind, ChildGoalUpdate, CodexPane, CodexWorkSummary, TerminalNotice};
+use super::agent::{
+    self, AgentKind, CheckpointRequest, ChildGoalUpdate, CodexPane, CodexWorkSummary,
+    TerminalNotice, UndoRequest,
+};
 use super::codex_memory::{codex_body_update_request, codex_trace_link_label, codex_work_memo};
 pub(super) use super::file_picker::PICKER_VISIBLE_ROWS;
 use super::file_picker::{
@@ -580,7 +583,62 @@ impl DodJob {
     }
 }
 
+/// 短いターン（開始から未満なら通知しない）の抑制閾値。
+const NOTIFY_MIN_TURN_SECS: u64 = 10;
+
+/// `ADDNESS_NOTIFY` で選べる通知レベル。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotifyMode {
+    /// すべて無効。
+    Off,
+    /// ターミナルベルのみ。
+    Bell,
+    /// ベル + OS 通知（既定）。
+    Full,
+}
+
+/// `ADDNESS_NOTIFY` の値を通知レベルへ解釈する。未設定・不明値は既定の `Full`。
+fn parse_notify_mode(raw: Option<&str>) -> NotifyMode {
+    match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("off") | Some("none") | Some("0") => NotifyMode::Off,
+        Some("bell") => NotifyMode::Bell,
+        _ => NotifyMode::Full,
+    }
+}
+
+/// ターン所要秒から通知を出すべきか判定する。
+/// `Some(n)` かつ閾値未満なら短いターンとして抑制、それ以外（承認・不明）は通知する。
+fn should_emit_notice(turn_elapsed_secs: Option<u64>, threshold_secs: u64) -> bool {
+    match turn_elapsed_secs {
+        Some(secs) => secs >= threshold_secs,
+        None => true,
+    }
+}
+
+/// AppleScript の文字列リテラルへ安全に埋め込めるようエスケープする。
+/// `\` と `"` をエスケープし、改行類は空白へ潰す（osascript には引数で渡すためシェル注入は起きない）。
+fn applescript_string_escape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' | '\r' | '\t' => out.push(' '),
+            ch if ch.is_control() => {}
+            ch => out.push(ch),
+        }
+    }
+    out
+}
+
 fn emit_terminal_notification(notice: &TerminalNotice) {
+    let mode = parse_notify_mode(std::env::var("ADDNESS_NOTIFY").ok().as_deref());
+    if mode == NotifyMode::Off {
+        return;
+    }
+    if !should_emit_notice(notice.turn_elapsed_secs, NOTIFY_MIN_TURN_SECS) {
+        return;
+    }
     let title = terminal_notification_text(&notice.title, 80);
     let message = terminal_notification_text(&notice.message, 240);
     if message.is_empty() {
@@ -588,11 +646,68 @@ fn emit_terminal_notification(notice: &TerminalNotice) {
     }
 
     let mut stdout = std::io::stdout();
-    let _ = write!(
-        stdout,
-        "\x07\x1b]9;{message}\x07\x1b]777;notify;{title};{message}\x07"
-    );
+    match mode {
+        NotifyMode::Bell => {
+            let _ = write!(stdout, "\x07");
+        }
+        NotifyMode::Full => {
+            let _ = write!(
+                stdout,
+                "\x07\x1b]9;{message}\x07\x1b]777;notify;{title};{message}\x07"
+            );
+        }
+        NotifyMode::Off => unreachable!(),
+    }
     let _ = stdout.flush();
+
+    // macOS では加えて osascript のデスクトップ通知を投げる（Full のみ）。
+    #[cfg(target_os = "macos")]
+    if mode == NotifyMode::Full {
+        let body = match &notice.context {
+            Some(ctx) if !ctx.trim().is_empty() => {
+                format!("{}｜{}", terminal_notification_text(ctx, 80), title)
+            }
+            _ => title.clone(),
+        };
+        spawn_macos_notification(&body);
+    }
+}
+
+/// macOS の `display notification` を別スレッドで投げる。UI をブロックしないよう wait せず、
+/// 5 秒でタイムアウトさせて回収する。失敗は無視する。
+#[cfg(target_os = "macos")]
+fn spawn_macos_notification(body: &str) {
+    let script = format!(
+        "display notification \"{}\" with title \"Addness\"",
+        applescript_string_escape(body)
+    );
+    std::thread::spawn(move || {
+        let Ok(mut child) = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        else {
+            return;
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(_) => break,
+            }
+        }
+    });
 }
 
 fn terminal_notification_text(input: &str, max_chars: usize) -> String {
@@ -616,6 +731,157 @@ fn terminal_notification_text(input: &str, max_chars: usize) -> String {
     let mut out = collapsed.chars().take(keep).collect::<String>();
     out.push_str("...");
     out
+}
+
+// ---------------------------------------------------------------------------
+// ターン単位チェックポイント / undo の git 実行（すべてブロッキングプールで実行する）
+// ---------------------------------------------------------------------------
+
+/// チェックポイント作成ジョブの結果。
+enum CheckpointJobResult {
+    /// ref を作成した（変更あり=スナップショット / 変更なし=HEAD）。
+    Recorded,
+    /// git リポジトリではない → 記録しない。
+    NotRepo,
+    /// 失敗（薄くログするだけでターンは続行する）。
+    Failed(String),
+}
+
+struct CheckpointJobOutcome {
+    ref_name: String,
+    turn: usize,
+    result: CheckpointJobResult,
+}
+
+struct UndoJobOutcome {
+    turn: usize,
+    error: Option<String>,
+}
+
+fn git_is_repo(cwd: &std::path::Path) -> bool {
+    std::process::Command::new("git")
+        .current_dir(cwd)
+        .args(["rev-parse", "--git-dir"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// git を実行し、成功時に stdout（trim 済み）を返す。失敗は None。
+fn git_capture(
+    cwd: &std::path::Path,
+    args: &[&str],
+    index: Option<&std::path::Path>,
+) -> Option<String> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.current_dir(cwd).args(args);
+    if let Some(index) = index {
+        cmd.env("GIT_INDEX_FILE", index);
+    }
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// git を実行し、成功なら Ok、失敗なら stderr を Err で返す。
+fn git_run(
+    cwd: &std::path::Path,
+    args: &[&str],
+    index: Option<&std::path::Path>,
+) -> Result<(), String> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.current_dir(cwd).args(args);
+    if let Some(index) = index {
+        cmd.env("GIT_INDEX_FILE", index);
+    }
+    let out = cmd.output().map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// 一時 index を使い、作業ツリー全体（untracked 含む）のスナップショットコミットを作る。
+/// 実 index・作業ツリー・スタッシュを一切変更しない。生成コミット SHA を返す。
+fn git_snapshot_commit(cwd: &std::path::Path, head: &str, message: &str) -> Result<String, String> {
+    let tmp_index = std::env::temp_dir().join(format!(
+        "addness-checkpoint-index-{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    let _ = std::fs::remove_file(&tmp_index);
+    let result = (|| {
+        // HEAD の内容で一時 index を初期化してから作業ツリー全体を stage する。
+        git_run(cwd, &["read-tree", "HEAD"], Some(&tmp_index))?;
+        git_run(cwd, &["add", "-A"], Some(&tmp_index))?;
+        let tree = git_capture(cwd, &["write-tree"], Some(&tmp_index))
+            .ok_or_else(|| "write-tree に失敗".to_string())?;
+        git_capture(
+            cwd,
+            &["commit-tree", &tree, "-p", head, "-m", message],
+            None,
+        )
+        .ok_or_else(|| "commit-tree に失敗".to_string())
+    })();
+    let _ = std::fs::remove_file(&tmp_index);
+    result
+}
+
+/// チェックポイント ref を作成する（変更があればスナップショット、無ければ HEAD を指す）。
+fn git_create_checkpoint(cwd: &str, ref_name: &str, message: &str) -> CheckpointJobResult {
+    let cwd = std::path::Path::new(cwd);
+    if !git_is_repo(cwd) {
+        return CheckpointJobResult::NotRepo;
+    }
+    let Some(head) = git_capture(cwd, &["rev-parse", "HEAD"], None) else {
+        return CheckpointJobResult::Failed("HEAD を取得できません（初期コミット前）".to_string());
+    };
+    let porcelain = git_capture(cwd, &["status", "--porcelain"], None).unwrap_or_default();
+    let commit = if agent::git_status_has_changes(&porcelain) {
+        match git_snapshot_commit(cwd, &head, message) {
+            Ok(sha) => sha,
+            Err(e) => return CheckpointJobResult::Failed(e),
+        }
+    } else {
+        head
+    };
+    match git_run(cwd, &["update-ref", ref_name, &commit], None) {
+        Ok(()) => CheckpointJobResult::Recorded,
+        Err(e) => CheckpointJobResult::Failed(e),
+    }
+}
+
+/// チェックポイント ref の状態へ作業ツリーとインデックスを戻す。
+/// ref に存在しない（チェックポイント後に新規作成された）ファイルは削除しない。
+fn git_restore_checkpoint(cwd: &str, ref_name: &str) -> Result<(), String> {
+    let cwd = std::path::Path::new(cwd);
+    git_run(
+        cwd,
+        &[
+            "restore",
+            "--source",
+            ref_name,
+            "--staged",
+            "--worktree",
+            "--",
+            ":/",
+        ],
+        None,
+    )
+}
+
+/// チェックポイント ref を削除する（掃除用、失敗は無視）。
+fn git_delete_ref(cwd: &str, ref_name: &str) {
+    let _ = git_run(
+        std::path::Path::new(cwd),
+        &["update-ref", "-d", ref_name],
+        None,
+    );
 }
 
 pub struct App {
@@ -695,6 +961,10 @@ pub struct App {
     codex_dod_job: Option<DodJob>,
     /// 最初の実依頼など、節目の Codex 作業メモを body に非同期記録するジョブ。
     codex_body_record_job: Option<JoinHandle<CodexBodyRecordOutcome>>,
+    /// ターン開始時チェックポイント作成の非同期ジョブ。
+    codex_checkpoint_job: Option<JoinHandle<CheckpointJobOutcome>>,
+    /// /undo（チェックポイント復元）の非同期ジョブ。
+    codex_undo_job: Option<JoinHandle<UndoJobOutcome>>,
     /// 初回表示後にメンバー・ルートゴール詳細を埋める遅延ロードジョブ。
     deferred_initial_load: Option<JoinHandle<DeferredInitialData>>,
 
@@ -750,6 +1020,8 @@ impl App {
             needs_full_clear: false,
             codex_dod_job: None,
             codex_body_record_job: None,
+            codex_checkpoint_job: None,
+            codex_undo_job: None,
             deferred_initial_load: None,
             status_deadline: None,
         }
@@ -1538,6 +1810,139 @@ impl App {
         true
     }
 
+    /// ターン開始時に予約されたチェックポイント作成ジョブを起動する。
+    fn maybe_start_checkpoint_job(&mut self) -> bool {
+        if self.codex_checkpoint_job.is_some() {
+            return false;
+        }
+        let Some(req) = self
+            .codex
+            .as_mut()
+            .and_then(|pane| pane.take_checkpoint_request())
+        else {
+            return false;
+        };
+        self.codex_checkpoint_job = Some(self.rt.spawn(async move {
+            let CheckpointRequest {
+                cwd,
+                ref_name,
+                turn,
+                message,
+            } = req;
+            let job_ref = ref_name.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                git_create_checkpoint(&cwd, &job_ref, &message)
+            })
+            .await
+            .unwrap_or_else(|e| CheckpointJobResult::Failed(format!("ジョブ失敗: {e}")));
+            CheckpointJobOutcome {
+                ref_name,
+                turn,
+                result,
+            }
+        }));
+        true
+    }
+
+    fn poll_checkpoint_job(&mut self) -> bool {
+        let Some(handle) = self.codex_checkpoint_job.as_ref() else {
+            return false;
+        };
+        if !handle.is_finished() {
+            return false;
+        }
+        let handle = self.codex_checkpoint_job.take().unwrap();
+        let Ok(outcome) = self.rt.block_on(handle) else {
+            return true;
+        };
+        let mut evicted = Vec::new();
+        let mut cwd = None;
+        if let Some(pane) = self.codex.as_mut() {
+            let now = Local::now().format("%H:%M");
+            match outcome.result {
+                CheckpointJobResult::Recorded => {
+                    cwd = Some(pane.cwd.clone());
+                    evicted = pane.record_checkpoint(outcome.ref_name, outcome.turn);
+                    pane.push_activity(format!(
+                        "{now} turn {}のチェックポイントを保存",
+                        outcome.turn
+                    ));
+                }
+                CheckpointJobResult::NotRepo => {
+                    // git リポジトリでなければチェックポイントは取らない（無音）。
+                }
+                CheckpointJobResult::Failed(e) => {
+                    pane.push_activity(format!("{now} チェックポイント保存に失敗: {e}"));
+                }
+            }
+        }
+        // 上限超過で押し出された古い ref を掃除する（投げっぱなし）。
+        if let Some(cwd) = cwd {
+            for ref_name in evicted {
+                let cwd = cwd.clone();
+                self.rt.spawn(async move {
+                    let _ =
+                        tokio::task::spawn_blocking(move || git_delete_ref(&cwd, &ref_name)).await;
+                });
+            }
+        }
+        true
+    }
+
+    /// /undo の復元ジョブを起動する。
+    fn maybe_start_undo_job(&mut self) -> bool {
+        if self.codex_undo_job.is_some() {
+            return false;
+        }
+        let Some(req) = self
+            .codex
+            .as_mut()
+            .and_then(|pane| pane.take_undo_request())
+        else {
+            return false;
+        };
+        self.codex_undo_job = Some(self.rt.spawn(async move {
+            let UndoRequest {
+                cwd,
+                ref_name,
+                turn,
+            } = req;
+            let restore_cwd = cwd.clone();
+            let restore_ref = ref_name.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                git_restore_checkpoint(&restore_cwd, &restore_ref)
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("ジョブ失敗: {e}")));
+            // 復元に成功したら消費したチェックポイント ref を掃除する。
+            if result.is_ok() {
+                let _ = tokio::task::spawn_blocking(move || git_delete_ref(&cwd, &ref_name)).await;
+            }
+            UndoJobOutcome {
+                turn,
+                error: result.err(),
+            }
+        }));
+        true
+    }
+
+    fn poll_undo_job(&mut self) -> bool {
+        let Some(handle) = self.codex_undo_job.as_ref() else {
+            return false;
+        };
+        if !handle.is_finished() {
+            return false;
+        }
+        let handle = self.codex_undo_job.take().unwrap();
+        let Ok(outcome) = self.rt.block_on(handle) else {
+            return true;
+        };
+        if let Some(pane) = self.codex.as_mut() {
+            pane.note_undo_result(outcome.turn, outcome.error);
+        }
+        true
+    }
+
     fn maybe_start_codex_turn_body_record(&mut self) -> bool {
         if self.codex_body_record_job.is_some() {
             return false;
@@ -1701,6 +2106,10 @@ impl App {
             emit_terminal_notification(&notice);
             changed = true;
         }
+        changed |= self.maybe_start_checkpoint_job();
+        changed |= self.poll_checkpoint_job();
+        changed |= self.maybe_start_undo_job();
+        changed |= self.poll_undo_job();
         changed |= self.maybe_start_codex_prompt_body_record();
         changed |= self.poll_codex_body_record_job();
         changed |= self.maybe_start_codex_turn_body_record();
@@ -5804,5 +6213,191 @@ mod dod_tests {
         assert_eq!(again.matches("## Codex作業メモ").count(), 1);
         assert_eq!(again.matches("## Codex決定ログ").count(), 1);
         assert_eq!(again.matches("## PR/Release Traceability").count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod notify_tests {
+    use super::{
+        NOTIFY_MIN_TURN_SECS, NotifyMode, applescript_string_escape, parse_notify_mode,
+        should_emit_notice,
+    };
+
+    #[test]
+    fn parse_notify_mode_defaults_to_full() {
+        assert_eq!(parse_notify_mode(None), NotifyMode::Full);
+        assert_eq!(parse_notify_mode(Some("on")), NotifyMode::Full);
+        assert_eq!(parse_notify_mode(Some("なにか")), NotifyMode::Full);
+        assert_eq!(parse_notify_mode(Some(" Bell ")), NotifyMode::Bell);
+        assert_eq!(parse_notify_mode(Some("OFF")), NotifyMode::Off);
+        assert_eq!(parse_notify_mode(Some("none")), NotifyMode::Off);
+    }
+
+    #[test]
+    fn should_emit_notice_suppresses_short_turns_only() {
+        // ターン完了（Some）: 閾値未満は抑制、以上は通知。
+        assert!(!should_emit_notice(Some(0), NOTIFY_MIN_TURN_SECS));
+        assert!(!should_emit_notice(Some(9), NOTIFY_MIN_TURN_SECS));
+        assert!(should_emit_notice(Some(10), NOTIFY_MIN_TURN_SECS));
+        assert!(should_emit_notice(Some(120), NOTIFY_MIN_TURN_SECS));
+        // 承認・その他（None）は常に通知。
+        assert!(should_emit_notice(None, NOTIFY_MIN_TURN_SECS));
+    }
+
+    #[test]
+    fn applescript_string_escape_escapes_quotes_and_backslash() {
+        assert_eq!(applescript_string_escape("plain"), "plain");
+        assert_eq!(applescript_string_escape("a\"b"), "a\\\"b");
+        assert_eq!(applescript_string_escape("a\\b"), "a\\\\b");
+        assert_eq!(applescript_string_escape("line1\nline2"), "line1 line2");
+        // 制御文字は除去する。
+        assert_eq!(applescript_string_escape("a\u{7}b"), "ab");
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::{
+        CheckpointJobResult, git_create_checkpoint, git_delete_ref, git_restore_checkpoint,
+    };
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("git 実行");
+        assert!(
+            out.status.success(),
+            "git {:?} 失敗: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn setup_repo(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "addness_checkpoint_{}_{}_{}",
+            tag,
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        git(&dir, &["config", "user.email", "test@example.com"]);
+        git(&dir, &["config", "user.name", "Test"]);
+        git(&dir, &["config", "commit.gpgsign", "false"]);
+        fs::write(dir.join("tracked.txt"), "v1\n").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-q", "-m", "init"]);
+        dir
+    }
+
+    #[test]
+    fn checkpoint_leaves_worktree_and_index_untouched_but_creates_ref() {
+        let dir = setup_repo("clean");
+        let cwd = dir.display().to_string();
+
+        // 作業ツリーを変更（tracked 変更 + untracked 追加）。
+        fs::write(dir.join("tracked.txt"), "v2-checkpoint\n").unwrap();
+        fs::write(dir.join("untracked_a.txt"), "a\n").unwrap();
+
+        let before_status = git(&dir, &["status", "--porcelain"]);
+        let before_head = git(&dir, &["rev-parse", "HEAD"]);
+
+        let refn = "refs/addness/checkpoint-test-0";
+        let result = git_create_checkpoint(&cwd, refn, "addness-checkpoint-turn-1");
+        assert!(matches!(result, CheckpointJobResult::Recorded));
+
+        // ref が作られている。
+        let cp = git(&dir, &["rev-parse", refn]);
+        assert_ne!(
+            cp, before_head,
+            "変更ありなのでスナップショットコミットになる"
+        );
+
+        // 作業ツリー・インデックス・HEAD は無変更。
+        assert_eq!(git(&dir, &["status", "--porcelain"]), before_status);
+        assert_eq!(git(&dir, &["rev-parse", "HEAD"]), before_head);
+        assert_eq!(
+            fs::read_to_string(dir.join("tracked.txt")).unwrap(),
+            "v2-checkpoint\n"
+        );
+        // スタッシュスタックは空のまま。
+        assert_eq!(git(&dir, &["stash", "list"]), "");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checkpoint_with_no_changes_points_at_head() {
+        let dir = setup_repo("nochange");
+        let cwd = dir.display().to_string();
+        let head = git(&dir, &["rev-parse", "HEAD"]);
+        let refn = "refs/addness/checkpoint-test-0";
+        let result = git_create_checkpoint(&cwd, refn, "cp");
+        assert!(matches!(result, CheckpointJobResult::Recorded));
+        assert_eq!(git(&dir, &["rev-parse", refn]), head);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undo_restores_content_and_keeps_new_files() {
+        let dir = setup_repo("undo");
+        let cwd = dir.display().to_string();
+
+        // チェックポイント時点: tracked=v2 + untracked_a。
+        fs::write(dir.join("tracked.txt"), "v2-checkpoint\n").unwrap();
+        fs::write(dir.join("untracked_a.txt"), "a\n").unwrap();
+        let refn = "refs/addness/checkpoint-test-0";
+        assert!(matches!(
+            git_create_checkpoint(&cwd, refn, "cp"),
+            CheckpointJobResult::Recorded
+        ));
+
+        // チェックポイント後: tracked を更に変更 + 新規ファイル B 作成 + a を削除。
+        fs::write(dir.join("tracked.txt"), "v3-after\n").unwrap();
+        fs::write(dir.join("new_b.txt"), "b\n").unwrap();
+        fs::remove_file(dir.join("untracked_a.txt")).unwrap();
+
+        // undo（復元）。
+        git_restore_checkpoint(&cwd, refn).expect("復元成功");
+
+        // tracked はチェックポイント時点へ戻る。
+        assert_eq!(
+            fs::read_to_string(dir.join("tracked.txt")).unwrap(),
+            "v2-checkpoint\n"
+        );
+        // チェックポイント時に存在した untracked_a は復元される。
+        assert_eq!(
+            fs::read_to_string(dir.join("untracked_a.txt")).unwrap(),
+            "a\n"
+        );
+        // チェックポイント後に新規作成した B は残る（消さない）。
+        assert!(dir.join("new_b.txt").exists());
+
+        git_delete_ref(&cwd, refn);
+        assert!(super::git_capture(&dir, &["rev-parse", "--verify", refn], None).is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checkpoint_on_non_repo_reports_not_repo() {
+        let dir = std::env::temp_dir().join(format!(
+            "addness_checkpoint_norepo_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let result = git_create_checkpoint(&dir.display().to_string(), "refs/addness/x", "cp");
+        assert!(matches!(result, CheckpointJobResult::NotRepo));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

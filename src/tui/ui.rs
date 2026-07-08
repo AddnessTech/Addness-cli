@@ -3638,6 +3638,9 @@ fn codex_header_lines(pane: &CodexPane, max_width: usize, max_rows: usize) -> Ve
         format!("Turn {}", pane.turn_count()),
         format!("表示:{}", pane.log_filter_label()),
     ];
+    if let Some(usage) = pane.usage_header_label() {
+        parts.push(usage);
+    }
     if pane.collapsed_turn_count() > 0 {
         parts.push(format!("格納{}", pane.collapsed_turn_count()));
     }

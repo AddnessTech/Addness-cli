@@ -44,6 +44,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/skills", "ローカル skill 一覧 / 使用依頼"),
     ("/new", "新しいセッションを開始"),
     ("/clear", "表示ログをクリア"),
+    ("/undo", "直近ターンのチェックポイントへ戻す"),
     ("/stop", "実行中のターンを中断"),
     ("/sessions", "セッション候補を番号付きで表示"),
     ("/resume", "作業メモ・決定ログから再開"),
@@ -1702,6 +1703,11 @@ pub struct ActiveWorkPackage {
 pub struct TerminalNotice {
     pub title: String,
     pub message: String,
+    /// 通知の文脈（ゴール名など）。OS 通知の本文に添える。空なら省略。
+    pub context: Option<String>,
+    /// ターン完了通知のターン所要秒。`Some(n)` かつ閾値未満なら通知を抑制する。
+    /// 承認・その他の通知は `None`（常に通知する）。
+    pub turn_elapsed_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1814,6 +1820,43 @@ enum CodexDecisionResponse {
     Accept,
     Deny,
     Always,
+}
+
+/// 確認バナー（YesNo）に紐づく、Accept 時に実行するペイン固有アクション。
+/// codex/claude の承認リトライ経路とは別に、Addness 独自の操作を確認付きで走らせるのに使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneDecisionAction {
+    /// 直近チェックポイントへ作業ツリーを戻す（/undo）。
+    Undo,
+}
+
+/// ペインが保持するチェックポイントのスタック上限（超過分は古い ref から掃除する）。
+const CHECKPOINT_STACK_MAX: usize = 10;
+
+/// ターン開始時に取ったチェックポイント（git ref）1 件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Checkpoint {
+    /// 更新した ref 名（例: `refs/addness/checkpoint-<slug>-<seq>`）。
+    ref_name: String,
+    /// 対応するターン番号（表示・確認メッセージ用）。
+    turn: usize,
+}
+
+/// App（ホスト）へ依頼するチェックポイント作成要求。git 実行は非同期ジョブで行う。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointRequest {
+    pub cwd: String,
+    pub ref_name: String,
+    pub turn: usize,
+    pub message: String,
+}
+
+/// App（ホスト）へ依頼する undo（チェックポイント復元）要求。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndoRequest {
+    pub cwd: String,
+    pub ref_name: String,
+    pub turn: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2042,6 +2085,8 @@ pub struct CodexPane {
     claude_total_cost_usd: Option<f64>,
     /// result の usage 要約（保存のみ）。
     claude_last_usage: Option<String>,
+    /// result の usage から算出したコンテキスト占有トークン数（ヘッダ/`/usage` 表示用）。
+    claude_context_tokens: Option<u64>,
     /// system/init が報告する現在の model（保存のみ、表示同期用）。
     claude_active_model: Option<String>,
     /// system/init が報告する現在の permissionMode（保存のみ、表示同期用）。
@@ -2077,6 +2122,16 @@ pub struct CodexPane {
     codex_appserver_running_item: Option<String>,
     /// 直近の thread/tokenUsage/updated（保存のみ）。
     codex_appserver_token_usage: Option<codex_appserver::TokenUsageInfo>,
+    /// ターン単位チェックポイント（git ref）のスタック。末尾が最新。/undo で末尾から遡る。
+    checkpoints: Vec<Checkpoint>,
+    /// チェックポイント ref 名に使う単調増加シーケンス。
+    checkpoint_seq: usize,
+    /// App が非同期で処理するチェックポイント作成要求（ターン開始時にセット）。
+    pending_checkpoint_request: Option<CheckpointRequest>,
+    /// App が非同期で処理する undo（復元）要求（/undo 確認 Accept 時にセット）。
+    pending_undo_request: Option<UndoRequest>,
+    /// 確認バナー（YesNo）に紐づく Accept 時アクション。/undo 確認で使う。
+    pending_decision_action: Option<PaneDecisionAction>,
 }
 
 impl CodexPane {
@@ -2251,6 +2306,7 @@ impl CodexPane {
             claude_resident_restart_pending: false,
             claude_total_cost_usd: None,
             claude_last_usage: None,
+            claude_context_tokens: None,
             claude_active_model: None,
             claude_active_permission_mode: None,
             codex_appserver_enabled: kind == AgentKind::Codex && codex_appserver_default_enabled(),
@@ -2268,6 +2324,11 @@ impl CodexPane {
             codex_appserver_output: HashMap::new(),
             codex_appserver_running_item: None,
             codex_appserver_token_usage: None,
+            checkpoints: Vec::new(),
+            checkpoint_seq: 0,
+            pending_checkpoint_request: None,
+            pending_undo_request: None,
+            pending_decision_action: None,
         };
         let name = kind.display_name();
         if pane.loaded_history_count > 0 {
@@ -2346,6 +2407,7 @@ impl CodexPane {
         pane.claude_resident_restart_pending = false;
         pane.claude_total_cost_usd = None;
         pane.claude_last_usage = None;
+        pane.claude_context_tokens = None;
         pane.claude_active_model = None;
         pane.claude_active_permission_mode = None;
         pane.codex_appserver_enabled = false;
@@ -2363,6 +2425,11 @@ impl CodexPane {
         pane.codex_appserver_output.clear();
         pane.codex_appserver_running_item = None;
         pane.codex_appserver_token_usage = None;
+        pane.checkpoints.clear();
+        pane.checkpoint_seq = 0;
+        pane.pending_checkpoint_request = None;
+        pane.pending_undo_request = None;
+        pane.pending_decision_action = None;
         pane.diff_view = None;
         pane.addness_body_excerpt = None;
         pane.turn_picker = None;
@@ -4214,7 +4281,7 @@ impl CodexPane {
                 self.action = Some("応答完了".to_string());
                 self.push_log(CodexLogKind::System, "Codex の応答が完了しました");
                 self.record_turn_duration();
-                self.push_terminal_notice("Codex 完了", "Codex の出力が完了しました");
+                self.push_turn_complete_notice("Codex 完了", "Codex の出力が完了しました");
             }
             "turn.failed" => {
                 self.turn_running = false;
@@ -4229,7 +4296,7 @@ impl CodexPane {
                 self.push_log(CodexLogKind::Error, message.clone());
                 self.refresh_current_turn_title();
                 self.queue_completed_turn_body_record();
-                self.push_terminal_notice("Codex 失敗", message);
+                self.push_turn_complete_notice("Codex 失敗", message);
             }
             "error" => {
                 let message = nested_error_message(&value)
@@ -4271,6 +4338,9 @@ impl CodexPane {
                 // total_cost_usd / usage / session_id を保存する（表示は後続タスク）。
                 if let Some(cost) = value.get("total_cost_usd").and_then(Value::as_f64) {
                     self.claude_total_cost_usd = Some(cost);
+                }
+                if let Some(ctx) = claude::context_tokens(value) {
+                    self.claude_context_tokens = Some(ctx);
                 }
                 if let Some(session_id) = claude::session_id(value) {
                     self.thread_id = Some(session_id);
@@ -4461,11 +4531,11 @@ impl CodexPane {
                 .text
                 .unwrap_or_else(|| "Claude Code ターンが失敗しました".to_string());
             self.push_log(CodexLogKind::Error, message.clone());
-            self.push_terminal_notice("Claude Code 失敗", message);
+            self.push_turn_complete_notice("Claude Code 失敗", message);
         } else {
             self.action = Some("応答完了".to_string());
             self.push_log(CodexLogKind::System, "Claude Code の応答が完了しました");
-            self.push_terminal_notice("Claude Code 完了", "Claude Code の出力が完了しました");
+            self.push_turn_complete_notice("Claude Code 完了", "Claude Code の出力が完了しました");
         }
 
         // 常駐モードはプロセスが終了しないので、ここでキュー再開を駆動する
@@ -5525,11 +5595,11 @@ impl CodexPane {
         if status == "failed" {
             let message = "Codex ターンが失敗しました".to_string();
             self.push_log(CodexLogKind::Error, message.clone());
-            self.push_terminal_notice("Codex 失敗", message);
+            self.push_turn_complete_notice("Codex 失敗", message);
         } else {
             self.action = Some("応答完了".to_string());
             self.push_log(CodexLogKind::System, "Codex の応答が完了しました");
-            self.push_terminal_notice("Codex 完了", "Codex の出力が完了しました");
+            self.push_turn_complete_notice("Codex 完了", "Codex の出力が完了しました");
         }
         self.current_turn_prompt = None;
         self.current_turn_retry_prompt = None;
@@ -6208,6 +6278,8 @@ impl CodexPane {
     }
 
     fn set_pending_decision(&mut self, decision: CodexDecisionBanner) {
+        // 新しいバナーは既定でペイン固有アクションを持たない（/undo だけが直後に立てる）。
+        self.pending_decision_action = None;
         let message = decision.message.clone();
         self.pending_decision = Some(decision);
         let name = self.kind.display_name();
@@ -6221,6 +6293,11 @@ impl CodexPane {
         auto: bool,
     ) {
         self.pending_decision = None;
+        // Addness 独自アクション（/undo など）に紐づく確認は codex/claude 経路へ流さず個別処理する。
+        if let Some(pane_action) = self.pending_decision_action.take() {
+            self.resolve_pane_decision_action(pane_action, response);
+            return;
+        }
         let response_label = decision.label_for_response(response);
         if auto {
             self.action = Some(format!("確認自動応答: {response_label}"));
@@ -6337,10 +6414,153 @@ impl CodexPane {
         self.pending_notices.pop_front()
     }
 
+    // ----- ターン単位チェックポイント / undo -----
+
+    /// ターン開始時（ユーザープロンプト実行時）にチェックポイント作成を予約する。
+    /// 実際の git 操作はホスト（App）が非同期ジョブで行う。
+    fn request_checkpoint(&mut self) {
+        let slug = checkpoint_slug(&self.goal_id);
+        let seq = self.checkpoint_seq;
+        self.checkpoint_seq = self.checkpoint_seq.saturating_add(1);
+        let ref_name = checkpoint_ref_name(&slug, seq);
+        // turn_count はターンが実際に始まると増える。ここでは次ターン番号を見込みで使う。
+        let turn = self.turn_count.saturating_add(1);
+        self.pending_checkpoint_request = Some(CheckpointRequest {
+            cwd: self.cwd.clone(),
+            ref_name,
+            turn,
+            message: format!("addness-checkpoint-turn-{turn}"),
+        });
+    }
+
+    /// ホストがチェックポイント作成要求を取り出す。
+    pub fn take_checkpoint_request(&mut self) -> Option<CheckpointRequest> {
+        self.pending_checkpoint_request.take()
+    }
+
+    /// ホストが undo（復元）要求を取り出す。
+    pub fn take_undo_request(&mut self) -> Option<UndoRequest> {
+        self.pending_undo_request.take()
+    }
+
+    /// 作成済みチェックポイント ref をスタックへ記録し、上限超過で掃除すべき ref 名を返す。
+    pub fn record_checkpoint(&mut self, ref_name: String, turn: usize) -> Vec<String> {
+        let evicted = push_checkpoint_with_evictions(
+            &mut self.checkpoints,
+            Checkpoint { ref_name, turn },
+            CHECKPOINT_STACK_MAX,
+        );
+        evicted.into_iter().map(|cp| cp.ref_name).collect()
+    }
+
+    /// undo 結果をペインへ通知する（ホストの非同期ジョブ完了時に呼ぶ）。
+    pub fn note_undo_result(&mut self, turn: usize, error: Option<String>) {
+        match error {
+            None => {
+                self.action = Some("undo 完了".to_string());
+                self.push_log(
+                    CodexLogKind::System,
+                    format!(
+                        "turn {turn} のチェックポイントへ作業ツリーを戻しました。チェックポイント以降に新規作成したファイルは残っています。"
+                    ),
+                );
+            }
+            Some(e) => {
+                self.push_log(CodexLogKind::Error, format!("undo に失敗しました: {e}"));
+            }
+        }
+    }
+
+    /// `/undo` コマンド。直近チェックポイントへ戻す前に YesNo 確認バナーを出す。
+    fn handle_undo_slash_command(&mut self) {
+        if self.checkpoints.is_empty() {
+            self.push_log(CodexLogKind::System, "チェックポイントがありません");
+            return;
+        }
+        // 実行中のターンに割り込んで作業ツリーを書き換えると危険なので受け付けない。
+        if self.is_turn_running() {
+            self.push_log(
+                CodexLogKind::System,
+                "ターン実行中は /undo できません。完了を待つか /stop で中断してください",
+            );
+            return;
+        }
+        if self.pending_decision.is_some() {
+            self.push_log(
+                CodexLogKind::System,
+                "確認応答の待機中です。先に応答してから /undo してください",
+            );
+            return;
+        }
+        let turn = self.checkpoints.last().map(|cp| cp.turn).unwrap_or(0);
+        let message = format!(
+            "turn {turn} のチェックポイントへ作業ツリーを戻します（新規作成ファイルは残ります）。よろしいですか？"
+        );
+        // set_pending_decision がアクションをクリアするため、バナー設定後に立てる。
+        self.set_pending_decision(CodexDecisionBanner::new(CodexDecisionKind::YesNo, message));
+        self.pending_decision_action = Some(PaneDecisionAction::Undo);
+    }
+
+    /// YesNo 確認に対するペイン固有アクションの解決。
+    fn resolve_pane_decision_action(
+        &mut self,
+        action: PaneDecisionAction,
+        response: CodexDecisionResponse,
+    ) {
+        match action {
+            PaneDecisionAction::Undo => match response {
+                CodexDecisionResponse::Accept => self.request_undo(),
+                _ => {
+                    self.action = Some("undo 取消".to_string());
+                    self.push_log(CodexLogKind::System, "undo を取り消しました");
+                }
+            },
+        }
+    }
+
+    /// スタック末尾のチェックポイントを取り出し、復元要求をホストへ渡す。
+    fn request_undo(&mut self) {
+        let Some(cp) = self.checkpoints.pop() else {
+            self.push_log(CodexLogKind::System, "チェックポイントがありません");
+            return;
+        };
+        self.push_log(
+            CodexLogKind::System,
+            format!("turn {} のチェックポイントへ復元を開始します", cp.turn),
+        );
+        self.pending_undo_request = Some(UndoRequest {
+            cwd: self.cwd.clone(),
+            ref_name: cp.ref_name,
+            turn: cp.turn,
+        });
+    }
+
+    /// 通知の文脈ラベル（ゴール名）。空なら None。
+    fn notice_context(&self) -> Option<String> {
+        let title = self.goal_title.trim();
+        (!title.is_empty()).then(|| title.to_string())
+    }
+
     fn push_terminal_notice(&mut self, title: impl Into<String>, message: impl Into<String>) {
+        let context = self.notice_context();
         self.pending_notices.push_back(TerminalNotice {
             title: title.into(),
             message: message.into(),
+            context,
+            turn_elapsed_secs: None,
+        });
+    }
+
+    /// ターン完了（正常/失敗）通知。ターン所要秒を添えて、短いターンの通知抑制に使う。
+    fn push_turn_complete_notice(&mut self, title: impl Into<String>, message: impl Into<String>) {
+        let context = self.notice_context();
+        // turn_started_at はこの時点でまだ保持されている（manage_turn_timer が別途クリアする）。
+        let elapsed = self.turn_started_at.map(|t| t.elapsed().as_secs());
+        self.pending_notices.push_back(TerminalNotice {
+            title: title.into(),
+            message: message.into(),
+            context,
+            turn_elapsed_secs: elapsed,
         });
     }
 
@@ -6577,6 +6797,8 @@ impl CodexPane {
             return;
         }
 
+        // ターン開始（ユーザープロンプト送信）ごとにチェックポイントを予約する。
+        self.request_checkpoint();
         let exec_prompt = self.prompt_with_goal_mode(&submitted);
         self.start_turn_with_display_prompt(&exec_prompt, &display_prompt);
     }
@@ -7195,6 +7417,10 @@ impl CodexPane {
             }
             "usage" | "tokens" | "token-usage" => {
                 self.push_slash_usage();
+                true
+            }
+            "undo" => {
+                self.handle_undo_slash_command();
                 true
             }
             _ => false,
@@ -8885,12 +9111,101 @@ impl CodexPane {
         );
     }
 
+    /// codex ヘッダに常設表示する「コスト | ctx N%」相当のラベル。未取得なら None。
+    pub fn usage_header_label(&self) -> Option<String> {
+        match self.kind {
+            AgentKind::ClaudeCode => {
+                let mut parts = Vec::new();
+                if let Some(cost) = self.claude_total_cost_usd {
+                    parts.push(format!("${cost:.4}"));
+                }
+                if let Some(used) = self.claude_context_tokens {
+                    let window =
+                        claude_context_window_for_model(self.claude_active_model.as_deref());
+                    if let Some(pct) = context_percent(used, window) {
+                        parts.push(format!("ctx {pct}%"));
+                    }
+                }
+                (!parts.is_empty()).then(|| parts.join(" | "))
+            }
+            AgentKind::Codex => {
+                let usage = self.codex_appserver_token_usage.as_ref()?;
+                let mut parts = Vec::new();
+                if let Some(total) = usage.total_tokens {
+                    parts.push(format!("{} tok", format_token_count(total)));
+                    if let Some(window) = usage.model_context_window
+                        && let Some(pct) = context_percent(total, window)
+                    {
+                        parts.push(format!("ctx {pct}%"));
+                    }
+                }
+                (!parts.is_empty()).then(|| parts.join(" | "))
+            }
+        }
+    }
+
     fn push_slash_usage(&mut self) {
         let name = self.kind.display_name();
-        let usage = self.last_token_usage_label.clone().unwrap_or_else(|| {
-            format!("まだ取得できていません。{name} turn 実行後に表示されます。")
-        });
-        self.push_log(CodexLogKind::System, format!("トークン: {usage}"));
+        let mut lines = vec![format!("{name} 使用状況:")];
+        match self.kind {
+            AgentKind::ClaudeCode => {
+                match self.claude_total_cost_usd {
+                    Some(cost) => lines.push(format!("  累計コスト: ${cost:.4}")),
+                    None => lines.push("  累計コスト: 未取得".to_string()),
+                }
+                if let Some(usage) = &self.claude_last_usage {
+                    lines.push(format!("  直近usage: {usage}"));
+                }
+                match self.claude_context_tokens {
+                    Some(used) => {
+                        let window =
+                            claude_context_window_for_model(self.claude_active_model.as_deref());
+                        let pct = context_percent(used, window)
+                            .map(|p| format!("{p}%"))
+                            .unwrap_or_else(|| "-".to_string());
+                        let remain = window.saturating_sub(used);
+                        lines.push(format!(
+                            "  コンテキスト: {} / {} ({pct}, 残り {})",
+                            format_token_count(used),
+                            format_token_count(window),
+                            format_token_count(remain)
+                        ));
+                    }
+                    None => lines.push("  コンテキスト: 未取得".to_string()),
+                }
+            }
+            AgentKind::Codex => match &self.codex_appserver_token_usage {
+                Some(usage) => {
+                    if let Some(total) = usage.total_tokens {
+                        lines.push(format!("  累計トークン: {}", format_token_count(total)));
+                    }
+                    if let Some(last) = usage.last_total_tokens {
+                        lines.push(format!("  直近ターン: {}", format_token_count(last)));
+                    }
+                    if let (Some(total), Some(window)) =
+                        (usage.total_tokens, usage.model_context_window)
+                    {
+                        let pct = context_percent(total, window)
+                            .map(|p| format!("{p}%"))
+                            .unwrap_or_else(|| "-".to_string());
+                        let remain = window.saturating_sub(total);
+                        lines.push(format!(
+                            "  コンテキスト: {} / {} ({pct}, 残り {})",
+                            format_token_count(total),
+                            format_token_count(window),
+                            format_token_count(remain)
+                        ));
+                    }
+                }
+                None => match &self.last_token_usage_label {
+                    Some(usage) => lines.push(format!("  トークン: {usage}")),
+                    None => lines.push(format!(
+                        "  まだ取得できていません。{name} turn 実行後に表示されます。"
+                    )),
+                },
+            },
+        }
+        self.push_log(CodexLogKind::System, lines.join("\n"));
     }
 
     fn push_debug_config(&mut self) {
@@ -9315,8 +9630,10 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
         }
         self.push_log(CodexLogKind::System, "予約した入力を実行します");
         if queued.apply_goal_mode {
+            // run_submitted_line_with_display 側で request_checkpoint する。
             self.run_submitted_line_with_display(queued.submitted, queued.display_prompt);
         } else {
+            self.request_checkpoint();
             self.start_turn_with_display_prompt(&queued.submitted, &queued.display_prompt);
         }
         true
@@ -9554,6 +9871,7 @@ TUI helpers:
   /remember|/memo <内容> - Addness bodyの作業メモへ保存
   /handoff [メモ] - 現在の会話をAddness bodyへ再開用に保存
   /diff, /history, /turn [picker|N|all|old|close N|toggle N], /rollout, /debug-config, /ps, /stop [all], /btw
+  /undo - ターン開始時のチェックポイントへ作業ツリーを戻す（新規作成ファイルは残る）
   /feedback [message], /test-approval [message], /compact [notes], /plan [task]
   /resume, /status, /usage, /help, /exit"#
 }
@@ -9608,6 +9926,7 @@ TUI helpers:
   /remember|/memo <内容> - Addness bodyのCodex作業メモへ保存
   /handoff [メモ] - 現在の会話をAddness bodyへ再開用に保存
   /diff, /history, /turn [picker|N|all|old|close N|toggle N], /rollout, /debug-config, /ps, /stop [all], /btw
+  /undo - ターン開始時のチェックポイントへ作業ツリーを戻す（新規作成ファイルは残る）
   /feedback [message], /test-approval [message], /compact [notes], /plan [task]
   /resume, /status, /usage, /help, /exit"#
 }
@@ -10247,6 +10566,87 @@ fn format_elapsed(secs: u64) -> String {
     } else {
         format!("{minutes}:{seconds:02}")
     }
+}
+
+/// トークン数を k / M で丸めた短い表示にする（例: 12711 → "12.7k"、1_500_000 → "1.5M"）。
+fn format_token_count(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// 使用トークン / コンテキスト長からパーセント（0-100、四捨五入）を返す。window が 0 なら None。
+fn context_percent(used: u64, window: u64) -> Option<u8> {
+    if window == 0 {
+        return None;
+    }
+    let pct = (used as f64 / window as f64 * 100.0).round();
+    Some(pct.clamp(0.0, 100.0) as u8)
+}
+
+/// モデル名から想定コンテキスト長を返す。既知マップに無ければ 200k と仮定する。
+fn claude_context_window_for_model(model: Option<&str>) -> u64 {
+    const DEFAULT_WINDOW: u64 = 200_000;
+    let Some(model) = model else {
+        return DEFAULT_WINDOW;
+    };
+    let lower = model.to_ascii_lowercase();
+    // 1M コンテキストのモデル（例: `...[1m]` / `...-1m`）だけ別枠にする。
+    if lower.contains("[1m]") || lower.contains("-1m") {
+        1_000_000
+    } else {
+        DEFAULT_WINDOW
+    }
+}
+
+/// goal_id からチェックポイント ref に使える slug を作る（英数と '-' のみ、他は '-'）。
+/// 連続する '-' はまとめ、前後の '-' は落とす。空になった場合は "pane"。
+fn checkpoint_slug(goal_id: &str) -> String {
+    let mut slug = String::with_capacity(goal_id.len());
+    let mut last_dash = false;
+    for ch in goal_id.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash {
+            slug.push('-');
+            last_dash = true;
+        }
+    }
+    let trimmed = slug.trim_matches('-');
+    if trimmed.is_empty() {
+        "pane".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// チェックポイント ref 名を組み立てる。
+fn checkpoint_ref_name(slug: &str, seq: usize) -> String {
+    format!("refs/addness/checkpoint-{slug}-{seq}")
+}
+
+/// `git status --porcelain` 出力に作業ツリー/インデックスの変更があるか。
+pub(super) fn git_status_has_changes(porcelain: &str) -> bool {
+    porcelain.lines().any(|line| !line.trim().is_empty())
+}
+
+/// チェックポイントをスタックへ push し、上限超過分（古い順）を返す（呼び出し側が ref を掃除する）。
+fn push_checkpoint_with_evictions(
+    stack: &mut Vec<Checkpoint>,
+    checkpoint: Checkpoint,
+    max: usize,
+) -> Vec<Checkpoint> {
+    stack.push(checkpoint);
+    let mut evicted = Vec::new();
+    while stack.len() > max.max(1) {
+        evicted.push(stack.remove(0));
+    }
+    evicted
 }
 
 /// 端末出力から ANSI エスケープ列と制御文字を取り除く。ライブ出力の表示前に使う。
@@ -16703,6 +17103,169 @@ mod tests {
         assert_eq!(format_elapsed(83), "1:23");
         assert_eq!(format_elapsed(3600), "1:00:00");
         assert_eq!(format_elapsed(3723), "1:02:03");
+    }
+
+    #[test]
+    fn format_token_count_rounds_k_and_m() {
+        assert_eq!(format_token_count(0), "0");
+        assert_eq!(format_token_count(999), "999");
+        assert_eq!(format_token_count(12_711), "12.7k");
+        assert_eq!(format_token_count(1_000), "1.0k");
+        assert_eq!(format_token_count(1_500_000), "1.5M");
+    }
+
+    #[test]
+    fn context_percent_computes_and_guards_zero_window() {
+        assert_eq!(context_percent(45_000, 100_000), Some(45));
+        assert_eq!(context_percent(0, 200_000), Some(0));
+        assert_eq!(context_percent(200_000, 200_000), Some(100));
+        // 上限 100% でクランプする。
+        assert_eq!(context_percent(300_000, 200_000), Some(100));
+        assert_eq!(context_percent(10, 0), None);
+    }
+
+    #[test]
+    fn claude_context_window_maps_default_and_1m() {
+        assert_eq!(claude_context_window_for_model(None), 200_000);
+        assert_eq!(
+            claude_context_window_for_model(Some("claude-sonnet-4-5")),
+            200_000
+        );
+        assert_eq!(
+            claude_context_window_for_model(Some("claude-opus-4-8[1m]")),
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn usage_header_label_claude_shows_cost_and_ctx() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.kind = AgentKind::ClaudeCode;
+        assert_eq!(pane.usage_header_label(), None);
+        pane.claude_total_cost_usd = Some(0.0123);
+        pane.claude_context_tokens = Some(90_000);
+        pane.claude_active_model = Some("claude-sonnet-4-5".to_string());
+        assert_eq!(
+            pane.usage_header_label().as_deref(),
+            Some("$0.0123 | ctx 45%")
+        );
+    }
+
+    #[test]
+    fn checkpoint_slug_sanitizes_goal_id() {
+        assert_eq!(checkpoint_slug("abc123"), "abc123");
+        assert_eq!(
+            checkpoint_slug("11111111-2222-3333-4444-555555555555"),
+            "11111111-2222-3333-4444-555555555555"
+        );
+        assert_eq!(checkpoint_slug("Foo/Bar_Baz"), "foo-bar-baz");
+        assert_eq!(checkpoint_slug("--@@--"), "pane");
+        assert_eq!(checkpoint_slug(""), "pane");
+    }
+
+    #[test]
+    fn checkpoint_ref_name_builds_namespaced_ref() {
+        assert_eq!(
+            checkpoint_ref_name("goal-1", 3),
+            "refs/addness/checkpoint-goal-1-3"
+        );
+    }
+
+    #[test]
+    fn git_status_has_changes_detects_nonblank_lines() {
+        assert!(!git_status_has_changes(""));
+        assert!(!git_status_has_changes("\n  \n"));
+        assert!(git_status_has_changes(" M src/main.rs"));
+        assert!(git_status_has_changes("?? new.txt\n"));
+    }
+
+    #[test]
+    fn push_checkpoint_evicts_oldest_over_limit() {
+        let mut stack = Vec::new();
+        let mut evicted_total = Vec::new();
+        for i in 0..12 {
+            let evicted = push_checkpoint_with_evictions(
+                &mut stack,
+                Checkpoint {
+                    ref_name: format!("refs/addness/checkpoint-p-{i}"),
+                    turn: i,
+                },
+                CHECKPOINT_STACK_MAX,
+            );
+            evicted_total.extend(evicted);
+        }
+        // 上限 10 件を保持、古い 2 件（turn 0,1）が押し出される。
+        assert_eq!(stack.len(), CHECKPOINT_STACK_MAX);
+        assert_eq!(stack.first().unwrap().turn, 2);
+        assert_eq!(stack.last().unwrap().turn, 11);
+        assert_eq!(
+            evicted_total.iter().map(|c| c.turn).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn undo_slash_without_checkpoint_reports_missing() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.finished = false;
+        submit_line(&mut pane, "/undo");
+        assert!(pane.log.iter().any(|line| {
+            line.kind == CodexLogKind::System && line.text.contains("チェックポイントがありません")
+        }));
+        assert!(pane.decision_banner().is_none());
+    }
+
+    #[test]
+    fn undo_slash_with_checkpoint_prompts_and_pops_on_accept() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.finished = false;
+        pane.record_checkpoint("refs/addness/checkpoint-p-0".to_string(), 1);
+        pane.record_checkpoint("refs/addness/checkpoint-p-1".to_string(), 2);
+
+        submit_line(&mut pane, "/undo");
+        let banner = pane.decision_banner().expect("確認バナーが出る");
+        assert_eq!(banner.kind, CodexDecisionKind::YesNo);
+
+        // Accept で undo 要求が積まれ、最新チェックポイント（turn 2）が pop される。
+        pane.handle_decision_key(KeyEvent::from(KeyCode::Char('y')));
+        let req = pane.take_undo_request().expect("undo 要求が積まれる");
+        assert_eq!(req.turn, 2);
+        assert_eq!(req.ref_name, "refs/addness/checkpoint-p-1");
+        assert_eq!(pane.checkpoints.len(), 1);
+    }
+
+    #[test]
+    fn undo_slash_deny_keeps_checkpoint() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.finished = false;
+        pane.record_checkpoint("refs/addness/checkpoint-p-0".to_string(), 1);
+        submit_line(&mut pane, "/undo");
+        pane.handle_decision_key(KeyEvent::from(KeyCode::Char('n')));
+        assert!(pane.take_undo_request().is_none());
+        assert_eq!(pane.checkpoints.len(), 1);
+    }
+
+    #[test]
+    fn undo_appears_in_slash_command_list() {
+        assert!(SLASH_COMMANDS.iter().any(|(name, _)| *name == "/undo"));
+        // /undo は codex 専用ではない（両バックエンドで使える）。
+        assert!(!CODEX_ONLY_SLASH_COMMANDS.contains(&"/undo"));
+    }
+
+    #[test]
+    fn usage_header_label_codex_shows_tokens_and_ctx() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.kind = AgentKind::Codex;
+        assert_eq!(pane.usage_header_label(), None);
+        pane.codex_appserver_token_usage = Some(codex_appserver::TokenUsageInfo {
+            total_tokens: Some(12_711),
+            last_total_tokens: Some(42),
+            model_context_window: Some(258_400),
+        });
+        assert_eq!(
+            pane.usage_header_label().as_deref(),
+            Some("12.7k tok | ctx 5%")
+        );
     }
 
     #[test]

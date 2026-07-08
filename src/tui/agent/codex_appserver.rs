@@ -291,7 +291,7 @@ pub(super) enum ThreadItemKind {
         content: Vec<String>,
     },
     FileChange {
-        paths: Vec<String>,
+        changes: Vec<FileChangeDetail>,
         status: Option<String>,
     },
     McpToolCall {
@@ -301,6 +301,16 @@ pub(super) enum ThreadItemKind {
     },
     /// 上記以外（webSearch 等）。type 名を保持。
     Other(String),
+}
+
+/// fileChange の変更 1 件（パス・種別・unified diff 文字列）。
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct FileChangeDetail {
+    pub(super) path: String,
+    /// "add" / "delete" / "update"（PatchChangeKind.type）。
+    pub(super) change_type: String,
+    /// unified diff 文字列（空のこともある）。
+    pub(super) diff: String,
 }
 
 /// ThreadItem の共通情報。
@@ -581,13 +591,30 @@ fn parse_thread_item(item: Option<&Value>) -> Option<ThreadItemInfo> {
             content: string_array(item.get("content")),
         },
         "fileChange" => ThreadItemKind::FileChange {
-            paths: item
+            changes: item
                 .get("changes")
                 .and_then(Value::as_array)
                 .map(|arr| {
                     arr.iter()
-                        .filter_map(|c| c.get("path").and_then(Value::as_str))
-                        .map(str::to_string)
+                        .filter_map(|c| {
+                            let path = c.get("path").and_then(Value::as_str)?.to_string();
+                            let change_type = c
+                                .get("kind")
+                                .and_then(|k| k.get("type"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("update")
+                                .to_string();
+                            let diff = c
+                                .get("diff")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                            Some(FileChangeDetail {
+                                path,
+                                change_type,
+                                diff,
+                            })
+                        })
                         .collect()
                 })
                 .unwrap_or_default(),
@@ -1092,13 +1119,16 @@ mod tests {
         let fc = json!({
             "jsonrpc": "2.0",
             "method": "item/completed",
-            "params": {"item": {"id": "f1", "type": "fileChange", "status": "completed", "changes": [{"path": "src/a.rs", "kind": "update", "diff": ""}]}}
+            "params": {"item": {"id": "f1", "type": "fileChange", "status": "completed", "changes": [{"path": "src/a.rs", "kind": {"type": "update"}, "diff": "@@\n-old\n+new\n"}]}}
         });
         match parse_message(&fc) {
             Some(ServerMessage::Notification(Notification::ItemCompleted(item))) => match item.kind
             {
-                ThreadItemKind::FileChange { paths, .. } => {
-                    assert_eq!(paths, vec!["src/a.rs".to_string()]);
+                ThreadItemKind::FileChange { changes, .. } => {
+                    assert_eq!(changes.len(), 1);
+                    assert_eq!(changes[0].path, "src/a.rs");
+                    assert_eq!(changes[0].change_type, "update");
+                    assert_eq!(changes[0].diff, "@@\n-old\n+new\n");
                 }
                 other => panic!("unexpected {other:?}"),
             },

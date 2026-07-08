@@ -36,7 +36,7 @@ const COLOR_INPUT_BG: Color = Color::Rgb(27, 30, 36);
 const CODEX_TOOL_COMMAND_PREVIEW_WIDTH: usize = 56;
 /// @メンションのファイル候補パレットで一度に表示する最大行数。
 const MENTION_PALETTE_VISIBLE_ROWS: usize = 10;
-const CODEX_EDIT_DIFF_PREVIEW_LINES: usize = 3;
+const CODEX_EDIT_DIFF_PREVIEW_LINES: usize = 8;
 
 /// Replace @uuid mentions in text with @member_name
 fn replace_member_mentions(text: &str, members: &HashMap<MemberId, Member>) -> String {
@@ -4683,9 +4683,9 @@ fn json_output_summary(output: &str) -> Option<String> {
 }
 
 fn codex_runtime_status(pane: &CodexPane, max_width: usize) -> String {
-    let state = pane.run_state().label();
+    let state = pane.run_state_elapsed_label();
     let view = format!("表示:{} Ctrl-Tで切替", pane.log_filter_label());
-    let fixed_width = UnicodeWidthStr::width(state)
+    let fixed_width = UnicodeWidthStr::width(state.as_str())
         .saturating_add(UnicodeWidthStr::width(view.as_str()))
         .saturating_add(8);
     let detail = codex_current_activity_label(pane, max_width.saturating_sub(fixed_width));
@@ -4976,7 +4976,7 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
         ]),
         Line::from(vec![
             Span::styled("状態 ", Style::default().fg(COLOR_MUTED)),
-            Span::styled(run_state.label(), state_style),
+            Span::styled(pane.run_state_elapsed_label(), state_style),
             Span::styled(
                 format!("  Turn {}", pane.turn_count()),
                 Style::default().fg(COLOR_MUTED),
@@ -5043,6 +5043,21 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
             ),
             Span::styled(assistant, assistant_style),
         ]));
+    }
+    // 実行中コマンドのライブ出力（末尾最大3行）を薄色ブロックで添える。
+    // コマンド完了で消え、確定した Tool 行だけがログに残る。
+    let live_output = pane.codex_appserver_live_output();
+    if pane.current_command().is_some() && !live_output.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "実行中の出力",
+            Style::default().fg(COLOR_MUTED),
+        )));
+        for out_line in &live_output {
+            lines.push(Line::from(Span::styled(
+                ellipsize_width(&format!("  {out_line}"), prompt_width),
+                Style::default().fg(COLOR_MUTED),
+            )));
+        }
     }
     lines.push(Line::from(""));
     lines.extend(codex_dashboard_shortcut_lines(prompt_width));
@@ -5197,13 +5212,14 @@ fn ellipsize_width(text: &str, max_width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivePane, App, COLOR_DANGER, COLOR_EVENT, COLOR_SUCCESS, COLOR_WARN,
-        cached_assistant_markdown_count, cached_assistant_markdown_lines, codex_activity_lines,
-        codex_child_goal_lines, codex_dashboard_shortcut_lines, codex_decision_choice_line,
-        codex_decision_input_lines, codex_decision_title_hint, codex_diff_lines, codex_header_line,
-        codex_header_lines, codex_input_prompt_render, codex_log_entry_lines, codex_log_lines,
-        codex_markdown_styles, codex_runtime_status, codex_visible_log_lines, codex_work_label,
-        draw_status_bar, ellipsize_width, markdown, prompt_preview, summarize_tool_display_text,
+        ActivePane, App, CODEX_EDIT_DIFF_PREVIEW_LINES, COLOR_DANGER, COLOR_EVENT, COLOR_SUCCESS,
+        COLOR_WARN, cached_assistant_markdown_count, cached_assistant_markdown_lines,
+        code_edit_diff_preview, codex_activity_lines, codex_child_goal_lines,
+        codex_dashboard_shortcut_lines, codex_decision_choice_line, codex_decision_input_lines,
+        codex_decision_title_hint, codex_diff_lines, codex_header_line, codex_header_lines,
+        codex_input_prompt_render, codex_log_entry_lines, codex_log_lines, codex_markdown_styles,
+        codex_runtime_status, codex_visible_log_lines, codex_work_label, draw_status_bar,
+        ellipsize_width, markdown, prompt_preview, summarize_tool_display_text,
     };
     use crate::api::ApiClient;
     use crate::tui::agent::{
@@ -5357,6 +5373,22 @@ mod tests {
                 .style
                 .add_modifier
                 .contains(Modifier::DIM)
+        );
+    }
+
+    #[test]
+    fn code_edit_diff_preview_caps_and_reports_omitted() {
+        let mut text = String::from("*** Update File: big.rs\n");
+        for i in 0..20 {
+            text.push_str(&format!("+line{i}\n"));
+        }
+        let preview = code_edit_diff_preview(&text, CODEX_EDIT_DIFF_PREVIEW_LINES);
+        // 8 行までのプレビュー + 省略行。
+        assert_eq!(preview.len(), CODEX_EDIT_DIFF_PREVIEW_LINES + 1);
+        assert_eq!(preview[0], "+line0");
+        assert_eq!(
+            preview[CODEX_EDIT_DIFF_PREVIEW_LINES],
+            format!("... 差分行を{}行省略", 20 - CODEX_EDIT_DIFF_PREVIEW_LINES)
         );
     }
 

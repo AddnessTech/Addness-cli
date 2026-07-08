@@ -1911,6 +1911,10 @@ pub struct CodexPane {
     /// codex が現在実行中として報告したコマンド。
     current_command: Option<String>,
     current_command_started_at: Option<Instant>,
+    /// 実行中ターンの開始時刻。経過時間表示と完了時の所要時間算出に使う。
+    turn_started_at: Option<Instant>,
+    /// 直近に再描画へ反映した経過秒。秒表示が変わったフレームだけ再描画するために保持する。
+    last_elapsed_tick_secs: Option<u64>,
     /// `codex exec` 通常ターン以外のサブコマンドを実行中ならその表示名。
     child_process_label: Option<String>,
     /// サブコマンドの非JSON stdout/stderr。完了時にまとめてToolログへ出す。
@@ -2177,6 +2181,8 @@ impl CodexPane {
             action: None,
             current_command: None,
             current_command_started_at: None,
+            turn_started_at: None,
+            last_elapsed_tick_secs: None,
             child_process_label: None,
             child_process_output: Vec::new(),
             child_process_error_output: Vec::new(),
@@ -2446,6 +2452,66 @@ impl CodexPane {
     pub fn current_command_elapsed_secs(&self) -> Option<u64> {
         self.current_command_started_at
             .map(|t| t.elapsed().as_secs())
+    }
+
+    /// 実行中ターンの経過秒（開始からの秒）。ターン非実行時は None。
+    pub fn turn_elapsed_secs(&self) -> Option<u64> {
+        if self.is_turn_running() {
+            self.turn_started_at.map(|t| t.elapsed().as_secs())
+        } else {
+            None
+        }
+    }
+
+    /// いま表示すべき経過秒。コマンド実行中はコマンド経過、それ以外はターン経過。
+    fn current_display_elapsed_secs(&self) -> Option<u64> {
+        if !self.is_turn_running() {
+            return None;
+        }
+        if self.current_command.is_some() {
+            self.current_command_elapsed_secs()
+        } else {
+            self.turn_elapsed_secs()
+        }
+    }
+
+    /// 状態ラベルに経過時間を添えた表示（例: 「考え中 1:23」）。
+    pub fn run_state_elapsed_label(&self) -> String {
+        let label = self.run_state().label();
+        match self.current_display_elapsed_secs() {
+            Some(secs) => format!("{label} {}", format_elapsed(secs)),
+            None => label.to_string(),
+        }
+    }
+
+    /// ターン開始/終了に応じて経過タイマーを管理し、表示秒が変わったら true を返す。
+    /// タイマー表示のためだけの毎フレーム再描画を避け、秒が繰り上がった時だけ再描画させる。
+    fn manage_turn_timer(&mut self) -> bool {
+        if self.is_turn_running() {
+            if self.turn_started_at.is_none() {
+                self.turn_started_at = Some(Instant::now());
+            }
+        } else {
+            self.turn_started_at = None;
+        }
+        let current = self.current_display_elapsed_secs();
+        if current != self.last_elapsed_tick_secs {
+            self.last_elapsed_tick_secs = current;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 完了したターンの所要時間を控えめな System 行として残す。
+    fn record_turn_duration(&mut self) {
+        if let Some(started) = self.turn_started_at {
+            let secs = started.elapsed().as_secs();
+            self.push_log(
+                CodexLogKind::System,
+                format!("所要 {}", format_elapsed(secs)),
+            );
+        }
     }
 
     pub fn turn_count(&self) -> usize {
@@ -4005,6 +4071,9 @@ impl CodexPane {
             }
         }
 
+        // 経過時間タイマー: 表示秒が繰り上がったフレームだけ再描画させる。
+        changed |= self.manage_turn_timer();
+
         changed
     }
 
@@ -4144,6 +4213,7 @@ impl CodexPane {
                 self.queue_completed_turn_body_record();
                 self.action = Some("応答完了".to_string());
                 self.push_log(CodexLogKind::System, "Codex の応答が完了しました");
+                self.record_turn_duration();
                 self.push_terminal_notice("Codex 完了", "Codex の出力が完了しました");
             }
             "turn.failed" => {
@@ -4271,17 +4341,27 @@ impl CodexPane {
                         format!("(思考) {}", compact_one_line(&text, 2_000)),
                     );
                 }
-                claude::ClaudeBlock::ToolUse { name, summary } => {
+                claude::ClaudeBlock::ToolUse {
+                    name,
+                    summary,
+                    edit_patch,
+                } => {
                     if let Some(summary) = &summary {
                         self.current_command = Some(compact_tool_text(summary));
                         self.current_command_started_at = Some(Instant::now());
                     }
                     self.action = Some(format!("ツール実行: {name}"));
-                    let label = match &summary {
-                        Some(summary) => format!("{name} {}", compact_tool_text(summary)),
-                        None => name.clone(),
-                    };
-                    self.push_log(CodexLogKind::Tool, label);
+                    // Edit/Write は変更内容を色付き差分プレビュー行（見出し + diff）として残す。
+                    // ラベル行と重複しないよう、パッチがあればそれをツール実行行にする。
+                    if let Some(patch) = edit_patch {
+                        self.push_log(CodexLogKind::Tool, patch);
+                    } else {
+                        let label = match &summary {
+                            Some(summary) => format!("{name} {}", compact_tool_text(summary)),
+                            None => name.clone(),
+                        };
+                        self.push_log(CodexLogKind::Tool, label);
+                    }
                 }
             }
         }
@@ -4342,6 +4422,7 @@ impl CodexPane {
         self.streaming_assistant_index = None;
         self.refresh_current_turn_title();
         self.queue_completed_turn_body_record();
+        self.record_turn_duration();
         self.claude_resident_last_activity = Some(Instant::now());
 
         // 常駐モードで interrupt 要求中に来た result（aborted_streaming）は中断完了として扱う。
@@ -5414,6 +5495,7 @@ impl CodexPane {
         self.codex_appserver_output.clear();
         self.codex_appserver_running_item = None;
         self.codex_appserver_last_activity = Some(Instant::now());
+        self.record_turn_duration();
 
         // interrupt 要求中に来た完了は中断完了として扱い、キューを自動開始しない。
         if self.codex_appserver_interrupting || status == "interrupted" {
@@ -5492,7 +5574,8 @@ impl CodexPane {
                 self.action = Some(format!("ツール実行: {label}"));
                 self.push_log(CodexLogKind::Tool, format!("MCP {label}"));
             }
-            K::FileChange { paths, .. } => {
+            K::FileChange { changes, .. } => {
+                let paths = codex_appserver_change_paths(&changes);
                 let label = codex_appserver_paths_label(&paths);
                 self.push_log(CodexLogKind::Tool, format!("ファイル変更 {label}"));
             }
@@ -5549,10 +5632,15 @@ impl CodexPane {
                     );
                 }
             }
-            K::FileChange { paths, status } => {
+            K::FileChange { changes, status } => {
+                let paths = codex_appserver_change_paths(&changes);
                 let label = codex_appserver_paths_label(&paths);
                 let status = status.unwrap_or_else(|| "完了".to_string());
                 self.push_log(CodexLogKind::Tool, format!("ファイル変更 {status} {label}"));
+                // unified diff を持つ変更は、見出し + 色付き差分プレビュー行として残す。
+                if let Some(patch) = codex_filechange_patch_text(&changes) {
+                    self.push_log(CodexLogKind::Tool, patch);
+                }
             }
             K::McpToolCall {
                 server,
@@ -5580,7 +5668,11 @@ impl CodexPane {
             if line.is_empty() {
                 continue;
             }
-            buffer.push_back(compact_one_line(line, 200));
+            let sanitized = sanitize_terminal_line(line);
+            if sanitized.trim().is_empty() {
+                continue;
+            }
+            buffer.push_back(compact_one_line(&sanitized, 200));
             while buffer.len() > CODEX_APPSERVER_OUTPUT_TAIL_LINES {
                 buffer.pop_front();
             }
@@ -10004,6 +10096,211 @@ fn codex_appserver_paths_label(paths: &[String]) -> String {
     compact_one_line(&label, 120)
 }
 
+/// fileChange の各変更からパスだけを取り出す。
+fn codex_appserver_change_paths(changes: &[codex_appserver::FileChangeDetail]) -> Vec<String> {
+    changes.iter().map(|c| c.path.clone()).collect()
+}
+
+/// apply_patch テキスト 1 セクションに含める差分本文行の上限。
+/// 表示側（code_edit_diff_preview）でさらに 8 行へ切り詰めるが、
+/// ログ・セッション記録の肥大化を防ぐためにここでも上限を設ける。
+const CODEX_PATCH_SECTION_MAX_LINES: usize = 40;
+
+/// codex 互換の apply_patch テキスト（`EDIT ` 接頭辞付き）を組み立てる。
+/// `sections` は (ヘッダ行, 本文行) で、本文行は既に `+`/`-`/`@@` 接頭辞付き。
+/// 空なら None。描画は既存の `code_edit_display_text` が担当する（色付き差分プレビュー）。
+fn build_apply_patch_text(sections: &[(String, Vec<String>)]) -> Option<String> {
+    if sections.is_empty() {
+        return None;
+    }
+    let mut out = vec!["EDIT *** Begin Patch".to_string()];
+    for (header, body) in sections {
+        out.push(header.clone());
+        for line in body {
+            out.push(line.clone());
+        }
+    }
+    out.push("*** End Patch".to_string());
+    Some(out.join("\n"))
+}
+
+/// 生テキストを行分割し、各行へ `prefix` を付けて最大 `max` 行まで返す。
+/// 空テキストは空の差分として扱う。
+fn prefixed_diff_lines(text: &str, prefix: char, max: usize) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    text.replace('\r', "")
+        .split('\n')
+        .take(max)
+        .map(|line| format!("{prefix}{line}"))
+        .collect()
+}
+
+/// Claude の Edit / MultiEdit / Write の tool_use input から差分プレビュー用の
+/// apply_patch テキストを組み立てる純粋関数。対象外ツールや情報不足なら None。
+fn claude_edit_patch_text(name: &str, input: &Value) -> Option<String> {
+    let path = input
+        .get("file_path")
+        .and_then(Value::as_str)
+        .filter(|p| !p.is_empty())?;
+    match name {
+        "Write" => {
+            let content = input.get("content").and_then(Value::as_str).unwrap_or("");
+            let body = prefixed_diff_lines(content, '+', CODEX_PATCH_SECTION_MAX_LINES);
+            build_apply_patch_text(&[(format!("*** Add File: {path}"), body)])
+        }
+        "Edit" => {
+            let old = input
+                .get("old_string")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let new = input
+                .get("new_string")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let body = edit_pair_body(old, new);
+            if body.is_empty() {
+                return None;
+            }
+            build_apply_patch_text(&[(format!("*** Update File: {path}"), body)])
+        }
+        "MultiEdit" => {
+            let edits = input.get("edits").and_then(Value::as_array)?;
+            let mut body = Vec::new();
+            for edit in edits {
+                let old = edit.get("old_string").and_then(Value::as_str).unwrap_or("");
+                let new = edit.get("new_string").and_then(Value::as_str).unwrap_or("");
+                body.extend(edit_pair_body(old, new));
+            }
+            if body.is_empty() {
+                return None;
+            }
+            build_apply_patch_text(&[(format!("*** Update File: {path}"), body)])
+        }
+        _ => None,
+    }
+}
+
+/// 旧行を `-`、新行を `+` として並べた差分本文を作る（行単位 diff は取らない）。
+fn edit_pair_body(old: &str, new: &str) -> Vec<String> {
+    let half = CODEX_PATCH_SECTION_MAX_LINES / 2;
+    let mut body = Vec::new();
+    if !old.is_empty() {
+        body.extend(prefixed_diff_lines(old, '-', half));
+    }
+    if !new.is_empty() {
+        body.extend(prefixed_diff_lines(new, '+', half));
+    }
+    body
+}
+
+/// codex 常駐 fileChange の unified diff から apply_patch テキストを組み立てる。
+fn codex_filechange_patch_text(changes: &[codex_appserver::FileChangeDetail]) -> Option<String> {
+    let mut sections = Vec::new();
+    for change in changes {
+        let header = match change.change_type.as_str() {
+            "add" => format!("*** Add File: {}", change.path),
+            "delete" => format!("*** Delete File: {}", change.path),
+            _ => format!("*** Update File: {}", change.path),
+        };
+        let body: Vec<String> = change
+            .diff
+            .replace('\r', "")
+            .split('\n')
+            .filter(|line| is_meaningful_diff_line(line))
+            .take(CODEX_PATCH_SECTION_MAX_LINES)
+            .map(str::to_string)
+            .collect();
+        if body.is_empty() {
+            continue;
+        }
+        sections.push((header, body));
+    }
+    build_apply_patch_text(&sections)
+}
+
+/// unified diff からファイルヘッダ等のノイズ行を除き、`@@`/`+`/`-` の意味行だけ残す。
+fn is_meaningful_diff_line(line: &str) -> bool {
+    if line.starts_with("+++")
+        || line.starts_with("---")
+        || line.starts_with("diff ")
+        || line.starts_with("index ")
+        || line.starts_with("new file")
+        || line.starts_with("deleted file")
+        || line.starts_with("rename ")
+        || line.starts_with("similarity ")
+        || line.starts_with("\\ No newline")
+    {
+        return false;
+    }
+    line.starts_with("@@") || line.starts_with('+') || line.starts_with('-')
+}
+
+/// 経過秒を mm:ss（1時間以上は h:mm:ss）で整形する純粋関数。
+fn format_elapsed(secs: u64) -> String {
+    let hours = secs / 3600;
+    let minutes = (secs % 3600) / 60;
+    let seconds = secs % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
+}
+
+/// 端末出力から ANSI エスケープ列と制御文字を取り除く。ライブ出力の表示前に使う。
+fn sanitize_terminal_line(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            match chars.peek() {
+                Some('[') => {
+                    // CSI: パラメータ・中間バイトを読み飛ばし、終端バイト(0x40-0x7E)まで消費。
+                    chars.next();
+                    while let Some(&c) = chars.peek() {
+                        chars.next();
+                        if ('\u{40}'..='\u{7e}').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    // OSC: BEL(0x07) か ST(ESC \) まで。
+                    chars.next();
+                    while let Some(&c) = chars.peek() {
+                        if c == '\u{7}' {
+                            chars.next();
+                            break;
+                        }
+                        if c == '\u{1b}' {
+                            chars.next();
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
+                            break;
+                        }
+                        chars.next();
+                    }
+                }
+                Some(_) => {
+                    // ESC X（2バイトのエスケープ）。
+                    chars.next();
+                }
+                None => {}
+            }
+            continue;
+        }
+        if ch == '\t' {
+            out.push(' ');
+        } else if !ch.is_control() {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 fn spawn_line_reader<R>(reader: R, tx: Sender<CodexProcessEvent>, stderr: bool)
 where
     R: std::io::Read + Send + 'static,
@@ -12516,9 +12813,33 @@ mod tests {
         assert!(pane.log.iter().any(|line| line.kind == CodexLogKind::Tool
             && line.text.contains("Bash")
             && line.text.contains("cargo test")));
+        // Write は色付き差分プレビュー用の apply_patch 行として残る（Add File 見出し）。
         assert!(pane.log.iter().any(|line| line.kind == CodexLogKind::Tool
-            && line.text.contains("Write")
-            && line.text.contains("/tmp/x.rs")));
+            && line.text.starts_with("EDIT ")
+            && line.text.contains("*** Add File: /tmp/x.rs")));
+    }
+
+    #[test]
+    fn claude_edit_tool_use_emits_colored_diff_line() {
+        let mut pane = claude_pane();
+        pane.handle_json_event(serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [
+                {"type": "tool_use", "name": "Edit", "input": {
+                    "file_path": "src/x.rs",
+                    "old_string": "let a = 1;",
+                    "new_string": "let a = 2;"
+                }}
+            ]}
+        }));
+        let edit_line = pane
+            .log
+            .iter()
+            .find(|line| line.kind == CodexLogKind::Tool && line.text.starts_with("EDIT "))
+            .expect("EDIT 行が残る");
+        assert!(edit_line.text.contains("*** Update File: src/x.rs"));
+        assert!(edit_line.text.contains("-let a = 1;"));
+        assert!(edit_line.text.contains("+let a = 2;"));
     }
 
     #[test]
@@ -16373,5 +16694,102 @@ mod tests {
 
         assert!(prompt.contains("0: A"));
         assert!(prompt.contains("1: B"));
+    }
+
+    #[test]
+    fn format_elapsed_formats_minutes_and_hours() {
+        assert_eq!(format_elapsed(0), "0:00");
+        assert_eq!(format_elapsed(45), "0:45");
+        assert_eq!(format_elapsed(83), "1:23");
+        assert_eq!(format_elapsed(3600), "1:00:00");
+        assert_eq!(format_elapsed(3723), "1:02:03");
+    }
+
+    #[test]
+    fn sanitize_terminal_line_strips_ansi_and_control() {
+        // CSI カラーコード・OSC・制御文字を除去し、タブは空白へ。
+        let input = "\u{1b}[31mred\u{1b}[0m\ttext\u{7}end\u{1b}]0;title\u{7}!";
+        assert_eq!(sanitize_terminal_line(input), "red textend!");
+        assert_eq!(sanitize_terminal_line("plain"), "plain");
+    }
+
+    #[test]
+    fn claude_edit_patch_text_builds_update_patch() {
+        let input = serde_json::json!({
+            "file_path": "src/x.rs",
+            "old_string": "old1\nold2",
+            "new_string": "new1"
+        });
+        let patch = claude_edit_patch_text("Edit", &input).unwrap();
+        assert!(patch.starts_with("EDIT *** Begin Patch"));
+        assert!(patch.contains("*** Update File: src/x.rs"));
+        assert!(patch.contains("-old1"));
+        assert!(patch.contains("-old2"));
+        assert!(patch.contains("+new1"));
+        assert!(patch.contains("*** End Patch"));
+    }
+
+    #[test]
+    fn claude_edit_patch_text_builds_add_patch_for_write() {
+        let input = serde_json::json!({
+            "file_path": "src/new.rs",
+            "content": "line1\nline2"
+        });
+        let patch = claude_edit_patch_text("Write", &input).unwrap();
+        assert!(patch.contains("*** Add File: src/new.rs"));
+        assert!(patch.contains("+line1"));
+        assert!(patch.contains("+line2"));
+        // Edit/Write 以外や file_path 無しは対象外。
+        assert!(claude_edit_patch_text("Bash", &input).is_none());
+        assert!(claude_edit_patch_text("Edit", &serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn claude_edit_patch_text_caps_long_content() {
+        let content = (0..100)
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let input = serde_json::json!({ "file_path": "big.rs", "content": content });
+        let patch = claude_edit_patch_text("Write", &input).unwrap();
+        // 本文行はセクション上限（40行）までに抑える（全文は出さない）。
+        let plus_lines = patch.lines().filter(|l| l.starts_with('+')).count();
+        assert_eq!(plus_lines, CODEX_PATCH_SECTION_MAX_LINES);
+    }
+
+    #[test]
+    fn codex_filechange_patch_text_from_unified_diff() {
+        let changes = vec![
+            codex_appserver::FileChangeDetail {
+                path: "src/a.rs".to_string(),
+                change_type: "update".to_string(),
+                diff: "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n".to_string(),
+            },
+            codex_appserver::FileChangeDetail {
+                path: "src/b.rs".to_string(),
+                change_type: "add".to_string(),
+                diff: "+added line\n".to_string(),
+            },
+        ];
+        let patch = codex_filechange_patch_text(&changes).unwrap();
+        assert!(patch.contains("*** Update File: src/a.rs"));
+        assert!(patch.contains("*** Add File: src/b.rs"));
+        assert!(patch.contains("@@ -1,2 +1,2 @@"));
+        assert!(patch.contains("-old"));
+        assert!(patch.contains("+new"));
+        assert!(patch.contains("+added line"));
+        // ファイルヘッダ（--- / +++）はノイズとして除去する。
+        assert!(!patch.contains("--- a/src/a.rs"));
+        assert!(!patch.contains("+++ b/src/a.rs"));
+    }
+
+    #[test]
+    fn codex_filechange_patch_text_empty_without_diff() {
+        let changes = vec![codex_appserver::FileChangeDetail {
+            path: "src/a.rs".to_string(),
+            change_type: "update".to_string(),
+            diff: String::new(),
+        }];
+        assert!(codex_filechange_patch_text(&changes).is_none());
     }
 }

@@ -546,6 +546,8 @@ pub(super) enum ClaudeBlock {
     ToolUse {
         name: String,
         summary: Option<String>,
+        /// Edit/Write/MultiEdit のとき、色付き差分プレビュー用の apply_patch テキスト。
+        edit_patch: Option<String>,
     },
 }
 
@@ -584,10 +586,15 @@ pub(super) fn assistant_blocks(value: &Value) -> Vec<ClaudeBlock> {
                     .and_then(Value::as_str)
                     .unwrap_or("tool")
                     .to_string();
-                let summary = item
-                    .get("input")
-                    .and_then(|input| tool_use_summary(&name, input));
-                blocks.push(ClaudeBlock::ToolUse { name, summary });
+                let input = item.get("input");
+                let summary = input.and_then(|input| tool_use_summary(&name, input));
+                let edit_patch =
+                    input.and_then(|input| super::claude_edit_patch_text(&name, input));
+                blocks.push(ClaudeBlock::ToolUse {
+                    name,
+                    summary,
+                    edit_patch,
+                });
             }
             _ => {}
         }
@@ -1189,14 +1196,19 @@ mod tests {
             blocks[2],
             ClaudeBlock::ToolUse {
                 name: "Bash".to_string(),
-                summary: Some("ls -la".to_string())
+                summary: Some("ls -la".to_string()),
+                edit_patch: None,
             }
         );
         assert_eq!(
             blocks[3],
             ClaudeBlock::ToolUse {
                 name: "Write".to_string(),
-                summary: Some("/tmp/x.rs".to_string())
+                summary: Some("/tmp/x.rs".to_string()),
+                // content 未指定の Write は空の Add パッチになる。
+                edit_patch: Some(
+                    "EDIT *** Begin Patch\n*** Add File: /tmp/x.rs\n*** End Patch".to_string()
+                ),
             }
         );
     }

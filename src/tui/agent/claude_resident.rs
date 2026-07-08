@@ -322,6 +322,21 @@ impl ResidentClient {
             .ok()?;
         Self::new(child).ok()
     }
+
+    /// テスト用: 子プロセスの PID。
+    #[cfg(test)]
+    pub(super) fn child_pid(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+impl Drop for ResidentClient {
+    /// パニック/drop 時の孤児化を防ぐ。closing（stdin クローズ済みで終了待ち）でも
+    /// 最終的に kill + wait して確実にゾンビ化を避ける。
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 #[cfg(test)]
@@ -485,5 +500,21 @@ mod tests {
         let input = json!({"file_path": "/a.rs"});
         assert!(tool_matches_rules("Edit", &input, &["Edit".to_string()]));
         assert!(!tool_matches_rules("Edit", &input, &["Write".to_string()]));
+    }
+
+    #[test]
+    fn drop_kills_child_process() {
+        let Some(client) = ResidentClient::spawn_dummy() else {
+            return; // `cat` 不在環境ではスキップ。
+        };
+        let pid = client.child_pid();
+        drop(client);
+        // Drop 内で wait() 済みなので同期的に reap されている。
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(!alive, "drop 後も子プロセスが生存している");
     }
 }

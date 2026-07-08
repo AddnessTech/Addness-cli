@@ -617,7 +617,8 @@ fn should_emit_notice(turn_elapsed_secs: Option<u64>, threshold_secs: u64) -> bo
 
 /// AppleScript の文字列リテラルへ安全に埋め込めるようエスケープする。
 /// `\` と `"` をエスケープし、改行類は空白へ潰す（osascript には引数で渡すためシェル注入は起きない）。
-fn applescript_string_escape(input: &str) -> String {
+/// `agent` モジュール（クリップボード PNG 書き出し）でも共有する。
+pub(super) fn applescript_string_escape(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {
         match ch {
@@ -858,6 +859,7 @@ fn git_create_checkpoint(cwd: &str, ref_name: &str, message: &str) -> Checkpoint
 
 /// チェックポイント ref の状態へ作業ツリーとインデックスを戻す。
 /// ref に存在しない（チェックポイント後に新規作成された）ファイルは削除しない。
+/// 復元範囲はこのペインの作業ディレクトリ配下（`.`）に限定し、cwd 外は巻き戻さない。
 fn git_restore_checkpoint(cwd: &str, ref_name: &str) -> Result<(), String> {
     let cwd = std::path::Path::new(cwd);
     git_run(
@@ -869,7 +871,7 @@ fn git_restore_checkpoint(cwd: &str, ref_name: &str) -> Result<(), String> {
             "--staged",
             "--worktree",
             "--",
-            ":/",
+            ".",
         ],
         None,
     )
@@ -2056,6 +2058,13 @@ impl App {
         self.codex_last_scroll_input = None;
         // 進行中の非同期作業メモ記録を先に止め、この後の同期終了記録と body を奪い合わせない。
         if let Some(job) = self.codex_body_record_job.take() {
+            job.abort();
+        }
+        // チェックポイント / undo ジョブも中断して次に開くペインを汚さない。
+        if let Some(job) = self.codex_checkpoint_job.take() {
+            job.abort();
+        }
+        if let Some(job) = self.codex_undo_job.take() {
             job.abort();
         }
         if let Some(mut pane) = self.codex.take() {
@@ -6281,8 +6290,7 @@ mod checkpoint_tests {
 
     fn setup_repo(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "addness_checkpoint_{}_{}_{}",
-            tag,
+            "addness_checkpoint_{tag}_{}_{}",
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
@@ -6384,6 +6392,46 @@ mod checkpoint_tests {
         git_delete_ref(&cwd, refn);
         assert!(super::git_capture(&dir, &["rev-parse", "--verify", refn], None).is_none());
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undo_only_restores_within_cwd() {
+        let dir = setup_repo("cwd-scope");
+        // サブディレクトリと、その中/外のトラッキングファイルを用意する。
+        let sub = dir.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(dir.join("root.txt"), "root-v1\n").unwrap();
+        fs::write(sub.join("inner.txt"), "inner-v1\n").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-q", "-m", "add files"]);
+
+        // 現状（v1）で全ツリーのチェックポイントを作成する。
+        let refn = "refs/addness/checkpoint-test-0";
+        assert!(matches!(
+            git_create_checkpoint(&dir.display().to_string(), refn, "cp"),
+            CheckpointJobResult::Recorded
+        ));
+
+        // チェックポイント後: cwd 内も外も変更する。
+        fs::write(dir.join("root.txt"), "root-v2\n").unwrap();
+        fs::write(sub.join("inner.txt"), "inner-v2\n").unwrap();
+
+        // 復元は cwd（sub）配下に限定する。
+        git_restore_checkpoint(&sub.display().to_string(), refn).expect("復元成功");
+
+        // cwd 配下はチェックポイント状態へ戻る。
+        assert_eq!(
+            fs::read_to_string(sub.join("inner.txt")).unwrap(),
+            "inner-v1\n"
+        );
+        // cwd 外は巻き戻らない。
+        assert_eq!(
+            fs::read_to_string(dir.join("root.txt")).unwrap(),
+            "root-v2\n"
+        );
+
+        git_delete_ref(&dir.display().to_string(), refn);
         let _ = fs::remove_dir_all(&dir);
     }
 

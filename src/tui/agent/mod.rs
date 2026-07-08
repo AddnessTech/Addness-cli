@@ -2100,6 +2100,8 @@ pub struct CodexPane {
     codex_appserver_phase: CodexAppServerPhase,
     /// thread 確立を待って送るターン本文（ハンドシェイク完了時に turn/start する）。
     codex_appserver_pending_turn: Option<String>,
+    /// 保留ターンに添付する画像パス（turn/start の localImage 入力に載せる）。
+    codex_appserver_pending_images: Vec<String>,
     /// 進行中ターンの turn.id（turn/interrupt に使う）。
     codex_appserver_turn_id: Option<String>,
     /// 送信済み turn/start の JSON-RPC id（応答で turn.id を確定するのに使う）。
@@ -2127,7 +2129,8 @@ pub struct CodexPane {
     /// チェックポイント ref 名に使う単調増加シーケンス。
     checkpoint_seq: usize,
     /// App が非同期で処理するチェックポイント作成要求（ターン開始時にセット）。
-    pending_checkpoint_request: Option<CheckpointRequest>,
+    /// ジョブは 1 件ずつ処理されるため、消化前に複数溜まっても取りこぼさないようキューで持つ。
+    pending_checkpoint_requests: VecDeque<CheckpointRequest>,
     /// App が非同期で処理する undo（復元）要求（/undo 確認 Accept 時にセット）。
     pending_undo_request: Option<UndoRequest>,
     /// 確認バナー（YesNo）に紐づく Accept 時アクション。/undo 確認で使う。
@@ -2313,6 +2316,7 @@ impl CodexPane {
             codex_appserver: None,
             codex_appserver_phase: CodexAppServerPhase::Idle,
             codex_appserver_pending_turn: None,
+            codex_appserver_pending_images: Vec::new(),
             codex_appserver_turn_id: None,
             codex_appserver_turn_req_id: None,
             codex_appserver_pending_approval: None,
@@ -2326,7 +2330,7 @@ impl CodexPane {
             codex_appserver_token_usage: None,
             checkpoints: Vec::new(),
             checkpoint_seq: 0,
-            pending_checkpoint_request: None,
+            pending_checkpoint_requests: VecDeque::new(),
             pending_undo_request: None,
             pending_decision_action: None,
         };
@@ -2427,7 +2431,7 @@ impl CodexPane {
         pane.codex_appserver_token_usage = None;
         pane.checkpoints.clear();
         pane.checkpoint_seq = 0;
-        pane.pending_checkpoint_request = None;
+        pane.pending_checkpoint_requests.clear();
         pane.pending_undo_request = None;
         pane.pending_decision_action = None;
         pane.diff_view = None;
@@ -3369,10 +3373,7 @@ impl CodexPane {
             let value = self.claude_settings.cycle_effort();
             self.action = Some(format!("effort: {value}"));
             self.push_activity(format!("Claude Code effort を {value} に変更"));
-            self.push_log(
-                CodexLogKind::System,
-                format!("次回ターンの effort: {value}"),
-            );
+            self.note_claude_effort_change(value);
             return;
         }
         let value = self.exec_settings.cycle_reasoning();
@@ -3390,10 +3391,24 @@ impl CodexPane {
         let value = self.claude_settings.set_effort(value);
         self.action = Some(format!("effort: {value}"));
         self.push_activity(format!("Claude Code effort を {value} に変更"));
-        self.push_log(
-            CodexLogKind::System,
-            format!("次回ターンの effort: {value}"),
-        );
+        self.note_claude_effort_change(value);
+    }
+
+    /// effort 変更をログに出し、常駐が生きていれば再起動保留を立てる。
+    /// effort には set_effort 相当の control_request が無いため、常駐は再起動 + resume で反映する。
+    fn note_claude_effort_change(&mut self, value: &str) {
+        if self.claude_resident.is_some() {
+            self.claude_resident_restart_pending = true;
+            self.push_log(
+                CodexLogKind::System,
+                format!("effort を {value} に変更しました（常駐プロセス再接続後に反映）"),
+            );
+        } else {
+            self.push_log(
+                CodexLogKind::System,
+                format!("次回ターンの effort: {value}"),
+            );
+        }
     }
 
     fn set_reasoning(&mut self, value: CodexReasoningChoice) {
@@ -4091,6 +4106,8 @@ impl CodexPane {
                             self.push_terminal_notice(format!("{name} コマンド失敗"), message);
                         }
                     } else if !self.turn_finished_by_event {
+                        // イベントで終了検知できなかったフォールバック経路。他 3 経路と同型に
+                        // record_turn_duration() + push_turn_complete_notice() で締める。
                         if status.success() {
                             self.refresh_current_turn_title();
                             self.queue_completed_turn_body_record();
@@ -4098,7 +4115,8 @@ impl CodexPane {
                                 CodexLogKind::System,
                                 format!("{name} ターンが完了しました"),
                             );
-                            self.push_terminal_notice(
+                            self.record_turn_duration();
+                            self.push_turn_complete_notice(
                                 format!("{name} 完了"),
                                 format!("{name} の出力が完了しました"),
                             );
@@ -4107,7 +4125,8 @@ impl CodexPane {
                             self.push_log(CodexLogKind::Error, message.clone());
                             self.refresh_current_turn_title();
                             self.queue_completed_turn_body_record();
-                            self.push_terminal_notice(format!("{name} 失敗"), message);
+                            self.record_turn_duration();
+                            self.push_turn_complete_notice(format!("{name} 失敗"), message);
                         }
                     }
                     self.turn_finished_by_event = false;
@@ -4181,9 +4200,10 @@ impl CodexPane {
             self.disable_claude_partial_messages_and_retry();
             return;
         }
-        // 旧 stderr ヒューリスティック承認はワンショット専用（常駐 app-server では承認は
-        // サーバ発リクエストで届くため使わない）。
+        // 旧 stderr ヒューリスティック承認はワンショット専用（常駐 app-server / 常駐 Claude では
+        // 承認はサーバ発リクエスト / can_use_tool の正規経路で届くため使わない）。
         if self.codex_appserver.is_none()
+            && self.claude_resident.is_none()
             && let Some(decision) = decision_banner("stderr", Some(trimmed))
         {
             self.set_pending_decision(decision);
@@ -4830,6 +4850,8 @@ impl CodexPane {
             self.claude_resident = None;
             self.claude_interrupt_deadline = None;
             self.claude_interrupting = false;
+            // kill フォールバックでも Addness へ作業メモを記録する（current_turn_prompt を消す前に）。
+            self.queue_completed_turn_body_record();
             self.turn_running = false;
             self.current_command = None;
             self.current_command_started_at = None;
@@ -4900,6 +4922,10 @@ impl CodexPane {
         self.claude_interrupting = false;
         self.claude_pending_setting_change = None;
         let was_running = self.turn_running;
+        if was_running {
+            // 実行中の死亡/切断でも Addness へ作業メモを記録する（current_turn_prompt を消す前に）。
+            self.queue_completed_turn_body_record();
+        }
         self.turn_running = false;
         self.current_command = None;
         self.current_command_started_at = None;
@@ -5263,13 +5289,14 @@ impl CodexPane {
         }
 
         self.codex_appserver_pending_turn = Some(full_prompt);
+        // 添付画像は turn/start へ渡すため退避してから入力欄をクリアする。
+        self.codex_appserver_pending_images = std::mem::take(&mut self.exec_settings.image_paths);
         self.turn_running = true;
         self.turn_finished_by_event = false;
         self.pending_decision = None;
         self.diff_view = None;
         self.codex_appserver_interrupting = false;
         self.codex_appserver_interrupt_deadline = None;
-        self.exec_settings.image_paths.clear();
         self.current_turn_prompt = Some(display_prompt.to_string());
         self.current_turn_retry_prompt = Some(prompt.to_string());
         self.codex_appserver_last_activity = Some(Instant::now());
@@ -5307,11 +5334,13 @@ impl CodexPane {
             return;
         };
         let effort = self.codex_appserver_effort();
+        let images = std::mem::take(&mut self.codex_appserver_pending_images);
         let Some(client) = self.codex_appserver.as_mut() else {
             return;
         };
         let id = client.next_id();
-        let request = codex_appserver::turn_start_request(id, &thread_id, &text, effort.as_deref());
+        let request =
+            codex_appserver::turn_start_request(id, &thread_id, &text, effort.as_deref(), &images);
         if client.send_value(&request) {
             self.codex_appserver_turn_req_id = Some(id);
             self.codex_appserver_last_activity = Some(Instant::now());
@@ -5672,9 +5701,7 @@ impl CodexPane {
                 let exit = exit_code
                     .map(|code| format!("exit {code}"))
                     .unwrap_or_else(|| "終了".to_string());
-                let duration = duration_ms
-                    .map(|ms| format!(" {}ms", ms))
-                    .unwrap_or_default();
+                let duration = duration_ms.map(|ms| format!(" {ms}ms")).unwrap_or_default();
                 let state = if exit_code == Some(0) { "OK" } else { "FAIL" };
                 self.push_log(
                     CodexLogKind::Tool,
@@ -6015,12 +6042,17 @@ impl CodexPane {
         self.codex_appserver_pending_setting = None;
         self.codex_appserver_pending_approval = None;
         self.codex_appserver_pending_turn = None;
+        self.codex_appserver_pending_images.clear();
         self.codex_appserver_turn_id = None;
         self.codex_appserver_turn_req_id = None;
         self.codex_appserver_restart_pending = false;
         self.codex_appserver_output.clear();
         self.codex_appserver_running_item = None;
         let was_running = self.turn_running;
+        if was_running {
+            // 実行中の死亡/切断でも Addness へ作業メモを記録する（current_turn_prompt を消す前に）。
+            self.queue_completed_turn_body_record();
+        }
         self.turn_running = false;
         self.current_command = None;
         self.current_command_started_at = None;
@@ -6056,6 +6088,11 @@ impl CodexPane {
             CodexLogKind::System,
             "常駐初期化に失敗したためワンショットで実行します",
         );
+        // 常駐 turn/start へ渡せなかった添付画像はワンショットの -i 引数へ戻す。
+        if !self.codex_appserver_pending_images.is_empty() {
+            self.exec_settings.image_paths =
+                std::mem::take(&mut self.codex_appserver_pending_images);
+        }
         if let Some(prompt) = retry {
             let display = display.unwrap_or_else(|| prompt.clone());
             self.start_oneshot_turn(&prompt, &display);
@@ -6073,6 +6110,7 @@ impl CodexPane {
         self.codex_appserver_pending_setting = None;
         self.codex_appserver_pending_approval = None;
         self.codex_appserver_pending_turn = None;
+        self.codex_appserver_pending_images.clear();
         self.codex_appserver_turn_id = None;
         self.codex_appserver_turn_req_id = None;
         self.codex_appserver_restart_pending = false;
@@ -6425,17 +6463,23 @@ impl CodexPane {
         let ref_name = checkpoint_ref_name(&slug, seq);
         // turn_count はターンが実際に始まると増える。ここでは次ターン番号を見込みで使う。
         let turn = self.turn_count.saturating_add(1);
-        self.pending_checkpoint_request = Some(CheckpointRequest {
-            cwd: self.cwd.clone(),
-            ref_name,
-            turn,
-            message: format!("addness-checkpoint-turn-{turn}"),
-        });
+        // 上限（4 件）を超えたら最古を捨てて無制限に溜まらないようにする。
+        const MAX_PENDING_CHECKPOINTS: usize = 4;
+        while self.pending_checkpoint_requests.len() >= MAX_PENDING_CHECKPOINTS {
+            self.pending_checkpoint_requests.pop_front();
+        }
+        self.pending_checkpoint_requests
+            .push_back(CheckpointRequest {
+                cwd: self.cwd.clone(),
+                ref_name,
+                turn,
+                message: format!("addness-checkpoint-turn-{turn}"),
+            });
     }
 
-    /// ホストがチェックポイント作成要求を取り出す。
+    /// ホストがチェックポイント作成要求を取り出す（キュー先頭から 1 件ずつ）。
     pub fn take_checkpoint_request(&mut self) -> Option<CheckpointRequest> {
-        self.pending_checkpoint_request.take()
+        self.pending_checkpoint_requests.pop_front()
     }
 
     /// ホストが undo（復元）要求を取り出す。
@@ -6494,7 +6538,7 @@ impl CodexPane {
         }
         let turn = self.checkpoints.last().map(|cp| cp.turn).unwrap_or(0);
         let message = format!(
-            "turn {turn} のチェックポイントへ作業ツリーを戻します（新規作成ファイルは残ります）。よろしいですか？"
+            "turn {turn} のチェックポイントへこのペインの作業ディレクトリ配下を戻します（新規作成ファイルは残ります）。よろしいですか？"
         );
         // set_pending_decision がアクションをクリアするため、バナー設定後に立てる。
         self.set_pending_decision(CodexDecisionBanner::new(CodexDecisionKind::YesNo, message));
@@ -6587,7 +6631,11 @@ impl CodexPane {
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('c' | 'C'))
         {
+            // Esc 経路と同様、常駐はまず graceful interrupt を試み、駄目なら kill に落とす。
             if self.claude_resident.is_some() && self.request_claude_interrupt() {
+                return;
+            }
+            if self.codex_appserver.is_some() && self.request_codex_appserver_interrupt() {
                 return;
             }
             self.kill_current_turn();
@@ -6600,6 +6648,9 @@ impl CodexPane {
                 && matches!(key.code, KeyCode::Char('c' | 'C'))
             {
                 if self.claude_resident.is_some() && self.request_claude_interrupt() {
+                    return;
+                }
+                if self.codex_appserver.is_some() && self.request_codex_appserver_interrupt() {
                     return;
                 }
                 self.kill_current_turn();
@@ -7465,6 +7516,10 @@ impl CodexPane {
             );
             return;
         }
+        // アイドル常駐が生きていると thread_id を捨てても旧セッションを継続してしまうため、
+        // 新規セッション開始の前に常駐を落として次ターンを新 spawn で始める。
+        self.teardown_claude_resident();
+        self.teardown_codex_appserver();
         self.thread_id = None;
         self.current_turn_prompt = None;
         self.current_turn_retry_prompt = None;
@@ -7932,6 +7987,9 @@ impl CodexPane {
                 None => return,
             },
         };
+        // アイドル常駐が生きていると新 thread_id/--fork-session が無視されるため、
+        // resume/fork の前に必ず常駐を落として新規 spawn で反映させる。
+        self.teardown_claude_resident();
         self.thread_id = Some(session_id.clone());
         self.claude_fork_next = fork;
         let verb = if fork { "fork" } else { "resume" };
@@ -9798,6 +9856,8 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
         }
         self.child = None;
         self.teardown_claude_resident();
+        // 常駐 codex app-server プロセスも終了させる（kill_current_turn と同様に孤児化を防ぐ）。
+        self.teardown_codex_appserver();
         self.turn_running = false;
         self.current_command = None;
         self.current_command_started_at = None;
@@ -9871,7 +9931,7 @@ TUI helpers:
   /remember|/memo <内容> - Addness bodyの作業メモへ保存
   /handoff [メモ] - 現在の会話をAddness bodyへ再開用に保存
   /diff, /history, /turn [picker|N|all|old|close N|toggle N], /rollout, /debug-config, /ps, /stop [all], /btw
-  /undo - ターン開始時のチェックポイントへ作業ツリーを戻す（新規作成ファイルは残る）
+  /undo - ターン開始時のチェックポイントへこのペインの作業ディレクトリ配下を戻す（新規作成ファイルは残る）
   /feedback [message], /test-approval [message], /compact [notes], /plan [task]
   /resume, /status, /usage, /help, /exit"#
 }
@@ -9926,7 +9986,7 @@ TUI helpers:
   /remember|/memo <内容> - Addness bodyのCodex作業メモへ保存
   /handoff [メモ] - 現在の会話をAddness bodyへ再開用に保存
   /diff, /history, /turn [picker|N|all|old|close N|toggle N], /rollout, /debug-config, /ps, /stop [all], /btw
-  /undo - ターン開始時のチェックポイントへ作業ツリーを戻す（新規作成ファイルは残る）
+  /undo - ターン開始時のチェックポイントへこのペインの作業ディレクトリ配下を戻す（新規作成ファイルは残る）
   /feedback [message], /test-approval [message], /compact [notes], /plan [task]
   /resume, /status, /usage, /help, /exit"#
 }
@@ -10306,19 +10366,20 @@ fn run_osascript_write_clipboard_png(
     timeout: std::time::Duration,
 ) -> std::io::Result<bool> {
     use std::io::Read;
+    // パスに `"` や `\` が含まれても AppleScript 文字列リテラルを壊さないようエスケープする。
+    let escaped_path = super::app::applescript_string_escape(&path.display().to_string());
     let script = format!(
-        "set outFile to POSIX file \"{}\"\n\
-try\n\
-    set pngData to (the clipboard as «class PNGf»)\n\
-on error\n\
-    return \"NO_IMAGE\"\n\
-end try\n\
-set fh to open for access outFile with write permission\n\
-set eof fh to 0\n\
-write pngData to fh\n\
-close access fh\n\
-return \"OK\"",
-        path.display()
+        r#"set outFile to POSIX file "{escaped_path}"
+try
+    set pngData to (the clipboard as «class PNGf»)
+on error
+    return "NO_IMAGE"
+end try
+set fh to open for access outFile with write permission
+set eof fh to 0
+write pngData to fh
+close access fh
+return "OK""#
     );
     let mut child = Command::new("osascript")
         .arg("-e")
@@ -17250,6 +17311,35 @@ mod tests {
         assert!(SLASH_COMMANDS.iter().any(|(name, _)| *name == "/undo"));
         // /undo は codex 専用ではない（両バックエンドで使える）。
         assert!(!CODEX_ONLY_SLASH_COMMANDS.contains(&"/undo"));
+    }
+
+    #[test]
+    fn checkpoint_requests_queue_and_drain_in_order() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        // ジョブ消化前に複数のチェックポイントが予約されても取りこぼさない。
+        pane.request_checkpoint();
+        pane.request_checkpoint();
+        pane.request_checkpoint();
+        let first = pane.take_checkpoint_request().expect("1件目");
+        let second = pane.take_checkpoint_request().expect("2件目");
+        let third = pane.take_checkpoint_request().expect("3件目");
+        // 先入れ先出しで seq（turn 見込み番号）が単調増加する。
+        assert!(first.turn <= second.turn && second.turn <= third.turn);
+        assert!(pane.take_checkpoint_request().is_none());
+    }
+
+    #[test]
+    fn checkpoint_requests_are_capped() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        // 上限 4 件を超える予約は最古が捨てられ、無制限には溜まらない。
+        for _ in 0..8 {
+            pane.request_checkpoint();
+        }
+        let mut count = 0;
+        while pane.take_checkpoint_request().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 4);
     }
 
     #[test]

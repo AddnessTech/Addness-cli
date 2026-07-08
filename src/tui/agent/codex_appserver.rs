@@ -137,18 +137,21 @@ pub(super) fn thread_resume_request(id: u64, thread_id: &str, config: &ThreadCon
 }
 
 /// turn/start リクエスト。effort はここでオーバーライドする（thread/start には effort が無い）。
+/// `image_paths` は LocalImageUserInput（`{"type":"localImage","path":...}`）として input に追加する。
 pub(super) fn turn_start_request(
     id: u64,
     thread_id: &str,
     text: &str,
     effort: Option<&str>,
+    image_paths: &[String],
 ) -> Value {
+    let mut input = vec![json!({"type": "text", "text": text, "text_elements": []})];
+    for path in image_paths {
+        input.push(json!({"type": "localImage", "path": path}));
+    }
     let mut params = serde_json::Map::new();
     params.insert("threadId".to_string(), json!(thread_id));
-    params.insert(
-        "input".to_string(),
-        json!([{"type": "text", "text": text, "text_elements": []}]),
-    );
+    params.insert("input".to_string(), Value::Array(input));
     if let Some(effort) = effort {
         params.insert("effort".to_string(), json!(effort));
     }
@@ -794,6 +797,21 @@ impl AppServerClient {
             .ok()?;
         Self::new(child).ok()
     }
+
+    /// テスト用: 子プロセスの PID。
+    #[cfg(test)]
+    pub(super) fn child_pid(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+impl Drop for AppServerClient {
+    /// パニック/drop 時の孤児化を防ぐ。closing（stdin クローズ済みで終了待ち）でも
+    /// 最終的に kill + wait して確実にゾンビ化を避ける。
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 #[cfg(test)]
@@ -852,7 +870,7 @@ mod tests {
 
     #[test]
     fn turn_start_request_shape() {
-        let v = turn_start_request(4, "th-1", "1+1は?", Some("high"));
+        let v = turn_start_request(4, "th-1", "1+1は?", Some("high"), &[]);
         assert_eq!(v["method"], "turn/start");
         assert_eq!(v["params"]["threadId"], "th-1");
         assert_eq!(v["params"]["input"][0]["type"], "text");
@@ -862,8 +880,21 @@ mod tests {
 
     #[test]
     fn turn_start_omits_effort_when_none() {
-        let v = turn_start_request(4, "th-1", "hi", None);
+        let v = turn_start_request(4, "th-1", "hi", None, &[]);
         assert!(v["params"].get("effort").is_none());
+    }
+
+    #[test]
+    fn turn_start_appends_local_images() {
+        let images = vec!["/tmp/a.png".to_string(), "/tmp/b.png".to_string()];
+        let v = turn_start_request(4, "th-1", "見て", None, &images);
+        let input = v["params"]["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["type"], "text");
+        assert_eq!(input[1]["type"], "localImage");
+        assert_eq!(input[1]["path"], "/tmp/a.png");
+        assert_eq!(input[2]["type"], "localImage");
+        assert_eq!(input[2]["path"], "/tmp/b.png");
     }
 
     #[test]
@@ -1158,5 +1189,21 @@ mod tests {
         // ワンショット codex の snake_case イベントは JSON-RPC ではない。
         let v = json!({"type": "thread.started", "thread_id": "abc"});
         assert_eq!(parse_message(&v), None);
+    }
+
+    #[test]
+    fn drop_kills_child_process() {
+        let Some(client) = AppServerClient::spawn_dummy() else {
+            return; // `cat` 不在環境ではスキップ。
+        };
+        let pid = client.child_pid();
+        drop(client);
+        // Drop 内で wait() 済みなので同期的に reap されている。
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(!alive, "drop 後も子プロセスが生存している");
     }
 }

@@ -1576,6 +1576,18 @@ struct CodexPaneSpawnOptions<'a> {
     status_label: String,
     session_log_path: Option<PathBuf>,
     input_history_path: Option<PathBuf>,
+    /// クリップボード画像の保存先（`~/.addness/attachments/`）。テストでは一時ディレクトリを注入する。
+    attachments_dir: Option<PathBuf>,
+}
+
+/// 長文ペーストを入力欄で畳み込んだときの保持データ。
+/// 入力欄にはプレースホルダだけ挿入し、送信時に全文へ展開する。
+#[derive(Debug, Clone)]
+struct StoredPaste {
+    /// 入力欄へ挿入したプレースホルダ文字列（例: `[貼り付け#1: 120行]`）。
+    placeholder: String,
+    /// 展開時に差し戻す全文（改行正規化済み）。
+    full: String,
 }
 
 /// 子ゴール 1 件の表示用情報。
@@ -1845,6 +1857,12 @@ pub struct CodexPane {
     /// 最初の実依頼の body 自動記録を済み（再試行しない）とするフラグ。
     body_record_done: bool,
     input_state: CodexInputState,
+    /// 入力欄で畳み込み中の長文ペースト（送信時に全文へ展開してクリア）。
+    pending_pastes: Vec<StoredPaste>,
+    /// 畳み込みペーストの通し番号（プレースホルダの `#N`）。送信でリセットする。
+    paste_seq: usize,
+    /// クリップボード画像の保存先ディレクトリ（`~/.addness/attachments/`）。テストでは注入する。
+    attachments_dir: Option<PathBuf>,
     /// スラッシュコマンドパレットで選択中の候補インデックス。入力が変わると 0 に戻す。
     slash_palette_selected: usize,
     /// `@` メンションのファイル候補パレットで選択中のインデックス。入力が変わると 0 に戻す。
@@ -1946,6 +1964,7 @@ impl CodexPane {
             addness_bin,
             session_log_path: agent_session_log_path(kind, &goal_id),
             input_history_path: input_history_file_path(),
+            attachments_dir: attachments_dir_path(),
             goal_id,
             goal_title,
             dod,
@@ -1965,6 +1984,7 @@ impl CodexPane {
             status_label,
             session_log_path,
             input_history_path,
+            attachments_dir,
         } = options;
         let dod_items = split_dod_items(&dod);
         let dod_checks = vec![None; dod_items.len()];
@@ -2038,6 +2058,9 @@ impl CodexPane {
             auto_record_attempted: false,
             body_record_done: false,
             input_state,
+            pending_pastes: Vec::new(),
+            paste_seq: 0,
+            attachments_dir,
             slash_palette_selected: 0,
             mention_palette_selected: 0,
             mention_palette_dismissed: false,
@@ -2119,6 +2142,9 @@ impl CodexPane {
         pane.log.clear();
         pane.session_log_path = None;
         pane.input_history_path = None;
+        pane.attachments_dir = None;
+        pane.pending_pastes.clear();
+        pane.paste_seq = 0;
         pane.input_state.history.clear();
         pane.mention_palette_selected = 0;
         pane.mention_palette_dismissed = false;
@@ -3776,6 +3802,15 @@ impl CodexPane {
             return;
         }
         self.persist_raw_event("stderr", trimmed);
+        // 古い claude CLI が `--include-partial-messages` を拒否した場合、ストリーミングを
+        // 無効化して現在のターンを一度だけ自動再試行する（sticky フラグで無限ループを防ぐ）。
+        if self.kind == AgentKind::ClaudeCode
+            && !self.claude_settings.no_partial_messages()
+            && claude::stderr_indicates_no_partial_messages(trimmed)
+        {
+            self.disable_claude_partial_messages_and_retry();
+            return;
+        }
         if let Some(decision) = decision_banner("stderr", Some(trimmed)) {
             self.set_pending_decision(decision);
         }
@@ -4165,6 +4200,18 @@ impl CodexPane {
         self.start_turn(prompt);
     }
 
+    /// 古い claude CLI 検出時: ストリーミング用フラグを sticky で無効化し、
+    /// 現在のターンを一度だけ自動再試行する。再試行対象が無ければ次ターンから自然に無効になる。
+    fn disable_claude_partial_messages_and_retry(&mut self) {
+        self.claude_settings.disable_partial_messages();
+        self.push_log(
+            CodexLogKind::System,
+            "お使いのclaude CLIはストリーミング表示に未対応のため無効化しました（アップデート推奨）",
+        );
+        // フラグは既に立っているので、再試行ターンの stderr では再発火しない（1 回だけ）。
+        self.retry_current_turn_after_permission_change("ストリーミング無効化");
+    }
+
     fn handle_generic_json_event(&mut self, event_type: &str, value: &Value) {
         if let Some(decision) = decision_banner(event_type, first_text_field(value).as_deref()) {
             self.set_pending_decision(decision);
@@ -4439,7 +4486,76 @@ impl CodexPane {
         if self.finished || self.pending_decision.is_some() {
             return;
         }
-        self.input_state.insert_text(text);
+        let normalized = normalize_input_text(text);
+        if paste_should_fold(&normalized) {
+            // 長文は入力欄にプレースホルダだけ挿入し、全文はペイン側に保持する。
+            self.paste_seq += 1;
+            let line_count = paste_line_count(&normalized);
+            let placeholder = paste_placeholder(self.paste_seq, &normalized);
+            self.input_state.insert_text(&placeholder);
+            self.pending_pastes.push(StoredPaste {
+                placeholder,
+                full: normalized,
+            });
+            self.action = Some(format!("貼り付けを折り畳み: {line_count}行"));
+        } else {
+            self.input_state.insert_text(text);
+        }
+    }
+
+    /// 送信直前に、入力行中のプレースホルダを保持中の全文へ展開する。
+    /// ユーザーが編集して完全一致しなくなったプレースホルダはそのまま送る。
+    /// 展開後は保持データと通し番号をクリアする。
+    fn expand_pending_pastes(&mut self, line: String) -> String {
+        if self.pending_pastes.is_empty() {
+            return line;
+        }
+        let expanded = expand_paste_placeholders(&line, &self.pending_pastes);
+        self.pending_pastes.clear();
+        self.paste_seq = 0;
+        expanded
+    }
+
+    /// Ctrl+V: クリップボードの画像を `~/.addness/attachments/` へ保存し、入力欄にパスを挿入する。
+    /// macOS 以外は未対応。外部コマンド失敗はメッセージ表示のみ（パニック・ハングしない）。
+    pub fn attach_clipboard_image(&mut self) {
+        if self.finished || self.pending_decision.is_some() {
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let Some(dir) = self.attachments_dir.clone() else {
+                self.push_log(CodexLogKind::Error, "画像の保存先ディレクトリが未設定です");
+                return;
+            };
+            match capture_clipboard_image_to_dir(&dir) {
+                Ok(Some(path)) => {
+                    let path_str = path.display().to_string();
+                    self.input_state.insert_text(&path_str);
+                    self.action = Some("クリップボード画像を添付".to_string());
+                    self.push_log(
+                        CodexLogKind::System,
+                        format!("クリップボード画像を保存しパスを挿入しました: {path_str}"),
+                    );
+                }
+                Ok(None) => {
+                    self.push_log(CodexLogKind::System, "クリップボードに画像がありません");
+                }
+                Err(e) => {
+                    self.push_log(
+                        CodexLogKind::Error,
+                        format!("クリップボード画像の取得に失敗しました: {e}"),
+                    );
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.push_log(
+                CodexLogKind::System,
+                "クリップボード画像の添付はこの環境では未対応です",
+            );
+        }
     }
 
     /// TUI 側の操作からシステムプロンプト（F9 再開など）を codex に送信する。
@@ -4471,6 +4587,9 @@ impl CodexPane {
         if submitted.is_empty() {
             return;
         }
+
+        // 畳み込んだ長文ペーストのプレースホルダを全文へ展開してから履歴・実行へ渡す。
+        let submitted = self.expand_pending_pastes(submitted);
 
         self.record_input_history(&submitted);
 
@@ -7827,6 +7946,146 @@ fn normalize_input_text(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
+/// 長文ペーストを入力欄で畳み込む閾値（行数）。これを超えるとプレースホルダ化する。
+const PASTE_FOLD_LINES: usize = 10;
+/// 長文ペーストを入力欄で畳み込む閾値（文字数）。これを超えるとプレースホルダ化する。
+const PASTE_FOLD_CHARS: usize = 800;
+
+/// ペーストの行数（改行区切りのセグメント数）。空文字列は 0 行。
+fn paste_line_count(text: &str) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    text.split('\n').count()
+}
+
+/// ペーストを畳み込むべきか（10 行超 または 800 文字超）。
+fn paste_should_fold(normalized: &str) -> bool {
+    paste_line_count(normalized) > PASTE_FOLD_LINES || normalized.chars().count() > PASTE_FOLD_CHARS
+}
+
+/// 入力欄へ挿入するプレースホルダ文字列を作る（例: `[貼り付け#1: 120行]`）。
+fn paste_placeholder(index: usize, normalized: &str) -> String {
+    format!("[貼り付け#{index}: {}行]", paste_line_count(normalized))
+}
+
+/// 入力行中のプレースホルダを、保持中の全文へ展開する（純粋関数）。
+/// プレースホルダがそのまま残っている（完全一致する）ものだけ差し替える。
+/// ユーザーが編集して一致しなくなったものはそのまま残す。
+fn expand_paste_placeholders(line: &str, pastes: &[StoredPaste]) -> String {
+    let mut out = line.to_string();
+    for paste in pastes {
+        if out.contains(paste.placeholder.as_str()) {
+            out = out.replace(paste.placeholder.as_str(), &paste.full);
+        }
+    }
+    out
+}
+
+/// クリップボード画像の保存先（`~/.addness/attachments/`）。
+fn attachments_dir_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".addness").join("attachments"))
+}
+
+/// `clip-<N>.png` の連番を解析する。
+fn parse_clip_index(name: &str) -> Option<usize> {
+    name.strip_prefix("clip-")?
+        .strip_suffix(".png")?
+        .parse()
+        .ok()
+}
+
+/// 既存ファイル名一覧から次の `clip-<N>.png` を決める（純粋関数）。
+fn next_clip_filename(existing: &[String]) -> String {
+    let max = existing
+        .iter()
+        .filter_map(|name| parse_clip_index(name))
+        .max()
+        .unwrap_or(0);
+    format!("clip-{}.png", max + 1)
+}
+
+/// ディレクトリ内の既存 `clip-*.png` を調べ、次の保存先パスを返す。
+fn next_clip_path(dir: &Path) -> PathBuf {
+    let existing: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect();
+    dir.join(next_clip_filename(&existing))
+}
+
+/// macOS: クリップボードの PNG を `dir` 内の次の連番へ保存する。
+/// 画像が無ければ `Ok(None)`、保存できたら `Ok(Some(path))`、外部コマンド失敗は `Err`。
+#[cfg(target_os = "macos")]
+fn capture_clipboard_image_to_dir(dir: &Path) -> std::io::Result<Option<PathBuf>> {
+    std::fs::create_dir_all(dir)?;
+    let path = next_clip_path(dir);
+    if run_osascript_write_clipboard_png(&path, std::time::Duration::from_secs(5))? {
+        Ok(Some(path))
+    } else {
+        Ok(None)
+    }
+}
+
+/// macOS: `osascript` でクリップボードの PNG をファイルへ書き出す。
+/// 書き出せたら `Ok(true)`、画像が無ければ `Ok(false)`。タイムアウト付き（ハング防止）。
+#[cfg(target_os = "macos")]
+fn run_osascript_write_clipboard_png(
+    path: &Path,
+    timeout: std::time::Duration,
+) -> std::io::Result<bool> {
+    use std::io::Read;
+    let script = format!(
+        "set outFile to POSIX file \"{}\"\n\
+try\n\
+    set pngData to (the clipboard as «class PNGf»)\n\
+on error\n\
+    return \"NO_IMAGE\"\n\
+end try\n\
+set fh to open for access outFile with write permission\n\
+set eof fh to 0\n\
+write pngData to fh\n\
+close access fh\n\
+return \"OK\"",
+        path.display()
+    );
+    let mut child = Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let mut out = String::new();
+            if let Some(mut so) = child.stdout.take() {
+                let _ = so.read_to_string(&mut out);
+            }
+            if status.success() && out.trim() == "OK" && path.exists() {
+                return Ok(true);
+            }
+            // 画像なし・書き込み失敗時は中途半端なファイルを残さない。
+            let _ = std::fs::remove_file(path);
+            return Ok(false);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(path);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "osascript がタイムアウトしました",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 fn prev_char_boundary(text: &str, cursor: usize) -> Option<usize> {
     if cursor == 0 {
         return None;
@@ -10310,6 +10569,7 @@ mod tests {
             addness_bin: "addness",
             session_log_path: None,
             input_history_path: None,
+            attachments_dir: None,
             goal_id: "goal/claude".to_string(),
             goal_title: "Claude goal".to_string(),
             dod: String::new(),
@@ -10328,6 +10588,23 @@ mod tests {
         }));
         assert_eq!(pane.thread_id.as_deref(), Some("sid-1"));
         assert!(pane.log.iter().any(|line| line.kind == CodexLogKind::Turn));
+    }
+
+    #[test]
+    fn claude_stderr_unknown_partial_flag_disables_streaming_once() {
+        let mut pane = claude_pane();
+        // 再試行対象プロンプトは無い状態にし、spawn せず判定・フラグ・ログのみ確認する。
+        pane.current_turn_retry_prompt = None;
+        assert!(!pane.claude_settings.no_partial_messages());
+
+        pane.handle_stderr_line("error: unknown option '--include-partial-messages'");
+        assert!(pane.claude_settings.no_partial_messages());
+        let disabled_msg = |line: &CodexLogLine| line.text.contains("ストリーミング表示に未対応");
+        assert_eq!(pane.log.iter().filter(|l| disabled_msg(l)).count(), 1);
+
+        // 2 回目の同種 stderr ではフラグ済みなので再発火せず、無効化ログも増えない（無限ループ防止）。
+        pane.handle_stderr_line("error: unknown option '--include-partial-messages'");
+        assert_eq!(pane.log.iter().filter(|l| disabled_msg(l)).count(), 1);
     }
 
     #[test]
@@ -10627,6 +10904,129 @@ mod tests {
         // 文字入力で選択は先頭へ戻る。
         type_input(&mut pane, "s");
         assert_eq!(pane.slash_palette_selected(), 0);
+    }
+
+    #[test]
+    fn paste_fold_threshold_boundaries() {
+        // 10 行ちょうど・800 文字ちょうどは畳み込まない（超えたら畳み込む）。
+        let ten_lines = (0..10)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(paste_line_count(&ten_lines), 10);
+        assert!(!paste_should_fold(&ten_lines));
+        let eleven_lines = (0..11)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(paste_line_count(&eleven_lines), 11);
+        assert!(paste_should_fold(&eleven_lines));
+
+        let exactly_800 = "a".repeat(800);
+        assert!(!paste_should_fold(&exactly_800));
+        let over_800 = "a".repeat(801);
+        assert!(paste_should_fold(&over_800));
+    }
+
+    #[test]
+    fn paste_placeholder_reports_line_count() {
+        let text = "l1\nl2\nl3";
+        assert_eq!(paste_placeholder(1, text), "[貼り付け#1: 3行]");
+        assert_eq!(paste_placeholder(2, "solo"), "[貼り付け#2: 1行]");
+    }
+
+    #[test]
+    fn expand_paste_placeholders_replaces_matching_and_keeps_edited() {
+        let pastes = vec![
+            StoredPaste {
+                placeholder: "[貼り付け#1: 3行]".to_string(),
+                full: "l1\nl2\nl3".to_string(),
+            },
+            StoredPaste {
+                placeholder: "[貼り付け#2: 2行]".to_string(),
+                full: "a\nb".to_string(),
+            },
+        ];
+        let line = "前 [貼り付け#1: 3行] 中 [貼り付け#2: 2行] 後";
+        assert_eq!(
+            expand_paste_placeholders(line, &pastes),
+            "前 l1\nl2\nl3 中 a\nb 後"
+        );
+        // 編集されて一致しないプレースホルダは展開せずそのまま残す。
+        let edited = "[貼り付け#1: 9行] のこり";
+        assert_eq!(expand_paste_placeholders(edited, &pastes), edited);
+    }
+
+    #[test]
+    fn paste_input_folds_long_and_expands_on_submit() {
+        let mut pane = live_pane();
+        let long = (0..15)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        pane.paste_input(&long);
+        assert_eq!(pane.input_line(), "[貼り付け#1: 15行]");
+        assert_eq!(pane.pending_pastes.len(), 1);
+
+        // 2 件目は #2 として区別する。
+        pane.paste_input(&long);
+        assert!(pane.input_line().contains("[貼り付け#2: 15行]"));
+        assert_eq!(pane.pending_pastes.len(), 2);
+
+        // 送信時展開: プレースホルダが全文へ戻り、保持データはクリアされる。
+        let line = pane.input_line().to_string();
+        let expanded = pane.expand_pending_pastes(line);
+        assert!(expanded.contains("line0\nline1"));
+        assert!(!expanded.contains("[貼り付け#"));
+        assert!(pane.pending_pastes.is_empty());
+        assert_eq!(pane.paste_seq, 0);
+    }
+
+    #[test]
+    fn paste_input_short_inserts_directly() {
+        let mut pane = live_pane();
+        pane.paste_input("short paste");
+        assert_eq!(pane.input_line(), "short paste");
+        assert!(pane.pending_pastes.is_empty());
+    }
+
+    #[test]
+    fn next_clip_filename_increments_past_existing() {
+        assert_eq!(next_clip_filename(&[]), "clip-1.png");
+        let existing = vec![
+            "clip-1.png".to_string(),
+            "clip-3.png".to_string(),
+            "other.png".to_string(),
+        ];
+        assert_eq!(next_clip_filename(&existing), "clip-4.png");
+    }
+
+    #[test]
+    fn next_clip_path_uses_injected_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "addness-clip-test-{}-{}",
+            std::process::id(),
+            "nextpath"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("clip-1.png"), b"x").unwrap();
+        std::fs::write(dir.join("clip-3.png"), b"x").unwrap();
+        let path = next_clip_path(&dir);
+        assert_eq!(path.parent().unwrap(), dir.as_path());
+        assert_eq!(path.file_name().unwrap().to_str().unwrap(), "clip-4.png");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn attach_clipboard_image_on_non_macos_reports_unsupported() {
+        // macOS 以外では未対応メッセージを出す（osascript は呼ばない）。
+        #[cfg(not(target_os = "macos"))]
+        {
+            let mut pane = live_pane();
+            pane.attach_clipboard_image();
+            assert!(pane.log.iter().any(|line| line.text.contains("未対応")));
+        }
     }
 
     fn has_addness_developer_instructions(args: &[String]) -> bool {
@@ -11532,6 +11932,7 @@ mod tests {
                 status_label: "TEST".to_string(),
                 session_log_path: Some(history_path),
                 input_history_path: None,
+                attachments_dir: None,
             })
             .unwrap();
             pane.handle_stdout_line(r#"{"type":"agent_message.delta","delta":"hel"}"#);
@@ -11554,6 +11955,7 @@ mod tests {
             status_label: "TEST".to_string(),
             session_log_path: Some(history_path),
             input_history_path: None,
+            attachments_dir: None,
         })
         .unwrap();
 

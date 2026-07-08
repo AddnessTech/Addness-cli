@@ -2257,6 +2257,12 @@ impl App {
                         pane.toggle_old_turns_collapsed();
                         return;
                     }
+                    // Ctrl+V: クリップボード画像を添付する（bracketed paste とは別の生キー）。
+                    // macOS 端末では Cmd+V が貼り付け（bracketed paste）なので Ctrl+V は生キーで届く。
+                    KeyCode::Char('v' | 'V') => {
+                        pane.attach_clipboard_image();
+                        return;
+                    }
                     _ => {}
                 }
             }

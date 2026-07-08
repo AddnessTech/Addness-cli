@@ -200,6 +200,9 @@ pub(super) struct ClaudeExecSettings {
     /// 以後の全ターンに付与する（セッションレベルの sticky 許可リスト）。
     sticky_allowed_tools: Vec<String>,
     additional_dirs: Vec<String>,
+    /// 古い claude CLI が `--include-partial-messages` 未対応と判明した場合に立てる sticky フラグ。
+    /// 立つと以後の全ターンで同フラグを付けず、ストリーミングなしのブロック表示へ退化する。
+    no_partial_messages: bool,
 }
 
 impl Default for ClaudeExecSettings {
@@ -211,6 +214,7 @@ impl Default for ClaudeExecSettings {
             permission_mode: ClaudePermissionMode::Config,
             sticky_allowed_tools: Vec::new(),
             additional_dirs: Vec::new(),
+            no_partial_messages: false,
         }
     }
 }
@@ -300,6 +304,16 @@ impl ClaudeExecSettings {
             self.additional_dirs.push(dir);
         }
     }
+
+    /// `--include-partial-messages` を今後付けないか（古い CLI 検出後の sticky フラグ）。
+    pub(super) fn no_partial_messages(&self) -> bool {
+        self.no_partial_messages
+    }
+
+    /// 古い CLI 検出時に呼び、以後のターンでストリーミング用フラグを無効化する。
+    pub(super) fn disable_partial_messages(&mut self) {
+        self.no_partial_messages = true;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -325,9 +339,13 @@ pub(super) fn exec_args(
         OsString::from("--output-format"),
         OsString::from("stream-json"),
         OsString::from("--verbose"),
-        // トークン単位のストリーミング表示のため部分メッセージを受け取る。
-        OsString::from("--include-partial-messages"),
     ];
+
+    // トークン単位のストリーミング表示のため部分メッセージを受け取る。
+    // 古い claude CLI が未対応と判明した場合（sticky フラグ）は付けず、ブロック表示へ退化する。
+    if !settings.no_partial_messages {
+        args.push(OsString::from("--include-partial-messages"));
+    }
 
     if let Some(session_id) = session_id {
         args.push(OsString::from("--resume"));
@@ -394,6 +412,21 @@ pub(super) fn exec_args(
     args.push(OsString::from(developer_instructions));
 
     args
+}
+
+/// 古い claude CLI が `--include-partial-messages` を未対応で拒否した stderr かどうか。
+/// unknown option / unexpected argument 系のメッセージにフラグ名が含まれるかで判定する。
+pub(super) fn stderr_indicates_no_partial_messages(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    if !lower.contains("--include-partial-messages") {
+        return false;
+    }
+    lower.contains("unknown option")
+        || lower.contains("unknown argument")
+        || lower.contains("unexpected argument")
+        || lower.contains("unknown flag")
+        || lower.contains("unrecognized")
+        || lower.contains("invalid option")
 }
 
 // ---------------------------------------------------------------------------
@@ -983,6 +1016,42 @@ mod tests {
         let settings = ClaudeExecSettings::default();
         let args = os(&exec_args(None, &settings, &[], false, "x"));
         assert!(!args.iter().any(|a| a == "--allowedTools"));
+    }
+
+    #[test]
+    fn exec_args_omits_partial_messages_when_disabled() {
+        let mut settings = ClaudeExecSettings::default();
+        assert!(!settings.no_partial_messages());
+        settings.disable_partial_messages();
+        assert!(settings.no_partial_messages());
+        let args = os(&exec_args(None, &settings, &[], false, "x"));
+        assert!(!args.iter().any(|a| a == "--include-partial-messages"));
+        // 他の基本フラグは維持される。
+        assert_eq!(
+            &args[0..4],
+            &["-p", "--output-format", "stream-json", "--verbose"]
+        );
+    }
+
+    #[test]
+    fn stderr_no_partial_messages_detection() {
+        assert!(stderr_indicates_no_partial_messages(
+            "error: unknown option '--include-partial-messages'"
+        ));
+        assert!(stderr_indicates_no_partial_messages(
+            "error: unexpected argument '--include-partial-messages' found"
+        ));
+        assert!(stderr_indicates_no_partial_messages(
+            "Unknown Flag: --include-partial-messages"
+        ));
+        // フラグ名を含まない一般的なエラーは対象外。
+        assert!(!stderr_indicates_no_partial_messages(
+            "error: unknown option '--foo'"
+        ));
+        // フラグ名を含むが unknown/unexpected 系でない出力は対象外。
+        assert!(!stderr_indicates_no_partial_messages(
+            "using --include-partial-messages for streaming"
+        ));
     }
 
     #[test]

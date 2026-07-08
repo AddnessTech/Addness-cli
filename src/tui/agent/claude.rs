@@ -243,6 +243,20 @@ impl ClaudeExecSettings {
         self.permission_mode.label().to_string()
     }
 
+    /// `--model` に相当する現在の実効値。`config`（既定）なら None。
+    /// 常駐モードの `set_model` control_request 送信可否の判定に使う。
+    pub(super) fn effective_model_arg(&self) -> Option<&str> {
+        self.model_override
+            .as_deref()
+            .or_else(|| self.model.cli_arg())
+    }
+
+    /// `--permission-mode` に相当する現在の実効値。`config`（既定）なら None。
+    /// 常駐モードの `set_permission_mode` control_request 送信可否の判定に使う。
+    pub(super) fn effective_permission_mode_arg(&self) -> Option<&str> {
+        self.permission_mode.cli_arg()
+    }
+
     /// sticky 許可リストを一覧表示用に返す。
     pub(super) fn sticky_allowed_tools(&self) -> &[String] {
         &self.sticky_allowed_tools
@@ -340,39 +354,14 @@ pub(super) fn exec_args(
         OsString::from("stream-json"),
         OsString::from("--verbose"),
     ];
-
-    // トークン単位のストリーミング表示のため部分メッセージを受け取る。
-    // 古い claude CLI が未対応と判明した場合（sticky フラグ）は付けず、ブロック表示へ退化する。
-    if !settings.no_partial_messages {
-        args.push(OsString::from("--include-partial-messages"));
-    }
-
-    if let Some(session_id) = session_id {
-        args.push(OsString::from("--resume"));
-        args.push(OsString::from(session_id));
-        if fork {
-            args.push(OsString::from("--fork-session"));
-        }
-    }
-
-    if let Some(model) = settings
-        .model_override
-        .as_deref()
-        .or_else(|| settings.model.cli_arg())
-    {
-        args.push(OsString::from("--model"));
-        args.push(OsString::from(model));
-    }
-
-    if let Some(effort) = settings.effort.cli_arg() {
-        args.push(OsString::from("--effort"));
-        args.push(OsString::from(effort));
-    }
+    push_partial_messages_flag(&mut args, settings);
+    push_resume_args(&mut args, session_id, fork);
+    push_model_and_effort_args(&mut args, settings);
 
     // 承認直後の続行ターン（one-shot allowedTools を消費）で permission_mode が Plan の場合は、
     // plan が実行を抑止して承認済みでも再拒否ループに陥るのを避けるため、このターンだけ
     // --permission-mode を default（フラグ省略）へ落とす。sticky 許可のみのターンでは通常どおり
-    // settings の permission_mode を尊重する。
+    // settings の permission_mode を尊重する。ワンショット専用のヒューリスティック。
     let effective_mode = if !one_shot_allowed_tools.is_empty()
         && settings.permission_mode == ClaudePermissionMode::Plan
     {
@@ -386,12 +375,90 @@ pub(super) fn exec_args(
     }
 
     // 権限: sticky 許可リスト + 今回だけの許可ルールを `--allowedTools` へ（重複除去）。
+    push_allowed_tools_args(
+        &mut args,
+        settings
+            .sticky_allowed_tools
+            .iter()
+            .chain(one_shot_allowed_tools.iter()),
+    );
+    push_add_dir_args(&mut args, settings);
+    push_system_prompt_args(&mut args, developer_instructions);
+    args
+}
+
+/// 常駐（多ターン 1 プロセス）モードの起動引数を組み立てる。
+/// exec_args と共通する部分（resume/model/effort/allowedTools/add-dir/system-prompt）は
+/// 同じヘルパを共有し、常駐固有の入力ストリームと承認プロンプトフラグだけを足す。
+///
+/// * `session_id` — プロセス死亡・アイドル回収後の再接続に使う `--resume <id>`。
+/// * `fork` — resume 時にセッションを複製する（`--fork-session`）。
+///
+/// 承認はプロセス実行中に can_use_tool でその場処理するため、one-shot allowedTools は取らず
+/// sticky 許可リストのみを付与する。plan-drop ヒューリスティックも使わない。
+pub(super) fn resident_args(
+    session_id: Option<&str>,
+    settings: &ClaudeExecSettings,
+    fork: bool,
+    developer_instructions: &str,
+) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec![
+        OsString::from("-p"),
+        OsString::from("--input-format"),
+        OsString::from("stream-json"),
+        OsString::from("--output-format"),
+        OsString::from("stream-json"),
+        OsString::from("--verbose"),
+    ];
+    push_partial_messages_flag(&mut args, settings);
+    // その場承認（can_use_tool）を stdio 経由で受けるための隠しフラグ。
+    args.push(OsString::from("--permission-prompt-tool"));
+    args.push(OsString::from("stdio"));
+    push_resume_args(&mut args, session_id, fork);
+    push_model_and_effort_args(&mut args, settings);
+    if let Some(mode) = settings.permission_mode.cli_arg() {
+        args.push(OsString::from("--permission-mode"));
+        args.push(OsString::from(mode));
+    }
+    // 常駐では sticky 許可リストのみを付与する（今回だけの許可は can_use_tool 応答で処理）。
+    push_allowed_tools_args(&mut args, settings.sticky_allowed_tools.iter());
+    push_add_dir_args(&mut args, settings);
+    push_system_prompt_args(&mut args, developer_instructions);
+    args
+}
+
+/// トークン単位のストリーミング表示のため部分メッセージを受け取る。
+/// 古い claude CLI が未対応と判明した場合（sticky フラグ）は付けず、ブロック表示へ退化する。
+fn push_partial_messages_flag(args: &mut Vec<OsString>, settings: &ClaudeExecSettings) {
+    if !settings.no_partial_messages {
+        args.push(OsString::from("--include-partial-messages"));
+    }
+}
+
+fn push_resume_args(args: &mut Vec<OsString>, session_id: Option<&str>, fork: bool) {
+    if let Some(session_id) = session_id {
+        args.push(OsString::from("--resume"));
+        args.push(OsString::from(session_id));
+        if fork {
+            args.push(OsString::from("--fork-session"));
+        }
+    }
+}
+
+fn push_model_and_effort_args(args: &mut Vec<OsString>, settings: &ClaudeExecSettings) {
+    if let Some(model) = settings.effective_model_arg() {
+        args.push(OsString::from("--model"));
+        args.push(OsString::from(model));
+    }
+    if let Some(effort) = settings.effort.cli_arg() {
+        args.push(OsString::from("--effort"));
+        args.push(OsString::from(effort));
+    }
+}
+
+fn push_allowed_tools_args<'a>(args: &mut Vec<OsString>, rules: impl Iterator<Item = &'a String>) {
     let mut allowed: Vec<&str> = Vec::new();
-    for rule in settings
-        .sticky_allowed_tools
-        .iter()
-        .chain(one_shot_allowed_tools.iter())
-    {
+    for rule in rules {
         if !allowed.contains(&rule.as_str()) {
             allowed.push(rule.as_str());
         }
@@ -402,16 +469,18 @@ pub(super) fn exec_args(
             args.push(OsString::from(rule));
         }
     }
+}
 
+fn push_add_dir_args(args: &mut Vec<OsString>, settings: &ClaudeExecSettings) {
     for dir in &settings.additional_dirs {
         args.push(OsString::from("--add-dir"));
         args.push(OsString::from(dir));
     }
+}
 
+fn push_system_prompt_args(args: &mut Vec<OsString>, developer_instructions: &str) {
     args.push(OsString::from("--append-system-prompt"));
     args.push(OsString::from(developer_instructions));
-
-    args
 }
 
 /// 古い claude CLI が `--include-partial-messages` を未対応で拒否した stderr かどうか。

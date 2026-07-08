@@ -12,7 +12,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -21,6 +21,7 @@ use serde_json::Value;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 mod claude;
+mod claude_resident;
 mod codex;
 
 pub const CODEX_LOG_PREFIX_WIDTH: usize = 7;
@@ -132,6 +133,14 @@ const CODEX_SESSION_HISTORY_MAX_RECORDS: usize = 20_000;
 const CODEX_SESSION_HISTORY_MAX_BYTES: u64 = 20 * 1024 * 1024;
 /// 入力履歴（↑↓で呼び戻す過去プロンプト）の保持上限。
 const INPUT_HISTORY_MAX: usize = 200;
+/// 常駐 Claude Code の interrupt がグレースフルに完了するのを待つ上限。
+/// 超えたら従来どおり kill し、次ターンで `--resume` 再起動する。
+const CLAUDE_INTERRUPT_GRACE: Duration = Duration::from_secs(2);
+/// 常駐 Claude Code の set_model / set_permission_mode 応答を待つ上限。
+/// 超えたら stdin close → 新フラグ + `--resume` で再起動へフォールバックする。
+const CLAUDE_SETTING_CHANGE_GRACE: Duration = Duration::from_secs(2);
+/// 常駐 Claude Code をアイドル回収するまでの無操作時間（メモリ約300MB対策）。
+const CLAUDE_RESIDENT_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// @メンションのファイル候補を一度に表示する最大件数。
 const MENTION_PALETTE_MAX: usize = 10;
 
@@ -196,6 +205,34 @@ pub fn claude_path() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// 常駐（多ターン 1 プロセス）モードを既定で使うか。`ADDNESS_CLAUDE_RESIDENT=0` で
+/// ワンショット（1 ターン 1 プロセス）へ退避する。
+fn claude_resident_default_enabled() -> bool {
+    match std::env::var("ADDNESS_CLAUDE_RESIDENT") {
+        Ok(value) => value != "0",
+        Err(_) => true,
+    }
+}
+
+/// 常駐モードで承認バナー表示中の can_use_tool 要求（応答に必要な情報）。
+#[derive(Debug, Clone)]
+struct ClaudePendingTool {
+    /// 応答時にエコーバックする request_id。
+    request_id: String,
+    /// 許可時に `updatedInput` として返す入力（そのまま返す）。
+    input: Value,
+    /// 「これからずっと許可」で sticky 許可リストへ入れるルール。
+    rules: Vec<String>,
+}
+
+/// 常駐モードで送信済みの set_model / set_permission_mode 応答待ち（フォールバック判定用）。
+#[derive(Debug, Clone)]
+struct ClaudePendingSettingChange {
+    request_id: String,
+    deadline: Instant,
+    label: String,
 }
 
 /// codex 実行ファイルのパスを解決する。
@@ -1939,6 +1976,31 @@ pub struct CodexPane {
     /// 直前の承認リトライで許可した拒否内容（claude 専用）。
     /// リトライ結果で同一の拒否が再発したらループとみなしてエラー表示する。
     claude_approved_denials: Vec<claude::ClaudeDenial>,
+    /// 常駐（多ターン 1 プロセス）モードを使うか（ClaudeCode 専用）。
+    /// 既定は環境変数で決まり、常駐 spawn 失敗時はこのセッションだけ false へ落とす。
+    claude_resident_enabled: bool,
+    /// 常駐 Claude Code プロセスのクライアント。None=未起動 / 死亡 / アイドル回収済み。
+    claude_resident: Option<claude_resident::ResidentClient>,
+    /// 常駐プロセスの最終アクティビティ時刻（アイドル回収判定に使う）。
+    claude_resident_last_activity: Option<Instant>,
+    /// interrupt を送ってから result（中断完了）を待つ期限。超えたら kill フォールバック。
+    claude_interrupt_deadline: Option<Instant>,
+    /// interrupt 要求中フラグ。result 受信時に中断完了として扱い、キューを自動開始しない。
+    claude_interrupting: bool,
+    /// 承認バナー表示中の can_use_tool 要求（応答用）。
+    claude_pending_tool: Option<ClaudePendingTool>,
+    /// 送信済みの set_model / set_permission_mode 応答待ち。
+    claude_pending_setting_change: Option<ClaudePendingSettingChange>,
+    /// 設定変更が control_request では反映できず、アイドル時に再起動が必要な状態。
+    claude_resident_restart_pending: bool,
+    /// result の `total_cost_usd`（セッション累積、保存のみ）。
+    claude_total_cost_usd: Option<f64>,
+    /// result の usage 要約（保存のみ）。
+    claude_last_usage: Option<String>,
+    /// system/init が報告する現在の model（保存のみ、表示同期用）。
+    claude_active_model: Option<String>,
+    /// system/init が報告する現在の permissionMode（保存のみ、表示同期用）。
+    claude_active_permission_mode: Option<String>,
 }
 
 impl CodexPane {
@@ -2100,6 +2162,19 @@ impl CodexPane {
             claude_pending_allowed_tools: Vec::new(),
             claude_pending_denials: Vec::new(),
             claude_approved_denials: Vec::new(),
+            claude_resident_enabled: kind == AgentKind::ClaudeCode
+                && claude_resident_default_enabled(),
+            claude_resident: None,
+            claude_resident_last_activity: None,
+            claude_interrupt_deadline: None,
+            claude_interrupting: false,
+            claude_pending_tool: None,
+            claude_pending_setting_change: None,
+            claude_resident_restart_pending: false,
+            claude_total_cost_usd: None,
+            claude_last_usage: None,
+            claude_active_model: None,
+            claude_active_permission_mode: None,
         };
         let name = kind.display_name();
         if pane.loaded_history_count > 0 {
@@ -2168,6 +2243,18 @@ impl CodexPane {
         pane.claude_pending_allowed_tools = Vec::new();
         pane.claude_pending_denials = Vec::new();
         pane.claude_approved_denials = Vec::new();
+        pane.claude_resident_enabled = false;
+        pane.claude_resident = None;
+        pane.claude_resident_last_activity = None;
+        pane.claude_interrupt_deadline = None;
+        pane.claude_interrupting = false;
+        pane.claude_pending_tool = None;
+        pane.claude_pending_setting_change = None;
+        pane.claude_resident_restart_pending = false;
+        pane.claude_total_cost_usd = None;
+        pane.claude_last_usage = None;
+        pane.claude_active_model = None;
+        pane.claude_active_permission_mode = None;
         pane.diff_view = None;
         pane.addness_body_excerpt = None;
         pane.turn_picker = None;
@@ -2502,6 +2589,18 @@ impl CodexPane {
     pub fn interrupt_turn_by_esc(&mut self) -> bool {
         if !self.is_turn_running() {
             return false;
+        }
+        // 常駐モードはまず graceful interrupt を試み、2 秒で完了しなければ update() 側で kill する。
+        if self.claude_resident.is_some() && self.request_claude_interrupt() {
+            self.push_log(CodexLogKind::System, "Esc でターンを中断します".to_string());
+            let queued = self.queued_prompts.len();
+            if queued > 0 {
+                self.push_log(
+                    CodexLogKind::System,
+                    format!("予約{queued}件は保留中（/stop queued で破棄可）"),
+                );
+            }
+            return true;
         }
         self.kill_current_turn();
         self.push_log(
@@ -2980,6 +3079,7 @@ impl CodexPane {
             self.action = Some(format!("model: {value}"));
             self.push_activity(format!("Claude Code model を {value} に変更"));
             self.push_log(CodexLogKind::System, format!("次回ターンの model: {value}"));
+            self.push_claude_resident_model();
             return;
         }
         self.exec_settings.model_override = None;
@@ -2995,6 +3095,7 @@ impl CodexPane {
             self.action = Some(format!("model: {value}"));
             self.push_activity(format!("Claude Code model を {value} に変更"));
             self.push_log(CodexLogKind::System, format!("次回ターンの model: {value}"));
+            self.push_claude_resident_model();
             return;
         }
         if let Some(model) = parse_builtin_model_choice(value) {
@@ -3066,6 +3167,7 @@ impl CodexPane {
                 CodexLogKind::System,
                 format!("次回ターンの permission-mode: {value}"),
             );
+            self.push_claude_resident_permission_mode();
             return;
         }
         let value = self.exec_settings.cycle_approval();
@@ -3086,6 +3188,7 @@ impl CodexPane {
             CodexLogKind::System,
             format!("次回ターンの permission-mode: {value}"),
         );
+        self.push_claude_resident_permission_mode();
     }
 
     fn set_approval(&mut self, value: CodexApprovalChoice) {
@@ -3695,6 +3798,12 @@ impl CodexPane {
             }
         }
 
+        // 常駐 Claude Code プロセスのポーリング（死亡検知・中断/設定タイムアウト・アイドル回収）。
+        // 常駐時は self.child は None なので、下の従来ターン終了検知とは競合しない。
+        if self.kind == AgentKind::ClaudeCode {
+            changed |= self.poll_claude_resident();
+        }
+
         if let Some(child) = self.child.as_mut() {
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -3934,7 +4043,14 @@ impl CodexPane {
                 if claude::event_subtype(value) == Some("init") {
                     if let Some(session_id) = claude::session_id(value) {
                         // session_id は codex の thread_id フィールドを共用する。
-                        self.thread_id = Some(session_id);
+                        self.thread_id = Some(session_id.clone());
+                    }
+                    // 毎ターン再送される init から現在の model/permissionMode を表示同期用に保存。
+                    if let Some(model) = value.get("model").and_then(Value::as_str) {
+                        self.claude_active_model = Some(model.to_string());
+                    }
+                    if let Some(mode) = value.get("permissionMode").and_then(Value::as_str) {
+                        self.claude_active_permission_mode = Some(mode.to_string());
                     }
                     self.begin_claude_turn();
                 }
@@ -3942,7 +4058,17 @@ impl CodexPane {
             }
             "assistant" => self.handle_claude_assistant(value),
             "user" => self.handle_claude_tool_results(value),
+            "control_request" => self.handle_claude_control_request(value),
+            "control_cancel_request" => self.handle_claude_control_cancel(value),
+            "control_response" => self.handle_claude_control_response(value),
             "result" => {
+                // total_cost_usd / usage / session_id を保存する（表示は後続タスク）。
+                if let Some(cost) = value.get("total_cost_usd").and_then(Value::as_f64) {
+                    self.claude_total_cost_usd = Some(cost);
+                }
+                if let Some(session_id) = claude::session_id(value) {
+                    self.thread_id = Some(session_id);
+                }
                 let result = claude::parse_result(value);
                 self.handle_claude_result(result);
             }
@@ -4070,6 +4196,7 @@ impl CodexPane {
 
     fn handle_claude_result(&mut self, result: claude::ClaudeResult) {
         if let Some(usage) = result.usage_label {
+            self.claude_last_usage = Some(usage.clone());
             self.last_token_usage_label = Some(usage);
         }
         self.turn_running = false;
@@ -4079,8 +4206,32 @@ impl CodexPane {
         self.streaming_assistant_index = None;
         self.refresh_current_turn_title();
         self.queue_completed_turn_body_record();
+        self.claude_resident_last_activity = Some(Instant::now());
+
+        // 常駐モードで interrupt 要求中に来た result（aborted_streaming）は中断完了として扱う。
+        // 既存仕様どおり、中断時はキューを自動開始しない。
+        if self.claude_interrupting {
+            self.claude_interrupting = false;
+            self.claude_interrupt_deadline = None;
+            self.pending_decision = None;
+            self.claude_pending_tool = None;
+            self.current_turn_prompt = None;
+            self.current_turn_retry_prompt = None;
+            self.action = Some("中断完了".to_string());
+            self.push_log(CodexLogKind::System, "ターンを中断しました");
+            let queued = self.queued_prompts.len();
+            if queued > 0 {
+                self.push_log(
+                    CodexLogKind::System,
+                    format!("予約{queued}件は保留中（/stop queued で破棄可）"),
+                );
+            }
+            return;
+        }
 
         if !result.denials.is_empty() {
+            // 常駐モードでは承認は can_use_tool で解決するため denials は基本来ない。
+            // 来た場合（ワンショット経路）は従来どおりリトライバナーを出す。
             self.set_claude_permission_decision(&result.denials);
             return;
         }
@@ -4098,6 +4249,14 @@ impl CodexPane {
             self.action = Some("応答完了".to_string());
             self.push_log(CodexLogKind::System, "Claude Code の応答が完了しました");
             self.push_terminal_notice("Claude Code 完了", "Claude Code の出力が完了しました");
+        }
+
+        // 常駐モードはプロセスが終了しないので、ここでキュー再開を駆動する
+        // （ワンショットは update() のプロセス終了検知が駆動するため二重にしない）。
+        if self.claude_resident.is_some() {
+            self.current_turn_prompt = None;
+            self.current_turn_retry_prompt = None;
+            self.start_next_queued_turn_if_idle();
         }
     }
 
@@ -4151,6 +4310,12 @@ impl CodexPane {
 
     /// 承認 Accept/Always 後に `--resume` で続行ターンを開始する。
     fn resolve_claude_decision(&mut self, response: CodexDecisionResponse, response_label: &str) {
+        // 常駐モードの can_use_tool 応答はプロセスへ control_response を返してその場で続行する
+        // （ワンショットのような resume 再実行はしない）。
+        if self.claude_pending_tool.is_some() {
+            self.resolve_claude_resident_tool(response, response_label);
+            return;
+        }
         self.action = Some(format!("確認応答: {response_label}"));
         self.push_activity(format!("確認待ちに {response_label} で応答"));
         let rules = std::mem::take(&mut self.claude_pending_allowed_tools);
@@ -4210,6 +4375,506 @@ impl CodexPane {
         );
         // フラグは既に立っているので、再試行ターンの stderr では再発火しない（1 回だけ）。
         self.retry_current_turn_after_permission_change("ストリーミング無効化");
+    }
+
+    // -----------------------------------------------------------------------
+    // 常駐（多ターン 1 プロセス）モード
+    // -----------------------------------------------------------------------
+
+    /// このターンを常駐経路で送るか（ClaudeCode かつ常駐有効）。
+    fn claude_resident_active(&self) -> bool {
+        self.kind == AgentKind::ClaudeCode && self.claude_resident_enabled
+    }
+
+    /// 常駐 claude プロセスを spawn する（stdout/stderr は既存の line reader で読む）。
+    fn spawn_claude_resident(&mut self) -> Result<claude_resident::ResidentClient> {
+        let mut cmd = Command::new(&self.codex_bin);
+        for arg in claude::resident_args(
+            self.thread_id.as_deref(),
+            &self.claude_settings,
+            self.claude_fork_next,
+            addness_tui_developer_instructions(),
+        ) {
+            cmd.arg(arg);
+        }
+        cmd.current_dir(&self.cwd);
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        self.apply_agent_env(&mut cmd);
+
+        let mut child = cmd
+            .spawn()
+            .context("Claude Code 常駐プロセスの起動に失敗しました")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("Claude Code 常駐プロセス stdout の取得に失敗しました")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("Claude Code 常駐プロセス stderr の取得に失敗しました")?;
+        spawn_line_reader(stdout, self.tx.clone(), false);
+        spawn_line_reader(stderr, self.tx.clone(), true);
+        claude_resident::ResidentClient::new(child)
+    }
+
+    /// 常駐モードでターンを開始する（既存プロセスがあれば再利用、無ければ spawn）。
+    /// spawn 自体に失敗した場合はワンショットへフォールバックする。
+    fn start_claude_resident_turn(&mut self, prompt: &str, display_prompt: &str) {
+        self.esc_interrupt_armed = false;
+        if self.is_turn_running() {
+            self.push_log(
+                CodexLogKind::System,
+                "前の Claude Code ターンがまだ実行中です",
+            );
+            return;
+        }
+
+        // グレースフル終了中の常駐は使わず、確実に終了させてから作り直す。
+        if let Some(resident) = self.claude_resident.as_mut()
+            && resident.closing
+        {
+            resident.kill();
+            self.claude_resident = None;
+        }
+
+        if self.claude_resident.is_none() {
+            match self.spawn_claude_resident() {
+                Ok(client) => {
+                    self.claude_resident = Some(client);
+                    self.claude_fork_next = false;
+                    let resume = if self.thread_id.is_some() {
+                        "（--resume で再接続）"
+                    } else {
+                        ""
+                    };
+                    self.push_log(
+                        CodexLogKind::System,
+                        format!("Claude Code 常駐プロセスを起動しました{resume}"),
+                    );
+                }
+                Err(e) => {
+                    // 常駐 spawn 失敗 → このセッションはワンショットへ退避する。
+                    self.claude_resident_enabled = false;
+                    self.push_log(
+                        CodexLogKind::System,
+                        format!("常駐プロセスの起動に失敗したためワンショットで実行します: {e}"),
+                    );
+                    self.start_oneshot_turn(prompt, display_prompt);
+                    return;
+                }
+            }
+        }
+
+        let full_prompt = self.prompt_with_addness_context(prompt);
+        let sent = self
+            .claude_resident
+            .as_ref()
+            .is_some_and(|resident| resident.send_user_message(&full_prompt));
+        if !sent {
+            // writer が死んでいる → プロセス死亡として扱い、次ターンで再接続する。
+            self.push_log(
+                CodexLogKind::Error,
+                "常駐プロセスへの送信に失敗しました。次のターンで再接続します",
+            );
+            self.handle_claude_resident_death();
+            return;
+        }
+
+        self.turn_running = true;
+        self.turn_finished_by_event = false;
+        self.pending_decision = None;
+        self.diff_view = None;
+        self.claude_interrupting = false;
+        self.claude_interrupt_deadline = None;
+        self.claude_one_shot_allowed_tools = Vec::new();
+        self.current_turn_prompt = Some(display_prompt.to_string());
+        self.current_turn_retry_prompt = Some(prompt.to_string());
+        self.claude_resident_last_activity = Some(Instant::now());
+        self.scroll_to_live();
+    }
+
+    /// 常駐 claude プロセスのポーリング（毎フレーム `update()` から呼ぶ）。
+    /// 死亡検知・interrupt タイムアウト・設定変更タイムアウト・アイドル回収を扱う。
+    fn poll_claude_resident(&mut self) -> bool {
+        // 1. 終了検知（死亡 or グレースフルクローズ完了）。
+        let waited = match self.claude_resident.as_mut() {
+            Some(resident) => resident.try_wait(),
+            None => return false,
+        };
+        match waited {
+            Ok(Some(_status)) => {
+                let closing = self
+                    .claude_resident
+                    .as_ref()
+                    .map(|r| r.closing)
+                    .unwrap_or(false);
+                self.claude_resident = None;
+                if closing {
+                    self.push_log(
+                        CodexLogKind::System,
+                        "アイドルのため Claude Code 常駐プロセスを終了しました（次のターンで再接続）",
+                    );
+                } else {
+                    self.handle_claude_resident_death();
+                }
+                return true;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                self.claude_resident = None;
+                self.push_log(
+                    CodexLogKind::Error,
+                    format!("Claude Code 常駐プロセスの状態確認に失敗しました: {e}"),
+                );
+                self.handle_claude_resident_death();
+                return true;
+            }
+        }
+
+        // 2. interrupt グレースフル待ちのタイムアウト → kill フォールバック。
+        if let Some(deadline) = self.claude_interrupt_deadline
+            && Instant::now() >= deadline
+        {
+            if let Some(resident) = self.claude_resident.as_mut() {
+                resident.kill();
+            }
+            self.claude_resident = None;
+            self.claude_interrupt_deadline = None;
+            self.claude_interrupting = false;
+            self.turn_running = false;
+            self.current_command = None;
+            self.current_command_started_at = None;
+            self.streaming_assistant_index = None;
+            self.pending_decision = None;
+            self.claude_pending_tool = None;
+            self.current_turn_prompt = None;
+            self.current_turn_retry_prompt = None;
+            self.push_log(
+                CodexLogKind::System,
+                "中断が2秒以内に完了しなかったため常駐プロセスを終了しました（次のターンで再接続）",
+            );
+            return true;
+        }
+
+        // 3. 設定変更（set_model / set_permission_mode）応答のタイムアウト → 再起動フォールバック。
+        if let Some(change) = self.claude_pending_setting_change.as_ref()
+            && Instant::now() >= change.deadline
+        {
+            let label = change.label.clone();
+            self.claude_pending_setting_change = None;
+            self.claude_resident_restart_pending = true;
+            self.push_log(
+                CodexLogKind::System,
+                format!("{label}の応答がタイムアウトしました。次のアイドルで再起動します"),
+            );
+            return true;
+        }
+
+        // 4. アイドル時: 設定変更の再起動保留があればグレースフルに閉じる（次ターンで再 spawn）。
+        if self.claude_resident_restart_pending
+            && !self.turn_running
+            && self.pending_decision.is_none()
+            && self.claude_pending_tool.is_none()
+        {
+            self.claude_resident_restart_pending = false;
+            if let Some(resident) = self.claude_resident.as_mut() {
+                resident.begin_close();
+            }
+            self.push_log(
+                CodexLogKind::System,
+                "設定を反映するため常駐プロセスを再起動します（次のターンで再接続）",
+            );
+            return true;
+        }
+
+        // 5. アイドル回収（無操作が続いたらメモリ節約のため閉じる）。
+        if !self.turn_running
+            && self.pending_decision.is_none()
+            && self.claude_pending_tool.is_none()
+            && let Some(last) = self.claude_resident_last_activity
+            && last.elapsed() >= CLAUDE_RESIDENT_IDLE_TIMEOUT
+        {
+            self.claude_resident_last_activity = None;
+            if let Some(resident) = self.claude_resident.as_mut() {
+                resident.begin_close();
+            }
+            return true;
+        }
+
+        false
+    }
+
+    /// 常駐プロセスが予期せず死んだときの処理。実行中ターンはエラー終了扱い。
+    fn handle_claude_resident_death(&mut self) {
+        self.claude_resident = None;
+        self.claude_interrupt_deadline = None;
+        self.claude_interrupting = false;
+        self.claude_pending_setting_change = None;
+        let was_running = self.turn_running;
+        self.turn_running = false;
+        self.current_command = None;
+        self.current_command_started_at = None;
+        self.streaming_assistant_index = None;
+        self.pending_decision = None;
+        self.claude_pending_tool = None;
+        self.current_turn_prompt = None;
+        self.current_turn_retry_prompt = None;
+        if was_running {
+            self.refresh_current_turn_title();
+        }
+        let message = "Claude Code プロセスが終了しました。次のターンで再接続します";
+        self.push_log(CodexLogKind::Error, message);
+        self.push_terminal_notice("Claude Code 切断", message);
+        // 中断・死亡時はキューを自動開始しない（ユーザー判断を待つ）。
+    }
+
+    /// 常駐モードで実行中ターンへ interrupt（グレースフル中断）を送る。
+    /// 送れたら 2 秒の完了待ちを開始し `true` を返す。
+    fn request_claude_interrupt(&mut self) -> bool {
+        if self.claude_resident.is_none() {
+            return false;
+        }
+        let sent = self
+            .claude_resident
+            .as_mut()
+            .and_then(|resident| resident.send_interrupt())
+            .is_some();
+        if !sent {
+            return false;
+        }
+        self.claude_interrupting = true;
+        self.claude_interrupt_deadline = Some(Instant::now() + CLAUDE_INTERRUPT_GRACE);
+        self.claude_resident_last_activity = Some(Instant::now());
+        self.push_log(
+            CodexLogKind::System,
+            "中断を要求しました（2秒以内に完了しなければ再起動します）",
+        );
+        true
+    }
+
+    /// 常駐モードの can_use_tool 制御要求を処理する。
+    /// セッション許可ルールにマッチすればバナーを出さず自動許可、そうでなければバナー表示。
+    fn handle_claude_control_request(&mut self, value: &Value) {
+        let Some(claude_resident::ResidentControl::CanUseTool(request)) =
+            claude_resident::parse_control(value)
+        else {
+            return;
+        };
+        self.claude_resident_last_activity = Some(Instant::now());
+
+        // セッション内許可ルールにマッチ → 届いた時点でバナーなし自動許可。
+        if claude_resident::tool_matches_rules(
+            &request.tool_name,
+            &request.input,
+            self.claude_settings.sticky_allowed_tools(),
+        ) {
+            if let Some(resident) = self.claude_resident.as_ref() {
+                resident.send_allow(&request.request_id, &request.input);
+            }
+            self.push_log(
+                CodexLogKind::Tool,
+                format!("{} を自動許可（セッション許可ルール）", request.tool_name),
+            );
+            return;
+        }
+
+        // バナー表示（既存 CodexDecisionBanner を流用）。
+        let rules = claude_resident::rules_for_request(&request.tool_name, &request.input);
+        let summary = claude::tool_use_summary(&request.tool_name, &request.input);
+        let target = summary
+            .as_deref()
+            .map(|s| format!("（{}）", compact_one_line(s, 80)))
+            .unwrap_or_default();
+        let allow = if rules.is_empty() {
+            String::new()
+        } else {
+            format!(" 常に許可の対象: {}", rules.join(", "))
+        };
+        let message = format!(
+            "ツール実行の許可を求めています: {}{target}。{allow}",
+            request.tool_name
+        );
+        self.claude_pending_tool = Some(ClaudePendingTool {
+            request_id: request.request_id,
+            input: request.input,
+            rules,
+        });
+        self.set_pending_decision(CodexDecisionBanner::new(
+            CodexDecisionKind::Permission,
+            message,
+        ));
+    }
+
+    /// 承認要求のキャンセル（中断時など）。該当バナーを閉じ、応答は送らない。
+    fn handle_claude_control_cancel(&mut self, value: &Value) {
+        let Some(claude_resident::ResidentControl::Cancel { request_id }) =
+            claude_resident::parse_control(value)
+        else {
+            return;
+        };
+        if self
+            .claude_pending_tool
+            .as_ref()
+            .is_some_and(|pending| pending.request_id == request_id)
+        {
+            self.claude_pending_tool = None;
+            self.pending_decision = None;
+            self.push_log(CodexLogKind::System, "ツール承認要求がキャンセルされました");
+        }
+    }
+
+    /// 自前で送った control_request（set_model / set_permission_mode）への応答処理。
+    fn handle_claude_control_response(&mut self, value: &Value) {
+        let Some(claude_resident::ResidentControl::Response(response)) =
+            claude_resident::parse_control(value)
+        else {
+            return;
+        };
+        let Some(change) = self.claude_pending_setting_change.as_ref() else {
+            return;
+        };
+        if change.request_id != response.request_id {
+            return;
+        }
+        let label = change.label.clone();
+        self.claude_pending_setting_change = None;
+        if response.success {
+            self.push_log(CodexLogKind::System, format!("{label}を反映しました"));
+        } else {
+            let detail = response.error.unwrap_or_else(|| "エラー".to_string());
+            self.claude_resident_restart_pending = true;
+            self.push_log(
+                CodexLogKind::System,
+                format!("{label}の実行時反映に失敗（{detail}）。次のアイドルで再起動します"),
+            );
+        }
+    }
+
+    /// 常駐モードの承認バナーへの応答を control_response としてプロセスへ返す。
+    /// ワンショットのような resume 再実行はせず、進行中ターンをその場で続行させる。
+    fn resolve_claude_resident_tool(
+        &mut self,
+        response: CodexDecisionResponse,
+        response_label: &str,
+    ) {
+        let Some(pending) = self.claude_pending_tool.take() else {
+            return;
+        };
+        self.action = Some(format!("確認応答: {response_label}"));
+        self.push_activity(format!("ツール承認に {response_label} で応答"));
+        self.claude_resident_last_activity = Some(Instant::now());
+        let Some(resident) = self.claude_resident.as_ref() else {
+            return;
+        };
+        match response {
+            CodexDecisionResponse::Accept => {
+                resident.send_allow(&pending.request_id, &pending.input);
+                self.push_log(CodexLogKind::System, "今回だけ許可して続行します");
+            }
+            CodexDecisionResponse::Always => {
+                resident.send_allow(&pending.request_id, &pending.input);
+                let rules_label = if pending.rules.is_empty() {
+                    String::new()
+                } else {
+                    format!("（{}）", pending.rules.join(", "))
+                };
+                self.claude_settings.add_allowed_tools(&pending.rules);
+                self.push_log(
+                    CodexLogKind::System,
+                    format!("これからずっと許可{rules_label}して続行します"),
+                );
+            }
+            CodexDecisionResponse::Deny => {
+                resident.send_deny(&pending.request_id, "ユーザーが拒否しました");
+                self.push_log(
+                    CodexLogKind::System,
+                    "拒否しました（Claude はこのツールなしで続行します）",
+                );
+            }
+        }
+    }
+
+    /// F2（model）を常駐プロセスへ set_model control_request で反映する。
+    /// 具体値が無い（config）場合は再起動フォールバックへ回す。
+    fn push_claude_resident_model(&mut self) {
+        if self.claude_resident.is_none() {
+            return;
+        }
+        let Some(model) = self
+            .claude_settings
+            .effective_model_arg()
+            .map(str::to_string)
+        else {
+            self.claude_resident_restart_pending = true;
+            return;
+        };
+        let request_id = self
+            .claude_resident
+            .as_mut()
+            .and_then(|resident| resident.send_set_model(&model));
+        match request_id {
+            Some(request_id) => {
+                self.claude_pending_setting_change = Some(ClaudePendingSettingChange {
+                    request_id,
+                    deadline: Instant::now() + CLAUDE_SETTING_CHANGE_GRACE,
+                    label: format!("model 変更（{model}）"),
+                });
+            }
+            None => self.claude_resident_restart_pending = true,
+        }
+    }
+
+    /// F4（permission-mode）を常駐プロセスへ set_permission_mode control_request で反映する。
+    fn push_claude_resident_permission_mode(&mut self) {
+        if self.claude_resident.is_none() {
+            return;
+        }
+        let Some(mode) = self
+            .claude_settings
+            .effective_permission_mode_arg()
+            .map(str::to_string)
+        else {
+            self.claude_resident_restart_pending = true;
+            return;
+        };
+        let request_id = self
+            .claude_resident
+            .as_mut()
+            .and_then(|resident| resident.send_set_permission_mode(&mode));
+        match request_id {
+            Some(request_id) => {
+                self.claude_pending_setting_change = Some(ClaudePendingSettingChange {
+                    request_id,
+                    deadline: Instant::now() + CLAUDE_SETTING_CHANGE_GRACE,
+                    label: format!("permission-mode 変更（{mode}）"),
+                });
+            }
+            None => self.claude_resident_restart_pending = true,
+        }
+    }
+
+    /// 起動する子プロセスへ Addness 文脈の環境変数を設定する（3 系統の spawn で共有）。
+    fn apply_agent_env(&self, cmd: &mut Command) {
+        // 後方互換: codex のときだけ従来の ADDNESS_TUI_CODEX を維持する。
+        if self.kind == AgentKind::Codex {
+            cmd.env("ADDNESS_TUI_CODEX", "1");
+        }
+        cmd.env("ADDNESS_TUI_BACKEND", self.kind.backend_env_value());
+        cmd.env("ADDNESS_GOAL_ID", &self.goal_id);
+        cmd.env("ADDNESS_GOAL_TITLE", &self.goal_title);
+        cmd.env("ADDNESS_GOAL_STATUS", &self.status_label);
+        cmd.env("ADDNESS_GOAL_DOD", &self.dod);
+        cmd.env("ADDNESS_TASK_GOAL_ID", &self.goal_id);
+        cmd.env("ADDNESS_TASK_GOAL_TITLE", &self.goal_title);
+        cmd.env("ADDNESS_PARENT_GOAL_ID", &self.parent_goal_id);
+        cmd.env("ADDNESS_PARENT_GOAL_TITLE", &self.parent_goal_title);
+        cmd.env(
+            "ADDNESS_WORKTREE_BRANCH",
+            git_branch_label(Path::new(&self.cwd)),
+        );
+        cmd.env("ADDNESS_BIN", &self.addness_bin);
     }
 
     fn handle_generic_json_event(&mut self, event_type: &str, value: &Value) {
@@ -4454,6 +5119,9 @@ impl CodexPane {
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('c' | 'C'))
         {
+            if self.claude_resident.is_some() && self.request_claude_interrupt() {
+                return;
+            }
             self.kill_current_turn();
             self.start_next_queued_turn_if_idle();
             return;
@@ -4463,6 +5131,9 @@ impl CodexPane {
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && matches!(key.code, KeyCode::Char('c' | 'C'))
             {
+                if self.claude_resident.is_some() && self.request_claude_interrupt() {
+                    return;
+                }
                 self.kill_current_turn();
             }
             return;
@@ -4682,6 +5353,17 @@ impl CodexPane {
     }
 
     fn start_turn_with_display_prompt(&mut self, prompt: &str, display_prompt: &str) {
+        // ClaudeCode の常駐モードは 1 プロセスで多ターンを回す（別経路）。
+        if self.claude_resident_active() {
+            self.start_claude_resident_turn(prompt, display_prompt);
+            return;
+        }
+        self.start_oneshot_turn(prompt, display_prompt);
+    }
+
+    /// ワンショット（1 ターン 1 プロセス）でターンを開始する。codex 経路と、常駐を無効化した
+    /// / 常駐 spawn に失敗した ClaudeCode 経路で使う。
+    fn start_oneshot_turn(&mut self, prompt: &str, display_prompt: &str) {
         // 新しいターンでは前ターンの Esc 中断アームを持ち越さない。
         self.esc_interrupt_armed = false;
         let name = self.kind.display_name();
@@ -5333,7 +6015,11 @@ impl CodexPane {
 
     fn handle_stop_slash_command(&mut self, args: &str) {
         if self.is_turn_running() {
-            self.kill_current_turn();
+            if self.claude_resident.is_some() && self.request_claude_interrupt() {
+                // graceful interrupt を送った。完了は result / タイムアウトで検知する。
+            } else {
+                self.kill_current_turn();
+            }
         } else {
             let name = self.kind.display_name();
             self.push_log(
@@ -6969,13 +7655,39 @@ impl CodexPane {
         self.push_log(
             CodexLogKind::System,
             format!(
-                "設定詳細:\ncodex_bin={}\n作業フォルダ={}\ncodex_home={codex_home}\nセッション={thread}\nturn={}\n設定={}\n履歴={history}\nconfig_overrides:\n  - {config}",
+                "設定詳細:\ncodex_bin={}\n作業フォルダ={}\ncodex_home={codex_home}\nセッション={thread}\nturn={}\n設定={}\n履歴={history}\nconfig_overrides:\n  - {config}{}",
                 compact_home_path(&self.codex_bin),
                 self.cwd,
                 self.turn_count,
                 self.settings_label(),
+                self.claude_resident_debug_suffix(),
             ),
         );
+    }
+
+    /// `/debug-config` に付ける常駐 Claude Code の状態（保存済み cost/usage/model 等）。
+    /// ClaudeCode 以外では空文字。
+    fn claude_resident_debug_suffix(&self) -> String {
+        if self.kind != AgentKind::ClaudeCode {
+            return String::new();
+        }
+        let resident = if self.claude_resident.is_some() {
+            "resident(alive)"
+        } else if self.claude_resident_enabled {
+            "resident(idle/none)"
+        } else {
+            "oneshot"
+        };
+        let model = self.claude_active_model.as_deref().unwrap_or("-");
+        let mode = self.claude_active_permission_mode.as_deref().unwrap_or("-");
+        let cost = self
+            .claude_total_cost_usd
+            .map(|c| format!("${c:.4}"))
+            .unwrap_or_else(|| "-".to_string());
+        let usage = self.claude_last_usage.as_deref().unwrap_or("-");
+        format!(
+            "\nclaude_mode={resident}\nactive_model={model}\nactive_permission={mode}\ntotal_cost={cost}\nlast_usage={usage}"
+        )
     }
 
     fn push_feedback_draft(&mut self, message: &str) {
@@ -7382,24 +8094,7 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
-        // 後方互換: codex のときだけ従来の ADDNESS_TUI_CODEX を維持する。
-        if self.kind == AgentKind::Codex {
-            cmd.env("ADDNESS_TUI_CODEX", "1");
-        }
-        cmd.env("ADDNESS_TUI_BACKEND", self.kind.backend_env_value());
-        cmd.env("ADDNESS_GOAL_ID", &self.goal_id);
-        cmd.env("ADDNESS_GOAL_TITLE", &self.goal_title);
-        cmd.env("ADDNESS_GOAL_STATUS", &self.status_label);
-        cmd.env("ADDNESS_GOAL_DOD", &self.dod);
-        cmd.env("ADDNESS_TASK_GOAL_ID", &self.goal_id);
-        cmd.env("ADDNESS_TASK_GOAL_TITLE", &self.goal_title);
-        cmd.env("ADDNESS_PARENT_GOAL_ID", &self.parent_goal_id);
-        cmd.env("ADDNESS_PARENT_GOAL_TITLE", &self.parent_goal_title);
-        cmd.env(
-            "ADDNESS_WORKTREE_BRANCH",
-            git_branch_label(Path::new(&self.cwd)),
-        );
-        cmd.env("ADDNESS_BIN", &self.addness_bin);
+        self.apply_agent_env(&mut cmd);
 
         let name = self.kind.display_name();
         let mut child = cmd
@@ -7447,24 +8142,7 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
-        // 後方互換: codex のときだけ従来の ADDNESS_TUI_CODEX を維持する。
-        if self.kind == AgentKind::Codex {
-            cmd.env("ADDNESS_TUI_CODEX", "1");
-        }
-        cmd.env("ADDNESS_TUI_BACKEND", self.kind.backend_env_value());
-        cmd.env("ADDNESS_GOAL_ID", &self.goal_id);
-        cmd.env("ADDNESS_GOAL_TITLE", &self.goal_title);
-        cmd.env("ADDNESS_GOAL_STATUS", &self.status_label);
-        cmd.env("ADDNESS_GOAL_DOD", &self.dod);
-        cmd.env("ADDNESS_TASK_GOAL_ID", &self.goal_id);
-        cmd.env("ADDNESS_TASK_GOAL_TITLE", &self.goal_title);
-        cmd.env("ADDNESS_PARENT_GOAL_ID", &self.parent_goal_id);
-        cmd.env("ADDNESS_PARENT_GOAL_TITLE", &self.parent_goal_title);
-        cmd.env(
-            "ADDNESS_WORKTREE_BRANCH",
-            git_branch_label(Path::new(&self.cwd)),
-        );
-        cmd.env("ADDNESS_BIN", &self.addness_bin);
+        self.apply_agent_env(&mut cmd);
 
         let mut child = cmd
             .spawn()
@@ -7491,6 +8169,8 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
             let _ = child.wait();
         }
         self.child = None;
+        // 常駐 Claude Code プロセスも終了させる（次ターンで --resume 再接続する）。
+        self.teardown_claude_resident();
         self.turn_running = false;
         self.current_command = None;
         self.current_command_started_at = None;
@@ -7543,6 +8223,7 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
             let _ = child.wait();
         }
         self.child = None;
+        self.teardown_claude_resident();
         self.turn_running = false;
         self.current_command = None;
         self.current_command_started_at = None;
@@ -7550,6 +8231,18 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
         self.current_turn_prompt = None;
         self.current_turn_retry_prompt = None;
         self.queued_prompts.clear();
+    }
+
+    /// 常駐 Claude Code プロセスを終了させ、常駐関連の一時状態をリセットする。
+    fn teardown_claude_resident(&mut self) {
+        if let Some(mut resident) = self.claude_resident.take() {
+            resident.kill();
+        }
+        self.claude_interrupt_deadline = None;
+        self.claude_interrupting = false;
+        self.claude_pending_tool = None;
+        self.claude_pending_setting_change = None;
+        self.claude_resident_restart_pending = false;
     }
 
     /// DoD を更新する。内容が変わった場合のみ項目・判定を作り直し `true` を返す。
@@ -10577,6 +11270,17 @@ mod tests {
         })
         .unwrap();
         pane.log.clear();
+        // 既定は常駐だが、プロセス起動を伴わないユニットテストではワンショット経路を検証する。
+        // 常駐固有の遷移は claude_resident_pane() を使う専用テストで検証する。
+        pane.claude_resident_enabled = false;
+        pane
+    }
+
+    /// 常駐クライアントを差し込んだ ClaudeCode ペイン（実プロセスは起動しない）。
+    /// `set_resident_for_test` でダミー `Child` を入れ、常駐固有の状態遷移を検証する。
+    fn claude_resident_pane() -> CodexPane {
+        let mut pane = claude_pane();
+        pane.claude_resident_enabled = true;
         pane
     }
 
@@ -10718,6 +11422,178 @@ mod tests {
         assert!(pane.settings_label().contains("allow:1"));
         // 今回だけの一時ルールには入らない。
         assert!(pane.claude_one_shot_allowed_tools.is_empty());
+    }
+
+    // -- 常駐モード（実プロセスは cat のダミー）--------------------------------
+
+    /// 常駐クライアント（ダミー）を差し込む。生成不可な環境では None を返す。
+    fn with_dummy_resident(pane: &mut CodexPane) -> bool {
+        match claude_resident::ResidentClient::spawn_dummy() {
+            Some(client) => {
+                pane.claude_resident = Some(client);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn can_use_tool_event(request_id: &str, tool: &str, input: serde_json::Value) -> Value {
+        serde_json::json!({
+            "type": "control_request",
+            "request_id": request_id,
+            "request": {"subtype": "can_use_tool", "tool_name": tool, "input": input}
+        })
+    }
+
+    #[test]
+    fn claude_resident_can_use_tool_auto_allows_matching_rule() {
+        let mut pane = claude_resident_pane();
+        if !with_dummy_resident(&mut pane) {
+            return;
+        }
+        // セッション許可ルールに Edit を入れておく。
+        pane.claude_settings
+            .add_allowed_tools(&["Edit".to_string()]);
+        pane.handle_json_event(can_use_tool_event(
+            "req-a",
+            "Edit",
+            serde_json::json!({"file_path": "/a.rs"}),
+        ));
+        // マッチしたのでバナーを出さず自動許可（pending_tool は立たない）。
+        assert!(pane.pending_decision.is_none());
+        assert!(pane.claude_pending_tool.is_none());
+        assert!(pane.log.iter().any(|l| l.text.contains("自動許可")));
+    }
+
+    #[test]
+    fn claude_resident_can_use_tool_raises_banner_and_always_adds_sticky() {
+        let mut pane = claude_resident_pane();
+        if !with_dummy_resident(&mut pane) {
+            return;
+        }
+        pane.handle_json_event(can_use_tool_event(
+            "req-b",
+            "Bash",
+            serde_json::json!({"command": "rm -rf x"}),
+        ));
+        // 未許可なのでバナーが立ち、応答用に pending_tool を保持する。
+        let banner = pane.pending_decision.as_ref().expect("banner");
+        assert_eq!(banner.kind, CodexDecisionKind::Permission);
+        assert_eq!(
+            pane.claude_pending_tool
+                .as_ref()
+                .map(|p| p.request_id.clone()),
+            Some("req-b".to_string())
+        );
+        // l（これからずっと許可）で sticky に Bash(rm:*) が入り、バナー/pending が消える。
+        pane.handle_decision_key(key(KeyCode::Char('l')));
+        assert!(pane.pending_decision.is_none());
+        assert!(pane.claude_pending_tool.is_none());
+        assert!(
+            pane.claude_settings
+                .sticky_allowed_tools()
+                .iter()
+                .any(|r| r == "Bash(rm:*)")
+        );
+    }
+
+    #[test]
+    fn claude_resident_cancel_closes_banner_without_response() {
+        let mut pane = claude_resident_pane();
+        if !with_dummy_resident(&mut pane) {
+            return;
+        }
+        pane.handle_json_event(can_use_tool_event(
+            "req-c",
+            "Write",
+            serde_json::json!({"file_path": "/a.rs"}),
+        ));
+        assert!(pane.pending_decision.is_some());
+        // 同一 request_id のキャンセルでバナーを閉じ、pending をクリアする。
+        pane.handle_json_event(serde_json::json!({
+            "type": "control_cancel_request", "request_id": "req-c"
+        }));
+        assert!(pane.pending_decision.is_none());
+        assert!(pane.claude_pending_tool.is_none());
+    }
+
+    #[test]
+    fn claude_resident_esc_sends_graceful_interrupt() {
+        let mut pane = claude_resident_pane();
+        if !with_dummy_resident(&mut pane) {
+            return;
+        }
+        pane.turn_running = true;
+        assert!(pane.interrupt_turn_by_esc());
+        // graceful interrupt を送り、2 秒の完了待ちへ入る（まだ kill しない）。
+        assert!(pane.claude_interrupting);
+        assert!(pane.claude_interrupt_deadline.is_some());
+        assert!(pane.claude_resident.is_some());
+        assert!(pane.turn_running);
+    }
+
+    #[test]
+    fn claude_resident_result_after_interrupt_completes_without_queue() {
+        let mut pane = claude_resident_pane();
+        if !with_dummy_resident(&mut pane) {
+            return;
+        }
+        pane.turn_running = true;
+        pane.claude_interrupting = true;
+        pane.claude_interrupt_deadline = Some(Instant::now() + CLAUDE_INTERRUPT_GRACE);
+        pane.queued_prompts
+            .push_back(QueuedPrompt::user("次の依頼".to_string()));
+        pane.handle_json_event(serde_json::json!({
+            "type": "result", "subtype": "error_during_execution",
+            "is_error": true, "result": null, "terminal_reason": "aborted_streaming",
+            "session_id": "sid-1"
+        }));
+        // 中断完了として扱い、キューは自動開始しない（保留）。
+        assert!(!pane.claude_interrupting);
+        assert!(pane.claude_interrupt_deadline.is_none());
+        assert!(!pane.turn_running);
+        assert_eq!(pane.queued_prompts.len(), 1);
+        assert!(pane.log.iter().any(|l| l.text.contains("中断しました")));
+    }
+
+    #[test]
+    fn claude_resident_death_marks_turn_error() {
+        let mut pane = claude_resident_pane();
+        if !with_dummy_resident(&mut pane) {
+            return;
+        }
+        pane.turn_running = true;
+        pane.handle_claude_resident_death();
+        assert!(pane.claude_resident.is_none());
+        assert!(!pane.turn_running);
+        assert!(
+            pane.log
+                .iter()
+                .any(|l| l.kind == CodexLogKind::Error && l.text.contains("プロセスが終了"))
+        );
+    }
+
+    #[test]
+    fn claude_resident_normal_result_starts_queued_turn() {
+        let mut pane = claude_resident_pane();
+        if !with_dummy_resident(&mut pane) {
+            return;
+        }
+        pane.thread_id = Some("sid-1".to_string());
+        pane.turn_running = true;
+        // 実プロセスは cat なので次ターンの実起動はしないが、キューが消費されることを確認する。
+        pane.queued_prompts
+            .push_back(QueuedPrompt::direct("依頼".to_string(), "依頼".to_string()));
+        pane.handle_json_event(serde_json::json!({
+            "type": "result", "subtype": "success", "is_error": false, "result": "done",
+            "session_id": "sid-1", "total_cost_usd": 0.0088,
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        }));
+        // cost/usage を保存する。
+        assert_eq!(pane.claude_total_cost_usd, Some(0.0088));
+        assert!(pane.claude_last_usage.is_some());
+        // キューが消費されて次ターンへ進む（実プロセスは cat のため送信のみ）。
+        assert_eq!(pane.queued_prompts.len(), 0);
     }
 
     #[test]

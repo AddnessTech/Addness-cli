@@ -23,6 +23,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 mod claude;
 mod claude_resident;
 mod codex;
+mod codex_appserver;
 
 pub const CODEX_LOG_PREFIX_WIDTH: usize = 7;
 
@@ -141,6 +142,16 @@ const CLAUDE_INTERRUPT_GRACE: Duration = Duration::from_secs(2);
 const CLAUDE_SETTING_CHANGE_GRACE: Duration = Duration::from_secs(2);
 /// 常駐 Claude Code をアイドル回収するまでの無操作時間（メモリ約300MB対策）。
 const CLAUDE_RESIDENT_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// 常駐 codex app-server の interrupt がグレースフルに完了するのを待つ上限。
+/// 超えたら kill し、次ターンで thread/resume 再起動する（Claude 側の定数を流用）。
+const CODEX_APPSERVER_INTERRUPT_GRACE: Duration = CLAUDE_INTERRUPT_GRACE;
+/// 常駐 codex app-server の thread/settings/update 応答を待つ上限。
+/// 超えたら再起動 + thread/resume へフォールバックする。
+const CODEX_APPSERVER_SETTING_CHANGE_GRACE: Duration = CLAUDE_SETTING_CHANGE_GRACE;
+/// 常駐 codex app-server をアイドル回収するまでの無操作時間（RSS 約38MB だが Claude 側と揃える）。
+const CODEX_APPSERVER_IDLE_TIMEOUT: Duration = CLAUDE_RESIDENT_IDLE_TIMEOUT;
+/// 実行中コマンドのライブ出力バッファに保持する末尾行数。
+const CODEX_APPSERVER_OUTPUT_TAIL_LINES: usize = 3;
 /// @メンションのファイル候補を一度に表示する最大件数。
 const MENTION_PALETTE_MAX: usize = 10;
 
@@ -231,6 +242,36 @@ struct ClaudePendingTool {
 #[derive(Debug, Clone)]
 struct ClaudePendingSettingChange {
     request_id: String,
+    deadline: Instant,
+    label: String,
+}
+
+/// codex app-server を常駐モードで既定利用するか。`ADDNESS_CODEX_RESIDENT=0` で
+/// 従来の `codex exec --json`（1 ターン 1 プロセス）へ退避する。
+fn codex_appserver_default_enabled() -> bool {
+    match std::env::var("ADDNESS_CODEX_RESIDENT") {
+        Ok(value) => value != "0",
+        Err(_) => true,
+    }
+}
+
+/// 常駐 codex app-server のハンドシェイク/ターン進行フェーズ。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CodexAppServerPhase {
+    /// 未起動、または死亡・回収済み。
+    Idle,
+    /// initialize 送信済み、応答待ち。id を保持。
+    Initializing { request_id: u64 },
+    /// thread/start または thread/resume 送信済み、応答待ち。resume 失敗時のフォールバック判定に使う。
+    StartingThread { request_id: u64, resuming: bool },
+    /// thread 確立済み。turn/start 可能。
+    Ready,
+}
+
+/// codex app-server の thread/settings/update 応答待ち（フォールバック判定用）。
+#[derive(Debug, Clone)]
+struct CodexAppServerSettingChange {
+    request_id: u64,
     deadline: Instant,
     label: String,
 }
@@ -2001,6 +2042,37 @@ pub struct CodexPane {
     claude_active_model: Option<String>,
     /// system/init が報告する現在の permissionMode（保存のみ、表示同期用）。
     claude_active_permission_mode: Option<String>,
+    /// codex app-server 常駐モードを使うか（Codex 専用）。既定は環境変数で決まり、
+    /// spawn / initialize 失敗時はこのセッションだけ false へ落として `codex exec --json` に退避する。
+    codex_appserver_enabled: bool,
+    /// 常駐 codex app-server プロセスのクライアント。None=未起動 / 死亡 / アイドル回収済み。
+    codex_appserver: Option<codex_appserver::AppServerClient>,
+    /// 常駐 app-server のハンドシェイク/ターン進行フェーズ。
+    codex_appserver_phase: CodexAppServerPhase,
+    /// thread 確立を待って送るターン本文（ハンドシェイク完了時に turn/start する）。
+    codex_appserver_pending_turn: Option<String>,
+    /// 進行中ターンの turn.id（turn/interrupt に使う）。
+    codex_appserver_turn_id: Option<String>,
+    /// 送信済み turn/start の JSON-RPC id（応答で turn.id を確定するのに使う）。
+    codex_appserver_turn_req_id: Option<u64>,
+    /// 承認バナー表示中のサーバ発リクエスト（応答用）。
+    codex_appserver_pending_approval: Option<codex_appserver::ApprovalRequest>,
+    /// 送信済みの thread/settings/update 応答待ち。
+    codex_appserver_pending_setting: Option<CodexAppServerSettingChange>,
+    /// 設定変更が settings/update では反映できず、アイドル時に再起動が必要な状態。
+    codex_appserver_restart_pending: bool,
+    /// 常駐プロセスの最終アクティビティ時刻（アイドル回収判定に使う）。
+    codex_appserver_last_activity: Option<Instant>,
+    /// interrupt を送ってから turn/completed(interrupted) を待つ期限。超えたら kill フォールバック。
+    codex_appserver_interrupt_deadline: Option<Instant>,
+    /// interrupt 要求中フラグ。turn/completed 受信時に中断完了として扱い、キューを自動開始しない。
+    codex_appserver_interrupting: bool,
+    /// 実行中コマンドのライブ出力バッファ（itemId → 末尾 N 行）。item/completed で解放する。
+    codex_appserver_output: HashMap<String, VecDeque<String>>,
+    /// 現在ライブ出力を受けている commandExecution の itemId（末尾行の描画対象）。
+    codex_appserver_running_item: Option<String>,
+    /// 直近の thread/tokenUsage/updated（保存のみ）。
+    codex_appserver_token_usage: Option<codex_appserver::TokenUsageInfo>,
 }
 
 impl CodexPane {
@@ -2175,6 +2247,21 @@ impl CodexPane {
             claude_last_usage: None,
             claude_active_model: None,
             claude_active_permission_mode: None,
+            codex_appserver_enabled: kind == AgentKind::Codex && codex_appserver_default_enabled(),
+            codex_appserver: None,
+            codex_appserver_phase: CodexAppServerPhase::Idle,
+            codex_appserver_pending_turn: None,
+            codex_appserver_turn_id: None,
+            codex_appserver_turn_req_id: None,
+            codex_appserver_pending_approval: None,
+            codex_appserver_pending_setting: None,
+            codex_appserver_restart_pending: false,
+            codex_appserver_last_activity: None,
+            codex_appserver_interrupt_deadline: None,
+            codex_appserver_interrupting: false,
+            codex_appserver_output: HashMap::new(),
+            codex_appserver_running_item: None,
+            codex_appserver_token_usage: None,
         };
         let name = kind.display_name();
         if pane.loaded_history_count > 0 {
@@ -2255,6 +2342,21 @@ impl CodexPane {
         pane.claude_last_usage = None;
         pane.claude_active_model = None;
         pane.claude_active_permission_mode = None;
+        pane.codex_appserver_enabled = false;
+        pane.codex_appserver = None;
+        pane.codex_appserver_phase = CodexAppServerPhase::Idle;
+        pane.codex_appserver_pending_turn = None;
+        pane.codex_appserver_turn_id = None;
+        pane.codex_appserver_turn_req_id = None;
+        pane.codex_appserver_pending_approval = None;
+        pane.codex_appserver_pending_setting = None;
+        pane.codex_appserver_restart_pending = false;
+        pane.codex_appserver_last_activity = None;
+        pane.codex_appserver_interrupt_deadline = None;
+        pane.codex_appserver_interrupting = false;
+        pane.codex_appserver_output.clear();
+        pane.codex_appserver_running_item = None;
+        pane.codex_appserver_token_usage = None;
         pane.diff_view = None;
         pane.addness_body_excerpt = None;
         pane.turn_picker = None;
@@ -2592,6 +2694,17 @@ impl CodexPane {
         }
         // 常駐モードはまず graceful interrupt を試み、2 秒で完了しなければ update() 側で kill する。
         if self.claude_resident.is_some() && self.request_claude_interrupt() {
+            self.push_log(CodexLogKind::System, "Esc でターンを中断します".to_string());
+            let queued = self.queued_prompts.len();
+            if queued > 0 {
+                self.push_log(
+                    CodexLogKind::System,
+                    format!("予約{queued}件は保留中（/stop queued で破棄可）"),
+                );
+            }
+            return true;
+        }
+        if self.codex_appserver.is_some() && self.request_codex_appserver_interrupt() {
             self.push_log(CodexLogKind::System, "Esc でターンを中断します".to_string());
             let queued = self.queued_prompts.len();
             if queued > 0 {
@@ -3087,6 +3200,7 @@ impl CodexPane {
         self.action = Some(format!("model: {value}"));
         self.push_activity(format!("Codex model を {value} に変更"));
         self.push_log(CodexLogKind::System, format!("次回ターンの model: {value}"));
+        self.push_codex_appserver_model();
     }
 
     fn set_model(&mut self, value: &str) {
@@ -3114,6 +3228,7 @@ impl CodexPane {
         self.action = Some(format!("model: {value}"));
         self.push_activity(format!("Codex model を {value} に変更"));
         self.push_log(CodexLogKind::System, format!("次回ターンの model: {value}"));
+        self.push_codex_appserver_model();
     }
 
     pub fn cycle_reasoning(&mut self) {
@@ -3134,6 +3249,7 @@ impl CodexPane {
             CodexLogKind::System,
             format!("次回ターンの reasoning effort: {value}"),
         );
+        self.push_codex_appserver_effort();
     }
 
     /// ClaudeCode の `/effort` フリーテキスト設定。
@@ -3156,6 +3272,7 @@ impl CodexPane {
             CodexLogKind::System,
             format!("次回ターンの reasoning effort: {value}"),
         );
+        self.push_codex_appserver_effort();
     }
 
     pub fn cycle_approval(&mut self) {
@@ -3177,6 +3294,7 @@ impl CodexPane {
             CodexLogKind::System,
             format!("次回ターンの approval: {value}"),
         );
+        self.push_codex_appserver_approval();
     }
 
     /// ClaudeCode の permission-mode 設定（`/permissions <mode>`）。
@@ -3200,6 +3318,7 @@ impl CodexPane {
             CodexLogKind::System,
             format!("次回ターンの approval: {value}"),
         );
+        self.push_codex_appserver_approval();
     }
 
     pub fn cycle_sandbox(&mut self) {
@@ -3217,6 +3336,7 @@ impl CodexPane {
             CodexLogKind::System,
             format!("次回ターンの sandbox: {value}"),
         );
+        self.push_codex_appserver_sandbox();
     }
 
     fn set_sandbox(&mut self, value: CodexSandboxChoice) {
@@ -3228,6 +3348,7 @@ impl CodexPane {
             CodexLogKind::System,
             format!("次回ターンの sandbox: {value}"),
         );
+        self.push_codex_appserver_sandbox();
     }
 
     pub fn toggle_web_search(&mut self) {
@@ -3803,6 +3924,10 @@ impl CodexPane {
         if self.kind == AgentKind::ClaudeCode {
             changed |= self.poll_claude_resident();
         }
+        // 常駐 codex app-server プロセスのポーリング（死亡検知・中断/設定タイムアウト・アイドル回収）。
+        if self.kind == AgentKind::Codex {
+            changed |= self.poll_codex_appserver();
+        }
 
         if let Some(child) = self.child.as_mut() {
             match child.try_wait() {
@@ -3920,7 +4045,11 @@ impl CodexPane {
             self.disable_claude_partial_messages_and_retry();
             return;
         }
-        if let Some(decision) = decision_banner("stderr", Some(trimmed)) {
+        // 旧 stderr ヒューリスティック承認はワンショット専用（常駐 app-server では承認は
+        // サーバ発リクエストで届くため使わない）。
+        if self.codex_appserver.is_none()
+            && let Some(decision) = decision_banner("stderr", Some(trimmed))
+        {
             self.set_pending_decision(decision);
         }
         if self.child_process_label.is_some() {
@@ -3954,6 +4083,13 @@ impl CodexPane {
     fn handle_json_event(&mut self, value: Value) {
         if self.kind == AgentKind::ClaudeCode {
             self.handle_claude_json_event(&value);
+            return;
+        }
+
+        // 常駐 app-server の JSON-RPC メッセージ（"jsonrpc":"2.0" を持つ）は別経路で処理する。
+        // ワンショット exec の snake_case イベント・codex サブコマンド JSON には jsonrpc が無い。
+        if self.codex_appserver.is_some() && value.get("jsonrpc").is_some() {
+            self.handle_codex_appserver_message(&value);
             return;
         }
 
@@ -4855,6 +4991,1020 @@ impl CodexPane {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Codex app-server 常駐モード
+    // -----------------------------------------------------------------------
+
+    fn codex_appserver_active(&self) -> bool {
+        self.kind == AgentKind::Codex && self.codex_appserver_enabled
+    }
+
+    /// 常駐 codex app-server を spawn する（stdout/stderr は既存の line reader で読む）。
+    fn spawn_codex_appserver(&mut self) -> Result<codex_appserver::AppServerClient> {
+        let mut cmd = Command::new(&self.codex_bin);
+        cmd.arg("app-server");
+        cmd.current_dir(&self.cwd);
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        self.apply_agent_env(&mut cmd);
+
+        let mut child = cmd
+            .spawn()
+            .context("codex app-server 常駐プロセスの起動に失敗しました")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("codex app-server 常駐プロセス stdout の取得に失敗しました")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("codex app-server 常駐プロセス stderr の取得に失敗しました")?;
+        spawn_line_reader(stdout, self.tx.clone(), false);
+        spawn_line_reader(stderr, self.tx.clone(), true);
+        codex_appserver::AppServerClient::new(child)
+    }
+
+    /// 現在の CodexExecSettings から thread/start・thread/resume 用の設定を組み立てる。
+    fn codex_appserver_thread_config(&self) -> codex_appserver::ThreadConfig {
+        let settings = &self.exec_settings;
+        // dangerously-bypass-approvals-and-sandbox 相当は never + danger-full-access で表す。
+        let (approval, sandbox) = if settings.bypass_approvals_and_sandbox {
+            (Some("never".to_string()), "danger-full-access".to_string())
+        } else {
+            (
+                settings.approval.cli_arg().map(str::to_string),
+                settings.sandbox.cli_arg().to_string(),
+            )
+        };
+        codex_appserver::ThreadConfig {
+            cwd: Some(self.cwd.clone()),
+            model: settings.model_cli_arg().map(str::to_string),
+            approval_policy: approval,
+            sandbox: Some(sandbox),
+            developer_instructions: Some(addness_tui_developer_instructions().to_string()),
+        }
+    }
+
+    /// turn/start に載せる reasoning effort（None は codex の既定）。
+    fn codex_appserver_effort(&self) -> Option<String> {
+        self.exec_settings
+            .reasoning
+            .config_value()
+            .map(str::to_string)
+    }
+
+    /// 常駐モードでターンを開始する（既存プロセスがあれば再利用、無ければ spawn しハンドシェイク）。
+    fn start_codex_appserver_turn(&mut self, prompt: &str, display_prompt: &str) {
+        self.esc_interrupt_armed = false;
+        if self.is_turn_running() {
+            self.push_log(CodexLogKind::System, "前の Codex ターンがまだ実行中です");
+            return;
+        }
+        // グレースフル終了中の常駐は使わず、確実に終了させてから作り直す。
+        if let Some(client) = self.codex_appserver.as_mut()
+            && client.closing
+        {
+            client.kill();
+            self.codex_appserver = None;
+            self.codex_appserver_phase = CodexAppServerPhase::Idle;
+        }
+
+        let full_prompt = self.prompt_with_addness_context(prompt);
+
+        if self.codex_appserver.is_none() {
+            match self.spawn_codex_appserver() {
+                Ok(client) => {
+                    self.codex_appserver = Some(client);
+                    self.codex_appserver_phase = CodexAppServerPhase::Idle;
+                    if !self.send_codex_appserver_initialize() {
+                        // writer が死んでいる → ワンショットへ退避する。
+                        self.codex_appserver = None;
+                        self.codex_appserver_phase = CodexAppServerPhase::Idle;
+                        self.codex_appserver_enabled = false;
+                        self.push_log(
+                            CodexLogKind::Error,
+                            "常駐プロセスへの initialize 送信に失敗したためワンショットで実行します",
+                        );
+                        self.start_oneshot_turn(prompt, display_prompt);
+                        return;
+                    }
+                    let resume = if self.thread_id.is_some() {
+                        "（thread/resume で再接続）"
+                    } else {
+                        ""
+                    };
+                    self.push_log(
+                        CodexLogKind::System,
+                        format!("Codex app-server 常駐プロセスを起動しました{resume}"),
+                    );
+                }
+                Err(e) => {
+                    self.codex_appserver_enabled = false;
+                    self.push_log(
+                        CodexLogKind::System,
+                        format!("常駐プロセスの起動に失敗したためワンショットで実行します: {e}"),
+                    );
+                    self.start_oneshot_turn(prompt, display_prompt);
+                    return;
+                }
+            }
+        }
+
+        self.codex_appserver_pending_turn = Some(full_prompt);
+        self.turn_running = true;
+        self.turn_finished_by_event = false;
+        self.pending_decision = None;
+        self.diff_view = None;
+        self.codex_appserver_interrupting = false;
+        self.codex_appserver_interrupt_deadline = None;
+        self.exec_settings.image_paths.clear();
+        self.current_turn_prompt = Some(display_prompt.to_string());
+        self.current_turn_retry_prompt = Some(prompt.to_string());
+        self.codex_appserver_last_activity = Some(Instant::now());
+        self.scroll_to_live();
+
+        // すでに thread 確立済みなら即座に turn/start する。未確立ならハンドシェイク完了時に送る。
+        if self.codex_appserver_phase == CodexAppServerPhase::Ready {
+            self.flush_codex_appserver_pending_turn();
+        }
+    }
+
+    /// initialize リクエストを送り、フェーズを Initializing にする。送信可否を返す。
+    fn send_codex_appserver_initialize(&mut self) -> bool {
+        let Some(client) = self.codex_appserver.as_mut() else {
+            return false;
+        };
+        let id = client.next_id();
+        let request =
+            codex_appserver::initialize_request(id, "addness-tui", env!("CARGO_PKG_VERSION"));
+        if client.send_value(&request) {
+            self.codex_appserver_phase = CodexAppServerPhase::Initializing { request_id: id };
+            true
+        } else {
+            false
+        }
+    }
+
+    /// thread 確立後に保留していたターン本文を turn/start で送る。
+    fn flush_codex_appserver_pending_turn(&mut self) {
+        let Some(text) = self.codex_appserver_pending_turn.take() else {
+            return;
+        };
+        let Some(thread_id) = self.thread_id.clone() else {
+            self.handle_codex_appserver_death();
+            return;
+        };
+        let effort = self.codex_appserver_effort();
+        let Some(client) = self.codex_appserver.as_mut() else {
+            return;
+        };
+        let id = client.next_id();
+        let request = codex_appserver::turn_start_request(id, &thread_id, &text, effort.as_deref());
+        if client.send_value(&request) {
+            self.codex_appserver_turn_req_id = Some(id);
+            self.codex_appserver_last_activity = Some(Instant::now());
+        } else {
+            self.push_log(
+                CodexLogKind::Error,
+                "常駐プロセスへの turn/start 送信に失敗しました。次のターンで再接続します",
+            );
+            self.handle_codex_appserver_death();
+        }
+    }
+
+    /// 常駐プロセスへ initialized 通知 → thread/start（or resume）を送る。
+    fn send_codex_appserver_start_thread(&mut self) {
+        let config = self.codex_appserver_thread_config();
+        let resume_target = self.thread_id.clone();
+        let Some(client) = self.codex_appserver.as_mut() else {
+            return;
+        };
+        if !client.send_value(&codex_appserver::initialized_notification()) {
+            self.handle_codex_appserver_death();
+            return;
+        }
+        let id = client.next_id();
+        let (request, resuming) = match resume_target.as_deref() {
+            Some(thread_id) => (
+                codex_appserver::thread_resume_request(id, thread_id, &config),
+                true,
+            ),
+            None => (codex_appserver::thread_start_request(id, &config), false),
+        };
+        if client.send_value(&request) {
+            self.codex_appserver_phase = CodexAppServerPhase::StartingThread {
+                request_id: id,
+                resuming,
+            };
+        } else {
+            self.handle_codex_appserver_death();
+        }
+    }
+
+    /// resume に失敗したとき、新規 thread/start で作り直す。
+    fn send_codex_appserver_fresh_thread(&mut self) {
+        let config = self.codex_appserver_thread_config();
+        let Some(client) = self.codex_appserver.as_mut() else {
+            return;
+        };
+        let id = client.next_id();
+        let request = codex_appserver::thread_start_request(id, &config);
+        if client.send_value(&request) {
+            self.codex_appserver_phase = CodexAppServerPhase::StartingThread {
+                request_id: id,
+                resuming: false,
+            };
+        } else {
+            self.handle_codex_appserver_death();
+        }
+    }
+
+    /// 常駐 codex app-server の JSON-RPC メッセージを処理する。
+    fn handle_codex_appserver_message(&mut self, value: &Value) {
+        let Some(message) = codex_appserver::parse_message(value) else {
+            return;
+        };
+        self.codex_appserver_last_activity = Some(Instant::now());
+        match message {
+            codex_appserver::ServerMessage::Response { id, result, error } => {
+                self.handle_codex_appserver_response(id, result, error);
+            }
+            codex_appserver::ServerMessage::Approval(request) => {
+                self.handle_codex_appserver_approval(request);
+            }
+            codex_appserver::ServerMessage::UnhandledRequest { id, method } => {
+                if let Some(client) = self.codex_appserver.as_ref() {
+                    client.send_value(&codex_appserver::error_response(
+                        &id,
+                        -32601,
+                        "method not supported by addness-tui",
+                    ));
+                }
+                self.push_log(
+                    CodexLogKind::Event,
+                    format!("Codex 未対応リクエストにエラー応答: {method}"),
+                );
+            }
+            codex_appserver::ServerMessage::Notification(notification) => {
+                self.handle_codex_appserver_notification(notification);
+            }
+        }
+    }
+
+    fn handle_codex_appserver_response(
+        &mut self,
+        id: u64,
+        result: Option<Value>,
+        error: Option<codex_appserver::JsonRpcError>,
+    ) {
+        // 1. initialize 応答。
+        if let CodexAppServerPhase::Initializing { request_id } = self.codex_appserver_phase
+            && request_id == id
+        {
+            if let Some(error) = error {
+                self.push_log(
+                    CodexLogKind::Error,
+                    format!("initialize に失敗しました（{}）", error.message),
+                );
+                self.fallback_codex_appserver_to_oneshot();
+                return;
+            }
+            self.send_codex_appserver_start_thread();
+            return;
+        }
+
+        // 2. thread/start・thread/resume 応答。
+        if let CodexAppServerPhase::StartingThread {
+            request_id,
+            resuming,
+        } = self.codex_appserver_phase
+            && request_id == id
+        {
+            if let Some(error) = error {
+                if resuming {
+                    self.push_log(
+                        CodexLogKind::System,
+                        format!(
+                            "thread/resume に失敗（{}）。新規スレッドで開始します",
+                            error.message
+                        ),
+                    );
+                    self.send_codex_appserver_fresh_thread();
+                } else {
+                    self.push_log(
+                        CodexLogKind::Error,
+                        format!("thread/start に失敗しました（{}）", error.message),
+                    );
+                    self.fallback_codex_appserver_to_oneshot();
+                }
+                return;
+            }
+            if let Some(thread_id) = result
+                .as_ref()
+                .and_then(codex_appserver::thread_id_from_response)
+            {
+                self.thread_id = Some(thread_id);
+            }
+            self.codex_appserver_phase = CodexAppServerPhase::Ready;
+            self.push_log(CodexLogKind::System, "Codex セッションを開始しました");
+            self.flush_codex_appserver_pending_turn();
+            return;
+        }
+
+        // 3. turn/start 応答（turn.id 確定）。
+        if self.codex_appserver_turn_req_id == Some(id) {
+            self.codex_appserver_turn_req_id = None;
+            if let Some(error) = error {
+                self.push_log(
+                    CodexLogKind::Error,
+                    format!("Codex ターンの開始に失敗しました（{}）", error.message),
+                );
+                self.finish_codex_appserver_turn_failed();
+                return;
+            }
+            if let Some(turn_id) = result
+                .as_ref()
+                .and_then(codex_appserver::turn_id_from_response)
+            {
+                self.codex_appserver_turn_id = Some(turn_id);
+            }
+            return;
+        }
+
+        // 4. thread/settings/update 応答。
+        if let Some(change) = self.codex_appserver_pending_setting.as_ref()
+            && change.request_id == id
+        {
+            let label = change.label.clone();
+            self.codex_appserver_pending_setting = None;
+            if let Some(error) = error {
+                self.codex_appserver_restart_pending = true;
+                self.push_log(
+                    CodexLogKind::System,
+                    format!(
+                        "{label}の実行時反映に失敗（{}）。次のアイドルで再起動します",
+                        error.message
+                    ),
+                );
+            } else {
+                self.push_log(CodexLogKind::System, format!("{label}を反映しました"));
+            }
+        }
+
+        // それ以外（interrupt の {} 応答など）は無視する。
+    }
+
+    fn handle_codex_appserver_notification(&mut self, notification: codex_appserver::Notification) {
+        use codex_appserver::Notification as N;
+        match notification {
+            N::TurnStarted => self.begin_codex_appserver_turn(),
+            N::TurnCompleted { status } => self.handle_codex_appserver_turn_completed(&status),
+            N::AgentMessageDelta { delta } => self.append_assistant_delta(&delta),
+            N::ReasoningDelta { text } => {
+                if !text.trim().is_empty() {
+                    self.push_log(
+                        CodexLogKind::Event,
+                        format!("(思考) {}", compact_one_line(&text, 2_000)),
+                    );
+                }
+            }
+            N::ItemStarted(item) => self.handle_codex_appserver_item_started(item),
+            N::ItemCompleted(item) => self.handle_codex_appserver_item_completed(item),
+            N::CommandOutputDelta { item_id, delta } => {
+                self.record_codex_appserver_output(&item_id, &delta);
+            }
+            N::TokenUsage(usage) => self.record_codex_appserver_token_usage(usage),
+            N::Error { message } => {
+                self.push_log(CodexLogKind::Error, message.clone());
+                self.push_terminal_notice("Codex エラー", message);
+            }
+            N::Ignored => {}
+        }
+    }
+
+    /// turn/started（ターン境界の始まり）で見出し行を出す。
+    fn begin_codex_appserver_turn(&mut self) {
+        if self.turn_count > 0 {
+            self.collapsed_turns.insert(self.turn_count);
+        }
+        self.current_command = None;
+        self.current_command_started_at = None;
+        self.action = Some("依頼を確認中".to_string());
+        self.turn_count = self.turn_count.saturating_add(1);
+        let label = self
+            .current_turn_prompt
+            .as_deref()
+            .or_else(|| self.last_prompt())
+            .map(compact_turn_prompt)
+            .filter(|prompt| !prompt.is_empty())
+            .map(|prompt| format!("Turn {} - {prompt}", self.turn_count))
+            .unwrap_or_else(|| format!("Turn {}", self.turn_count));
+        self.push_log(CodexLogKind::Turn, label);
+    }
+
+    fn handle_codex_appserver_turn_completed(&mut self, status: &str) {
+        self.turn_running = false;
+        self.turn_finished_by_event = true;
+        self.current_command = None;
+        self.current_command_started_at = None;
+        self.streaming_assistant_index = None;
+        self.codex_appserver_turn_id = None;
+        self.codex_appserver_turn_req_id = None;
+        self.codex_appserver_output.clear();
+        self.codex_appserver_running_item = None;
+        self.codex_appserver_last_activity = Some(Instant::now());
+
+        // interrupt 要求中に来た完了は中断完了として扱い、キューを自動開始しない。
+        if self.codex_appserver_interrupting || status == "interrupted" {
+            self.codex_appserver_interrupting = false;
+            self.codex_appserver_interrupt_deadline = None;
+            self.pending_decision = None;
+            self.codex_appserver_pending_approval = None;
+            self.current_turn_prompt = None;
+            self.current_turn_retry_prompt = None;
+            self.action = Some("中断完了".to_string());
+            self.refresh_current_turn_title();
+            self.push_log(CodexLogKind::System, "ターンを中断しました");
+            let queued = self.queued_prompts.len();
+            if queued > 0 {
+                self.push_log(
+                    CodexLogKind::System,
+                    format!("予約{queued}件は保留中（Enter で開始 / /stop queued で破棄）"),
+                );
+            }
+            return;
+        }
+
+        self.pending_decision = None;
+        self.codex_appserver_pending_approval = None;
+        self.refresh_current_turn_title();
+        self.queue_completed_turn_body_record();
+        if status == "failed" {
+            let message = "Codex ターンが失敗しました".to_string();
+            self.push_log(CodexLogKind::Error, message.clone());
+            self.push_terminal_notice("Codex 失敗", message);
+        } else {
+            self.action = Some("応答完了".to_string());
+            self.push_log(CodexLogKind::System, "Codex の応答が完了しました");
+            self.push_terminal_notice("Codex 完了", "Codex の出力が完了しました");
+        }
+        self.current_turn_prompt = None;
+        self.current_turn_retry_prompt = None;
+        self.start_next_queued_turn_if_idle();
+    }
+
+    /// turn/start 応答がエラーだったときにターンを失敗終了させる。
+    fn finish_codex_appserver_turn_failed(&mut self) {
+        self.turn_running = false;
+        self.current_command = None;
+        self.current_command_started_at = None;
+        self.streaming_assistant_index = None;
+        self.codex_appserver_turn_id = None;
+        self.pending_decision = None;
+        self.codex_appserver_pending_approval = None;
+        self.codex_appserver_pending_turn = None;
+        self.refresh_current_turn_title();
+        self.current_turn_prompt = None;
+        self.current_turn_retry_prompt = None;
+        self.push_terminal_notice("Codex 失敗", "Codex ターンの開始に失敗しました");
+        self.start_next_queued_turn_if_idle();
+    }
+
+    fn handle_codex_appserver_item_started(&mut self, item: codex_appserver::ThreadItemInfo) {
+        use codex_appserver::ThreadItemKind as K;
+        match item.kind {
+            K::CommandExecution { command, .. } => {
+                self.current_command = Some(compact_tool_text(&command));
+                self.current_command_started_at = Some(Instant::now());
+                self.refresh_action_from_text(&command);
+                self.codex_appserver_running_item = Some(item.id.clone());
+                self.codex_appserver_output.insert(item.id, VecDeque::new());
+                self.push_log(
+                    CodexLogKind::Tool,
+                    format!("$ {}", compact_tool_text(&command)),
+                );
+            }
+            K::McpToolCall { server, tool, .. } => {
+                let label = format!("{server}.{tool}");
+                self.current_command = Some(label.clone());
+                self.current_command_started_at = Some(Instant::now());
+                self.action = Some(format!("ツール実行: {label}"));
+                self.push_log(CodexLogKind::Tool, format!("MCP {label}"));
+            }
+            K::FileChange { paths, .. } => {
+                let label = codex_appserver_paths_label(&paths);
+                self.push_log(CodexLogKind::Tool, format!("ファイル変更 {label}"));
+            }
+            // reasoning / agentMessage はデルタ・完了で扱う。
+            _ => {}
+        }
+    }
+
+    fn handle_codex_appserver_item_completed(&mut self, item: codex_appserver::ThreadItemInfo) {
+        use codex_appserver::ThreadItemKind as K;
+        match item.kind {
+            K::CommandExecution {
+                command,
+                exit_code,
+                duration_ms,
+                ..
+            } => {
+                self.current_command = None;
+                self.current_command_started_at = None;
+                self.codex_appserver_output.remove(&item.id);
+                if self.codex_appserver_running_item.as_deref() == Some(item.id.as_str()) {
+                    self.codex_appserver_running_item = None;
+                }
+                let exit = exit_code
+                    .map(|code| format!("exit {code}"))
+                    .unwrap_or_else(|| "終了".to_string());
+                let duration = duration_ms
+                    .map(|ms| format!(" {}ms", ms))
+                    .unwrap_or_default();
+                let state = if exit_code == Some(0) { "OK" } else { "FAIL" };
+                self.push_log(
+                    CodexLogKind::Tool,
+                    format!("{state} {} ({exit}{duration})", compact_tool_text(&command)),
+                );
+            }
+            K::AgentMessage { text, .. } => {
+                // デルタで逐次表示済みならストリーミング行を確定するだけ。
+                if self.streaming_assistant_index.is_some() {
+                    self.streaming_assistant_index = None;
+                } else if !text.trim().is_empty() {
+                    self.push_log(CodexLogKind::Assistant, text);
+                }
+            }
+            K::Reasoning { summary, content } => {
+                let text = if !summary.is_empty() {
+                    summary.join(" ")
+                } else {
+                    content.join(" ")
+                };
+                if !text.trim().is_empty() {
+                    self.push_log(
+                        CodexLogKind::Event,
+                        format!("(思考) {}", compact_one_line(&text, 2_000)),
+                    );
+                }
+            }
+            K::FileChange { paths, status } => {
+                let label = codex_appserver_paths_label(&paths);
+                let status = status.unwrap_or_else(|| "完了".to_string());
+                self.push_log(CodexLogKind::Tool, format!("ファイル変更 {status} {label}"));
+            }
+            K::McpToolCall {
+                server,
+                tool,
+                status,
+            } => {
+                self.current_command = None;
+                self.current_command_started_at = None;
+                let status = status.unwrap_or_else(|| "完了".to_string());
+                self.push_log(CodexLogKind::Tool, format!("MCP {server}.{tool} {status}"));
+            }
+            K::Other(_) => {}
+        }
+    }
+
+    /// 実行中コマンドの stdout ストリーミングを末尾 N 行のリングバッファへ蓄積する。
+    fn record_codex_appserver_output(&mut self, item_id: &str, delta: &str) {
+        let buffer = self
+            .codex_appserver_output
+            .entry(item_id.to_string())
+            .or_default();
+        // delta は複数行を含みうる。行ごとにリングバッファへ push し、末尾 N 行だけ残す。
+        for line in delta.split_inclusive('\n') {
+            let line = line.trim_end_matches('\n');
+            if line.is_empty() {
+                continue;
+            }
+            buffer.push_back(compact_one_line(line, 200));
+            while buffer.len() > CODEX_APPSERVER_OUTPUT_TAIL_LINES {
+                buffer.pop_front();
+            }
+        }
+        self.codex_appserver_running_item = Some(item_id.to_string());
+    }
+
+    /// 実行中コマンドのライブ出力（末尾 N 行）。描画側が実行中 Tool 行の下に薄色で出す。
+    pub fn codex_appserver_live_output(&self) -> Vec<String> {
+        self.codex_appserver_running_item
+            .as_ref()
+            .and_then(|item| self.codex_appserver_output.get(item))
+            .map(|buffer| buffer.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn record_codex_appserver_token_usage(&mut self, usage: codex_appserver::TokenUsageInfo) {
+        let mut parts = Vec::new();
+        if let Some(total) = usage.total_tokens {
+            parts.push(format!("total {total}"));
+        }
+        if let Some(last) = usage.last_total_tokens {
+            parts.push(format!("last {last}"));
+        }
+        if let Some(window) = usage.model_context_window {
+            parts.push(format!("context {window}"));
+        }
+        if !parts.is_empty() {
+            self.last_token_usage_label = Some(parts.join(" / "));
+        }
+        self.codex_appserver_token_usage = Some(usage);
+    }
+
+    /// サーバ発の承認リクエストを既存 CodexDecisionBanner で提示する。
+    fn handle_codex_appserver_approval(&mut self, request: codex_appserver::ApprovalRequest) {
+        use codex_appserver::ApprovalKind as K;
+        let (heading, allow_hint) = match request.kind {
+            K::Command => ("コマンド実行の許可を求めています", "許可すると実行します"),
+            K::FileChange => ("ファイル変更の許可を求めています", "許可すると適用します"),
+            K::Permissions => ("権限昇格の許可を求めています", "許可すると権限を付与します"),
+        };
+        let target = compact_one_line(&request.summary, 100);
+        let session = if request.allows_session() {
+            " l=このセッション中は許可"
+        } else {
+            ""
+        };
+        let message = format!("{heading}: {target}。{allow_hint}。{session}");
+        self.codex_appserver_pending_approval = Some(request);
+        self.codex_appserver_last_activity = Some(Instant::now());
+        self.set_pending_decision(CodexDecisionBanner::new(
+            CodexDecisionKind::Permission,
+            message,
+        ));
+    }
+
+    /// 承認バナーの応答を JSON-RPC result としてプロセスへ返す（進行中ターンをその場で続行させる）。
+    fn resolve_codex_appserver_approval(
+        &mut self,
+        response: CodexDecisionResponse,
+        response_label: &str,
+    ) {
+        use codex_appserver::ApprovalKind as K;
+        let Some(request) = self.codex_appserver_pending_approval.take() else {
+            return;
+        };
+        self.action = Some(format!("確認応答: {response_label}"));
+        self.push_activity(format!("ツール承認に {response_label} で応答"));
+        self.codex_appserver_last_activity = Some(Instant::now());
+        let allows_session = request.allows_session();
+        let Some(client) = self.codex_appserver.as_ref() else {
+            return;
+        };
+        let reply = match request.kind {
+            K::Command | K::FileChange => {
+                let decision = match response {
+                    CodexDecisionResponse::Accept => "accept",
+                    CodexDecisionResponse::Always if allows_session => "acceptForSession",
+                    CodexDecisionResponse::Always => "accept",
+                    CodexDecisionResponse::Deny => "decline",
+                };
+                codex_appserver::approval_result(&request.id, decision)
+            }
+            K::Permissions => {
+                // permissions は decline が無く、付与プロファイル + scope で応答する。
+                let (granted, scope) = match response {
+                    CodexDecisionResponse::Accept => (
+                        request
+                            .requested_permissions
+                            .clone()
+                            .unwrap_or(serde_json::json!({})),
+                        "turn",
+                    ),
+                    CodexDecisionResponse::Always => (
+                        request
+                            .requested_permissions
+                            .clone()
+                            .unwrap_or(serde_json::json!({})),
+                        "session",
+                    ),
+                    // 拒否は「何も付与しない」で表す。
+                    CodexDecisionResponse::Deny => (serde_json::json!({}), "turn"),
+                };
+                codex_appserver::permissions_result(&request.id, granted, scope)
+            }
+        };
+        client.send_value(&reply);
+        match response {
+            CodexDecisionResponse::Accept => {
+                self.push_log(CodexLogKind::System, "今回だけ許可して続行します")
+            }
+            CodexDecisionResponse::Always => {
+                self.push_log(CodexLogKind::System, "このセッション中は許可して続行します")
+            }
+            CodexDecisionResponse::Deny => self.push_log(
+                CodexLogKind::System,
+                "拒否しました（Codex はこの操作なしで続行します）",
+            ),
+        }
+    }
+
+    /// 常駐モードで実行中ターンへ turn/interrupt（グレースフル中断）を送る。
+    /// 送れたら 2 秒の完了待ちを開始し `true` を返す。
+    fn request_codex_appserver_interrupt(&mut self) -> bool {
+        let (Some(thread_id), Some(turn_id)) =
+            (self.thread_id.clone(), self.codex_appserver_turn_id.clone())
+        else {
+            return false;
+        };
+        let Some(client) = self.codex_appserver.as_mut() else {
+            return false;
+        };
+        let id = client.next_id();
+        let request = codex_appserver::turn_interrupt_request(id, &thread_id, &turn_id);
+        if !client.send_value(&request) {
+            return false;
+        }
+        self.codex_appserver_interrupting = true;
+        self.codex_appserver_interrupt_deadline =
+            Some(Instant::now() + CODEX_APPSERVER_INTERRUPT_GRACE);
+        self.codex_appserver_last_activity = Some(Instant::now());
+        self.push_log(
+            CodexLogKind::System,
+            "中断を要求しました（2秒以内に完了しなければ再起動します）",
+        );
+        true
+    }
+
+    /// 常駐 codex app-server のポーリング（毎フレーム `update()` から呼ぶ）。
+    fn poll_codex_appserver(&mut self) -> bool {
+        // 1. 終了検知（死亡 or グレースフルクローズ完了）。
+        let waited = match self.codex_appserver.as_mut() {
+            Some(client) => client.try_wait(),
+            None => return false,
+        };
+        match waited {
+            Ok(Some(_status)) => {
+                let closing = self
+                    .codex_appserver
+                    .as_ref()
+                    .map(|c| c.closing)
+                    .unwrap_or(false);
+                self.codex_appserver = None;
+                self.codex_appserver_phase = CodexAppServerPhase::Idle;
+                if closing {
+                    self.push_log(
+                        CodexLogKind::System,
+                        "アイドルのため Codex app-server 常駐プロセスを終了しました（次のターンで再接続）",
+                    );
+                } else {
+                    self.handle_codex_appserver_death();
+                }
+                return true;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                self.codex_appserver = None;
+                self.codex_appserver_phase = CodexAppServerPhase::Idle;
+                self.push_log(
+                    CodexLogKind::Error,
+                    format!("Codex app-server 常駐プロセスの状態確認に失敗しました: {e}"),
+                );
+                self.handle_codex_appserver_death();
+                return true;
+            }
+        }
+
+        // 2. interrupt グレースフル待ちのタイムアウト → kill フォールバック。
+        if let Some(deadline) = self.codex_appserver_interrupt_deadline
+            && Instant::now() >= deadline
+        {
+            if let Some(client) = self.codex_appserver.as_mut() {
+                client.kill();
+            }
+            self.codex_appserver = None;
+            self.codex_appserver_phase = CodexAppServerPhase::Idle;
+            self.codex_appserver_interrupt_deadline = None;
+            self.codex_appserver_interrupting = false;
+            self.turn_running = false;
+            self.current_command = None;
+            self.current_command_started_at = None;
+            self.streaming_assistant_index = None;
+            self.pending_decision = None;
+            self.codex_appserver_pending_approval = None;
+            self.codex_appserver_turn_id = None;
+            self.codex_appserver_pending_turn = None;
+            self.current_turn_prompt = None;
+            self.current_turn_retry_prompt = None;
+            self.push_log(
+                CodexLogKind::System,
+                "中断が2秒以内に完了しなかったため常駐プロセスを終了しました（次のターンで再接続）",
+            );
+            return true;
+        }
+
+        // 3. 設定変更応答のタイムアウト → 再起動フォールバック。
+        if let Some(change) = self.codex_appserver_pending_setting.as_ref()
+            && Instant::now() >= change.deadline
+        {
+            let label = change.label.clone();
+            self.codex_appserver_pending_setting = None;
+            self.codex_appserver_restart_pending = true;
+            self.push_log(
+                CodexLogKind::System,
+                format!("{label}の応答がタイムアウトしました。次のアイドルで再起動します"),
+            );
+            return true;
+        }
+
+        // 4. アイドル時: 再起動保留があればグレースフルに閉じる（次ターンで再 spawn）。
+        if self.codex_appserver_restart_pending
+            && !self.turn_running
+            && self.pending_decision.is_none()
+            && self.codex_appserver_pending_approval.is_none()
+        {
+            self.codex_appserver_restart_pending = false;
+            if let Some(client) = self.codex_appserver.as_mut() {
+                client.begin_close();
+            }
+            self.push_log(
+                CodexLogKind::System,
+                "設定を反映するため常駐プロセスを再起動します（次のターンで再接続）",
+            );
+            return true;
+        }
+
+        // 5. アイドル回収（無操作が続いたら閉じる）。
+        if !self.turn_running
+            && self.pending_decision.is_none()
+            && self.codex_appserver_pending_approval.is_none()
+            && let Some(last) = self.codex_appserver_last_activity
+            && last.elapsed() >= CODEX_APPSERVER_IDLE_TIMEOUT
+        {
+            self.codex_appserver_last_activity = None;
+            if let Some(client) = self.codex_appserver.as_mut() {
+                client.begin_close();
+            }
+            return true;
+        }
+
+        false
+    }
+
+    /// 常駐プロセスが予期せず死んだときの処理。実行中ターンはエラー終了扱い。
+    fn handle_codex_appserver_death(&mut self) {
+        self.codex_appserver = None;
+        self.codex_appserver_phase = CodexAppServerPhase::Idle;
+        self.codex_appserver_interrupt_deadline = None;
+        self.codex_appserver_interrupting = false;
+        self.codex_appserver_pending_setting = None;
+        self.codex_appserver_pending_approval = None;
+        self.codex_appserver_pending_turn = None;
+        self.codex_appserver_turn_id = None;
+        self.codex_appserver_turn_req_id = None;
+        self.codex_appserver_restart_pending = false;
+        self.codex_appserver_output.clear();
+        self.codex_appserver_running_item = None;
+        let was_running = self.turn_running;
+        self.turn_running = false;
+        self.current_command = None;
+        self.current_command_started_at = None;
+        self.streaming_assistant_index = None;
+        self.pending_decision = None;
+        self.current_turn_prompt = None;
+        self.current_turn_retry_prompt = None;
+        if was_running {
+            self.refresh_current_turn_title();
+        }
+        let message = "Codex プロセスが終了しました。次のターンで再接続します";
+        self.push_log(CodexLogKind::Error, message);
+        self.push_terminal_notice("Codex 切断", message);
+    }
+
+    /// initialize / thread/start に失敗したとき、常駐を諦めてワンショットで同じターンを実行する。
+    fn fallback_codex_appserver_to_oneshot(&mut self) {
+        if let Some(mut client) = self.codex_appserver.take() {
+            client.kill();
+        }
+        self.codex_appserver_phase = CodexAppServerPhase::Idle;
+        self.codex_appserver_enabled = false;
+        self.codex_appserver_pending_turn = None;
+        self.codex_appserver_turn_id = None;
+        self.codex_appserver_turn_req_id = None;
+        let retry = self.current_turn_retry_prompt.clone();
+        let display = self.current_turn_prompt.clone();
+        // 進行中ターン状態をいったんクリアしてからワンショットへ切り替える。
+        self.turn_running = false;
+        self.current_turn_prompt = None;
+        self.current_turn_retry_prompt = None;
+        self.push_log(
+            CodexLogKind::System,
+            "常駐初期化に失敗したためワンショットで実行します",
+        );
+        if let Some(prompt) = retry {
+            let display = display.unwrap_or_else(|| prompt.clone());
+            self.start_oneshot_turn(&prompt, &display);
+        }
+    }
+
+    /// 常駐 codex app-server を強制終了し状態をクリアする（`/stop` kill・ペイン切替など）。
+    fn teardown_codex_appserver(&mut self) {
+        if let Some(mut client) = self.codex_appserver.take() {
+            client.kill();
+        }
+        self.codex_appserver_phase = CodexAppServerPhase::Idle;
+        self.codex_appserver_interrupt_deadline = None;
+        self.codex_appserver_interrupting = false;
+        self.codex_appserver_pending_setting = None;
+        self.codex_appserver_pending_approval = None;
+        self.codex_appserver_pending_turn = None;
+        self.codex_appserver_turn_id = None;
+        self.codex_appserver_turn_req_id = None;
+        self.codex_appserver_restart_pending = false;
+        self.codex_appserver_output.clear();
+        self.codex_appserver_running_item = None;
+    }
+
+    /// F2（model）を thread/settings/update で反映する。具体値が無ければ再起動フォールバック。
+    fn push_codex_appserver_model(&mut self) {
+        let value = self.exec_settings.model_cli_arg().map(str::to_string);
+        let update = codex_appserver::SettingsUpdate {
+            model: value.clone(),
+            ..Default::default()
+        };
+        self.push_codex_appserver_setting(update, "model 変更", value.is_some());
+    }
+
+    /// F3（effort）を thread/settings/update で反映する。
+    fn push_codex_appserver_effort(&mut self) {
+        let value = self.codex_appserver_effort();
+        let update = codex_appserver::SettingsUpdate {
+            effort: value.clone(),
+            ..Default::default()
+        };
+        self.push_codex_appserver_setting(update, "effort 変更", value.is_some());
+    }
+
+    /// F4（approval）を thread/settings/update で反映する。
+    fn push_codex_appserver_approval(&mut self) {
+        let value = if self.exec_settings.bypass_approvals_and_sandbox {
+            Some("never".to_string())
+        } else {
+            self.exec_settings.approval.cli_arg().map(str::to_string)
+        };
+        let update = codex_appserver::SettingsUpdate {
+            approval_policy: value.clone(),
+            ..Default::default()
+        };
+        self.push_codex_appserver_setting(update, "approval 変更", value.is_some());
+    }
+
+    /// F5（sandbox）を thread/settings/update で反映する。
+    fn push_codex_appserver_sandbox(&mut self) {
+        let value = if self.exec_settings.bypass_approvals_and_sandbox {
+            "danger-full-access".to_string()
+        } else {
+            self.exec_settings.sandbox.cli_arg().to_string()
+        };
+        let update = codex_appserver::SettingsUpdate {
+            sandbox: Some(value),
+            ..Default::default()
+        };
+        self.push_codex_appserver_setting(update, "sandbox 変更", true);
+    }
+
+    /// thread/settings/update を送る共通処理。具体値が無い（config）場合は再起動フォールバック。
+    fn push_codex_appserver_setting(
+        &mut self,
+        update: codex_appserver::SettingsUpdate,
+        label: &str,
+        had_value: bool,
+    ) {
+        // 常駐が無い / thread 未確立なら次の thread/start が新設定を載せるので何もしない。
+        if self.codex_appserver.is_none()
+            || self.codex_appserver_phase != CodexAppServerPhase::Ready
+            || self.thread_id.is_none()
+        {
+            return;
+        }
+        if !had_value {
+            // config へ戻す変更は settings/update では表現できないため再起動で反映する。
+            self.codex_appserver_restart_pending = true;
+            return;
+        }
+        let thread_id = self.thread_id.clone().unwrap_or_default();
+        let Some(client) = self.codex_appserver.as_mut() else {
+            return;
+        };
+        let id = client.next_id();
+        let Some(request) = codex_appserver::settings_update_request(id, &thread_id, &update)
+        else {
+            return;
+        };
+        if client.send_value(&request) {
+            self.codex_appserver_pending_setting = Some(CodexAppServerSettingChange {
+                request_id: id,
+                deadline: Instant::now() + CODEX_APPSERVER_SETTING_CHANGE_GRACE,
+                label: label.to_string(),
+            });
+        } else {
+            self.codex_appserver_restart_pending = true;
+        }
+    }
+
     /// 起動する子プロセスへ Addness 文脈の環境変数を設定する（3 系統の spawn で共有）。
     fn apply_agent_env(&self, cmd: &mut Command) {
         // 後方互換: codex のときだけ従来の ADDNESS_TUI_CODEX を維持する。
@@ -4993,6 +6143,12 @@ impl CodexPane {
 
         if self.kind == AgentKind::ClaudeCode {
             self.resolve_claude_decision(response, response_label);
+            return;
+        }
+
+        // 常駐 app-server の承認は JSON-RPC result を返してその場で続行する（resume 再実行しない）。
+        if self.codex_appserver_pending_approval.is_some() {
+            self.resolve_codex_appserver_approval(response, response_label);
             return;
         }
 
@@ -5356,6 +6512,11 @@ impl CodexPane {
         // ClaudeCode の常駐モードは 1 プロセスで多ターンを回す（別経路）。
         if self.claude_resident_active() {
             self.start_claude_resident_turn(prompt, display_prompt);
+            return;
+        }
+        // Codex の app-server 常駐モードも 1 プロセスで多ターンを回す（別経路）。
+        if self.codex_appserver_active() {
+            self.start_codex_appserver_turn(prompt, display_prompt);
             return;
         }
         self.start_oneshot_turn(prompt, display_prompt);
@@ -6017,6 +7178,8 @@ impl CodexPane {
         if self.is_turn_running() {
             if self.claude_resident.is_some() && self.request_claude_interrupt() {
                 // graceful interrupt を送った。完了は result / タイムアウトで検知する。
+            } else if self.codex_appserver.is_some() && self.request_codex_appserver_interrupt() {
+                // graceful interrupt を送った。完了は turn/completed / タイムアウトで検知する。
             } else {
                 self.kill_current_turn();
             }
@@ -8171,6 +9334,8 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
         self.child = None;
         // 常駐 Claude Code プロセスも終了させる（次ターンで --resume 再接続する）。
         self.teardown_claude_resident();
+        // 常駐 codex app-server プロセスも終了させる（次ターンで thread/resume 再接続する）。
+        self.teardown_codex_appserver();
         self.turn_running = false;
         self.current_command = None;
         self.current_command_started_at = None;
@@ -8824,6 +9989,19 @@ fn byte_index_for_width(text: &str, start: usize, end: usize, target_width: usiz
         }
     }
     candidate
+}
+
+/// fileChange の変更パス一覧を 1 行のラベルにまとめる（先頭数件 + 残り件数）。
+fn codex_appserver_paths_label(paths: &[String]) -> String {
+    if paths.is_empty() {
+        return "(パス不明)".to_string();
+    }
+    let shown = paths.len().min(3);
+    let mut label = paths[..shown].join(", ");
+    if paths.len() > shown {
+        label.push_str(&format!(" ほか{}件", paths.len() - shown));
+    }
+    compact_one_line(&label, 120)
 }
 
 fn spawn_line_reader<R>(reader: R, tx: Sender<CodexProcessEvent>, stderr: bool)
@@ -11594,6 +12772,232 @@ mod tests {
         assert!(pane.claude_last_usage.is_some());
         // キューが消費されて次ターンへ進む（実プロセスは cat のため送信のみ）。
         assert_eq!(pane.queued_prompts.len(), 0);
+    }
+
+    // -- Codex app-server 常駐モード（実プロセスは cat のダミー）--------------
+
+    /// app-server 常駐（ダミー・Ready 相当）を差し込んだ Codex ペインを作る。
+    /// 生成不可な環境では None。
+    fn codex_appserver_pane() -> Option<CodexPane> {
+        let mut pane = CodexPane::test_with_output(10, 80, 0, "");
+        pane.finished = false;
+        pane.kind = AgentKind::Codex;
+        pane.codex_appserver_enabled = true;
+        let client = codex_appserver::AppServerClient::spawn_dummy()?;
+        pane.codex_appserver = Some(client);
+        pane.codex_appserver_phase = CodexAppServerPhase::Ready;
+        pane.thread_id = Some("th-1".to_string());
+        Some(pane)
+    }
+
+    #[test]
+    fn codex_appserver_routes_jsonrpc_to_resident_handler() {
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        // turn/started で見出し行が立つ。
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0", "method": "turn/started", "params": {"threadId": "th-1"}
+        }));
+        assert!(pane.log.iter().any(|l| l.kind == CodexLogKind::Turn));
+    }
+
+    #[test]
+    fn codex_appserver_command_item_updates_running_command() {
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        pane.turn_running = true;
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0", "method": "item/started",
+            "params": {"item": {"id": "call_1", "type": "commandExecution", "command": "cargo build"}}
+        }));
+        assert!(pane.current_command.is_some());
+        // ライブ出力デルタが末尾行バッファに載る。
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0", "method": "item/commandExecution/outputDelta",
+            "params": {"itemId": "call_1", "delta": "compiling...\n"}
+        }));
+        assert_eq!(
+            pane.codex_appserver_live_output(),
+            vec!["compiling...".to_string()]
+        );
+        // 完了で current_command とバッファを解放し、確定行を残す。
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0", "method": "item/completed",
+            "params": {"item": {"id": "call_1", "type": "commandExecution", "command": "cargo build", "exitCode": 0, "durationMs": 900, "status": "completed"}}
+        }));
+        assert!(pane.current_command.is_none());
+        assert!(pane.codex_appserver_live_output().is_empty());
+        assert!(
+            pane.log
+                .iter()
+                .any(|l| l.kind == CodexLogKind::Tool && l.text.contains("OK"))
+        );
+    }
+
+    #[test]
+    fn codex_appserver_agent_message_delta_streams_and_completes() {
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        pane.turn_running = true;
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0", "method": "item/agentMessage/delta",
+            "params": {"itemId": "m1", "delta": "答えは"}
+        }));
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0", "method": "item/agentMessage/delta",
+            "params": {"itemId": "m1", "delta": "2です"}
+        }));
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0", "method": "item/completed",
+            "params": {"item": {"id": "m1", "type": "agentMessage", "text": "答えは2です", "phase": "final_answer"}}
+        }));
+        assert!(
+            pane.log
+                .iter()
+                .any(|l| l.kind == CodexLogKind::Assistant && l.text.contains("答えは2です"))
+        );
+    }
+
+    #[test]
+    fn codex_appserver_turn_completed_finishes_turn() {
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        pane.turn_running = true;
+        pane.codex_appserver_turn_id = Some("turn-1".to_string());
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0", "method": "turn/completed",
+            "params": {"threadId": "th-1", "turn": {"id": "turn-1", "status": "completed", "items": []}}
+        }));
+        // キューが無ければターンは終了状態になる。
+        assert!(!pane.turn_running);
+        assert!(pane.codex_appserver_turn_id.is_none());
+        assert!(pane.log.iter().any(|l| l.text.contains("応答が完了")));
+    }
+
+    #[test]
+    fn codex_appserver_turn_completed_consumes_queue() {
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        pane.turn_running = true;
+        pane.codex_appserver_turn_id = Some("turn-1".to_string());
+        pane.queued_prompts
+            .push_back(QueuedPrompt::direct("次".to_string(), "次".to_string()));
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0", "method": "turn/completed",
+            "params": {"threadId": "th-1", "turn": {"id": "turn-1", "status": "completed", "items": []}}
+        }));
+        // 通常完了はキューを消費して次ターンへ進む（ダミーは送信のみ）。
+        assert_eq!(pane.queued_prompts.len(), 0);
+    }
+
+    #[test]
+    fn codex_appserver_esc_sends_graceful_interrupt() {
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        pane.turn_running = true;
+        pane.codex_appserver_turn_id = Some("turn-1".to_string());
+        assert!(pane.interrupt_turn_by_esc());
+        assert!(pane.codex_appserver_interrupting);
+        assert!(pane.codex_appserver_interrupt_deadline.is_some());
+        assert!(pane.turn_running);
+    }
+
+    #[test]
+    fn codex_appserver_interrupted_completion_holds_queue() {
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        pane.turn_running = true;
+        pane.codex_appserver_interrupting = true;
+        pane.codex_appserver_interrupt_deadline =
+            Some(Instant::now() + CODEX_APPSERVER_INTERRUPT_GRACE);
+        pane.queued_prompts
+            .push_back(QueuedPrompt::direct("次".to_string(), "次".to_string()));
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0", "method": "turn/completed",
+            "params": {"threadId": "th-1", "turn": {"id": "turn-1", "status": "interrupted", "items": []}}
+        }));
+        assert!(!pane.codex_appserver_interrupting);
+        assert!(!pane.turn_running);
+        // 中断はキューを自動開始しない（保留）。
+        assert_eq!(pane.queued_prompts.len(), 1);
+        assert!(pane.log.iter().any(|l| l.text.contains("中断しました")));
+    }
+
+    #[test]
+    fn codex_appserver_command_approval_replies_with_decision() {
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        pane.turn_running = true;
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0", "id": 0, "method": "item/commandExecution/requestApproval",
+            "params": {"itemId": "call_1", "command": "rm -rf x", "availableDecisions": ["accept", "acceptForSession", "decline"]}
+        }));
+        let banner = pane.pending_decision.as_ref().expect("banner");
+        assert_eq!(banner.kind, CodexDecisionKind::Permission);
+        assert!(pane.codex_appserver_pending_approval.is_some());
+        // a（許可）で応答し、バナーと pending を解消する。
+        pane.handle_decision_key(key(KeyCode::Char('a')));
+        assert!(pane.pending_decision.is_none());
+        assert!(pane.codex_appserver_pending_approval.is_none());
+    }
+
+    #[test]
+    fn codex_appserver_token_usage_saved() {
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0", "method": "thread/tokenUsage/updated",
+            "params": {"threadId": "th-1", "tokenUsage": {"total": {"totalTokens": 100}, "last": {"totalTokens": 20}, "modelContextWindow": 4096}}
+        }));
+        assert!(pane.codex_appserver_token_usage.is_some());
+        assert!(
+            pane.last_token_usage_label
+                .as_deref()
+                .unwrap()
+                .contains("total 100")
+        );
+    }
+
+    #[test]
+    fn codex_appserver_death_marks_turn_error() {
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        pane.turn_running = true;
+        pane.handle_codex_appserver_death();
+        assert!(pane.codex_appserver.is_none());
+        assert!(!pane.turn_running);
+        assert_eq!(pane.codex_appserver_phase, CodexAppServerPhase::Idle);
+        assert!(
+            pane.log
+                .iter()
+                .any(|l| l.kind == CodexLogKind::Error && l.text.contains("プロセスが終了"))
+        );
+    }
+
+    #[test]
+    fn codex_appserver_settings_change_sends_update_when_ready() {
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        // 具体値のある model 変更は settings/update を送り、応答待ちになる。
+        pane.exec_settings.model = CodexModelChoice::Gpt5;
+        pane.push_codex_appserver_model();
+        assert!(pane.codex_appserver_pending_setting.is_some());
+        // config（値なし）へ戻す approval 変更は settings/update では表せず再起動保留になる。
+        pane.exec_settings.approval = CodexApprovalChoice::Config;
+        pane.codex_appserver_pending_setting = None;
+        pane.push_codex_appserver_approval();
+        assert!(pane.codex_appserver_restart_pending);
     }
 
     #[test]

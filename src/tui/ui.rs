@@ -4707,8 +4707,14 @@ fn codex_current_activity_label(pane: &CodexPane, max_width: usize) -> String {
                 .current_command_elapsed_secs()
                 .map(|secs| format!(" {secs}s"))
                 .unwrap_or_default();
+            // 常駐 codex の実行中コマンドは末尾のライブ出力行を薄く添える。
+            let live = pane
+                .codex_appserver_live_output()
+                .last()
+                .map(|line| format!(" › {line}"))
+                .unwrap_or_default();
             format!(
-                "{}{elapsed}{input_hint}",
+                "{}{elapsed}{live}{input_hint}",
                 codex_command_activity_summary(command)
             )
         } else if let Some(action) = pane.action.as_deref() {

@@ -46,8 +46,9 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/clear", "表示ログをクリア"),
     ("/undo", "直近ターンのチェックポイントへ戻す"),
     ("/stop", "実行中のターンを中断"),
-    ("/sessions", "セッション候補を番号付きで表示"),
-    ("/resume", "作業メモ・決定ログから再開"),
+    ("/sessions", "セッション候補を一覧から選択"),
+    ("/resume", "セッションを選んで再開"),
+    ("/resume-memo", "Addnessの作業メモ・決定ログから続きを再開"),
     ("/resume-last", "最新セッションを継続"),
     ("/resume-session", "番号 / id のセッションを継続"),
     ("/fork", "セッションを fork"),
@@ -88,6 +89,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/logout", "ログアウトする"),
     ("/status", "現在の状態を表示"),
     ("/usage", "token 使用量を表示"),
+    ("/exit", "エージェントペインを終了する"),
     ("/help", "スラッシュコマンド一覧を表示"),
 ];
 
@@ -1530,19 +1532,6 @@ fn parse_codex_session_meta_line(line: &str) -> Option<CodexSessionCandidate> {
     })
 }
 
-fn session_list_line(index: usize, session: &CodexSessionCandidate) -> String {
-    let short_id = short_session_id(&session.id);
-    let cwd = session
-        .cwd
-        .as_deref()
-        .map(|cwd| format!("  {}", compact_home_path(Path::new(cwd))))
-        .unwrap_or_default();
-    format!(
-        "{index}. {short_id}  {}  {}{cwd}",
-        session.updated_at, session.title
-    )
-}
-
 fn short_session_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
 }
@@ -1902,6 +1891,72 @@ struct CodexTurnPicker {
     selected_turn: usize,
 }
 
+/// 汎用リストピッカー（モデル・reasoning・approval・sandbox・セッション選択）の 1 項目。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexListPickerItem {
+    /// 一覧に出す主ラベル（モデル名、セッション ID 先頭 8 桁など）。
+    pub label: String,
+    /// 補足（説明、更新時刻+タイトルなど）。空可。
+    pub detail: String,
+    /// 確定時にアクションへ渡す値（`set_model` への引数、セッション ID など）。
+    pub value: String,
+    /// 現在値マーカー。
+    pub current: bool,
+}
+
+/// リストピッカー確定（Enter）時に実行するアクション。既存の setter / ハンドラへ委譲する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexListPickerAction {
+    SetModel,
+    /// Claude では effort。
+    SetReasoning,
+    /// Claude では permission-mode。
+    SetApproval,
+    /// Codex のみ。
+    SetSandbox,
+    /// Enter=resume / f=fork。
+    ResumeSession,
+}
+
+/// 候補一覧から ↑↓ + Enter で選ぶ汎用ピッカー（turn ピッカーと並置するボトムモーダル）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexListPicker {
+    pub title: String,
+    pub action: CodexListPickerAction,
+    pub items: Vec<CodexListPickerItem>,
+    pub selected: usize,
+}
+
+/// ピッカーの初期選択位置（`current` の項目。無ければ先頭）。
+fn list_picker_initial_selection(items: &[CodexListPickerItem]) -> usize {
+    items.iter().position(|item| item.current).unwrap_or(0)
+}
+
+/// 設定ピッカーの `config` 項目に付ける補足説明（それ以外の項目は空）。
+fn config_choice_detail(is_config: bool) -> String {
+    if is_config {
+        "CLI設定に従う".to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// セッション候補をピッカー項目へ変換する。`current` は現在の thread_id と一致する候補。
+fn session_picker_items(
+    candidates: &[CodexSessionCandidate],
+    thread_id: Option<&str>,
+) -> Vec<CodexListPickerItem> {
+    candidates
+        .iter()
+        .map(|session| CodexListPickerItem {
+            label: short_session_id(&session.id).to_string(),
+            detail: format!("{}  {}", session.updated_at, session.title),
+            value: session.id.clone(),
+            current: thread_id == Some(session.id.as_str()),
+        })
+        .collect()
+}
+
 #[derive(Debug, Deserialize)]
 struct CodexSessionIndexRecord {
     id: String,
@@ -2057,6 +2112,8 @@ pub struct CodexPane {
     diff_view: Option<String>,
     /// 格納済み turn を明示的に選んで展開・格納するためのパネル。
     turn_picker: Option<CodexTurnPicker>,
+    /// 候補一覧から ↑↓ + Enter で確定する汎用ピッカー（モデル・セッション等）。
+    list_picker: Option<CodexListPicker>,
     /// Addness 独自UI上で `codex exec` に注入する永続目標。
     goal_mode: CodexGoalMode,
     pending_decision: Option<CodexDecisionBanner>,
@@ -2325,6 +2382,7 @@ impl CodexPane {
             one_shot_approval: None,
             diff_view: None,
             turn_picker: None,
+            list_picker: None,
             pending_decision: None,
             goal_mode,
             dod,
@@ -3123,6 +3181,286 @@ impl CodexPane {
         self.toggle_turn_collapsed_by_number(turn)
     }
 
+    pub fn list_picker_open(&self) -> bool {
+        self.list_picker.is_some()
+    }
+
+    pub fn list_picker(&self) -> Option<&CodexListPicker> {
+        self.list_picker.as_ref()
+    }
+
+    /// 汎用リストピッカーを開く。turn ピッカーと同時には開かない（後勝ちで閉じる）。
+    fn open_list_picker(&mut self, picker: CodexListPicker) {
+        self.turn_picker = None;
+        self.list_picker = Some(picker);
+    }
+
+    pub fn close_list_picker(&mut self) {
+        self.list_picker = None;
+    }
+
+    /// リストピッカーの選択移動（turn ピッカーと同じく clamp・ラップなし）。
+    pub fn move_list_picker_selection(&mut self, delta: isize) {
+        let Some(picker) = self.list_picker.as_mut() else {
+            return;
+        };
+        if picker.items.is_empty() {
+            return;
+        }
+        let max = picker.items.len().saturating_sub(1) as isize;
+        picker.selected = (picker.selected as isize + delta).clamp(0, max) as usize;
+    }
+
+    /// リストピッカーの確定。既存の setter / ハンドラへ委譲する。
+    /// `fork` は ResumeSession のときだけ有効（それ以外のアクションでは無視して開いたまま）。
+    pub fn accept_list_picker(&mut self, fork: bool) {
+        let Some(picker) = self.list_picker.as_ref() else {
+            return;
+        };
+        if fork && picker.action != CodexListPickerAction::ResumeSession {
+            return;
+        }
+        let action = picker.action;
+        let Some(item) = picker.items.get(picker.selected) else {
+            self.list_picker = None;
+            return;
+        };
+        let value = item.value.clone();
+        self.list_picker = None;
+        match action {
+            CodexListPickerAction::SetModel => self.set_model(&value),
+            CodexListPickerAction::SetReasoning => self.handle_reasoning_slash_command(&value),
+            CodexListPickerAction::SetApproval => self.handle_approval_slash_command(&value),
+            CodexListPickerAction::SetSandbox => self.handle_sandbox_slash_command(&value),
+            CodexListPickerAction::ResumeSession => {
+                if self.kind == AgentKind::ClaudeCode {
+                    self.start_claude_resume(Some(&value), fork, "");
+                } else if fork {
+                    self.handle_fork_session_slash_command(&value, false);
+                } else {
+                    self.handle_resume_session_slash_command(&value, false);
+                }
+            }
+        }
+    }
+
+    /// `/model`（引数なし）: kind 別のモデル候補ピッカーを開く。
+    /// model_override 設定中はどれも current にせず、タイトルに現在値を出す。
+    fn open_model_picker(&mut self) {
+        let (items, override_name) = if self.kind == AgentKind::ClaudeCode {
+            let override_name = self.claude_settings.model_override().map(str::to_string);
+            let current = if override_name.is_some() {
+                None
+            } else {
+                Some(self.claude_settings.model_choice())
+            };
+            let items = [
+                claude::ClaudeModelChoice::Config,
+                claude::ClaudeModelChoice::Fable,
+                claude::ClaudeModelChoice::Opus,
+                claude::ClaudeModelChoice::Sonnet,
+                claude::ClaudeModelChoice::Haiku,
+            ]
+            .into_iter()
+            .map(|choice| CodexListPickerItem {
+                label: choice.label().to_string(),
+                detail: config_choice_detail(choice == claude::ClaudeModelChoice::Config),
+                value: choice.label().to_string(),
+                current: current == Some(choice),
+            })
+            .collect::<Vec<_>>();
+            (items, override_name)
+        } else {
+            let override_name = self.exec_settings.model_override.clone();
+            let current = if override_name.is_some() {
+                None
+            } else {
+                Some(self.exec_settings.model)
+            };
+            let items = [
+                CodexModelChoice::Config,
+                CodexModelChoice::Gpt55,
+                CodexModelChoice::Gpt5,
+                CodexModelChoice::O3,
+            ]
+            .into_iter()
+            .map(|choice| CodexListPickerItem {
+                label: choice.label().to_string(),
+                detail: config_choice_detail(choice == CodexModelChoice::Config),
+                value: choice.label().to_string(),
+                current: current == Some(choice),
+            })
+            .collect::<Vec<_>>();
+            (items, override_name)
+        };
+        let title = match override_name {
+            Some(name) => format!(" Model選択 — 現在: {name}（任意名は /model <name>） "),
+            None => " Model選択 — 任意名は /model <name> ".to_string(),
+        };
+        let selected = list_picker_initial_selection(&items);
+        self.open_list_picker(CodexListPicker {
+            title,
+            action: CodexListPickerAction::SetModel,
+            items,
+            selected,
+        });
+    }
+
+    /// `/reasoning` `/effort`（引数なし）: kind 別の推論強度候補ピッカーを開く。
+    fn open_reasoning_picker(&mut self) {
+        let (title, items) = if self.kind == AgentKind::ClaudeCode {
+            let current = self.claude_settings.effort_choice();
+            let items = [
+                claude::ClaudeEffortChoice::Config,
+                claude::ClaudeEffortChoice::Low,
+                claude::ClaudeEffortChoice::Medium,
+                claude::ClaudeEffortChoice::High,
+                claude::ClaudeEffortChoice::XHigh,
+                claude::ClaudeEffortChoice::Max,
+            ]
+            .into_iter()
+            .map(|choice| CodexListPickerItem {
+                label: choice.label().to_string(),
+                detail: config_choice_detail(choice == claude::ClaudeEffortChoice::Config),
+                value: choice.label().to_string(),
+                current: choice == current,
+            })
+            .collect::<Vec<_>>();
+            (" Effort選択 ".to_string(), items)
+        } else {
+            let current = self.exec_settings.reasoning;
+            let items = [
+                CodexReasoningChoice::Config,
+                CodexReasoningChoice::Low,
+                CodexReasoningChoice::Medium,
+                CodexReasoningChoice::High,
+                CodexReasoningChoice::XHigh,
+            ]
+            .into_iter()
+            .map(|choice| CodexListPickerItem {
+                label: choice.label().to_string(),
+                detail: config_choice_detail(choice == CodexReasoningChoice::Config),
+                value: choice.label().to_string(),
+                current: choice == current,
+            })
+            .collect::<Vec<_>>();
+            (" Reasoning選択 ".to_string(), items)
+        };
+        let selected = list_picker_initial_selection(&items);
+        self.open_list_picker(CodexListPicker {
+            title,
+            action: CodexListPickerAction::SetReasoning,
+            items,
+            selected,
+        });
+    }
+
+    /// `/approval` `/permissions`（引数なし）: kind 別の承認モード候補ピッカーを開く。
+    fn open_approval_picker(&mut self) {
+        let (title, items) = if self.kind == AgentKind::ClaudeCode {
+            let current = self.claude_settings.permission_mode_choice();
+            let items = [
+                claude::ClaudePermissionMode::Config,
+                claude::ClaudePermissionMode::Plan,
+                claude::ClaudePermissionMode::AcceptEdits,
+                claude::ClaudePermissionMode::DontAsk,
+                claude::ClaudePermissionMode::BypassPermissions,
+            ]
+            .into_iter()
+            .map(|choice| CodexListPickerItem {
+                label: choice.label().to_string(),
+                detail: config_choice_detail(choice == claude::ClaudePermissionMode::Config),
+                value: choice.label().to_string(),
+                current: choice == current,
+            })
+            .collect::<Vec<_>>();
+            (" Permission-mode選択 ".to_string(), items)
+        } else {
+            let current = self.exec_settings.approval;
+            let items = [
+                CodexApprovalChoice::Config,
+                CodexApprovalChoice::Untrusted,
+                CodexApprovalChoice::OnRequest,
+                CodexApprovalChoice::OnFailure,
+                CodexApprovalChoice::Never,
+            ]
+            .into_iter()
+            .map(|choice| CodexListPickerItem {
+                label: choice.label().to_string(),
+                detail: config_choice_detail(choice == CodexApprovalChoice::Config),
+                value: choice.label().to_string(),
+                current: choice == current,
+            })
+            .collect::<Vec<_>>();
+            (" Approval選択 ".to_string(), items)
+        };
+        let selected = list_picker_initial_selection(&items);
+        self.open_list_picker(CodexListPicker {
+            title,
+            action: CodexListPickerAction::SetApproval,
+            items,
+            selected,
+        });
+    }
+
+    /// `/sandbox`（引数なし・Codex のみ）: sandbox 候補ピッカーを開く。
+    fn open_sandbox_picker(&mut self) {
+        let current = self.exec_settings.sandbox;
+        let items = [
+            CodexSandboxChoice::ReadOnly,
+            CodexSandboxChoice::WorkspaceWrite,
+            CodexSandboxChoice::DangerFullAccess,
+        ]
+        .into_iter()
+        .map(|choice| CodexListPickerItem {
+            label: choice.label().to_string(),
+            detail: String::new(),
+            value: choice.label().to_string(),
+            current: choice == current,
+        })
+        .collect::<Vec<_>>();
+        let selected = list_picker_initial_selection(&items);
+        self.open_list_picker(CodexListPicker {
+            title: " Sandbox選択 ".to_string(),
+            action: CodexListPickerAction::SetSandbox,
+            items,
+            selected,
+        });
+    }
+
+    /// `/sessions` `/resume`（引数なし）: セッション候補ピッカーを開く。
+    /// 候補は `indexed_sessions` にも格納し、従来の `/resume-session <番号>` の
+    /// 番号解決と整合させる。候補 0 件なら開かない。
+    fn open_session_picker(&mut self, limit: usize) {
+        let candidates = if self.kind == AgentKind::ClaudeCode {
+            self.load_claude_session_candidates(limit)
+        } else {
+            match load_codex_session_candidates(limit) {
+                Ok(sessions) => sessions,
+                Err(e) => {
+                    self.push_log(
+                        CodexLogKind::Error,
+                        format!("Codex sessions の読み込みに失敗しました: {e}"),
+                    );
+                    return;
+                }
+            }
+        };
+        if candidates.is_empty() {
+            self.push_log(CodexLogKind::System, "セッションがありません");
+            return;
+        }
+        let items = session_picker_items(&candidates, self.thread_id.as_deref());
+        self.indexed_sessions = candidates;
+        let selected = list_picker_initial_selection(&items);
+        self.open_list_picker(CodexListPicker {
+            title: format!(" {} セッション選択 ", self.kind.display_name()),
+            action: CodexListPickerAction::ResumeSession,
+            items,
+            selected,
+        });
+    }
+
     pub fn toggle_old_turns_collapsed(&mut self) {
         if self.collapsed_turns.is_empty() {
             self.collapse_completed_turns();
@@ -3551,6 +3889,77 @@ impl CodexPane {
             format!("次回ターンの sandbox: {value}"),
         );
         self.push_codex_appserver_sandbox();
+    }
+
+    /// `/reasoning` `/effort`。引数なしはピッカー、引数ありは従来どおり直接指定。
+    fn handle_reasoning_slash_command(&mut self, args: &str) {
+        if args.is_empty() {
+            self.open_reasoning_picker();
+            return;
+        }
+        if self.kind == AgentKind::ClaudeCode {
+            if let Some(choice) = claude::parse_effort_choice(args) {
+                self.set_claude_effort(choice);
+            } else {
+                self.push_log(
+                    CodexLogKind::Error,
+                    "effort は config / low / medium / high / xhigh / max を指定してください",
+                );
+            }
+        } else if let Some(choice) = parse_reasoning_choice(args) {
+            self.set_reasoning(choice);
+        } else {
+            self.push_log(
+                CodexLogKind::Error,
+                "reasoning は config / low / medium / high / xhigh を指定してください",
+            );
+        }
+    }
+
+    /// `/approval` `/approvals`。引数なしはピッカー、引数ありは従来どおり直接指定。
+    fn handle_approval_slash_command(&mut self, args: &str) {
+        if args.is_empty() {
+            self.open_approval_picker();
+            return;
+        }
+        if self.kind == AgentKind::ClaudeCode {
+            if let Some(mode) = claude::parse_permission_mode(args) {
+                self.set_claude_permission_mode(mode);
+            } else {
+                self.push_log(
+                    CodexLogKind::Error,
+                    "permission-mode は config / plan / acceptEdits / dontAsk / bypassPermissions を指定してください",
+                );
+            }
+        } else if let Some(choice) = parse_approval_choice(args) {
+            self.set_approval(choice);
+        } else {
+            self.push_log(
+                CodexLogKind::Error,
+                "approval は config / untrusted / on-request / on-failure / never を指定してください",
+            );
+        }
+    }
+
+    /// `/sandbox`。Codex は引数なしでピッカー、引数ありで直接指定。
+    /// Claude Code では従来どおり非対応の案内だけ出す（`cycle_sandbox` が案内して no-op）。
+    fn handle_sandbox_slash_command(&mut self, args: &str) {
+        if self.kind == AgentKind::ClaudeCode {
+            self.cycle_sandbox();
+            return;
+        }
+        if args.is_empty() {
+            self.open_sandbox_picker();
+            return;
+        }
+        if let Some(choice) = parse_sandbox_choice(args) {
+            self.set_sandbox(choice);
+        } else {
+            self.push_log(
+                CodexLogKind::Error,
+                "sandbox は read-only / workspace-write / danger-full-access を指定してください",
+            );
+        }
     }
 
     pub fn toggle_web_search(&mut self) {
@@ -6968,6 +7377,9 @@ impl CodexPane {
 
     fn finish_from_exit_command(&mut self) {
         self.finished = true;
+        // 常駐/子プロセスを即座に落とす（アイドル回収を待たない）。turn_running も
+        // false になり、should_close_after_exit_command が成立してクローズ経路へ進む。
+        self.teardown_all_processes();
         self.queued_prompts.clear();
         self.pending_decision = None;
         self.current_command = None;
@@ -7338,58 +7750,18 @@ impl CodexPane {
             }
             "model" => {
                 if args.is_empty() {
-                    self.cycle_model();
+                    self.open_model_picker();
                 } else {
                     self.set_model(args);
                 }
                 true
             }
             "reasoning" | "effort" => {
-                if self.kind == AgentKind::ClaudeCode {
-                    if args.is_empty() {
-                        self.cycle_reasoning();
-                    } else if let Some(choice) = claude::parse_effort_choice(args) {
-                        self.set_claude_effort(choice);
-                    } else {
-                        self.push_log(
-                            CodexLogKind::Error,
-                            "effort は config / low / medium / high / xhigh / max を指定してください",
-                        );
-                    }
-                } else if args.is_empty() {
-                    self.cycle_reasoning();
-                } else if let Some(choice) = parse_reasoning_choice(args) {
-                    self.set_reasoning(choice);
-                } else {
-                    self.push_log(
-                        CodexLogKind::Error,
-                        "reasoning は config / low / medium / high / xhigh を指定してください",
-                    );
-                }
+                self.handle_reasoning_slash_command(args);
                 true
             }
             "approval" | "approvals" => {
-                if self.kind == AgentKind::ClaudeCode {
-                    if args.is_empty() {
-                        self.cycle_approval();
-                    } else if let Some(mode) = claude::parse_permission_mode(args) {
-                        self.set_claude_permission_mode(mode);
-                    } else {
-                        self.push_log(
-                            CodexLogKind::Error,
-                            "permission-mode は config / plan / acceptEdits / dontAsk / bypassPermissions を指定してください",
-                        );
-                    }
-                } else if args.is_empty() {
-                    self.cycle_approval();
-                } else if let Some(choice) = parse_approval_choice(args) {
-                    self.set_approval(choice);
-                } else {
-                    self.push_log(
-                        CodexLogKind::Error,
-                        "approval は config / untrusted / on-request / on-failure / never を指定してください",
-                    );
-                }
+                self.handle_approval_slash_command(args);
                 true
             }
             "permissions" | "permission" => {
@@ -7437,16 +7809,7 @@ impl CodexPane {
                 true
             }
             "sandbox" => {
-                if self.kind == AgentKind::ClaudeCode || args.is_empty() {
-                    self.cycle_sandbox();
-                } else if let Some(choice) = parse_sandbox_choice(args) {
-                    self.set_sandbox(choice);
-                } else {
-                    self.push_log(
-                        CodexLogKind::Error,
-                        "sandbox は read-only / workspace-write / danger-full-access を指定してください",
-                    );
-                }
+                self.handle_sandbox_slash_command(args);
                 true
             }
             "search" | "web-search" => {
@@ -7582,6 +7945,14 @@ impl CodexPane {
                 true
             }
             "resume" => {
+                if args.is_empty() {
+                    self.open_session_picker(20);
+                } else {
+                    self.handle_resume_session_slash_command(args, false);
+                }
+                true
+            }
+            "resume-memo" => {
                 self.submit_system_line(resume_prompt());
                 true
             }
@@ -7599,6 +7970,12 @@ impl CodexPane {
             }
             "undo" => {
                 self.handle_undo_slash_command();
+                true
+            }
+            "exit" | "quit" => {
+                // ターン実行中でも即終了させる（キュー予約に回さない）。
+                self.input_state.exit_command_sent = true;
+                self.finish_from_exit_command();
                 true
             }
             _ => false,
@@ -7654,6 +8031,12 @@ impl CodexPane {
         self.current_command_started_at = None;
         self.streaming_assistant_index = None;
         self.pending_decision = None;
+        // 旧セッションの checkpoint/予約を持ち越さない（新セッションで /undo が旧 checkpoint へ
+        // 巻き戻る事故を防ぐ。finished ペインのファクトリと同じ 3 フィールドを揃えてクリア）。
+        self.checkpoints.clear();
+        self.checkpoint_seq = 0;
+        self.pending_checkpoint_requests.clear();
+        self.queued_prompts.clear();
         self.action = Some(format!("新しい{name}セッション"));
         self.push_log(
             CodexLogKind::System,
@@ -8117,6 +8500,11 @@ impl CodexPane {
         // アイドル常駐が生きていると新 thread_id/--fork-session が無視されるため、
         // resume/fork の前に必ず常駐を落として新規 spawn で反映させる。
         self.teardown_claude_resident();
+        // 旧セッションの承認バナー・予約・実行中ターン情報を持ち越さない（/new と揃える）。
+        self.pending_decision = None;
+        self.queued_prompts.clear();
+        self.current_turn_prompt = None;
+        self.current_turn_retry_prompt = None;
         self.set_thread_id(Some(session_id.clone()));
         self.claude_fork_next = fork;
         let verb = if fork { "fork" } else { "resume" };
@@ -8159,37 +8547,7 @@ impl CodexPane {
             .filter(|n| *n > 0)
             .unwrap_or(12)
             .min(50);
-        if self.kind == AgentKind::ClaudeCode {
-            self.indexed_sessions = self.load_claude_session_candidates(limit);
-            self.push_codex_sessions_list();
-            return;
-        }
-        match load_codex_session_candidates(limit) {
-            Ok(sessions) => {
-                self.indexed_sessions = sessions;
-                self.push_codex_sessions_list();
-            }
-            Err(e) => self.push_log(
-                CodexLogKind::Error,
-                format!("Codex sessions の読み込みに失敗しました: {e}"),
-            ),
-        }
-    }
-
-    fn push_codex_sessions_list(&mut self) {
-        let name = self.kind.display_name();
-        if self.indexed_sessions.is_empty() {
-            self.push_log(CodexLogKind::System, format!("{name} sessions: none"));
-            return;
-        }
-        let lines = self
-            .indexed_sessions
-            .iter()
-            .enumerate()
-            .map(|(idx, session)| session_list_line(idx + 1, session))
-            .collect::<Vec<_>>()
-            .join("\n");
-        self.push_log(CodexLogKind::System, format!("{name} sessions:\n{lines}"));
+        self.open_session_picker(limit);
     }
 
     fn handle_resume_last_slash_command(&mut self, args: &str, include_all: bool) {
@@ -8522,7 +8880,11 @@ impl CodexPane {
 
     fn handle_permissions_slash_command(&mut self, args: &str) {
         let args = args.trim();
-        if args.is_empty() || matches!(args, "show" | "status") {
+        if args.is_empty() {
+            self.open_approval_picker();
+            return;
+        }
+        if matches!(args, "show" | "status") {
             self.push_permissions_status();
             return;
         }
@@ -9982,6 +10344,18 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
     /// codex プロセスを終了させる（ペインを閉じる時に呼ぶ）。
     /// kill 後に wait してゾンビプロセス化を防ぐ。
     pub fn kill(&mut self) {
+        self.teardown_all_processes();
+        self.current_command = None;
+        self.current_command_started_at = None;
+        self.pending_decision = None;
+        self.current_turn_prompt = None;
+        self.current_turn_retry_prompt = None;
+        self.queued_prompts.clear();
+    }
+
+    /// 常駐/子プロセスをすべて終了させ、`turn_running` を落とす（プロセスの後始末のみ）。
+    /// 状態クリアを伴う `kill()` と、`/exit`・`/quit` の即時終了経路で共有する。
+    fn teardown_all_processes(&mut self) {
         if let Some(child) = self.child.as_mut() {
             let _ = child.kill();
             let _ = child.wait();
@@ -9991,12 +10365,6 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
         // 常駐 codex app-server プロセスも終了させる（kill_current_turn と同様に孤児化を防ぐ）。
         self.teardown_codex_appserver();
         self.turn_running = false;
-        self.current_command = None;
-        self.current_command_started_at = None;
-        self.pending_decision = None;
-        self.current_turn_prompt = None;
-        self.current_turn_retry_prompt = None;
-        self.queued_prompts.clear();
     }
 
     /// 常駐 Claude Code プロセスを終了させ、常駐関連の一時状態をリセットする。
@@ -10139,10 +10507,10 @@ struct CodexInputState {
 
 impl CodexInputState {
     fn record_submitted(&mut self, submitted: &str) {
-        if !submitted.is_empty() && submitted != "/exit" {
+        if !submitted.is_empty() && !is_exit_prompt(submitted) {
             self.last_prompt = Some(submitted.to_string());
         }
-        if submitted == "/exit" {
+        if is_exit_prompt(submitted) {
             self.exit_command_sent = true;
         }
     }
@@ -14319,6 +14687,93 @@ mod tests {
     }
 
     #[test]
+    fn record_submitted_marks_exit_for_quit_and_exit_aliases() {
+        for cmd in ["/quit", "/exit"] {
+            let mut state = CodexInputState::default();
+            state.record_submitted(cmd);
+            assert!(
+                state.exit_command_sent,
+                "{cmd} should mark exit_command_sent"
+            );
+            assert!(
+                state.last_prompt.is_none(),
+                "{cmd} should not be recorded as last_prompt"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_exit_finishes_immediately_even_when_turn_running() {
+        let mut pane = claude_pane();
+        pane.turn_running = true;
+        pane.queued_prompts
+            .push_back(QueuedPrompt::user("queued".to_string()));
+
+        let handled = pane.handle_local_slash_command("/exit");
+
+        assert!(handled, "/exit should be handled locally");
+        assert!(pane.finished);
+        assert!(pane.queued_prompts.is_empty());
+        assert!(pane.input_state.exit_command_sent);
+        assert!(!pane.turn_running);
+        assert!(pane.should_close_after_exit_command());
+    }
+
+    #[test]
+    fn dispatch_quit_alias_finishes_and_marks_exit() {
+        let mut pane = claude_pane();
+
+        let handled = pane.handle_local_slash_command("/quit");
+
+        assert!(handled, "/quit should be handled locally");
+        assert!(pane.finished);
+        assert!(pane.input_state.exit_command_sent);
+        assert!(pane.should_close_after_exit_command());
+    }
+
+    #[test]
+    fn new_thread_clears_checkpoints_and_queued_prompts() {
+        let mut pane = claude_pane();
+        pane.checkpoints.push(Checkpoint {
+            ref_name: "refs/addness/checkpoint-x-0".to_string(),
+            turn: 1,
+        });
+        pane.checkpoint_seq = 3;
+        pane.pending_checkpoint_requests
+            .push_back(CheckpointRequest {
+                cwd: ".".to_string(),
+                ref_name: "refs/addness/checkpoint-x-1".to_string(),
+                turn: 2,
+                message: "cp".to_string(),
+            });
+        pane.queued_prompts
+            .push_back(QueuedPrompt::user("queued".to_string()));
+
+        pane.handle_new_thread_slash_command();
+
+        assert!(pane.checkpoints.is_empty());
+        assert_eq!(pane.checkpoint_seq, 0);
+        assert!(pane.pending_checkpoint_requests.is_empty());
+        assert!(pane.queued_prompts.is_empty());
+    }
+
+    #[test]
+    fn start_claude_resume_clears_pending_decision_and_queued_prompts() {
+        let mut pane = claude_pane();
+        pane.pending_decision = Some(CodexDecisionBanner::new(
+            CodexDecisionKind::Approval,
+            "承認待ち".to_string(),
+        ));
+        pane.queued_prompts
+            .push_back(QueuedPrompt::user("queued".to_string()));
+
+        pane.start_claude_resume(Some("session-123"), false, "続きをお願いします");
+
+        assert!(pane.pending_decision.is_none());
+        assert!(pane.queued_prompts.is_empty());
+    }
+
+    #[test]
     fn input_state_paste_preserves_newlines_as_single_prompt() {
         let mut state = CodexInputState::default();
         state.insert_text("first line\r\nsecond line\nthird line");
@@ -14647,7 +15102,8 @@ mod tests {
     }
 
     #[test]
-    fn queued_exit_finishes_when_turn_becomes_idle() {
+    fn exit_finishes_immediately_even_during_running_turn() {
+        // `/exit` はターン実行中でも即終了させる（キュー予約に回さない）。
         let mut pane = CodexPane::test_with_output(8, 20, 0, "");
         pane.finished = false;
         pane.turn_running = true;
@@ -14657,14 +15113,11 @@ mod tests {
         }
         pane.input(key(KeyCode::Enter));
 
-        assert!(!pane.finished);
-        assert_eq!(pane.queued_prompt_count(), 1);
-
-        pane.turn_running = false;
-        assert!(pane.start_next_queued_turn_if_idle());
-
         assert!(pane.finished);
         assert_eq!(pane.queued_prompt_count(), 0);
+        assert!(!pane.turn_running);
+        assert!(pane.input_state.exit_command_sent);
+        assert!(pane.should_close_after_exit_command());
     }
 
     #[test]
@@ -16410,10 +16863,20 @@ mod tests {
         let mut pane = CodexPane::test_with_output(8, 80, 0, "");
         pane.finished = false;
 
+        // 引数なしはピッカーを開くだけで設定は変えない。
         submit_line(&mut pane, "/model");
-        submit_line(&mut pane, "/reasoning");
-        submit_line(&mut pane, "/approval");
-        submit_line(&mut pane, "/sandbox");
+        assert!(pane.list_picker_open());
+        pane.close_list_picker();
+        assert_eq!(
+            pane.settings_label().split(' ').next(),
+            Some("model:config")
+        );
+
+        // 引数ありは従来どおり直接指定で反映される。
+        submit_line(&mut pane, "/model gpt-5.5");
+        submit_line(&mut pane, "/reasoning low");
+        submit_line(&mut pane, "/approval untrusted");
+        submit_line(&mut pane, "/sandbox danger-full-access");
         submit_line(&mut pane, "/settings");
 
         assert_eq!(pane.turn_count(), 0);
@@ -17755,5 +18218,192 @@ mod tests {
             diff: String::new(),
         }];
         assert!(codex_filechange_patch_text(&changes).is_none());
+    }
+
+    #[test]
+    fn model_slash_without_args_opens_picker_with_current_marker_claude() {
+        let mut pane = claude_pane();
+        assert!(pane.handle_local_slash_command("/model"));
+        let picker = pane.list_picker().expect("model picker");
+        assert_eq!(picker.action, CodexListPickerAction::SetModel);
+        let labels = picker
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, ["config", "fable", "opus", "sonnet", "haiku"]);
+        assert!(picker.items[0].current, "既定は config が現在値");
+        assert_eq!(picker.selected, 0);
+    }
+
+    #[test]
+    fn model_picker_accept_applies_selection_claude() {
+        let mut pane = claude_pane();
+        assert!(pane.handle_local_slash_command("/model"));
+        pane.move_list_picker_selection(2); // config -> opus
+        pane.accept_list_picker(false);
+        assert!(pane.list_picker().is_none());
+        assert_eq!(pane.claude_settings.effective_model_arg(), Some("opus"));
+    }
+
+    #[test]
+    fn model_picker_lists_codex_choices_and_applies_selection() {
+        let mut pane = live_pane();
+        pane.exec_settings.model = CodexModelChoice::Gpt5;
+        assert!(pane.handle_local_slash_command("/model"));
+        let picker = pane.list_picker().expect("model picker");
+        let labels = picker
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, ["config", "gpt-5.5", "gpt-5", "o3"]);
+        assert!(picker.items[2].current, "現在値 gpt-5 にマーカー");
+        assert_eq!(picker.selected, 2, "初期選択は現在値");
+        pane.move_list_picker_selection(-1); // gpt-5 -> gpt-5.5
+        pane.accept_list_picker(false);
+        assert_eq!(pane.exec_settings.model, CodexModelChoice::Gpt55);
+        assert!(pane.exec_settings.model_override.is_none());
+    }
+
+    #[test]
+    fn model_picker_shows_override_in_title_without_current_marker() {
+        let mut pane = live_pane();
+        pane.exec_settings.model_override = Some("my-custom-model".to_string());
+        assert!(pane.handle_local_slash_command("/model"));
+        let picker = pane.list_picker().expect("model picker");
+        assert!(picker.title.contains("my-custom-model"));
+        assert!(picker.items.iter().all(|item| !item.current));
+        assert_eq!(picker.selected, 0);
+    }
+
+    #[test]
+    fn reasoning_picker_accept_sets_claude_effort() {
+        let mut pane = claude_pane();
+        assert!(pane.handle_local_slash_command("/effort"));
+        let picker = pane.list_picker().expect("effort picker");
+        assert_eq!(picker.action, CodexListPickerAction::SetReasoning);
+        pane.move_list_picker_selection(3); // config -> high
+        pane.accept_list_picker(false);
+        assert!(pane.list_picker().is_none());
+        assert!(pane.claude_settings.label().contains("effort:high"));
+    }
+
+    #[test]
+    fn permissions_slash_without_args_opens_permission_picker_claude() {
+        let mut pane = claude_pane();
+        assert!(pane.handle_local_slash_command("/permissions"));
+        let picker = pane.list_picker().expect("permission picker");
+        assert_eq!(picker.action, CodexListPickerAction::SetApproval);
+        let labels = picker
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            [
+                "config",
+                "plan",
+                "acceptEdits",
+                "dontAsk",
+                "bypassPermissions"
+            ]
+        );
+        pane.move_list_picker_selection(1); // config -> plan
+        pane.accept_list_picker(false);
+        assert_eq!(pane.claude_settings.permission_label(), "plan");
+    }
+
+    #[test]
+    fn sandbox_picker_accept_sets_codex_sandbox() {
+        let mut pane = live_pane();
+        assert!(pane.handle_local_slash_command("/sandbox"));
+        let picker = pane.list_picker().expect("sandbox picker");
+        assert_eq!(picker.action, CodexListPickerAction::SetSandbox);
+        assert_eq!(picker.selected, 1, "既定 workspace-write が現在値");
+        pane.move_list_picker_selection(-1); // -> read-only
+        pane.accept_list_picker(false);
+        assert_eq!(pane.exec_settings.sandbox, CodexSandboxChoice::ReadOnly);
+    }
+
+    #[test]
+    fn list_picker_fork_accept_ignored_for_settings_picker() {
+        let mut pane = claude_pane();
+        assert!(pane.handle_local_slash_command("/model"));
+        pane.accept_list_picker(true);
+        assert!(
+            pane.list_picker().is_some(),
+            "ResumeSession 以外では f を無視して開いたままにする"
+        );
+    }
+
+    #[test]
+    fn session_picker_items_mark_current_thread() {
+        let candidates = vec![
+            CodexSessionCandidate {
+                id: "11111111-2222-3333-4444-555555555555".to_string(),
+                title: "first".to_string(),
+                updated_at: "2026-07-08T10:00:00Z".to_string(),
+                cwd: None,
+            },
+            CodexSessionCandidate {
+                id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string(),
+                title: "second".to_string(),
+                updated_at: "2026-07-07T09:00:00Z".to_string(),
+                cwd: None,
+            },
+        ];
+        let items = session_picker_items(&candidates, Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
+        assert_eq!(items[0].label, "11111111");
+        assert!(!items[0].current);
+        assert!(items[1].current);
+        assert_eq!(items[1].value, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+        assert!(items[0].detail.contains("first"));
+        assert!(items[0].detail.contains("2026-07-08"));
+        assert_eq!(list_picker_initial_selection(&items), 1);
+    }
+
+    #[test]
+    fn bare_resume_opens_session_picker_instead_of_memo_prompt() {
+        let mut pane = claude_pane();
+        assert!(pane.handle_local_slash_command("/resume"));
+        // 旧挙動の定型プロンプト送信はしない。
+        assert!(
+            !pane
+                .log
+                .iter()
+                .any(|line| line.text.contains("前回の続きから再開してください"))
+        );
+        // 候補があればセッションピッカー、無ければ案内ログのみ（実行環境のセッション有無に依存）。
+        match pane.list_picker() {
+            Some(picker) => assert_eq!(picker.action, CodexListPickerAction::ResumeSession),
+            None => assert!(
+                pane.log
+                    .iter()
+                    .any(|line| line.text.contains("セッションがありません"))
+            ),
+        }
+    }
+
+    #[test]
+    fn resume_memo_sends_legacy_resume_prompt() {
+        let mut pane = claude_pane();
+        assert!(pane.handle_local_slash_command("/resume-memo"));
+        assert!(pane.list_picker().is_none());
+        assert!(
+            pane.log
+                .iter()
+                .any(|line| line.text.contains("前回の続きから再開してください"))
+        );
+    }
+
+    #[test]
+    fn opening_list_picker_closes_turn_picker() {
+        let mut pane = claude_pane();
+        pane.turn_picker = Some(CodexTurnPicker { selected_turn: 1 });
+        assert!(pane.handle_local_slash_command("/model"));
+        assert!(!pane.turn_picker_open());
+        assert!(pane.list_picker_open());
     }
 }

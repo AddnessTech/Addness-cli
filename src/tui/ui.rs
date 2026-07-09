@@ -13,8 +13,8 @@ use std::time::Instant;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::agent::{
-    AgentKind, CODEX_LOG_PREFIX_WIDTH, ChildGoal, CodexDecisionKind, CodexLogKind, CodexLogLine,
-    CodexPane,
+    AgentKind, CODEX_LOG_PREFIX_WIDTH, ChildGoal, CodexDecisionKind, CodexListPickerAction,
+    CodexLogKind, CodexLogLine, CodexPane,
 };
 use super::app::{ActivePane, App, DeliverableFormField, FormField, ModalState};
 use super::goal_tree::{CommentView, TreeRow};
@@ -1165,7 +1165,12 @@ fn draw_codex_help_overlay(frame: &mut Frame, app: &mut App) {
                 "/ 入力",
                 "コマンド候補を入力欄の上に表示（Tab補完 / ↑↓選択）",
             ),
-            kv("/sessions [N]", "Claude Codeセッション候補を番号付きで表示"),
+            kv("/sessions [N]", "Claude Codeセッション候補を一覧から選択"),
+            kv(
+                "/resume [N|id]",
+                "セッションを一覧から選んで再開（f: fork）",
+            ),
+            kv("/resume-memo", "Addnessの作業メモ・決定ログから続きを再開"),
             kv("/resume-last [prompt]", "最新セッションを --resume で継続"),
             kv("/resume-last-all", "cwd外も含めて最新セッションを継続"),
             kv(
@@ -1196,7 +1201,12 @@ fn draw_codex_help_overlay(frame: &mut Frame, app: &mut App) {
                 "/ 入力",
                 "コマンド候補を入力欄の上に表示（Tab補完 / ↑↓選択）",
             ),
-            kv("/sessions [N]", "Codex session候補を番号付きで表示"),
+            kv("/sessions [N]", "Codex session候補を一覧から選択"),
+            kv(
+                "/resume [N|id]",
+                "セッションを一覧から選んで再開（f: fork）",
+            ),
+            kv("/resume-memo", "Addnessの作業メモ・決定ログから続きを再開"),
             kv(
                 "/codex-resume <args>",
                 "root codex resumeをno-alt-screenで実行",
@@ -1299,14 +1309,17 @@ fn draw_codex_help_overlay(frame: &mut Frame, app: &mut App) {
             section("claude code options for next turn"),
             kv("/settings", "モデル・effort・permission-mode設定を表示"),
             kv("/cd <dir>", "次の新規セッションの作業ルートを変更"),
-            kv("/model [name]", "モデルを切替 / 任意のmodel名を直接指定"),
+            kv(
+                "/model [name]",
+                "モデルを一覧から選択 / 任意のmodel名を直接指定",
+            ),
             kv(
                 "/reasoning|/effort [level]",
-                "effortを切替 / low, medium等を直接指定",
+                "effortを一覧から選択 / low, medium等を直接指定",
             ),
             kv(
                 "/permissions|/approval [mode]",
-                "permission-modeを切替または直接指定",
+                "permission-modeを一覧から選択または直接指定",
             ),
             kv("/add-dir <path>", "追加の書込許可ディレクトリを渡す"),
             kv(
@@ -1321,14 +1334,17 @@ fn draw_codex_help_overlay(frame: &mut Frame, app: &mut App) {
             section("codex options for next turn"),
             kv("/settings", "モデル・推論・承認・sandbox設定を表示"),
             kv("/cd <dir>", "次の新規Codexセッションの作業ルートを変更"),
-            kv("/model [name]", "モデルを切替 / 任意のmodel名を直接指定"),
+            kv(
+                "/model [name]",
+                "モデルを一覧から選択 / 任意のmodel名を直接指定",
+            ),
             kv(
                 "/reasoning [effort]",
-                "推論強度を切替 / low, medium等を直接指定",
+                "推論強度を一覧から選択 / low, medium等を直接指定",
             ),
             kv(
                 "/approval|/approvals / /sandbox",
-                "承認モード / sandboxを切替または直接指定",
+                "承認モード / sandboxを一覧から選択または直接指定",
             ),
             kv("/permissions", "承認/sandbox権限を表示・変更"),
             kv(
@@ -2856,7 +2872,69 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
         if pane.turn_picker_open() {
             draw_codex_turn_picker(frame, term_area, pane);
         }
+        if pane.list_picker_open() {
+            draw_codex_list_picker(frame, term_area, pane);
+        }
     }
+}
+
+/// 汎用リストピッカー（モデル・reasoning・approval・sandbox・セッション選択）の
+/// ボトム中央モーダル。turn ピッカーと同じ配置・配色で、選択行に `>`、現在値に `*` を出す。
+fn draw_codex_list_picker(frame: &mut Frame, area: Rect, pane: &CodexPane) {
+    let Some(picker) = pane.list_picker() else {
+        return;
+    };
+    let height = (picker.items.len() as u16 + 2).clamp(5, area.height.saturating_sub(2).max(5));
+    let picker_area = bottom_rect(82, height, 2, area);
+    clear_modal_area(frame, picker_area);
+
+    let hints = if picker.action == CodexListPickerAction::ResumeSession {
+        " ↑↓/jk: 選択 | Enter: 確定 | f: fork | Esc/q: 閉じる "
+    } else {
+        " ↑↓/jk: 選択 | Enter: 確定 | Esc/q: 閉じる "
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLOR_CODEX))
+        .title(picker.title.clone())
+        .title_bottom(Line::from(hints).style(Style::default().fg(COLOR_MUTED)));
+    let inner = block.inner(picker_area);
+    frame.render_widget(block, picker_area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // 候補が表示高さを超える場合は、選択行が見えるようにウィンドウをずらす。
+    let visible = inner.height as usize;
+    let start = picker
+        .selected
+        .saturating_sub(visible.saturating_sub(1))
+        .min(picker.items.len().saturating_sub(visible));
+    let mut lines = Vec::new();
+    for (index, item) in picker.items.iter().enumerate().skip(start).take(visible) {
+        let selected = index == picker.selected;
+        let marker = if selected { ">" } else { " " };
+        let current = if item.current { "*" } else { " " };
+        let style = if selected {
+            Style::default()
+                .fg(COLOR_TEXT_STRONG)
+                .add_modifier(Modifier::BOLD)
+        } else if item.current {
+            Style::default().fg(COLOR_SUCCESS)
+        } else {
+            Style::default().fg(COLOR_TEXT)
+        };
+        let text = if item.detail.is_empty() {
+            format!("{marker} [{current}] {}", item.label)
+        } else {
+            format!("{marker} [{current}] {}  {}", item.label, item.detail)
+        };
+        lines.push(Line::from(Span::styled(
+            ellipsize_width(&text, inner.width as usize),
+            style,
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_codex_turn_picker(frame: &mut Frame, area: Rect, pane: &CodexPane) {
@@ -3267,7 +3345,11 @@ struct CodexInputVisualLine {
     end: usize,
 }
 
-fn codex_input_panel_height(pane: &CodexPane, inner_width: u16, inner_height: u16) -> u16 {
+pub(crate) fn codex_input_panel_height(
+    pane: &CodexPane,
+    inner_width: u16,
+    inner_height: u16,
+) -> u16 {
     let base = if inner_height >= 4 { 2 } else { 1 };
     if pane.decision_banner().is_some() {
         let height = if inner_height >= 14 {

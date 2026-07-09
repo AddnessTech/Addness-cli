@@ -41,7 +41,7 @@ impl ClaudeModelChoice {
         }
     }
 
-    fn label(self) -> &'static str {
+    pub(super) fn label(self) -> &'static str {
         match self {
             Self::Config => "config",
             Self::Fable => "fable",
@@ -97,7 +97,7 @@ impl ClaudeEffortChoice {
         }
     }
 
-    fn label(self) -> &'static str {
+    pub(super) fn label(self) -> &'static str {
         match self {
             Self::Config => "config",
             Self::Low => "low",
@@ -153,7 +153,7 @@ impl ClaudePermissionMode {
         }
     }
 
-    fn label(self) -> &'static str {
+    pub(super) fn label(self) -> &'static str {
         match self {
             Self::Config => "config",
             Self::Plan => "plan",
@@ -260,6 +260,26 @@ impl ClaudeExecSettings {
     /// sticky 許可リストを一覧表示用に返す。
     pub(super) fn sticky_allowed_tools(&self) -> &[String] {
         &self.sticky_allowed_tools
+    }
+
+    /// 現在のビルトインモデル選択（ピッカーの current マーカー用）。
+    pub(super) fn model_choice(&self) -> ClaudeModelChoice {
+        self.model
+    }
+
+    /// `/model <任意文字列>` の override 名（設定中なら Some）。
+    pub(super) fn model_override(&self) -> Option<&str> {
+        self.model_override.as_deref()
+    }
+
+    /// 現在の effort 選択（ピッカーの current マーカー用）。
+    pub(super) fn effort_choice(&self) -> ClaudeEffortChoice {
+        self.effort
+    }
+
+    /// 現在の permission-mode 選択（ピッカーの current マーカー用）。
+    pub(super) fn permission_mode_choice(&self) -> ClaudePermissionMode {
+        self.permission_mode
     }
 
     pub(super) fn cycle_model(&mut self) -> &'static str {

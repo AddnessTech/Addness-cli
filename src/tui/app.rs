@@ -886,6 +886,22 @@ fn git_delete_ref(cwd: &str, ref_name: &str) {
     );
 }
 
+/// エージェントペインの UI 構造シグネチャ。入力欄高さの変化（承認バナー・複数行入力）や
+/// ピッカー/ヘルプ/diff の開閉・パレット表示など、構造が変わる遷移を前フレームと比較して
+/// 検知するための軽量な値。ペインが無いときは `None` として扱う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CodexUiSignature {
+    /// 入力欄パネルの高さ（`ui::codex_input_panel_height` 相当。バナー・複数行入力を包括）。
+    input_h: u16,
+    turn_picker_open: bool,
+    list_picker_open: bool,
+    show_help: bool,
+    diff_view_open: bool,
+    finished: bool,
+    slash_palette_active: bool,
+    mention_palette_active: bool,
+}
+
 pub struct App {
     pub(super) client: ApiClient,
     rt: Handle,
@@ -958,6 +974,10 @@ pub struct App {
     /// 次の描画前に画面を全クリアする（codex ⇄ 通常UI の構造遷移やリサイズで
     /// 前画面の残像が残らないようにするため）。
     needs_full_clear: bool,
+    /// 前フレームのエージェントペイン UI 構造シグネチャ。承認バナー・ピッカー・
+    /// diff/ヘルプ開閉など、入力欄高さやオーバーレイが変わる構造遷移を検知し、
+    /// bg を塗らない history 描画に前画面の色が残らないよう全クリアを誘発する。
+    codex_ui_signature: Option<CodexUiSignature>,
 
     /// DoD 自動判定（codex exec）の実行中ジョブ。
     codex_dod_job: Option<DodJob>,
@@ -1020,6 +1040,7 @@ impl App {
             codex_sync_tick: 0,
             pending_codex_tree_reload: false,
             needs_full_clear: false,
+            codex_ui_signature: None,
             codex_dod_job: None,
             codex_body_record_job: None,
             codex_checkpoint_job: None,
@@ -1119,6 +1140,15 @@ impl App {
             if self.poll_deferred_initial_load() {
                 needs_redraw = true;
             }
+            // エージェントペインの構造遷移（承認バナー出現/解決・ピッカー/ヘルプ/diff の
+            // 開閉・パレット表示による入力欄高さ変化）を検知する。bg を塗らない history
+            // 描画の上に前画面のバナー/入力欄背景色が残るため、変化したら全クリアする。
+            let signature = self.compute_codex_ui_signature();
+            if signature != self.codex_ui_signature {
+                self.codex_ui_signature = signature;
+                self.needs_full_clear = true;
+                needs_redraw = true;
+            }
             if needs_redraw {
                 // 構造遷移・リサイズ時は差分描画前に画面を全消去し、残像を断つ。
                 if self.needs_full_clear {
@@ -1173,6 +1203,27 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    /// 現在のエージェントペイン UI 構造シグネチャを計算する。ペインが無ければ `None`。
+    fn compute_codex_ui_signature(&self) -> Option<CodexUiSignature> {
+        let pane = self.codex.as_ref()?;
+        // 入力欄高さは draw と同じ内寸（term_area からボーダー分を引いた値）で計算する。
+        // codex_terminal_area は前フレームの draw で確定した領域。未描画時は 0 扱い。
+        let (inner_w, inner_h) = self
+            .codex_terminal_area
+            .map(|a| (a.width.saturating_sub(2), a.height.saturating_sub(2)))
+            .unwrap_or((0, 0));
+        Some(CodexUiSignature {
+            input_h: ui::codex_input_panel_height(pane, inner_w, inner_h),
+            turn_picker_open: pane.turn_picker_open(),
+            list_picker_open: pane.list_picker_open(),
+            show_help: self.show_help,
+            diff_view_open: pane.diff_view().is_some(),
+            finished: pane.finished,
+            slash_palette_active: pane.slash_palette_active(),
+            mention_palette_active: pane.mention_palette_active(),
+        })
     }
 
     /// バックグラウンドで取得した初期データを App の状態へ反映する。
@@ -2569,6 +2620,33 @@ impl App {
                     _ => return,
                 }
             }
+            // 汎用リストピッカー（モデル・セッション等）表示中は turn ピッカーと同じ方針で
+            // 全キーをピッカーが消費する（入力欄へ流さない）。f はセッション選択の fork 確定。
+            if pane.list_picker_open() {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        pane.close_list_picker();
+                        return;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        pane.move_list_picker_selection(-1);
+                        return;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        pane.move_list_picker_selection(1);
+                        return;
+                    }
+                    KeyCode::Enter => {
+                        pane.accept_list_picker(false);
+                        return;
+                    }
+                    KeyCode::Char('f') => {
+                        pane.accept_list_picker(true);
+                        return;
+                    }
+                    _ => return,
+                }
+            }
             // スラッシュコマンドパレット表示中は ↑↓ で候補選択・Tab で補完する。
             // Esc / 文字入力はそのまま入力欄へ流し、既存挙動（入力クリア等）に委ねる。
             if pane.slash_palette_active() && key.modifiers.is_empty() {
@@ -2743,7 +2821,7 @@ impl App {
                         self.start_dod_assessment();
                         return;
                     }
-                    KeyCode::Esc | KeyCode::Char('q') => {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::F(12) => {
                         self.close_codex();
                         return;
                     }
@@ -2821,6 +2899,7 @@ impl App {
             && !pane.slash_palette_active()
             && !pane.mention_palette_active()
             && !pane.turn_picker_open()
+            && !pane.list_picker_open()
             && pane.decision_banner().is_none()
             && pane.scrollback == 0
             && pane.input_line().is_empty()
@@ -5893,6 +5972,38 @@ mod codex_mouse_tests {
             App::codex_terminal_scroll_route(0, 0, false),
             CodexTerminalScrollRoute::None
         );
+    }
+
+    #[test]
+    fn codex_ui_signature_tracks_pane_overlay_and_picker_changes() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = ApiClient::new("t", "http://localhost").unwrap();
+        let mut app = App::new(client, rt.handle().clone());
+
+        // ペインが無ければシグネチャは None。
+        assert!(app.compute_codex_ui_signature().is_none());
+
+        app.codex = Some(CodexPane::test_with_output(20, 40, 0, ""));
+        app.codex_terminal_area = Some(Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 20,
+        });
+        let base = app.compute_codex_ui_signature();
+        assert!(base.is_some());
+
+        // ヘルプオーバーレイの開閉で構造が変わる。
+        app.show_help = true;
+        assert_ne!(app.compute_codex_ui_signature(), base);
+        app.show_help = false;
+        assert_eq!(app.compute_codex_ui_signature(), base);
+
+        // turn ピッカーの開閉で構造が変わる。
+        app.codex.as_mut().unwrap().test_add_completed_turn("done");
+        assert!(app.codex.as_mut().unwrap().open_turn_picker());
+        assert_ne!(app.compute_codex_ui_signature(), base);
+        app.codex.as_mut().unwrap().close_turn_picker();
     }
 
     #[test]

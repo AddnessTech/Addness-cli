@@ -99,6 +99,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
 /// - `CodexExecSettings`（codex専用の `-c key=value` オーバーライドや `codex_home` 上の
 ///   セッション管理ファイル）にのみ作用し、ClaudeCode のターン起動引数
 ///   （`claude::exec_args` / `ClaudeExecSettings`）には一切反映されないもの
+///
+/// なお `/image`・`/attachments`・`/fork` は両バックエンドで共通の操作として扱えるよう
+/// ここから外してある（画像は `append_claude_image_paths` でプロンプトへ、`/fork` は
+/// dispatch で `/fork-last` / `/fork-session` へ委譲する）。
 const CODEX_ONLY_SLASH_COMMANDS: &[&str] = &[
     "/review",
     "/apply",
@@ -114,11 +118,8 @@ const CODEX_ONLY_SLASH_COMMANDS: &[&str] = &[
     "/theme",
     "/vim",
     "/personality",
-    "/image",
-    "/attachments",
     "/search",
     "/config",
-    "/fork",
     "/archive",
     "/rename",
 ];
@@ -1614,6 +1615,11 @@ enum CodexSessionRecord {
         stream: String,
         line: String,
     },
+    /// 会話スレッド ID（Codex thread_id / Claude session_id を共用）の永続化。
+    /// `None` は `/new` によるリセット（tombstone）を表す。
+    ThreadId {
+        id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1642,6 +1648,8 @@ struct LoadedCodexSession {
     log: Vec<CodexLogLine>,
     record_count: usize,
     goal_mode: CodexGoalMode,
+    /// ログから復元した会話スレッド ID。最後の `ThreadId` レコードの値。
+    thread_id: Option<String>,
 }
 
 struct CodexPaneSpawnOptions<'a> {
@@ -2001,6 +2009,9 @@ pub struct CodexPane {
     queued_prompts: VecDeque<QueuedPrompt>,
     /// `codex exec --json` が返した Codex thread id。2ターン目以降の resume に使う。
     thread_id: Option<String>,
+    /// 表示ログから復元した thread_id を保持中で、まだライブイベントで裏取りできていない状態。
+    /// resume が失敗したら 1 回だけ新規セッションへフォールバックするために使う。
+    thread_id_restored: bool,
     /// いま実行中のターンに対応するユーザー入力。turn.started の見出しに使う。
     current_turn_prompt: Option<String>,
     /// 承認リトライ時に再実行する、Addness文脈注入前の実プロンプト。
@@ -2194,8 +2205,32 @@ impl CodexPane {
                 log: Vec::new(),
                 record_count: 0,
                 goal_mode: CodexGoalMode::default(),
+                thread_id: None,
             });
         let goal_mode = loaded.goal_mode.clone();
+
+        // 保存されていた thread_id の復元を検討する。Claude はセッション実体が cwd 依存の
+        // ファイルなので、現在の cwd 配下に実体が無ければ復元を破棄して新規で開始する。
+        // Codex は事前検証せず、resume 失敗時のフォールバックで吸収する。
+        enum ThreadRestore {
+            None,
+            Resumed(String),
+            ClaudeMissing,
+        }
+        let thread_restore = match loaded.thread_id.clone() {
+            Some(id) => {
+                if kind == AgentKind::ClaudeCode && !claude::session_file_exists(cwd, &id) {
+                    ThreadRestore::ClaudeMissing
+                } else {
+                    ThreadRestore::Resumed(id)
+                }
+            }
+            None => ThreadRestore::None,
+        };
+        let restored_thread_id = match &thread_restore {
+            ThreadRestore::Resumed(id) => Some(id.clone()),
+            _ => None,
+        };
         let loaded_history_count = loaded.log.len();
         let turn_count = loaded
             .log
@@ -2265,7 +2300,8 @@ impl CodexPane {
             input_history_path,
             esc_interrupt_armed: false,
             queued_prompts: VecDeque::new(),
-            thread_id: None,
+            thread_id: restored_thread_id.clone(),
+            thread_id_restored: restored_thread_id.is_some(),
             current_turn_prompt: None,
             current_turn_retry_prompt: None,
             turn_count,
@@ -2348,6 +2384,24 @@ impl CodexPane {
             CodexLogKind::System,
             format!("{name}入力欄で待機中。入力して Enter で依頼を送信します。"),
         );
+        match thread_restore {
+            ThreadRestore::Resumed(id) => {
+                pane.push_log(
+                    CodexLogKind::System,
+                    format!(
+                        "前回のセッション（{}…）を自動再開します。新規で始める場合は /new",
+                        short_session_id(&id)
+                    ),
+                );
+            }
+            ThreadRestore::ClaudeMissing => {
+                pane.push_log(
+                    CodexLogKind::System,
+                    "前回セッションが見つからないため新規セッションで開始します",
+                );
+            }
+            ThreadRestore::None => {}
+        }
         Ok(pane)
     }
 
@@ -3598,6 +3652,21 @@ impl CodexPane {
         self.push_log(CodexLogKind::System, "画像添付をクリアしました");
     }
 
+    /// ClaudeCode では画像を CLI 引数で渡せないため、添付画像パスを
+    /// プロンプト末尾に追記して Read ツールで読ませる。消費後はリストをクリアする。
+    fn append_claude_image_paths(&mut self, prompt: String) -> String {
+        if self.kind != AgentKind::ClaudeCode || self.exec_settings.image_paths.is_empty() {
+            return prompt;
+        }
+        let mut out = prompt;
+        out.push_str("\n\n添付画像（Readツールで内容を確認してください）:\n");
+        for path in &self.exec_settings.image_paths {
+            out.push_str(&format!("- {path}\n"));
+        }
+        self.exec_settings.image_paths.clear();
+        out
+    }
+
     fn add_writable_dir(&mut self, dir: String) {
         self.exec_settings.additional_dirs.push(dir.clone());
         let count = self.exec_settings.additional_dirs.len();
@@ -3998,7 +4067,40 @@ impl CodexPane {
                 .unwrap_or(false);
         if should_trim && let Ok(count) = trim_codex_session_log(&path) {
             self.session_record_count = count;
+            // トリムで末尾以外へ押し出された最後の ThreadId が失われうるため、
+            // 生きている thread_id を末尾へ書き直して復元可能に保つ。
+            if let Some(id) = self.thread_id.clone() {
+                let record = CodexSessionRecord::ThreadId { id: Some(id) };
+                if append_codex_session_record(&path, &record).is_ok() {
+                    self.session_record_count = self.session_record_count.saturating_add(1);
+                }
+            }
         }
+    }
+
+    /// thread_id を設定し、変化した場合のみ `ThreadId` レコードを永続化する。
+    /// Claude の init は毎ターン同じ id を再送するため、同値スキップで重複記録を防ぐ。
+    /// ライブイベント/ユーザー操作由来の設定なので、復元フラグは常に解除する。
+    fn set_thread_id(&mut self, id: Option<String>) {
+        self.thread_id_restored = false;
+        if self.thread_id == id {
+            return;
+        }
+        self.thread_id = id.clone();
+        self.persist_session_record(CodexSessionRecord::ThreadId { id });
+    }
+
+    /// 復元した thread_id での resume が失敗したとき、次ターンを新規セッションで開始する。
+    /// 復元フラグが立っているときだけ作用し、tombstone を書いてフラグを下ろす。
+    fn drop_restored_thread_on_failure(&mut self) {
+        if !self.thread_id_restored {
+            return;
+        }
+        self.set_thread_id(None);
+        self.push_log(
+            CodexLogKind::System,
+            "保存されていた前回セッションの再開に失敗したため、次のターンは新規セッションで開始します",
+        );
     }
 
     /// 子ゴールのライブリストを差し替える。新規 ID は一定時間ハイライトする。
@@ -4262,7 +4364,7 @@ impl CodexPane {
         match event_type.as_str() {
             "thread.started" => {
                 if let Some(thread_id) = string_at_any(&value, &["thread_id", "threadId", "id"]) {
-                    self.thread_id = Some(thread_id.clone());
+                    self.set_thread_id(Some(thread_id));
                     self.push_log(CodexLogKind::System, "Codex セッションを開始しました");
                 } else {
                     self.push_log(CodexLogKind::System, "Codex セッションを開始しました");
@@ -4317,6 +4419,7 @@ impl CodexPane {
                 self.refresh_current_turn_title();
                 self.queue_completed_turn_body_record();
                 self.push_turn_complete_notice("Codex 失敗", message);
+                self.drop_restored_thread_on_failure();
             }
             "error" => {
                 let message = nested_error_message(&value)
@@ -4324,6 +4427,7 @@ impl CodexPane {
                     .unwrap_or_else(|| "Codex エラー".to_string());
                 self.push_log(CodexLogKind::Error, message.clone());
                 self.push_terminal_notice("Codex エラー", message);
+                self.drop_restored_thread_on_failure();
             }
             _ => self.handle_generic_json_event(&event_type, &value),
         }
@@ -4336,7 +4440,7 @@ impl CodexPane {
                 if claude::event_subtype(value) == Some("init") {
                     if let Some(session_id) = claude::session_id(value) {
                         // session_id は codex の thread_id フィールドを共用する。
-                        self.thread_id = Some(session_id.clone());
+                        self.set_thread_id(Some(session_id));
                     }
                     // 毎ターン再送される init から現在の model/permissionMode を表示同期用に保存。
                     if let Some(model) = value.get("model").and_then(Value::as_str) {
@@ -4363,7 +4467,7 @@ impl CodexPane {
                     self.claude_context_tokens = Some(ctx);
                 }
                 if let Some(session_id) = claude::session_id(value) {
-                    self.thread_id = Some(session_id);
+                    self.set_thread_id(Some(session_id));
                 }
                 let result = claude::parse_result(value);
                 self.handle_claude_result(result);
@@ -4380,6 +4484,7 @@ impl CodexPane {
                     first_text_field(value).unwrap_or_else(|| "Claude Code エラー".to_string());
                 self.push_log(CodexLogKind::Error, message.clone());
                 self.push_terminal_notice("Claude Code エラー", message);
+                self.drop_restored_thread_on_failure();
             }
             // rate_limit_event など未知・非表示イベントは無視する。
             _ => {}
@@ -4552,6 +4657,9 @@ impl CodexPane {
                 .unwrap_or_else(|| "Claude Code ターンが失敗しました".to_string());
             self.push_log(CodexLogKind::Error, message.clone());
             self.push_turn_complete_notice("Claude Code 失敗", message);
+            // result に有効な session_id が含まれていれば site③ が復元フラグを解除済みなので、
+            // ここでの drop は「session_id を伴わないエラー」時のみ発火する。
+            self.drop_restored_thread_on_failure();
         } else {
             self.action = Some("応答完了".to_string());
             self.push_log(CodexLogKind::System, "Claude Code の応答が完了しました");
@@ -4775,6 +4883,7 @@ impl CodexPane {
         }
 
         let full_prompt = self.prompt_with_addness_context(prompt);
+        let full_prompt = self.append_claude_image_paths(full_prompt);
         let sent = self
             .claude_resident
             .as_ref()
@@ -4940,6 +5049,9 @@ impl CodexPane {
         let message = "Claude Code プロセスが終了しました。次のターンで再接続します";
         self.push_log(CodexLogKind::Error, message);
         self.push_terminal_notice("Claude Code 切断", message);
+        // 復元した session_id が init で裏取りされる前に死んだ場合は resume 失敗とみなし、
+        // 同じ --resume で死亡を繰り返さないよう新規セッションへフォールバックする。
+        self.drop_restored_thread_on_failure();
         // 中断・死亡時はキューを自動開始しない（ユーザー判断を待つ）。
     }
 
@@ -5484,7 +5596,7 @@ impl CodexPane {
                 .as_ref()
                 .and_then(codex_appserver::thread_id_from_response)
             {
-                self.thread_id = Some(thread_id);
+                self.set_thread_id(Some(thread_id));
             }
             self.codex_appserver_phase = CodexAppServerPhase::Ready;
             self.push_log(CodexLogKind::System, "Codex セッションを開始しました");
@@ -6903,6 +7015,7 @@ impl CodexPane {
 
         let retry_prompt = prompt.to_string();
         let prompt = self.prompt_with_addness_context(prompt);
+        let prompt = self.append_claude_image_paths(prompt);
         let command_result = self.spawn_exec_process(&prompt);
         self.one_shot_approval = None;
         self.claude_one_shot_allowed_tools = Vec::new();
@@ -7141,7 +7254,21 @@ impl CodexPane {
                 self.handle_side_slash_command(args);
                 true
             }
-            "fork" | "codex-fork" => {
+            "fork" => {
+                if self.kind == AgentKind::ClaudeCode {
+                    // Claude では bare /fork を /fork-last（引数なし）/ /fork-session（引数あり）へ委譲。
+                    if args.is_empty() {
+                        self.handle_fork_last_slash_command("", false);
+                    } else {
+                        self.handle_fork_session_slash_command(args, false);
+                    }
+                } else {
+                    self.handle_root_session_command_slash_command("fork", args);
+                }
+                true
+            }
+            "codex-fork" => {
+                // codex 専用（Claude では start_codex_subcommand のガードで拒否される）。
                 self.handle_root_session_command_slash_command("fork", args);
                 true
             }
@@ -7520,7 +7647,7 @@ impl CodexPane {
         // 新規セッション開始の前に常駐を落として次ターンを新 spawn で始める。
         self.teardown_claude_resident();
         self.teardown_codex_appserver();
-        self.thread_id = None;
+        self.set_thread_id(None);
         self.current_turn_prompt = None;
         self.current_turn_retry_prompt = None;
         self.current_command = None;
@@ -7990,7 +8117,7 @@ impl CodexPane {
         // アイドル常駐が生きていると新 thread_id/--fork-session が無視されるため、
         // resume/fork の前に必ず常駐を落として新規 spawn で反映させる。
         self.teardown_claude_resident();
-        self.thread_id = Some(session_id.clone());
+        self.set_thread_id(Some(session_id.clone()));
         self.claude_fork_next = fork;
         let verb = if fork { "fork" } else { "resume" };
         self.push_log(
@@ -8946,7 +9073,12 @@ impl CodexPane {
             lines.extend(numbered_or_none(&self.exec_settings.image_paths));
             lines.push(String::new());
             lines.push("Add dirs:".to_string());
-            lines.extend(numbered_or_none(&self.exec_settings.additional_dirs));
+            let add_dirs = if self.kind == AgentKind::ClaudeCode {
+                self.claude_settings.additional_dirs()
+            } else {
+                &self.exec_settings.additional_dirs
+            };
+            lines.extend(numbered_or_none(add_dirs));
             self.push_log(CodexLogKind::System, lines.join("\n"));
             return;
         }
@@ -11169,6 +11301,7 @@ fn load_codex_session(path: &Path) -> Result<LoadedCodexSession> {
                 log: Vec::new(),
                 record_count: 0,
                 goal_mode: CodexGoalMode::default(),
+                thread_id: None,
             });
         }
         Err(e) => {
@@ -11178,6 +11311,7 @@ fn load_codex_session(path: &Path) -> Result<LoadedCodexSession> {
 
     let mut log = Vec::new();
     let mut goal_mode = CodexGoalMode::default();
+    let mut thread_id = None;
     let mut record_count = 0usize;
     for line in BufReader::new(file).lines().map_while(Result::ok) {
         if line.trim().is_empty() {
@@ -11204,6 +11338,10 @@ fn load_codex_session(path: &Path) -> Result<LoadedCodexSession> {
             CodexSessionRecord::GoalMode { objective, paused } => {
                 goal_mode = CodexGoalMode { objective, paused };
             }
+            CodexSessionRecord::ThreadId { id } => {
+                // 最後の値を残す。tombstone（None）も最後ならそのまま反映する。
+                thread_id = id;
+            }
             CodexSessionRecord::RawEvent { .. } => {}
         }
         if log.len() > CODEX_SESSION_HISTORY_MAX_LOG_LINES {
@@ -11216,6 +11354,7 @@ fn load_codex_session(path: &Path) -> Result<LoadedCodexSession> {
         log,
         record_count,
         goal_mode,
+        thread_id,
     })
 }
 
@@ -14091,6 +14230,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn append_claude_image_paths_appends_and_clears_for_claude() {
+        let mut pane = claude_pane();
+        pane.exec_settings.image_paths = vec!["/tmp/a.png".to_string(), "/tmp/b.png".to_string()];
+        let out = pane.append_claude_image_paths("元のプロンプト".to_string());
+        assert!(out.starts_with("元のプロンプト"));
+        assert!(out.contains("添付画像（Readツールで内容を確認してください）:"));
+        assert!(out.contains("- /tmp/a.png"));
+        assert!(out.contains("- /tmp/b.png"));
+        // 消費後はリストがクリアされる。
+        assert!(pane.exec_settings.image_paths.is_empty());
+    }
+
+    #[test]
+    fn append_claude_image_paths_noop_for_codex() {
+        let mut pane = live_pane();
+        assert_eq!(pane.kind, AgentKind::Codex);
+        pane.exec_settings.image_paths = vec!["/tmp/a.png".to_string()];
+        let out = pane.append_claude_image_paths("元のプロンプト".to_string());
+        // Codex ではプロンプト不変・リスト保持（--image 引数で消費するため）。
+        assert_eq!(out, "元のプロンプト");
+        assert_eq!(
+            pane.exec_settings.image_paths,
+            vec!["/tmp/a.png".to_string()]
+        );
+    }
+
+    #[test]
+    fn image_slash_command_visible_for_claude() {
+        assert!(slash_command_visible_for_kind(
+            "/image",
+            AgentKind::ClaudeCode
+        ));
+        assert!(slash_command_visible_for_kind(
+            "/attachments",
+            AgentKind::ClaudeCode
+        ));
+        assert!(slash_command_visible_for_kind(
+            "/fork",
+            AgentKind::ClaudeCode
+        ));
+    }
+
     fn has_addness_developer_instructions(args: &[String]) -> bool {
         args.iter()
             .any(|arg| arg.starts_with("developer_instructions="))
@@ -15030,6 +15212,135 @@ mod tests {
         assert!(pane.history_label().contains("保存中"));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    /// テスト用の一時 JSONL パス。
+    fn thread_id_temp_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "addness-thread-id-{tag}-{}-{}.jsonl",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ))
+    }
+
+    /// session_log_path を注入した Codex ペイン（実プロセスは起動しない）。
+    fn codex_pane_with_log(path: PathBuf) -> CodexPane {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        CodexPane::spawn_inner(CodexPaneSpawnOptions {
+            kind: AgentKind::Codex,
+            codex_bin: Path::new("codex"),
+            cwd: &cwd,
+            addness_bin: "addness",
+            goal_id: "goal/thread".to_string(),
+            goal_title: "Thread goal".to_string(),
+            dod: String::new(),
+            status_label: "TEST".to_string(),
+            session_log_path: Some(path),
+            input_history_path: None,
+            attachments_dir: None,
+        })
+        .unwrap()
+    }
+
+    fn count_thread_id_records(path: &Path) -> usize {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains(r#""record":"thread_id""#))
+            .count()
+    }
+
+    #[test]
+    fn load_codex_session_restores_last_thread_id() {
+        let path = thread_id_temp_path("load-last");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            "{\"record\":\"thread_id\",\"id\":\"t1\"}\n{\"record\":\"thread_id\",\"id\":\"t2\"}\n",
+        )
+        .unwrap();
+
+        let loaded = load_codex_session(&path).unwrap();
+        assert_eq!(loaded.thread_id.as_deref(), Some("t2"));
+
+        // 末尾に tombstone(None) を書くと復元値も None になる。
+        std::fs::write(
+            &path,
+            "{\"record\":\"thread_id\",\"id\":\"t1\"}\n{\"record\":\"thread_id\",\"id\":null}\n",
+        )
+        .unwrap();
+        let loaded = load_codex_session(&path).unwrap();
+        assert_eq!(loaded.thread_id, None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_codex_session_skips_unknown_records() {
+        let path = thread_id_temp_path("unknown");
+        let _ = std::fs::remove_file(&path);
+        // 未知レコード（旧バイナリ互換）を挟んでも読込は壊れず、既知レコードは反映される。
+        std::fs::write(
+            &path,
+            "{\"record\":\"log\",\"kind\":\"System\",\"text\":\"hi\"}\n{\"record\":\"future_variant\",\"foo\":123}\n{\"record\":\"thread_id\",\"id\":\"t9\"}\n",
+        )
+        .unwrap();
+
+        let loaded = load_codex_session(&path).unwrap();
+        assert_eq!(loaded.thread_id.as_deref(), Some("t9"));
+        assert!(
+            loaded
+                .log
+                .iter()
+                .any(|line| line.kind == CodexLogKind::System && line.text == "hi")
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn set_thread_id_dedupes_and_persists_only_changes() {
+        let path = thread_id_temp_path("dedupe");
+        let _ = std::fs::remove_file(&path);
+        let mut pane = codex_pane_with_log(path.clone());
+        assert_eq!(count_thread_id_records(&path), 0);
+
+        pane.set_thread_id(Some("t1".to_string()));
+        pane.set_thread_id(Some("t1".to_string())); // 同値: 記録しない
+        assert_eq!(count_thread_id_records(&path), 1);
+
+        pane.set_thread_id(Some("t2".to_string())); // 変化: 1件追記
+        assert_eq!(count_thread_id_records(&path), 2);
+
+        pane.set_thread_id(None); // tombstone: 1件追記
+        assert_eq!(count_thread_id_records(&path), 3);
+        assert_eq!(pane.thread_id, None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn drop_restored_thread_on_failure_only_when_restored() {
+        let path = thread_id_temp_path("drop");
+        let _ = std::fs::remove_file(&path);
+        let mut pane = codex_pane_with_log(path.clone());
+
+        // 復元フラグが立っていなければ何もしない。
+        pane.thread_id = Some("live-1".to_string());
+        pane.thread_id_restored = false;
+        pane.drop_restored_thread_on_failure();
+        assert_eq!(pane.thread_id.as_deref(), Some("live-1"));
+        assert_eq!(count_thread_id_records(&path), 0);
+
+        // 復元フラグが立っていれば thread_id をクリアし tombstone を書く。
+        pane.thread_id = Some("restored-1".to_string());
+        pane.thread_id_restored = true;
+        pane.drop_restored_thread_on_failure();
+        assert_eq!(pane.thread_id, None);
+        assert!(!pane.thread_id_restored);
+        assert_eq!(count_thread_id_records(&path), 1);
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -319,6 +319,11 @@ impl ClaudeExecSettings {
         }
     }
 
+    /// 次ターンに渡す `--add-dir` の一覧（`/attachments` の list 表示用）。
+    pub(super) fn additional_dirs(&self) -> &[String] {
+        &self.additional_dirs
+    }
+
     /// `--include-partial-messages` を今後付けないか（古い CLI 検出後の sticky フラグ）。
     pub(super) fn no_partial_messages(&self) -> bool {
         self.no_partial_messages
@@ -934,6 +939,25 @@ pub(super) fn load_session_candidates_from(
         .collect()
 }
 
+/// 指定 config ディレクトリ配下に、cwd スラッグに対応する `<session_id>.jsonl` があるか判定する。
+/// テスト容易性のため config ディレクトリを引数注入する内部関数。
+pub(super) fn session_file_exists_in(config_dir: &Path, cwd: &str, session_id: &str) -> bool {
+    config_dir
+        .join("projects")
+        .join(cwd_slug(cwd))
+        .join(format!("{session_id}.jsonl"))
+        .is_file()
+}
+
+/// 本番用ラッパ。`CLAUDE_CONFIG_DIR` or `~/.claude` を解決してセッション実体の有無を判定する。
+/// config ディレクトリを解決できない場合は判定不能とみなし、存在扱い（復元を維持）する。
+pub(super) fn session_file_exists(cwd: &Path, session_id: &str) -> bool {
+    match config_dir() {
+        Some(dir) => session_file_exists_in(&dir, &cwd.display().to_string(), session_id),
+        None => true,
+    }
+}
+
 /// jsonl 1 ファイルから候補を作る。id=ファイル名、title=最初の人間 user メッセージ。
 pub(super) fn session_candidate_from_file(path: &Path, cwd: &str) -> Option<CodexSessionCandidate> {
     let id = path.file_stem()?.to_str()?.to_string();
@@ -1262,6 +1286,26 @@ mod tests {
         assert!(usage.contains("input=100"));
         assert!(usage.contains("output=50"));
         assert!(usage.contains("cost=$0.0123"));
+    }
+
+    #[test]
+    fn session_file_exists_in_checks_cwd_slug_path() {
+        let root = std::env::temp_dir().join(format!(
+            "addness-claude-session-exists-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cwd = "/Users/x/dev/foo";
+        let dir = root.join("projects").join(cwd_slug(cwd));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("sess-1.jsonl"), "{}\n").unwrap();
+
+        assert!(session_file_exists_in(&root, cwd, "sess-1"));
+        assert!(!session_file_exists_in(&root, cwd, "missing"));
+        // cwd が異なればスラッグが変わり実体は見つからない。
+        assert!(!session_file_exists_in(&root, "/other/dir", "sess-1"));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

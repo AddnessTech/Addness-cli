@@ -828,8 +828,13 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
                 " {name} 実行中  |  Ctrl-T:表示切替  |  F7:turn一覧  |  入力+Enter:次ターン予約  |  Ctrl-C:中断 "
             )
         } else {
+            let fkeys = if kind == AgentKind::ClaudeCode {
+                "F2-F4:設定  |  F6:差分"
+            } else {
+                "F2-F6:設定/差分"
+            };
             format!(
-                " 入力してEnterで{name}へ送信  |  Ctrl-T:表示切替  |  F7:turn一覧  |  F2-F6:設定/差分  |  ?/Ctrl+Q:操作一覧 "
+                " 入力してEnterで{name}へ送信  |  Ctrl-T:表示切替  |  F7:turn一覧  |  {fkeys}  |  ?/Ctrl+Q:操作一覧 "
             )
         };
         let status = Paragraph::new(Line::from(Span::styled(
@@ -1304,6 +1309,11 @@ fn draw_codex_help_overlay(frame: &mut Frame, app: &mut App) {
                 "permission-modeを切替または直接指定",
             ),
             kv("/add-dir <path>", "追加の書込許可ディレクトリを渡す"),
+            kv(
+                "/image <path>",
+                "画像を次ターンへ添付（list/clear/remove N）",
+            ),
+            kv("/attachments", "画像添付と追加dirを一覧・追加・クリア"),
             blank(),
         ]);
     } else {
@@ -2826,9 +2836,14 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
         } else if pane.scrollback > 0 {
             (format!(" {name} 履歴表示 — Esc: 最新へ戻る "), COLOR_PANEL)
         } else {
+            let fkeys = if pane.kind() == AgentKind::ClaudeCode {
+                "F2-F4:設定  F6:差分"
+            } else {
+                "F2-F6:設定/差分"
+            };
             (
                 format!(
-                    " {name} 入力待ち — F7:turn一覧  Ctrl-T:表示切替  Ctrl+↑↓:スクロール  F2-F6:設定/差分  F9:再開 "
+                    " {name} 入力待ち — F7:turn一覧  Ctrl-T:表示切替  Ctrl+↑↓:スクロール  {fkeys}  F9:再開 "
                 ),
                 COLOR_PANEL,
             )

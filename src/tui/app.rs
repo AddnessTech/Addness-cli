@@ -17,13 +17,13 @@ use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
 use crate::api::{
-    ApiClient, Comment, CreateGoalRequest, Deliverable, DeliverableType, GoalStatus, Member,
-    MemberId, Organization, UpdateGoalRequest,
+    ApiClient, Comment, CreateGoalRequest, Deliverable, DeliverableType, GoalChildItem, GoalStatus,
+    Member, MemberId, Organization, UpdateGoalRequest,
 };
 use crate::dbg_log;
 
+use super::agent::{self, AgentKind, ChildGoalUpdate, CodexPane, CodexWorkSummary, TerminalNotice};
 use super::codex_memory::{codex_body_update_request, codex_trace_link_label, codex_work_memo};
-use super::codex_pane::{self, CodexPane, CodexWorkSummary, TerminalNotice};
 pub(super) use super::file_picker::PICKER_VISIBLE_ROWS;
 use super::file_picker::{
     FileEntry, FilePickerReturn, complete_path, initial_picker_dir, read_dir_entries,
@@ -94,6 +94,7 @@ pub enum DeliverableFormField {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionMenuItem {
     WorkWithCodex,
+    WorkWithClaude,
     AddDeliverable,
     AddComment,
     CompleteGoal,
@@ -116,6 +117,7 @@ impl ActionMenuItem {
     pub fn label(&self) -> &'static str {
         match self {
             ActionMenuItem::WorkWithCodex => "codexで作業",
+            ActionMenuItem::WorkWithClaude => "claude codeで作業",
             ActionMenuItem::AddDeliverable => "add deliverable",
             ActionMenuItem::AddComment => "add comment",
             ActionMenuItem::CompleteGoal => "complete goal",
@@ -209,6 +211,18 @@ impl GoalDisplayStatus {
             Some(GoalStatus::Cancelled) => GoalDisplayStatus::Cancelled,
             _ => GoalDisplayStatus::NotStarted,
         }
+    }
+}
+
+fn child_goal_update_from_item(child: GoalChildItem) -> ChildGoalUpdate {
+    let status = GoalDisplayStatus::from_goal_state(child.status.as_ref(), child.is_completed);
+    ChildGoalUpdate {
+        id: child.id,
+        title: child.title,
+        description: child.description,
+        icon: status.icon(),
+        status_label: status.to_emoji_string(),
+        is_completed: status == GoalDisplayStatus::Completed,
     }
 }
 
@@ -323,6 +337,11 @@ pub enum ModalState {
         ret: FilePickerReturn,
     },
 }
+
+const CONFIRM_CANCEL: usize = 0;
+const CONFIRM_APPLY: usize = 1;
+const CONFIRM_ALWAYS: usize = 2;
+const CONFIRM_CHOICE_COUNT: usize = 3;
 
 /// 起動時にバックグラウンドで取得する初期データ。
 /// `&mut self` を奪わずに別タスクで取得できるよう、所有データだけを持つ。
@@ -519,12 +538,13 @@ fn is_permission_denied_error_text(text: &str) -> bool {
 struct CodexSnapshot {
     title: String,
     description: String,
+    body: Option<String>,
     status_label: String,
     comment_count: Option<usize>,
     deliverable_count: Option<usize>,
     trace_links: Vec<String>,
-    /// 子ゴール一覧（id, タイトル, 状態アイコン）。None=取得失敗。
-    children: Option<Vec<(String, String, &'static str)>>,
+    /// 子ゴール一覧。None=取得失敗。
+    children: Option<Vec<ChildGoalUpdate>>,
 }
 
 /// 実行中の DoD 自動判定（codex exec）ジョブ。
@@ -614,6 +634,9 @@ pub struct App {
 
     /// キーバインド一覧のヘルプオーバーレイ表示中か（`?` で開く）
     pub show_help: bool,
+    /// ヘルプオーバーレイのスクロール位置（行数）。描画側が実際の行数に
+    /// クランプし直す。開くたびに 0 へ戻す。
+    pub help_scroll: usize,
 
     // Goal trees
     pub goal_tree: GoalTree,
@@ -635,6 +658,10 @@ pub struct App {
 
     /// Modal state for create/edit goal dialogs
     pub modal_state: Option<ModalState>,
+    /// このTUIセッション中、同種の削除確認を省略する。
+    allow_delete_goal_without_confirm: bool,
+    allow_delete_deliverable_without_confirm: bool,
+    allow_delete_comment_without_confirm: bool,
 
     /// Success message to display in status bar (cleared on next key press)
     pub success_message: Option<String>,
@@ -686,6 +713,7 @@ impl App {
             show_org_popup: false,
             org_popup_index: 0,
             show_help: false,
+            help_scroll: 0,
             goal_tree: GoalTree::empty(),
             todays_goals_tree: GoalTree::empty(),
             todays_loaded: false,
@@ -696,6 +724,9 @@ impl App {
             content_height: 0,
             error_message: None,
             modal_state: None,
+            allow_delete_goal_without_confirm: false,
+            allow_delete_deliverable_without_confirm: false,
+            allow_delete_comment_without_confirm: false,
             success_message: None,
             codex: None,
             codex_terminal_area: None,
@@ -1154,6 +1185,7 @@ impl App {
                 title: goal_title,
                 items: vec![
                     ActionMenuItem::WorkWithCodex,
+                    ActionMenuItem::WorkWithClaude,
                     complete_item,
                     ActionMenuItem::AddComment,
                     ActionMenuItem::AddDeliverable,
@@ -1171,31 +1203,58 @@ impl App {
 
     /// 選択中ゴールの文脈を注入して、埋め込み codex セッションを起動する。
     fn start_codex(&mut self) {
+        self.start_agent(AgentKind::Codex);
+    }
+
+    fn start_agent(&mut self, kind: AgentKind) {
+        let name = kind.display_name();
+        let label = kind.label();
         let Some((goal_id, title)) = self.selected_goal_context() else {
-            self.error_message = Some("ゴールを選択してから codex を起動してください".to_string());
+            self.error_message = Some(format!("ゴールを選択してから {label} を起動してください"));
             return;
         };
 
-        // codex 未インストールでもクラッシュさせず、案内を出す。
-        let Some(codex_bin) = codex_pane::codex_path() else {
-            self.error_message = Some(
-                "codex が見つかりません。`brew install codex` 等でインストールしてください"
-                    .to_string(),
-            );
+        // 未インストールでもクラッシュさせず、案内を出す。
+        let bin = match kind {
+            AgentKind::Codex => agent::codex_path(),
+            AgentKind::ClaudeCode => agent::claude_path(),
+        };
+        let Some(agent_bin) = bin else {
+            self.error_message = Some(match kind {
+                AgentKind::Codex => {
+                    "codex が見つかりません。`brew install codex` 等でインストールしてください"
+                        .to_string()
+                }
+                AgentKind::ClaudeCode => {
+                    "claude が見つかりません。`npm install -g @anthropic-ai/claude-code` 等でインストールしてください"
+                        .to_string()
+                }
+            });
             return;
         };
 
         // DoD・ステータスを取得して左ペインの初期表示に使う。失敗しても空で続行する。
-        let (dod, status_label) = match self.api_call(self.client.get_goal(&goal_id)) {
+        let (dod, status_label, initial_body) = match self.api_call(self.client.get_goal(&goal_id))
+        {
             Ok(resp) => {
                 let goal = resp.data;
                 let status =
                     GoalDisplayStatus::from_goal_state(goal.status.as_ref(), goal.is_completed)
                         .to_emoji_string();
-                (goal.description.unwrap_or_default(), status)
+                (goal.description.unwrap_or_default(), status, goal.body)
             }
-            Err(_) => (String::new(), String::new()),
+            Err(_) => (String::new(), String::new(), None),
         };
+        let initial_children = self
+            .api_call(self.client.get_goal_children(&goal_id, 50, 0))
+            .ok()
+            .map(|resp| {
+                resp.data
+                    .children
+                    .into_iter()
+                    .map(child_goal_update_from_item)
+                    .collect::<Vec<_>>()
+            });
 
         // codex のサブプロセスから確実に呼べるよう、addness 自身の絶対パスを渡す。
         let addness_bin = std::env::current_exe()
@@ -1207,16 +1266,41 @@ impl App {
         // 対象ゴールの軽量コンテキストは環境変数で伝える。起動直後は初期プロンプトを
         // 送らず、ユーザーがすぐ最初の指示を入力できる状態にする。
         match CodexPane::spawn(
-            &codex_bin,
+            &agent_bin,
             &cwd,
             &addness_bin,
             goal_id,
             title,
             dod,
             status_label,
+            kind,
         ) {
             Ok(mut pane) => {
-                pane.push_activity(format!("{} codex を起動", Local::now().format("%H:%M")));
+                let body_loaded = pane.set_addness_body_context(initial_body);
+                pane.push_activity(format!("{} {label} を起動", Local::now().format("%H:%M")));
+                if body_loaded {
+                    pane.last_addness_read_at = Some(Instant::now());
+                    pane.last_addness_read_label = Some("body".to_string());
+                    pane.push_activity(format!(
+                        "{} 現状(body)を読込",
+                        Local::now().format("%H:%M")
+                    ));
+                }
+                if let Some(children) = initial_children {
+                    let count = children.len();
+                    pane.child_count = Some(count);
+                    pane.update_children(children);
+                    pane.last_addness_read_at = Some(Instant::now());
+                    pane.last_addness_read_label = Some(if body_loaded {
+                        "body/子ゴール".to_string()
+                    } else {
+                        "子ゴール".to_string()
+                    });
+                    pane.push_activity(format!(
+                        "{} 子ゴール{count}件を読込（完了済み含む）",
+                        Local::now().format("%H:%M")
+                    ));
+                }
                 if pane.loaded_history_count() > 0 {
                     pane.push_activity(format!(
                         "{} 前回履歴を{}件復元",
@@ -1253,7 +1337,7 @@ impl App {
                 Self::set_mouse_capture(true);
             }
             Err(e) => {
-                self.error_message = Some(format!("codex の起動に失敗しました: {e}"));
+                self.error_message = Some(format!("{name} の起動に失敗しました: {e}"));
             }
         }
     }
@@ -1400,6 +1484,62 @@ impl App {
         true
     }
 
+    fn maybe_start_codex_turn_body_record(&mut self) -> bool {
+        if self.codex_body_record_job.is_some() {
+            return false;
+        }
+        let Some((goal_id, cwd, prompt, summary, turn)) = self.codex.as_mut().and_then(|pane| {
+            let record = pane.take_completed_turn_body_record()?;
+            Some((
+                pane.goal_id.clone(),
+                pane.cwd.clone(),
+                record.prompt,
+                record.summary,
+                record.turn,
+            ))
+        }) else {
+            return false;
+        };
+
+        let client = self.client.clone();
+        self.codex_body_record_job = Some(self.rt.spawn(async move {
+            let session_state = format!("turn {turn}完了");
+            let record = tokio::task::spawn_blocking(move || {
+                codex_work_memo(&cwd, &session_state, prompt.as_deref(), Some(&summary))
+            })
+            .await
+            .unwrap_or_default();
+            let result = async {
+                let goal = client.get_goal(&goal_id).await?.data;
+                let req = codex_body_update_request(goal.body.as_deref(), &record);
+                client.update_goal(&goal_id, &req).await?;
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+
+            match result {
+                Ok(()) => CodexBodyRecordOutcome {
+                    ok: true,
+                    message: format!("現状(body)にturn {turn}完了メモを書込"),
+                },
+                Err(e) => {
+                    let message = format!("{e}");
+                    let message = if is_permission_denied_error_text(&message) {
+                        format!("書き込み権限なしのためturn {turn}完了メモをスキップ")
+                    } else {
+                        format!("turn {turn}完了メモに失敗: {message}")
+                    };
+                    CodexBodyRecordOutcome { ok: false, message }
+                }
+            }
+        }));
+        if let Some(pane) = self.codex.as_mut() {
+            let now = Local::now().format("%H:%M");
+            pane.push_activity(format!("{now} turn {turn}完了メモを予約"));
+        }
+        true
+    }
+
     fn maybe_record_finished_codex_session(&mut self) -> bool {
         // 非同期の作業メモ記録が進行中の間は、同じ body を二重に read-modify-write して
         // 互いの記録を上書きし合わないよう、ジョブ完了（poll で take）を待ってから終了記録する。
@@ -1409,12 +1549,8 @@ impl App {
         let Some((goal_id, cwd, last_prompt, summary)) = self.codex.as_mut().and_then(|pane| {
             if pane.finished && !pane.auto_record_attempted {
                 pane.auto_record_attempted = true;
-                Some((
-                    pane.goal_id.clone(),
-                    pane.cwd.clone(),
-                    pane.last_prompt().map(str::to_string),
-                    pane.work_summary(),
-                ))
+                let (last_prompt, summary) = pane.final_body_record_context();
+                Some((pane.goal_id.clone(), pane.cwd.clone(), last_prompt, summary))
             } else {
                 None
             }
@@ -1466,6 +1602,7 @@ impl App {
         if let Some(mut pane) = self.codex.take() {
             if !pane.auto_record_attempted {
                 pane.auto_record_attempted = true;
+                let (last_prompt, summary) = pane.final_body_record_context();
                 let state = if pane.finished {
                     "codex終了"
                 } else {
@@ -1475,8 +1612,8 @@ impl App {
                     &pane.goal_id,
                     &pane.cwd,
                     state,
-                    pane.last_prompt(),
-                    Some(&pane.work_summary()),
+                    last_prompt.as_deref(),
+                    Some(&summary),
                 );
             }
             pane.kill();
@@ -1512,6 +1649,7 @@ impl App {
         }
         changed |= self.maybe_start_codex_prompt_body_record();
         changed |= self.poll_codex_body_record_job();
+        changed |= self.maybe_start_codex_turn_body_record();
         changed |= self.maybe_record_finished_codex_session();
         if close_after_exit_command {
             self.close_codex();
@@ -1536,7 +1674,7 @@ impl App {
             self.error_message = Some("DoD が未設定のため判定できません".to_string());
             return;
         }
-        let Some(codex_bin) = codex_pane::codex_path() else {
+        let Some(codex_bin) = agent::codex_path() else {
             self.error_message = Some("codex が見つかりません".to_string());
             return;
         };
@@ -1550,13 +1688,13 @@ impl App {
         let schema_path = tmp.join(format!("addness-dod-schema-{goal_id}-{pid}.json"));
         let out_path = tmp.join(format!("addness-dod-out-{goal_id}-{pid}.json"));
 
-        if std::fs::write(&schema_path, codex_pane::dod_assessment_schema()).is_err() {
+        if std::fs::write(&schema_path, agent::dod_assessment_schema()).is_err() {
             self.error_message = Some("一時ファイルの書き込みに失敗しました".to_string());
             return;
         }
         let _ = std::fs::remove_file(&out_path);
 
-        let prompt = codex_pane::build_dod_assessment_prompt(&items);
+        let prompt = agent::build_dod_assessment_prompt(&items);
         let child = std::process::Command::new(&codex_bin)
             .arg("exec")
             .args(["-s", "read-only", "--color", "never"])
@@ -1702,12 +1840,7 @@ impl App {
                 r.data
                     .children
                     .into_iter()
-                    .map(|c| {
-                        let icon =
-                            GoalDisplayStatus::from_goal_state(c.status.as_ref(), c.is_completed)
-                                .icon();
-                        (c.id, c.title, icon)
-                    })
+                    .map(child_goal_update_from_item)
                     .collect::<Vec<_>>()
             });
             let comment_count = comments_res.ok().map(|r| r.total_count.max(0) as usize);
@@ -1722,6 +1855,7 @@ impl App {
             Some(CodexSnapshot {
                 title: goal.title,
                 description: goal.description.unwrap_or_default(),
+                body: goal.body,
                 status_label,
                 comment_count,
                 deliverable_count,
@@ -1763,6 +1897,12 @@ impl App {
                 if !pane.assessing && pane.set_dod(snap.description) {
                     pane.dod_changed_at = Some(Instant::now());
                     pane.push_activity(format!("{now} 方針(DoD)を書込反映"));
+                }
+
+                if pane.set_addness_body_context(snap.body) {
+                    pane.last_addness_read_at = Some(Instant::now());
+                    pane.last_addness_read_label = Some("body".to_string());
+                    pane.push_activity(format!("{now} 現状(body)を同期"));
                 }
 
                 // 子ゴール一覧の差し替え＋増加検知（codex が Addness に書き込んだサイン）。
@@ -1917,6 +2057,91 @@ impl App {
             if pane.handle_decision_key(key) {
                 return;
             }
+            if pane.turn_picker_open() {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        pane.close_turn_picker();
+                        return;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        pane.move_turn_picker_selection(-1);
+                        return;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        pane.move_turn_picker_selection(1);
+                        return;
+                    }
+                    KeyCode::Enter | KeyCode::Char('o') => {
+                        pane.open_selected_turn_from_picker();
+                        return;
+                    }
+                    KeyCode::Char('c') => {
+                        pane.close_selected_turn_from_picker();
+                        return;
+                    }
+                    KeyCode::Char(' ') => {
+                        pane.toggle_selected_turn_from_picker();
+                        return;
+                    }
+                    KeyCode::Char('a') => {
+                        pane.open_all_turns();
+                        return;
+                    }
+                    _ => return,
+                }
+            }
+            // スラッシュコマンドパレット表示中は ↑↓ で候補選択・Tab で補完する。
+            // Esc / 文字入力はそのまま入力欄へ流し、既存挙動（入力クリア等）に委ねる。
+            if pane.slash_palette_active() && key.modifiers.is_empty() {
+                match key.code {
+                    KeyCode::Up => {
+                        pane.move_slash_palette_selection(-1);
+                        return;
+                    }
+                    KeyCode::Down => {
+                        pane.move_slash_palette_selection(1);
+                        return;
+                    }
+                    KeyCode::Tab => {
+                        pane.accept_slash_palette_selection();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            if key.modifiers.is_empty() {
+                match key.code {
+                    KeyCode::F(2) => {
+                        pane.cycle_model();
+                        return;
+                    }
+                    KeyCode::F(3) => {
+                        pane.cycle_reasoning();
+                        return;
+                    }
+                    KeyCode::F(4) => {
+                        pane.cycle_approval();
+                        return;
+                    }
+                    KeyCode::F(5) => {
+                        pane.cycle_sandbox();
+                        return;
+                    }
+                    KeyCode::F(6) => {
+                        pane.toggle_diff_view();
+                        return;
+                    }
+                    KeyCode::F(7) => {
+                        pane.open_turn_picker();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            if key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('e' | 'E')) {
+                pane.toggle_visible_turn_collapsed();
+                return;
+            }
             if key.modifiers.contains(KeyModifiers::CONTROL) {
                 match key.code {
                     KeyCode::Char('t' | 'T') => {
@@ -1931,7 +2156,41 @@ impl App {
                         pane.clear_search();
                         return;
                     }
+                    KeyCode::Char('o' | 'O') | KeyCode::Enter | KeyCode::Char(' ') => {
+                        pane.toggle_visible_turn_collapsed();
+                        return;
+                    }
                     KeyCode::Char('e' | 'E') => {
+                        pane.toggle_old_turns_collapsed();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            if pane.decision_banner().is_none()
+                && pane.scrollback == 0
+                && !pane.finished
+                && pane.input_line().is_empty()
+                && key.modifiers.is_empty()
+                && matches!(key.code, KeyCode::Enter | KeyCode::Char(' '))
+            {
+                pane.toggle_visible_turn_collapsed();
+                return;
+            }
+            if pane.decision_banner().is_none()
+                && (pane.scrollback > 0 || pane.finished)
+                && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+            {
+                match key.code {
+                    KeyCode::Enter | KeyCode::Char(' ') if key.modifiers.is_empty() => {
+                        pane.toggle_visible_turn_collapsed();
+                        return;
+                    }
+                    KeyCode::Char('e') => {
+                        pane.toggle_visible_turn_collapsed();
+                        return;
+                    }
+                    KeyCode::Char('E') => {
                         pane.toggle_old_turns_collapsed();
                         return;
                     }
@@ -1997,6 +2256,10 @@ impl App {
                 pane.scroll_to_live();
                 return;
             }
+            if pane.scrollback == 0 && pane.captures_input_key(key) {
+                pane.input(key);
+                return;
+            }
             if Self::handle_codex_log_scroll(pane, key, true, false) {
                 return;
             }
@@ -2008,12 +2271,29 @@ impl App {
         }
     }
 
+    fn handle_codex_paste(&mut self, text: &str) {
+        if let Some(pane) = self.codex.as_mut() {
+            if pane.scrollback > 0 {
+                pane.scroll_to_live();
+            }
+            pane.paste_input(text);
+        }
+    }
+
+    fn handle_modal_paste(&mut self, text: &str) {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        for ch in normalized.chars() {
+            let ch = if matches!(ch, '\n' | '\t') { ' ' } else { ch };
+            self.handle_modal_input(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+    }
+
     fn send_codex_resume_prompt(&mut self) {
         if let Some(pane) = self.codex.as_mut() {
             if pane.scrollback > 0 {
                 pane.scroll_to_live();
             }
-            pane.submit_system_line(codex_pane::resume_prompt());
+            pane.submit_system_line(agent::resume_prompt());
             let now = Local::now().format("%H:%M");
             pane.push_activity(format!("{now} F9 再開プロンプトを送信"));
             self.success_message = Some("Addnessから再開するプロンプトを送信しました".to_string());
@@ -2226,12 +2506,13 @@ impl App {
         };
         let goal_id = pane.goal_id.clone();
         let goal_title = pane.goal_title.clone();
+        let name = pane.kind().label();
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let diff = codex_pane::git_diff_stat(&cwd);
+        let diff = agent::git_diff_stat(&cwd);
         let body = if diff.trim().is_empty() {
             String::new()
         } else {
-            format!("codexでの作業差分:\n{diff}\n\n")
+            format!("{name}での作業差分:\n{diff}\n\n")
         };
         self.modal_state = Some(ModalState::AddComment {
             goal_id,
@@ -2367,11 +2648,15 @@ impl App {
             self.error_message = Some("Please select a comment to delete".to_string());
             return;
         };
+        if self.allow_delete_comment_without_confirm {
+            self.modal_submit_delete_comment(goal_id, comment_id);
+            return;
+        }
         self.modal_state = Some(ModalState::DeleteComment {
             goal_id,
             comment_id,
             excerpt: truncate_comment(&content),
-            confirm_index: 0,
+            confirm_index: CONFIRM_CANCEL,
         });
     }
 
@@ -2510,8 +2795,64 @@ impl App {
             return Ok(());
         }
 
+        if let Event::Paste(text) = event {
+            if self.active_pane == ActivePane::Codex
+                && self.modal_state.is_none()
+                && !self.show_help
+            {
+                self.handle_codex_paste(&text);
+            } else if self.modal_state.is_some() && !self.show_help {
+                self.handle_modal_paste(&text);
+            }
+            return Ok(());
+        }
+
         if let Event::Key(key) = event {
             if key.kind != KeyEventKind::Press {
+                return Ok(());
+            }
+
+            if self.active_pane == ActivePane::Codex
+                && self.modal_state.is_none()
+                && Self::is_ctrl_help_key(key)
+            {
+                self.show_help = !self.show_help;
+                self.help_scroll = 0;
+                return Ok(());
+            }
+            if Self::is_ctrl_help_key(key) {
+                return Ok(());
+            }
+
+            if self.show_help {
+                // ヘルプ表示中は閉じる操作とスクロールのみ受け付ける。
+                // 実際の最大スクロール量は描画側（行数・枠高さ）が知っているため、
+                // ここでは意図だけを反映し、描画側で毎フレームクランプし直す。
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => {
+                        self.show_help = false;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.help_scroll = self.help_scroll.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.help_scroll = self.help_scroll.saturating_add(1);
+                    }
+                    KeyCode::PageUp => {
+                        self.help_scroll = self.help_scroll.saturating_sub(10);
+                    }
+                    KeyCode::PageDown => {
+                        self.help_scroll = self.help_scroll.saturating_add(10);
+                    }
+                    KeyCode::Home => {
+                        self.help_scroll = 0;
+                    }
+                    KeyCode::End => {
+                        // 描画側で実際の最大値へクランプされる。
+                        self.help_scroll = usize::MAX / 2;
+                    }
+                    _ => {}
+                }
                 return Ok(());
             }
 
@@ -2526,15 +2867,7 @@ impl App {
             self.error_message = None;
             self.success_message = None;
 
-            if self.show_help {
-                // ヘルプ表示中は閉じる操作のみ受け付ける。
-                if matches!(
-                    key.code,
-                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')
-                ) {
-                    self.show_help = false;
-                }
-            } else if self.modal_state.is_some() {
+            if self.modal_state.is_some() {
                 self.handle_modal_input(key);
             } else if self.show_org_popup {
                 self.handle_org_popup(key.code);
@@ -2543,6 +2876,11 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    fn is_ctrl_help_key(key: KeyEvent) -> bool {
+        key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
     }
 
     fn handle_org_popup(&mut self, code: KeyCode) {
@@ -2575,7 +2913,10 @@ impl App {
 
     fn handle_normal(&mut self, code: KeyCode) {
         match code {
-            KeyCode::Char('?') => self.show_help = true,
+            KeyCode::Char('?') => {
+                self.show_help = true;
+                self.help_scroll = 0;
+            }
             KeyCode::Char('q') | KeyCode::Esc => self.running = false,
             KeyCode::Tab => {
                 self.active_pane = match self.active_pane {
@@ -2908,10 +3249,14 @@ impl App {
         };
 
         if let Some((goal_id, goal_title)) = goal_info {
+            if self.allow_delete_goal_without_confirm {
+                self.modal_submit_delete(goal_id);
+                return;
+            }
             self.modal_state = Some(ModalState::DeleteGoal {
                 goal_id,
                 goal_title,
-                confirm_index: 0, // Default to Cancel
+                confirm_index: CONFIRM_CANCEL,
             });
         } else {
             self.error_message = Some("Please select a goal to delete".to_string());
@@ -2996,11 +3341,15 @@ impl App {
             return;
         };
 
+        if self.allow_delete_deliverable_without_confirm {
+            self.modal_submit_delete_deliverable(goal_id, deliverable_id);
+            return;
+        }
         self.modal_state = Some(ModalState::DeleteDeliverable {
             goal_id,
             deliverable_id,
             deliverable_name,
-            confirm_index: 0,
+            confirm_index: CONFIRM_CANCEL,
         });
     }
 
@@ -3281,34 +3630,16 @@ impl App {
                 }
             }
             KeyCode::Left => {
-                // For delete confirmation modal
-                if let Some(ModalState::DeleteGoal { confirm_index, .. }) = &mut self.modal_state {
-                    *confirm_index = 0; // Cancel
-                } else if let Some(ModalState::DeleteDeliverable { confirm_index, .. }) =
-                    &mut self.modal_state
+                if !self.modal_confirm_prev()
+                    && matches!(self.modal_state, Some(ModalState::ReactComment { .. }))
                 {
-                    *confirm_index = 0;
-                } else if let Some(ModalState::DeleteComment { confirm_index, .. }) =
-                    &mut self.modal_state
-                {
-                    *confirm_index = 0;
-                } else if matches!(self.modal_state, Some(ModalState::ReactComment { .. })) {
                     self.modal_react_prev();
                 }
             }
             KeyCode::Right => {
-                // For delete confirmation modal
-                if let Some(ModalState::DeleteGoal { confirm_index, .. }) = &mut self.modal_state {
-                    *confirm_index = 1; // Delete
-                } else if let Some(ModalState::DeleteDeliverable { confirm_index, .. }) =
-                    &mut self.modal_state
+                if !self.modal_confirm_next()
+                    && matches!(self.modal_state, Some(ModalState::ReactComment { .. }))
                 {
-                    *confirm_index = 1;
-                } else if let Some(ModalState::DeleteComment { confirm_index, .. }) =
-                    &mut self.modal_state
-                {
-                    *confirm_index = 1;
-                } else if matches!(self.modal_state, Some(ModalState::ReactComment { .. })) {
                     self.modal_react_next();
                 }
             }
@@ -3325,30 +3656,7 @@ impl App {
                         'k' => self.modal_move_target_prev(),
                         _ => {}
                     }
-                } else if let Some(ModalState::DeleteGoal { confirm_index, .. }) =
-                    &mut self.modal_state
-                {
-                    match c {
-                        'h' => *confirm_index = 0, // Cancel
-                        'l' => *confirm_index = 1, // Delete
-                        _ => {}
-                    }
-                } else if let Some(ModalState::DeleteDeliverable { confirm_index, .. }) =
-                    &mut self.modal_state
-                {
-                    match c {
-                        'h' => *confirm_index = 0,
-                        'l' => *confirm_index = 1,
-                        _ => {}
-                    }
-                } else if let Some(ModalState::DeleteComment { confirm_index, .. }) =
-                    &mut self.modal_state
-                {
-                    match c {
-                        'h' => *confirm_index = 0,
-                        'l' => *confirm_index = 1,
-                        _ => {}
-                    }
+                } else if self.modal_confirm_key(c) {
                 } else if matches!(self.modal_state, Some(ModalState::ReactComment { .. })) {
                     match c {
                         'j' | 'l' => self.modal_react_next(),
@@ -3364,6 +3672,48 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn modal_confirm_index_mut(&mut self) -> Option<&mut usize> {
+        match &mut self.modal_state {
+            Some(ModalState::DeleteGoal { confirm_index, .. })
+            | Some(ModalState::DeleteDeliverable { confirm_index, .. })
+            | Some(ModalState::DeleteComment { confirm_index, .. }) => Some(confirm_index),
+            _ => None,
+        }
+    }
+
+    fn modal_confirm_prev(&mut self) -> bool {
+        let Some(index) = self.modal_confirm_index_mut() else {
+            return false;
+        };
+        *index = if *index == CONFIRM_CANCEL {
+            CONFIRM_ALWAYS
+        } else {
+            (*index).saturating_sub(1)
+        };
+        true
+    }
+
+    fn modal_confirm_next(&mut self) -> bool {
+        let Some(index) = self.modal_confirm_index_mut() else {
+            return false;
+        };
+        *index = (*index + 1) % CONFIRM_CHOICE_COUNT;
+        true
+    }
+
+    fn modal_confirm_key(&mut self, c: char) -> bool {
+        let Some(index) = self.modal_confirm_index_mut() else {
+            return false;
+        };
+        match c.to_ascii_lowercase() {
+            'h' | 'n' => *index = CONFIRM_CANCEL,
+            'l' | 'y' => *index = CONFIRM_APPLY,
+            'a' => *index = CONFIRM_ALWAYS,
+            _ => return false,
+        }
+        true
     }
 
     fn modal_next_field(&mut self) {
@@ -3609,14 +3959,16 @@ impl App {
             }
             Some(ModalState::DeleteGoal {
                 goal_id,
-                confirm_index: 1,
+                confirm_index,
                 ..
-            }) => {
-                // User confirmed deletion
+            }) if confirm_index == CONFIRM_APPLY || confirm_index == CONFIRM_ALWAYS => {
+                if confirm_index == CONFIRM_ALWAYS {
+                    self.allow_delete_goal_without_confirm = true;
+                }
                 self.modal_submit_delete(goal_id);
             }
             Some(ModalState::DeleteGoal { .. }) => {
-                // confirm_index == 0 means cancel, do nothing
+                // cancel
             }
             Some(ModalState::AddDeliverable {
                 goal_id,
@@ -3658,9 +4010,12 @@ impl App {
             Some(ModalState::DeleteDeliverable {
                 goal_id,
                 deliverable_id,
-                confirm_index: 1,
+                confirm_index,
                 ..
-            }) => {
+            }) if confirm_index == CONFIRM_APPLY || confirm_index == CONFIRM_ALWAYS => {
+                if confirm_index == CONFIRM_ALWAYS {
+                    self.allow_delete_deliverable_without_confirm = true;
+                }
                 self.modal_submit_delete_deliverable(goal_id, deliverable_id);
             }
             Some(ModalState::DeleteDeliverable { .. }) => {}
@@ -3686,9 +4041,12 @@ impl App {
             Some(ModalState::DeleteComment {
                 goal_id,
                 comment_id,
-                confirm_index: 1,
+                confirm_index,
                 ..
-            }) => {
+            }) if confirm_index == CONFIRM_APPLY || confirm_index == CONFIRM_ALWAYS => {
+                if confirm_index == CONFIRM_ALWAYS {
+                    self.allow_delete_comment_without_confirm = true;
+                }
                 self.modal_submit_delete_comment(goal_id, comment_id);
             }
             Some(ModalState::DeleteComment { .. }) => {}
@@ -3866,6 +4224,7 @@ impl App {
     fn run_action_menu_item(&mut self, item: ActionMenuItem) {
         match item {
             ActionMenuItem::WorkWithCodex => self.start_codex(),
+            ActionMenuItem::WorkWithClaude => self.start_agent(AgentKind::ClaudeCode),
             ActionMenuItem::AddDeliverable => self.start_add_deliverable_modal(),
             ActionMenuItem::AddComment => self.start_add_comment_modal(),
             ActionMenuItem::CompleteGoal => self.do_set_goal_completed(true),
@@ -4490,6 +4849,242 @@ mod picker_interaction_tests {
 }
 
 #[cfg(test)]
+mod action_menu_tests {
+    use super::*;
+
+    #[test]
+    fn work_with_claude_item_has_label() {
+        assert_eq!(ActionMenuItem::WorkWithClaude.label(), "claude codeで作業");
+        assert_eq!(ActionMenuItem::WorkWithCodex.label(), "codexで作業");
+    }
+}
+
+#[cfg(test)]
+mod codex_help_key_tests {
+    use super::*;
+
+    #[test]
+    fn ctrl_help_key_accepts_ctrl_q() {
+        assert!(App::is_ctrl_help_key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL,
+        )));
+        // Ctrl+Shift+Q（大文字で届くケース）も許容する。
+        assert!(App::is_ctrl_help_key(KeyEvent::new(
+            KeyCode::Char('Q'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        )));
+    }
+
+    #[test]
+    fn ctrl_help_key_does_not_steal_plain_q_or_other_ctrl_keys() {
+        // 素の q はアプリ終了などに使うため横取りしない。
+        assert!(!App::is_ctrl_help_key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+        )));
+        // 旧割り当て（Ctrl+? / Ctrl+/）はもうヘルプを開かない。
+        assert!(!App::is_ctrl_help_key(KeyEvent::new(
+            KeyCode::Char('/'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(!App::is_ctrl_help_key(KeyEvent::new(
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL,
+        )));
+    }
+
+    fn app_for_help_scroll() -> (tokio::runtime::Runtime, App) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = ApiClient::new("t", "http://localhost").unwrap();
+        let mut app = App::new(client, rt.handle().clone());
+        app.show_help = true;
+        app.help_scroll = 5;
+        (rt, app)
+    }
+
+    #[test]
+    fn help_scroll_moves_with_arrow_and_page_keys_while_open() {
+        let (_rt, mut app) = app_for_help_scroll();
+
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)))
+            .unwrap();
+        assert_eq!(app.help_scroll, 6);
+        assert!(app.show_help);
+
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)))
+            .unwrap();
+        assert_eq!(app.help_scroll, 5);
+
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::PageDown,
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+        assert_eq!(app.help_scroll, 15);
+
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)))
+            .unwrap();
+        assert_eq!(app.help_scroll, 0);
+    }
+
+    #[test]
+    fn help_scroll_does_not_underflow_at_top() {
+        let (_rt, mut app) = app_for_help_scroll();
+        app.help_scroll = 0;
+
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)))
+            .unwrap();
+        assert_eq!(app.help_scroll, 0);
+    }
+
+    #[test]
+    fn help_close_keys_still_close_overlay_and_scroll_resets_next_open() {
+        let (_rt, mut app) = app_for_help_scroll();
+
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+            .unwrap();
+        assert!(!app.show_help);
+
+        // 素の '?' で再度開くとスクロールは先頭へ戻る。
+        app.handle_normal(KeyCode::Char('?'));
+        assert!(app.show_help);
+        assert_eq!(app.help_scroll, 0);
+    }
+}
+
+#[cfg(test)]
+mod codex_turn_key_tests {
+    use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn modified_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    fn app_with_codex_turns(scrollback: usize) -> (tokio::runtime::Runtime, App) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = ApiClient::new("t", "http://localhost").unwrap();
+        let mut app = App::new(client, rt.handle().clone());
+        let mut pane = CodexPane::test_with_output(6, 80, 0, "");
+        pane.finished = false;
+        pane.test_add_completed_turn("first response");
+        pane.test_add_completed_turn("second response");
+        pane.scrollback = scrollback;
+        app.active_pane = ActivePane::Codex;
+        app.codex = Some(pane);
+        (rt, app)
+    }
+
+    fn app_with_codex_history() -> (tokio::runtime::Runtime, App) {
+        app_with_codex_turns(1)
+    }
+
+    fn app_with_codex_live_input() -> (tokio::runtime::Runtime, App) {
+        app_with_codex_turns(0)
+    }
+
+    #[test]
+    fn history_enter_toggles_visible_turn_without_submitting_input() {
+        let (_rt, mut app) = app_with_codex_history();
+
+        app.handle_codex_key(key(KeyCode::Enter));
+
+        let pane = app.codex.as_ref().unwrap();
+        assert_eq!(pane.input_line(), "");
+        assert_eq!(pane.collapsed_turn_count(), 1);
+    }
+
+    #[test]
+    fn history_plain_digit_returns_to_live_and_types_without_turn_shortcut() {
+        let (_rt, mut app) = app_with_codex_history();
+
+        app.handle_codex_key(key(KeyCode::Char('1')));
+
+        let pane = app.codex.as_ref().unwrap();
+        assert_eq!(pane.input_line(), "1");
+        assert_eq!(pane.collapsed_turn_count(), 0);
+    }
+
+    #[test]
+    fn live_empty_enter_toggles_latest_turn_without_submitting_input() {
+        let (_rt, mut app) = app_with_codex_live_input();
+
+        app.handle_codex_key(key(KeyCode::Enter));
+
+        let pane = app.codex.as_ref().unwrap();
+        assert_eq!(pane.input_line(), "");
+        assert_eq!(pane.collapsed_turn_count(), 1);
+    }
+
+    #[test]
+    fn live_empty_space_toggles_latest_turn_without_typing_space() {
+        let (_rt, mut app) = app_with_codex_live_input();
+
+        app.handle_codex_key(key(KeyCode::Char(' ')));
+
+        let pane = app.codex.as_ref().unwrap();
+        assert_eq!(pane.input_line(), "");
+        assert_eq!(pane.collapsed_turn_count(), 1);
+    }
+
+    #[test]
+    fn live_ctrl_o_toggles_latest_turn_without_typing() {
+        let (_rt, mut app) = app_with_codex_live_input();
+
+        app.handle_codex_key(modified_key(KeyCode::Char('o'), KeyModifiers::CONTROL));
+
+        let pane = app.codex.as_ref().unwrap();
+        assert_eq!(pane.input_line(), "");
+        assert_eq!(pane.collapsed_turn_count(), 1);
+    }
+
+    #[test]
+    fn f7_turn_picker_opens_and_enter_expands_selected_turn() {
+        let (_rt, mut app) = app_with_codex_live_input();
+        {
+            let pane = app.codex.as_mut().unwrap();
+            pane.toggle_old_turns_collapsed();
+        }
+
+        app.handle_codex_key(key(KeyCode::F(7)));
+        {
+            let pane = app.codex.as_ref().unwrap();
+            assert!(pane.turn_picker_open());
+            assert_eq!(pane.turn_picker_selected_turn(), Some(1));
+            assert_eq!(pane.collapsed_turn_count(), 2);
+        }
+
+        app.handle_codex_key(key(KeyCode::Enter));
+
+        let pane = app.codex.as_ref().unwrap();
+        assert!(pane.turn_picker_open());
+        assert_eq!(pane.collapsed_turn_count(), 1);
+        assert!(!pane.turn_picker_items()[0].collapsed);
+    }
+
+    #[test]
+    fn live_plain_digit_still_types_into_codex_prompt() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = ApiClient::new("t", "http://localhost").unwrap();
+        let mut app = App::new(client, rt.handle().clone());
+        let mut pane = CodexPane::test_with_output(6, 80, 0, "");
+        pane.finished = false;
+        app.active_pane = ActivePane::Codex;
+        app.codex = Some(pane);
+
+        app.handle_codex_key(key(KeyCode::Char('1')));
+
+        let pane = app.codex.as_ref().unwrap();
+        assert_eq!(pane.input_line(), "1");
+        assert_eq!(pane.collapsed_turn_count(), 0);
+    }
+}
+
+#[cfg(test)]
 mod codex_mouse_tests {
     use super::*;
 
@@ -4811,8 +5406,8 @@ mod codex_mouse_tests {
 mod dod_tests {
     use super::super::codex_memory::{
         CODEX_DECISION_LOG_END, CODEX_DECISION_LOG_START, CODEX_TRACEABILITY_END,
-        CODEX_TRACEABILITY_START, codex_trace_link_label, ensure_codex_memory_sections,
-        upsert_codex_auto_record,
+        CODEX_TRACEABILITY_START, CODEX_WORK_MEMO_END, CODEX_WORK_MEMO_START,
+        codex_trace_link_label, ensure_codex_memory_sections, upsert_codex_auto_record,
     };
     use super::{extract_json_object, is_permission_denied_error_text, parse_dod_results};
 
@@ -4882,13 +5477,15 @@ mod dod_tests {
     }
 
     #[test]
-    fn ensure_codex_memory_sections_adds_decision_and_trace_blocks_once() {
+    fn ensure_codex_memory_sections_adds_memory_decision_and_trace_blocks_once() {
         let first = ensure_codex_memory_sections("手書きメモ".to_string());
         let second = ensure_codex_memory_sections(first.clone());
 
         assert!(second.contains("手書きメモ"));
+        assert_eq!(second.matches("## Codex作業メモ").count(), 1);
         assert_eq!(second.matches("## Codex決定ログ").count(), 1);
         assert_eq!(second.matches("## PR/Release Traceability").count(), 1);
+        assert!(second.contains("Codexの通常memoryへ混ぜない"));
     }
 
     #[test]
@@ -4937,12 +5534,15 @@ mod dod_tests {
         let seeded = ensure_codex_memory_sections(String::new());
         // codex が body を編集して不可視マーカーだけ落とした状況を模す。
         let without_markers = seeded
+            .replace(CODEX_WORK_MEMO_START, "")
+            .replace(CODEX_WORK_MEMO_END, "")
             .replace(CODEX_DECISION_LOG_START, "")
             .replace(CODEX_DECISION_LOG_END, "")
             .replace(CODEX_TRACEABILITY_START, "")
             .replace(CODEX_TRACEABILITY_END, "");
         let again = ensure_codex_memory_sections(without_markers);
 
+        assert_eq!(again.matches("## Codex作業メモ").count(), 1);
         assert_eq!(again.matches("## Codex決定ログ").count(), 1);
         assert_eq!(again.matches("## PR/Release Traceability").count(), 1);
     }

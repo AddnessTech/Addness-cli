@@ -37,6 +37,10 @@ fn normalize_due_date(input: &str) -> Result<String> {
     Ok(format!("{}T00:00:00Z", date.format("%Y-%m-%d")))
 }
 
+fn should_fetch_child_related(json: bool, include_related: bool) -> bool {
+    json || include_related
+}
+
 fn related_fetch_error_message(errors: &[RelatedFetchError]) -> String {
     let details = errors
         .iter()
@@ -62,10 +66,6 @@ fn handle_related_fetch_errors(strict: bool, errors: Vec<RelatedFetchError>) -> 
         );
     }
     Ok(())
-}
-
-fn should_fetch_child_related(json: bool, include_related: bool) -> bool {
-    json || include_related
 }
 
 #[derive(Subcommand)]
@@ -457,6 +457,17 @@ mod tests {
     }
 
     #[test]
+    fn child_related_fetch_preserves_json_compatibility() {
+        assert!(should_fetch_child_related(true, false));
+    }
+
+    #[test]
+    fn child_related_fetch_for_human_output_requires_flag() {
+        assert!(should_fetch_child_related(false, true));
+        assert!(!should_fetch_child_related(false, false));
+    }
+
+    #[test]
     fn related_fetch_error_message_lists_each_failure() {
         let errors = vec![RelatedFetchError {
             kind: "deliverables",
@@ -480,17 +491,6 @@ mod tests {
 
         assert!(handle_related_fetch_errors(false, errors.clone()).is_ok());
         assert!(handle_related_fetch_errors(true, errors).is_err());
-    }
-
-    #[test]
-    fn child_related_fetch_preserves_json_compatibility() {
-        assert!(should_fetch_child_related(true, false));
-    }
-
-    #[test]
-    fn child_related_fetch_for_human_output_requires_flag() {
-        assert!(should_fetch_child_related(false, true));
-        assert!(!should_fetch_child_related(false, false));
     }
 }
 
@@ -677,9 +677,7 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
                 .iter()
                 .map(|g| g.id.as_str())
                 .collect::<Vec<_>>();
-
             let mut related_errors = Vec::new();
-
             let children_deliverables = if should_fetch_child_related(*json, *with_deliverable) {
                 if *strict_related_fetch {
                     let (map, errors) = client.get_deliverables_map_with_errors(&subtree_ids).await;
@@ -702,7 +700,7 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
             } else {
                 HashMap::new()
             };
-            handle_related_fetch_errors(true, related_errors)?;
+            handle_related_fetch_errors(*strict_related_fetch, related_errors)?;
 
             // 階層構造を構成
             let goal_tree = GoalNode::build_tree(

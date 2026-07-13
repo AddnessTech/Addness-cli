@@ -7,16 +7,18 @@ use ratatui::{
 };
 
 use serde_json::Value;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::Instant;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::agent::{
-    AgentKind, CODEX_LOG_PREFIX_WIDTH, ChildGoal, CodexDecisionKind, CodexLogKind, CodexLogLine,
-    CodexPane,
+    AgentKind, CODEX_LOG_PREFIX_WIDTH, ChildGoal, CodexDecisionKind, CodexListPickerAction,
+    CodexLogKind, CodexLogLine, CodexPane,
 };
 use super::app::{ActivePane, App, DeliverableFormField, FormField, ModalState};
 use super::goal_tree::{CommentView, TreeRow};
+use super::markdown::{self, MarkdownStyles};
 use crate::api::{DeliverableType, GoalStatus, Member, MemberId};
 
 const COLOR_TEXT: Color = Color::Rgb(220, 224, 230);
@@ -32,7 +34,9 @@ const COLOR_EVENT: Color = Color::Rgb(142, 150, 160);
 const COLOR_PANEL: Color = Color::Rgb(76, 84, 96);
 const COLOR_INPUT_BG: Color = Color::Rgb(27, 30, 36);
 const CODEX_TOOL_COMMAND_PREVIEW_WIDTH: usize = 56;
-const CODEX_EDIT_DIFF_PREVIEW_LINES: usize = 3;
+/// @メンションのファイル候補パレットで一度に表示する最大行数。
+const MENTION_PALETTE_VISIBLE_ROWS: usize = 10;
+const CODEX_EDIT_DIFF_PREVIEW_LINES: usize = 8;
 
 /// Replace @uuid mentions in text with @member_name
 fn replace_member_mentions(text: &str, members: &HashMap<MemberId, Member>) -> String {
@@ -818,14 +822,19 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
             .map(|c| c.is_turn_running())
             .unwrap_or(false);
         let hint = if finished {
-            " [c]コメント  [s]状態  [d]成果物(PR/Release)  [v]DoD判定  Ctrl+Q:操作一覧  Esc/q:閉じる ".to_string()
+            " [c]コメント  [s]状態  [d]成果物(PR/Release)  [v]DoD判定  ?/Ctrl+Q:操作一覧  Esc/q:閉じる ".to_string()
         } else if running {
             format!(
                 " {name} 実行中  |  Ctrl-T:表示切替  |  F7:turn一覧  |  入力+Enter:次ターン予約  |  Ctrl-C:中断 "
             )
         } else {
+            let fkeys = if kind == AgentKind::ClaudeCode {
+                "F2-F4:設定  |  F6:差分"
+            } else {
+                "F2-F6:設定/差分"
+            };
             format!(
-                " 入力してEnterで{name}へ送信  |  Ctrl-T:表示切替  |  F7:turn一覧  |  F2-F6:設定/差分  |  Ctrl+Q:操作一覧 "
+                " 入力してEnterで{name}へ送信  |  Ctrl-T:表示切替  |  F7:turn一覧  |  {fkeys}  |  ?/Ctrl+Q:操作一覧 "
             )
         };
         let status = Paragraph::new(Line::from(Span::styled(
@@ -1020,7 +1029,7 @@ fn draw_help_overlay(frame: &mut Frame, app: &mut App) {
         kv("起動", "選択ゴールの文脈付きでcodexをペイン起動"),
         kv(
             "claude code連携",
-            "o →「claude codeで作業」で同様にペイン起動（F4=permission-mode、F5は未対応）",
+            "o →「claude codeで作業」で同様にペイン起動（権限はF4=permission-modeで切替。F5のsandboxは使わない）",
         ),
         kv("F2 / F3", "モデル / 推論強度を切替"),
         kv("F4 / F5", "承認モード / sandboxを切替"),
@@ -1090,7 +1099,10 @@ fn draw_codex_help_overlay(frame: &mut Frame, app: &mut App) {
 
     let mut lines: Vec<Line> = vec![
         section(&format!("{name} in Addness")),
-        kv("Ctrl+Q", "この操作一覧を表示 / 閉じる"),
+        kv(
+            "? / Ctrl+Q",
+            "この操作一覧を表示 / 閉じる（? は入力欄が空のとき）",
+        ),
         kv(
             "入力 + Enter",
             &format!("{name}へ依頼を送信（必要ならAddnessを参照）"),
@@ -1117,6 +1129,10 @@ fn draw_codex_help_overlay(frame: &mut Frame, app: &mut App) {
             &format!("ポインタ下の{name}履歴 / Addness枠をスクロール"),
         ),
         kv("↑↓ / PgUp/PgDn", &format!("{name}履歴をスクロール")),
+        kv(
+            "Ctrl+↑ / Ctrl+↓",
+            &format!("入力中でも{name}履歴を1行スクロール（↑は履歴呼び戻し）"),
+        ),
         kv("Home / End", "履歴先頭 / 最新へ移動"),
         kv("Ctrl-T", "表示を 会話 / 実行 / 失敗 / 全部 で切替"),
         kv("Ctrl-F", "履歴検索を開始"),
@@ -1149,7 +1165,12 @@ fn draw_codex_help_overlay(frame: &mut Frame, app: &mut App) {
                 "/ 入力",
                 "コマンド候補を入力欄の上に表示（Tab補完 / ↑↓選択）",
             ),
-            kv("/sessions [N]", "Claude Codeセッション候補を番号付きで表示"),
+            kv("/sessions [N]", "Claude Codeセッション候補を一覧から選択"),
+            kv(
+                "/resume [N|id]",
+                "セッションを一覧から選んで再開（f: fork）",
+            ),
+            kv("/resume-memo", "Addnessの作業メモ・決定ログから続きを再開"),
             kv("/resume-last [prompt]", "最新セッションを --resume で継続"),
             kv("/resume-last-all", "cwd外も含めて最新セッションを継続"),
             kv(
@@ -1180,7 +1201,12 @@ fn draw_codex_help_overlay(frame: &mut Frame, app: &mut App) {
                 "/ 入力",
                 "コマンド候補を入力欄の上に表示（Tab補完 / ↑↓選択）",
             ),
-            kv("/sessions [N]", "Codex session候補を番号付きで表示"),
+            kv("/sessions [N]", "Codex session候補を一覧から選択"),
+            kv(
+                "/resume [N|id]",
+                "セッションを一覧から選んで再開（f: fork）",
+            ),
+            kv("/resume-memo", "Addnessの作業メモ・決定ログから続きを再開"),
             kv(
                 "/codex-resume <args>",
                 "root codex resumeをno-alt-screenで実行",
@@ -1283,16 +1309,24 @@ fn draw_codex_help_overlay(frame: &mut Frame, app: &mut App) {
             section("claude code options for next turn"),
             kv("/settings", "モデル・effort・permission-mode設定を表示"),
             kv("/cd <dir>", "次の新規セッションの作業ルートを変更"),
-            kv("/model [name]", "モデルを切替 / 任意のmodel名を直接指定"),
+            kv(
+                "/model [name]",
+                "モデルを一覧から選択 / 任意のmodel名を直接指定",
+            ),
             kv(
                 "/reasoning|/effort [level]",
-                "effortを切替 / low, medium等を直接指定",
+                "effortを一覧から選択 / low, medium等を直接指定",
             ),
             kv(
                 "/permissions|/approval [mode]",
-                "permission-modeを切替または直接指定",
+                "permission-modeを一覧から選択または直接指定",
             ),
             kv("/add-dir <path>", "追加の書込許可ディレクトリを渡す"),
+            kv(
+                "/image <path>",
+                "画像を次ターンへ添付（list/clear/remove N）",
+            ),
+            kv("/attachments", "画像添付と追加dirを一覧・追加・クリア"),
             blank(),
         ]);
     } else {
@@ -1300,14 +1334,17 @@ fn draw_codex_help_overlay(frame: &mut Frame, app: &mut App) {
             section("codex options for next turn"),
             kv("/settings", "モデル・推論・承認・sandbox設定を表示"),
             kv("/cd <dir>", "次の新規Codexセッションの作業ルートを変更"),
-            kv("/model [name]", "モデルを切替 / 任意のmodel名を直接指定"),
+            kv(
+                "/model [name]",
+                "モデルを一覧から選択 / 任意のmodel名を直接指定",
+            ),
             kv(
                 "/reasoning [effort]",
-                "推論強度を切替 / low, medium等を直接指定",
+                "推論強度を一覧から選択 / low, medium等を直接指定",
             ),
             kv(
                 "/approval|/approvals / /sandbox",
-                "承認モード / sandboxを切替または直接指定",
+                "承認モード / sandboxを一覧から選択または直接指定",
             ),
             kv("/permissions", "承認/sandbox権限を表示・変更"),
             kv(
@@ -2807,15 +2844,22 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
             )
         } else if pane.is_turn_running() {
             (
-                format!(" {name} 実行中 — F7:turn一覧  Ctrl-T:表示切替  F6:差分  Ctrl-C:中断 "),
+                format!(
+                    " {name} 実行中 — F7:turn一覧  Ctrl-T:表示切替  F6:差分  Ctrl+↑↓:スクロール  Ctrl-C:中断 "
+                ),
                 COLOR_WARN,
             )
         } else if pane.scrollback > 0 {
             (format!(" {name} 履歴表示 — Esc: 最新へ戻る "), COLOR_PANEL)
         } else {
+            let fkeys = if pane.kind() == AgentKind::ClaudeCode {
+                "F2-F4:設定  F6:差分"
+            } else {
+                "F2-F6:設定/差分"
+            };
             (
                 format!(
-                    " {name} 入力待ち — F7:turn一覧  Ctrl-T:表示切替  F2-F6:設定/差分  F9:再開 "
+                    " {name} 入力待ち — F7:turn一覧  Ctrl-T:表示切替  Ctrl+↑↓:スクロール  {fkeys}  F9:再開 "
                 ),
                 COLOR_PANEL,
             )
@@ -2828,7 +2872,69 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
         if pane.turn_picker_open() {
             draw_codex_turn_picker(frame, term_area, pane);
         }
+        if pane.list_picker_open() {
+            draw_codex_list_picker(frame, term_area, pane);
+        }
     }
+}
+
+/// 汎用リストピッカー（モデル・reasoning・approval・sandbox・セッション選択）の
+/// ボトム中央モーダル。turn ピッカーと同じ配置・配色で、選択行に `>`、現在値に `*` を出す。
+fn draw_codex_list_picker(frame: &mut Frame, area: Rect, pane: &CodexPane) {
+    let Some(picker) = pane.list_picker() else {
+        return;
+    };
+    let height = (picker.items.len() as u16 + 2).clamp(5, area.height.saturating_sub(2).max(5));
+    let picker_area = bottom_rect(82, height, 2, area);
+    clear_modal_area(frame, picker_area);
+
+    let hints = if picker.action == CodexListPickerAction::ResumeSession {
+        " ↑↓/jk: 選択 | Enter: 確定 | f: fork | Esc/q: 閉じる "
+    } else {
+        " ↑↓/jk: 選択 | Enter: 確定 | Esc/q: 閉じる "
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLOR_CODEX))
+        .title(picker.title.clone())
+        .title_bottom(Line::from(hints).style(Style::default().fg(COLOR_MUTED)));
+    let inner = block.inner(picker_area);
+    frame.render_widget(block, picker_area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // 候補が表示高さを超える場合は、選択行が見えるようにウィンドウをずらす。
+    let visible = inner.height as usize;
+    let start = picker
+        .selected
+        .saturating_sub(visible.saturating_sub(1))
+        .min(picker.items.len().saturating_sub(visible));
+    let mut lines = Vec::new();
+    for (index, item) in picker.items.iter().enumerate().skip(start).take(visible) {
+        let selected = index == picker.selected;
+        let marker = if selected { ">" } else { " " };
+        let current = if item.current { "*" } else { " " };
+        let style = if selected {
+            Style::default()
+                .fg(COLOR_TEXT_STRONG)
+                .add_modifier(Modifier::BOLD)
+        } else if item.current {
+            Style::default().fg(COLOR_SUCCESS)
+        } else {
+            Style::default().fg(COLOR_TEXT)
+        };
+        let text = if item.detail.is_empty() {
+            format!("{marker} [{current}] {}", item.label)
+        } else {
+            format!("{marker} [{current}] {}  {}", item.label, item.detail)
+        };
+        lines.push(Line::from(Span::styled(
+            ellipsize_width(&text, inner.width as usize),
+            style,
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_codex_turn_picker(frame: &mut Frame, area: Rect, pane: &CodexPane) {
@@ -2939,12 +3045,14 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
     let (history_lines, total_history_lines) = if let Some(diff) = diff_view.as_deref() {
         codex_visible_diff_lines(diff, history_width, pane.scrollback, history_height)
     } else {
+        let streaming_line = pane.streaming_assistant_line();
         let filtered_log = pane.filtered_log_lines();
         codex_visible_log_lines(
             &filtered_log,
             history_width,
             pane.scrollback,
             history_height,
+            streaming_line,
         )
     };
     pane.sync_rendered_history_metrics(total_history_lines, history_height);
@@ -3051,10 +3159,95 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
         ));
     }
 
-    // 入力が `/xxx` のとき、入力欄の直上にスラッシュコマンドパレットを重ねる。
+    // 入力が `/xxx` のときはスラッシュコマンドパレット、`@xxx` のときは
+    // ファイル候補パレットを入力欄の直上に重ねる（両立しない）。
     if pane.slash_palette_active() {
         draw_codex_slash_palette(frame, input_chunk, history_chunk, pane);
+    } else if pane.mention_palette_active() {
+        draw_codex_mention_palette(frame, input_chunk, history_chunk, pane);
     }
+}
+
+/// 入力欄の直上に、現在の `@` 入力に一致するファイル候補を表示する。
+fn draw_codex_mention_palette(
+    frame: &mut Frame,
+    input_chunk: Rect,
+    history_chunk: Rect,
+    pane: &CodexPane,
+) {
+    let suggestions = pane.mention_palette_suggestions();
+    if suggestions.is_empty() {
+        return;
+    }
+    let total = suggestions.len();
+    let selected = pane.mention_palette_selected();
+
+    let avail = history_chunk.height as usize;
+    if avail < 3 {
+        return;
+    }
+    let rows = total.min(MENTION_PALETTE_VISIBLE_ROWS).min(avail - 2);
+    if rows == 0 {
+        return;
+    }
+    let start = if selected >= rows {
+        selected + 1 - rows
+    } else {
+        0
+    };
+    let end = (start + rows).min(total);
+
+    let ph = (rows + 2) as u16;
+    let area = Rect {
+        x: input_chunk.x,
+        y: input_chunk.y.saturating_sub(ph),
+        width: input_chunk.width,
+        height: ph,
+    };
+
+    clear_modal_area(frame, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLOR_CODEX))
+        .style(Style::default().bg(COLOR_INPUT_BG))
+        .title(Span::styled(
+            format!(" @ ファイル  {total}件 "),
+            Style::default().fg(COLOR_CODEX),
+        ))
+        .title_bottom(
+            Line::from(" Tab/Enter:確定  ↑↓:選択  Esc:消す ")
+                .style(Style::default().fg(COLOR_MUTED)),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let lines: Vec<Line> = (start..end)
+        .map(|i| {
+            let candidate = &suggestions[i];
+            let is_sel = i == selected;
+            let (marker, name_style) = if is_sel {
+                (
+                    "▸ ",
+                    Style::default()
+                        .fg(COLOR_TEXT_STRONG)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                ("  ", Style::default().fg(COLOR_TEXT))
+            };
+            let icon = if candidate.is_dir { "📁 " } else { "📄 " };
+            Line::from(vec![
+                Span::styled(marker, name_style),
+                Span::styled(icon, Style::default().fg(COLOR_MUTED)),
+                Span::styled(candidate.display.clone(), name_style),
+            ])
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(COLOR_INPUT_BG)),
+        inner,
+    );
 }
 
 /// 入力欄の直上に、現在の `/` 入力に一致するスラッシュコマンド候補を表示する。
@@ -3152,7 +3345,11 @@ struct CodexInputVisualLine {
     end: usize,
 }
 
-fn codex_input_panel_height(pane: &CodexPane, inner_width: u16, inner_height: u16) -> u16 {
+pub(crate) fn codex_input_panel_height(
+    pane: &CodexPane,
+    inner_width: u16,
+    inner_height: u16,
+) -> u16 {
     let base = if inner_height >= 4 { 2 } else { 1 };
     if pane.decision_banner().is_some() {
         let height = if inner_height >= 14 {
@@ -3538,6 +3735,9 @@ fn codex_header_lines(pane: &CodexPane, max_width: usize, max_rows: usize) -> Ve
         format!("Turn {}", pane.turn_count()),
         format!("表示:{}", pane.log_filter_label()),
     ];
+    if let Some(usage) = pane.usage_header_label() {
+        parts.push(usage);
+    }
     if pane.collapsed_turn_count() > 0 {
         parts.push(format!("格納{}", pane.collapsed_turn_count()));
     }
@@ -3702,7 +3902,11 @@ struct RenderedCodexLine {
     line: Line<'static>,
 }
 
-fn codex_log_lines(lines: &[&CodexLogLine], max_width: usize) -> Vec<RenderedCodexLine> {
+fn codex_log_lines(
+    lines: &[&CodexLogLine],
+    max_width: usize,
+    streaming: Option<&CodexLogLine>,
+) -> Vec<RenderedCodexLine> {
     lines
         .iter()
         .flat_map(|line| {
@@ -3710,10 +3914,17 @@ fn codex_log_lines(lines: &[&CodexLogLine], max_width: usize) -> Vec<RenderedCod
             if line.kind == CodexLogKind::Turn {
                 rendered.push(codex_separator_line(line.kind, max_width));
             }
-            rendered.extend(codex_log_entry_lines(line, max_width));
+            rendered.extend(codex_log_entry_lines(line, max_width, streaming));
             rendered
         })
         .collect()
+}
+
+/// assistant 行を Markdown 整形して描画すべきか判定する。
+/// ストリーミング中（未完成）の行はプレーン表示のままとする。
+fn is_completed_assistant(line: &CodexLogLine, streaming: Option<&CodexLogLine>) -> bool {
+    line.kind == CodexLogKind::Assistant
+        && !streaming.is_some_and(|current| std::ptr::eq(current, line))
 }
 
 fn codex_visible_log_lines(
@@ -3721,6 +3932,7 @@ fn codex_visible_log_lines(
     max_width: usize,
     scrollback: usize,
     viewport_height: usize,
+    streaming: Option<&CodexLogLine>,
 ) -> (Vec<RenderedCodexLine>, usize) {
     if lines.is_empty() || viewport_height == 0 {
         return (Vec::new(), 0);
@@ -3728,7 +3940,7 @@ fn codex_visible_log_lines(
 
     let counts = lines
         .iter()
-        .map(|line| codex_log_line_rendered_count(line, max_width))
+        .map(|line| codex_log_line_rendered_count(line, max_width, streaming))
         .collect::<Vec<_>>();
     let total = counts.iter().sum::<usize>();
     let max_scrollback = total.saturating_sub(viewport_height);
@@ -3751,7 +3963,7 @@ fn codex_visible_log_lines(
     let selected_start = selected_start.unwrap_or(view_start);
     let skip = view_start.saturating_sub(selected_start);
     let take = view_end.saturating_sub(view_start);
-    let visible = codex_log_lines(&selected, max_width)
+    let visible = codex_log_lines(&selected, max_width, streaming)
         .into_iter()
         .skip(skip)
         .take(take)
@@ -3835,9 +4047,71 @@ fn codex_diff_line_style(line: &str) -> Style {
     }
 }
 
-fn codex_log_line_rendered_count(line: &CodexLogLine, max_width: usize) -> usize {
+/// 完成済み assistant 行の Markdown 描画結果キャッシュ。
+/// キーは（テキスト内容のハッシュ, 折り返し幅）。ストリーミング中は 20ms ごとに全画面を
+/// 再描画するため、完成済み行を毎フレーム再パースすると CPU を浪費する。行数カウントと
+/// 実描画が同一のキャッシュ結果を参照することで「カウント＝描画行数」不変条件も保たれる。
+/// 幅変更（リサイズ）時はキー不一致となり自然に再計算される。
+const ASSISTANT_MD_CACHE_MAX: usize = 4096;
+
+/// 1 メッセージ分の Markdown 描画結果（視覚行ごとのスパン列）。
+type RenderedMarkdown = Vec<Vec<Span<'static>>>;
+
+thread_local! {
+    static ASSISTANT_MD_CACHE: RefCell<HashMap<(u64, usize), RenderedMarkdown>> =
+        RefCell::new(HashMap::new());
+}
+
+fn hash_markdown_text(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// 完成済み assistant テキストの Markdown 描画結果をキャッシュ経由で得て、`f` に渡す。
+/// 未キャッシュならレンダリングして格納する（サイズ上限超過時は一括クリア）。
+fn with_cached_assistant_markdown<R>(
+    text: &str,
+    content_width: usize,
+    f: impl FnOnce(&[Vec<Span<'static>>]) -> R,
+) -> R {
+    let key = (hash_markdown_text(text), content_width);
+    ASSISTANT_MD_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if !cache.contains_key(&key) {
+            let rendered =
+                markdown::render_assistant_markdown(text, content_width, &codex_markdown_styles());
+            if cache.len() >= ASSISTANT_MD_CACHE_MAX {
+                cache.clear();
+            }
+            cache.insert(key, rendered);
+        }
+        f(cache.get(&key).expect("just inserted"))
+    })
+}
+
+/// 完成済み assistant 行の描画行数（キャッシュ利用）。返り値は必ず 1 以上。
+fn cached_assistant_markdown_count(text: &str, content_width: usize) -> usize {
+    with_cached_assistant_markdown(text, content_width, |lines| lines.len().max(1))
+}
+
+/// 完成済み assistant 行の描画スパン列（キャッシュ利用）。呼び出し側で所有権が必要なので複製する。
+fn cached_assistant_markdown_lines(text: &str, content_width: usize) -> Vec<Vec<Span<'static>>> {
+    with_cached_assistant_markdown(text, content_width, |lines| lines.to_vec())
+}
+
+fn codex_log_line_rendered_count(
+    line: &CodexLogLine,
+    max_width: usize,
+    streaming: Option<&CodexLogLine>,
+) -> usize {
     let separator = usize::from(line.kind == CodexLogKind::Turn);
     let content_width = max_width.saturating_sub(CODEX_LOG_PREFIX_WIDTH).max(1);
+    if is_completed_assistant(line, streaming) {
+        // 描画（codex_log_entry_lines）と同じキャッシュ結果を参照して行数を数え、整合させる。
+        return separator + cached_assistant_markdown_count(&line.text, content_width);
+    }
     separator + wrapped_log_line_count(&codex_log_display_text(line), content_width)
 }
 
@@ -3860,10 +4134,17 @@ fn codex_separator_line(kind: CodexLogKind, max_width: usize) -> RenderedCodexLi
     }
 }
 
-fn codex_log_entry_lines(line: &CodexLogLine, max_width: usize) -> Vec<RenderedCodexLine> {
+fn codex_log_entry_lines(
+    line: &CodexLogLine,
+    max_width: usize,
+    streaming: Option<&CodexLogLine>,
+) -> Vec<RenderedCodexLine> {
     let (prefix, prefix_style, text_style) = codex_log_prefix(line);
     let continuation = "     | ";
     let content_width = max_width.saturating_sub(CODEX_LOG_PREFIX_WIDTH).max(1);
+    if is_completed_assistant(line, streaming) {
+        return codex_assistant_markdown_lines(&line.text, content_width, prefix, prefix_style);
+    }
     let text = codex_log_display_text(line);
     let is_edit_tool = matches!(line.kind, CodexLogKind::Tool) && line.text.starts_with("EDIT ");
     let wrapped = wrap_log_text(&text, content_width);
@@ -3889,6 +4170,62 @@ fn codex_log_entry_lines(line: &CodexLogLine, max_width: usize) -> Vec<RenderedC
         ));
         lines.push(RenderedCodexLine {
             line: Line::from(spans),
+        });
+    }
+    lines
+}
+
+/// assistant メッセージのテーマ配色。
+fn codex_markdown_styles() -> MarkdownStyles {
+    MarkdownStyles {
+        text: Style::default().fg(COLOR_TEXT),
+        heading: Style::default()
+            .fg(COLOR_ADDNESS)
+            .add_modifier(Modifier::BOLD),
+        strong: Style::default()
+            .fg(COLOR_TEXT_STRONG)
+            .add_modifier(Modifier::BOLD),
+        emphasis: Style::default()
+            .fg(COLOR_TEXT)
+            .add_modifier(Modifier::ITALIC),
+        inline_code: Style::default().fg(COLOR_WARN).bg(COLOR_INPUT_BG),
+        code_block: Style::default().fg(COLOR_TEXT).bg(COLOR_INPUT_BG),
+        code_label: Style::default().fg(COLOR_MUTED),
+        quote: Style::default()
+            .fg(COLOR_MUTED)
+            .add_modifier(Modifier::ITALIC),
+        quote_marker: Style::default().fg(COLOR_PANEL),
+        list_marker: Style::default()
+            .fg(COLOR_ADDNESS)
+            .add_modifier(Modifier::BOLD),
+        rule: Style::default().fg(COLOR_PANEL),
+        link: Style::default()
+            .fg(COLOR_ADDNESS)
+            .add_modifier(Modifier::UNDERLINED),
+    }
+}
+
+/// 完成済み assistant メッセージを Markdown 整形し、プレフィックス列付きの
+/// 描画行に変換する。折り返しは `render_assistant_markdown` 側で実施済み。
+fn codex_assistant_markdown_lines(
+    text: &str,
+    content_width: usize,
+    prefix: &'static str,
+    prefix_style: Style,
+) -> Vec<RenderedCodexLine> {
+    let continuation = "     | ";
+    let content_lines = cached_assistant_markdown_lines(text, content_width);
+    let mut lines = Vec::with_capacity(content_lines.len().max(1));
+    for (idx, mut spans) in content_lines.into_iter().enumerate() {
+        let (prefix_text, marker_style) = if idx == 0 {
+            (prefix, prefix_style)
+        } else {
+            (continuation, Style::default().fg(COLOR_PANEL))
+        };
+        let mut line_spans = vec![Span::styled(prefix_text, marker_style)];
+        line_spans.append(&mut spans);
+        lines.push(RenderedCodexLine {
+            line: Line::from(line_spans),
         });
     }
     lines
@@ -4446,9 +4783,9 @@ fn json_output_summary(output: &str) -> Option<String> {
 }
 
 fn codex_runtime_status(pane: &CodexPane, max_width: usize) -> String {
-    let state = pane.run_state().label();
+    let state = pane.run_state_elapsed_label();
     let view = format!("表示:{} Ctrl-Tで切替", pane.log_filter_label());
-    let fixed_width = UnicodeWidthStr::width(state)
+    let fixed_width = UnicodeWidthStr::width(state.as_str())
         .saturating_add(UnicodeWidthStr::width(view.as_str()))
         .saturating_add(8);
     let detail = codex_current_activity_label(pane, max_width.saturating_sub(fixed_width));
@@ -4470,8 +4807,14 @@ fn codex_current_activity_label(pane: &CodexPane, max_width: usize) -> String {
                 .current_command_elapsed_secs()
                 .map(|secs| format!(" {secs}s"))
                 .unwrap_or_default();
+            // 常駐 codex の実行中コマンドは末尾のライブ出力行を薄く添える。
+            let live = pane
+                .codex_appserver_live_output()
+                .last()
+                .map(|line| format!(" › {line}"))
+                .unwrap_or_default();
             format!(
-                "{}{elapsed}{input_hint}",
+                "{}{elapsed}{live}{input_hint}",
                 codex_command_activity_summary(command)
             )
         } else if let Some(action) = pane.action.as_deref() {
@@ -4733,7 +5076,7 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
         ]),
         Line::from(vec![
             Span::styled("状態 ", Style::default().fg(COLOR_MUTED)),
-            Span::styled(run_state.label(), state_style),
+            Span::styled(pane.run_state_elapsed_label(), state_style),
             Span::styled(
                 format!("  Turn {}", pane.turn_count()),
                 Style::default().fg(COLOR_MUTED),
@@ -4800,6 +5143,21 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
             ),
             Span::styled(assistant, assistant_style),
         ]));
+    }
+    // 実行中コマンドのライブ出力（末尾最大3行）を薄色ブロックで添える。
+    // コマンド完了で消え、確定した Tool 行だけがログに残る。
+    let live_output = pane.codex_appserver_live_output();
+    if pane.current_command().is_some() && !live_output.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "実行中の出力",
+            Style::default().fg(COLOR_MUTED),
+        )));
+        for out_line in &live_output {
+            lines.push(Line::from(Span::styled(
+                ellipsize_width(&format!("  {out_line}"), prompt_width),
+                Style::default().fg(COLOR_MUTED),
+            )));
+        }
     }
     lines.push(Line::from(""));
     lines.extend(codex_dashboard_shortcut_lines(prompt_width));
@@ -4954,13 +5312,14 @@ fn ellipsize_width(text: &str, max_width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivePane, App, COLOR_DANGER, COLOR_EVENT, COLOR_SUCCESS, COLOR_WARN,
-        codex_activity_lines, codex_child_goal_lines, codex_dashboard_shortcut_lines,
-        codex_decision_choice_line, codex_decision_input_lines, codex_decision_title_hint,
-        codex_diff_lines, codex_header_line, codex_header_lines, codex_input_prompt_render,
-        codex_log_entry_lines, codex_log_lines, codex_runtime_status, codex_visible_log_lines,
-        codex_work_label, draw_status_bar, ellipsize_width, prompt_preview,
-        summarize_tool_display_text,
+        ActivePane, App, CODEX_EDIT_DIFF_PREVIEW_LINES, COLOR_DANGER, COLOR_EVENT, COLOR_SUCCESS,
+        COLOR_WARN, cached_assistant_markdown_count, cached_assistant_markdown_lines,
+        code_edit_diff_preview, codex_activity_lines, codex_child_goal_lines,
+        codex_dashboard_shortcut_lines, codex_decision_choice_line, codex_decision_input_lines,
+        codex_decision_title_hint, codex_diff_lines, codex_header_line, codex_header_lines,
+        codex_input_prompt_render, codex_log_entry_lines, codex_log_lines, codex_markdown_styles,
+        codex_runtime_status, codex_visible_log_lines, codex_work_label, draw_status_bar,
+        ellipsize_width, markdown, prompt_preview, summarize_tool_display_text,
     };
     use crate::api::ApiClient;
     use crate::tui::agent::{
@@ -4969,7 +5328,7 @@ mod tests {
     };
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::style::Modifier;
-    use ratatui::text::Line;
+    use ratatui::text::{Line, Span};
     use ratatui::{Terminal, backend::TestBackend};
     use std::time::Instant;
     use unicode_width::UnicodeWidthStr;
@@ -5027,7 +5386,7 @@ mod tests {
             text: "abcdef".to_string(),
         };
 
-        let lines = codex_log_entry_lines(&entry, CODEX_LOG_PREFIX_WIDTH + 3);
+        let lines = codex_log_entry_lines(&entry, CODEX_LOG_PREFIX_WIDTH + 3, None);
 
         assert_eq!(lines.len(), 2);
         assert_eq!(line_text(&lines[0].line), "返答 | abc");
@@ -5041,7 +5400,7 @@ mod tests {
             text: "exec_command_end (exit 1): cargo test\nfailed".to_string(),
         };
 
-        let lines = codex_log_entry_lines(&entry, 80);
+        let lines = codex_log_entry_lines(&entry, 80, None);
 
         assert_eq!(line_text(&lines[0].line), "失敗 | • 実行: cargo test");
         assert_eq!(line_text(&lines[1].line), "     |   └ テスト: 失敗");
@@ -5055,7 +5414,7 @@ mod tests {
             kind: CodexLogKind::Tool,
             text: "RUNNING cargo test".to_string(),
         };
-        let running_lines = codex_log_entry_lines(&running, 80);
+        let running_lines = codex_log_entry_lines(&running, 80, None);
         assert_eq!(running_lines[0].line.spans[1].content.as_ref(), "•");
         assert_eq!(running_lines[0].line.spans[1].style.fg, Some(COLOR_WARN));
 
@@ -5063,7 +5422,7 @@ mod tests {
             kind: CodexLogKind::Tool,
             text: "exec_command_end (exit 0): cargo test\nok".to_string(),
         };
-        let ok_lines = codex_log_entry_lines(&ok, 80);
+        let ok_lines = codex_log_entry_lines(&ok, 80, None);
         assert_eq!(ok_lines[0].line.spans[1].content.as_ref(), "•");
         assert_eq!(ok_lines[0].line.spans[1].style.fg, Some(COLOR_SUCCESS));
     }
@@ -5078,7 +5437,7 @@ mod tests {
             ),
         };
 
-        let lines = codex_log_entry_lines(&entry, 240);
+        let lines = codex_log_entry_lines(&entry, 240, None);
         let rendered = lines
             .iter()
             .map(|line| line_text(&line.line))
@@ -5101,7 +5460,7 @@ mod tests {
             text: "EDIT *** Begin Patch\n*** Update File: src/tui/ui.rs\n@@\n-old line\n+new line\n*** End Patch".to_string(),
         };
 
-        let lines = codex_log_entry_lines(&entry, 80);
+        let lines = codex_log_entry_lines(&entry, 80, None);
 
         assert_eq!(line_text(&lines[0].line), "編集 | 更新: src/tui/ui.rs");
         assert_eq!(line_text(&lines[1].line), "     | @@");
@@ -5114,6 +5473,22 @@ mod tests {
                 .style
                 .add_modifier
                 .contains(Modifier::DIM)
+        );
+    }
+
+    #[test]
+    fn code_edit_diff_preview_caps_and_reports_omitted() {
+        let mut text = String::from("*** Update File: big.rs\n");
+        for i in 0..20 {
+            text.push_str(&format!("+line{i}\n"));
+        }
+        let preview = code_edit_diff_preview(&text, CODEX_EDIT_DIFF_PREVIEW_LINES);
+        // 8 行までのプレビュー + 省略行。
+        assert_eq!(preview.len(), CODEX_EDIT_DIFF_PREVIEW_LINES + 1);
+        assert_eq!(preview[0], "+line0");
+        assert_eq!(
+            preview[CODEX_EDIT_DIFF_PREVIEW_LINES],
+            format!("... 差分行を{}行省略", 20 - CODEX_EDIT_DIFF_PREVIEW_LINES)
         );
     }
 
@@ -5392,7 +5767,7 @@ mod tests {
             kind: CodexLogKind::Tool,
             text: "exec_command_end (exit 0): cargo test\nok".to_string(),
         };
-        let lines = codex_log_entry_lines(&entry, 80);
+        let lines = codex_log_entry_lines(&entry, 80, None);
 
         assert!(
             !lines[0].line.spans[0]
@@ -5414,7 +5789,7 @@ mod tests {
             kind: CodexLogKind::Event,
             text: "waiting for approval".to_string(),
         };
-        let lines = codex_log_entry_lines(&entry, 80);
+        let lines = codex_log_entry_lines(&entry, 80, None);
 
         assert!(
             !lines[0].line.spans[0]
@@ -5430,7 +5805,7 @@ mod tests {
             kind: CodexLogKind::Event,
             text: "waiting for approval".to_string(),
         };
-        let lines = codex_log_entry_lines(&entry, 80);
+        let lines = codex_log_entry_lines(&entry, 80, None);
         let spans = &lines[0].line.spans;
 
         assert!(line_text(&lines[0].line).starts_with("     | "));
@@ -5449,7 +5824,7 @@ mod tests {
             kind: CodexLogKind::System,
             text: "Codex セッションを開始しました".to_string(),
         };
-        let lines = codex_log_entry_lines(&entry, 80);
+        let lines = codex_log_entry_lines(&entry, 80, None);
 
         assert!(line_text(&lines[0].line).starts_with("     | "));
         assert!(!line_text(&lines[0].line).starts_with("INFO | "));
@@ -5465,7 +5840,7 @@ mod tests {
             kind: CodexLogKind::Tool,
             text: "exec_command_begin: cargo test".to_string(),
         };
-        let lines = codex_log_lines(&[&turn, &tool], 24)
+        let lines = codex_log_lines(&[&turn, &tool], 24, None)
             .into_iter()
             .map(|line| line_text(&line.line))
             .collect::<Vec<_>>();
@@ -5484,8 +5859,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let refs = entries.iter().collect::<Vec<_>>();
-        let full = codex_log_lines(&refs, 40);
-        let (visible, total) = codex_visible_log_lines(&refs, 40, 3, 5);
+        let full = codex_log_lines(&refs, 40, None);
+        let (visible, total) = codex_visible_log_lines(&refs, 40, 3, 5, None);
 
         assert_eq!(total, full.len());
         let expected = full[full.len() - 8..full.len() - 3]
@@ -5497,6 +5872,39 @@ mod tests {
             .map(|line| line_text(&line.line))
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn assistant_markdown_cache_returns_same_result_on_hit() {
+        let text = "# 見出し\n\nこれは **強調** を含む段落です。\n\n- 項目1\n- 項目2";
+        let width = 24;
+        let plain = |lines: &[Vec<Span<'static>>]| {
+            lines
+                .iter()
+                .map(|spans: &Vec<Span<'static>>| {
+                    spans
+                        .iter()
+                        .map(|s| s.content.to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // 2 回呼んでも同一結果（キャッシュヒット）。
+        let first = cached_assistant_markdown_lines(text, width);
+        let second = cached_assistant_markdown_lines(text, width);
+        assert_eq!(plain(&first), plain(&second));
+
+        // カウントと描画行数が一致する（「カウント＝描画行数」不変条件）。
+        assert_eq!(cached_assistant_markdown_count(text, width), first.len());
+
+        // 直接レンダリングした結果とも行数が一致する。
+        let direct = markdown::render_assistant_markdown(text, width, &codex_markdown_styles());
+        assert_eq!(first.len(), direct.len());
+
+        // 幅が変わればキーが変わり、行数も再計算される（折り返しが変わる）。
+        let narrow = cached_assistant_markdown_lines(text, 8);
+        assert_eq!(cached_assistant_markdown_count(text, 8), narrow.len());
     }
 
     #[test]

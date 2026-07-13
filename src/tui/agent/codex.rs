@@ -98,7 +98,7 @@ impl CodexReasoningChoice {
         }
     }
 
-    fn config_value(self) -> Option<&'static str> {
+    pub(super) fn config_value(self) -> Option<&'static str> {
         match self {
             Self::Config => None,
             Self::Low => Some("low"),
@@ -150,7 +150,7 @@ impl CodexApprovalChoice {
         }
     }
 
-    fn cli_arg(self) -> Option<&'static str> {
+    pub(super) fn cli_arg(self) -> Option<&'static str> {
         match self {
             Self::Config => None,
             Self::Untrusted => Some("untrusted"),
@@ -196,7 +196,7 @@ impl CodexSandboxChoice {
         }
     }
 
-    fn cli_arg(self) -> &'static str {
+    pub(super) fn cli_arg(self) -> &'static str {
         self.label()
     }
 }
@@ -477,7 +477,7 @@ impl CodexExecSettings {
         self.model.label()
     }
 
-    fn model_cli_arg(&self) -> Option<&str> {
+    pub(super) fn model_cli_arg(&self) -> Option<&str> {
         self.model_override
             .as_deref()
             .or_else(|| self.model.cli_arg())

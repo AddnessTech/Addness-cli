@@ -6,13 +6,13 @@
 //! 2 ターン目以降は `codex exec resume <thread_id> --json` で同じ Codex セッションを
 //! 継続する。
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -21,7 +21,9 @@ use serde_json::Value;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 mod claude;
+mod claude_resident;
 mod codex;
+mod codex_appserver;
 
 use self::codex::{
     CodexApprovalChoice, CodexExecSettings, CodexLocalProviderChoice, CodexModelChoice,
@@ -54,9 +56,11 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/skills", "ローカル skill 一覧 / 使用依頼"),
     ("/new", "新しいセッションを開始"),
     ("/clear", "表示ログをクリア"),
+    ("/undo", "直近ターンのチェックポイントへ戻す"),
     ("/stop", "実行中のターンを中断"),
-    ("/sessions", "セッション候補を番号付きで表示"),
-    ("/resume", "作業メモ・決定ログから再開"),
+    ("/sessions", "セッション候補を一覧から選択"),
+    ("/resume", "セッションを選んで再開"),
+    ("/resume-memo", "Addnessの作業メモ・決定ログから続きを再開"),
     ("/resume-last", "最新セッションを継続"),
     ("/resume-session", "番号 / id のセッションを継続"),
     ("/fork", "セッションを fork"),
@@ -97,6 +101,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/logout", "ログアウトする"),
     ("/status", "現在の状態を表示"),
     ("/usage", "token 使用量を表示"),
+    ("/exit", "エージェントペインを終了する"),
     ("/help", "スラッシュコマンド一覧を表示"),
 ];
 
@@ -108,6 +113,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
 /// - `CodexExecSettings`（codex専用の `-c key=value` オーバーライドや `codex_home` 上の
 ///   セッション管理ファイル）にのみ作用し、ClaudeCode のターン起動引数
 ///   （`claude::exec_args` / `ClaudeExecSettings`）には一切反映されないもの
+///
+/// なお `/image`・`/attachments`・`/fork` は両バックエンドで共通の操作として扱えるよう
+/// ここから外してある（画像は `append_claude_image_paths` でプロンプトへ、`/fork` は
+/// dispatch で `/fork-last` / `/fork-session` へ委譲する）。
 const CODEX_ONLY_SLASH_COMMANDS: &[&str] = &[
     "/review",
     "/apply",
@@ -123,11 +132,8 @@ const CODEX_ONLY_SLASH_COMMANDS: &[&str] = &[
     "/theme",
     "/vim",
     "/personality",
-    "/image",
-    "/attachments",
     "/search",
     "/config",
-    "/fork",
     "/archive",
     "/rename",
 ];
@@ -142,6 +148,28 @@ const CLAUDE_SESSION_HISTORY_DIR: &str = "claude-sessions";
 const CODEX_SESSION_HISTORY_MAX_LOG_LINES: usize = 5_000;
 const CODEX_SESSION_HISTORY_MAX_RECORDS: usize = 20_000;
 const CODEX_SESSION_HISTORY_MAX_BYTES: u64 = 20 * 1024 * 1024;
+/// 入力履歴（↑↓で呼び戻す過去プロンプト）の保持上限。
+const INPUT_HISTORY_MAX: usize = 200;
+/// 常駐 Claude Code の interrupt がグレースフルに完了するのを待つ上限。
+/// 超えたら従来どおり kill し、次ターンで `--resume` 再起動する。
+const CLAUDE_INTERRUPT_GRACE: Duration = Duration::from_secs(2);
+/// 常駐 Claude Code の set_model / set_permission_mode 応答を待つ上限。
+/// 超えたら stdin close → 新フラグ + `--resume` で再起動へフォールバックする。
+const CLAUDE_SETTING_CHANGE_GRACE: Duration = Duration::from_secs(2);
+/// 常駐 Claude Code をアイドル回収するまでの無操作時間（メモリ約300MB対策）。
+const CLAUDE_RESIDENT_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// 常駐 codex app-server の interrupt がグレースフルに完了するのを待つ上限。
+/// 超えたら kill し、次ターンで thread/resume 再起動する（Claude 側の定数を流用）。
+const CODEX_APPSERVER_INTERRUPT_GRACE: Duration = CLAUDE_INTERRUPT_GRACE;
+/// 常駐 codex app-server の thread/settings/update 応答を待つ上限。
+/// 超えたら再起動 + thread/resume へフォールバックする。
+const CODEX_APPSERVER_SETTING_CHANGE_GRACE: Duration = CLAUDE_SETTING_CHANGE_GRACE;
+/// 常駐 codex app-server をアイドル回収するまでの無操作時間（RSS 約38MB だが Claude 側と揃える）。
+const CODEX_APPSERVER_IDLE_TIMEOUT: Duration = CLAUDE_RESIDENT_IDLE_TIMEOUT;
+/// 実行中コマンドのライブ出力バッファに保持する末尾行数。
+const CODEX_APPSERVER_OUTPUT_TAIL_LINES: usize = 3;
+/// @メンションのファイル候補を一度に表示する最大件数。
+const MENTION_PALETTE_MAX: usize = 10;
 
 /// TUI が起動するエージェントバックエンドの種別。
 /// バックエンド分岐（起動引数・イベントパース・セッション探索・表示名）で match する。
@@ -204,6 +232,64 @@ pub fn claude_path() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// 常駐（多ターン 1 プロセス）モードを既定で使うか。`ADDNESS_CLAUDE_RESIDENT=0` で
+/// ワンショット（1 ターン 1 プロセス）へ退避する。
+fn claude_resident_default_enabled() -> bool {
+    match std::env::var("ADDNESS_CLAUDE_RESIDENT") {
+        Ok(value) => value != "0",
+        Err(_) => true,
+    }
+}
+
+/// 常駐モードで承認バナー表示中の can_use_tool 要求（応答に必要な情報）。
+#[derive(Debug, Clone)]
+struct ClaudePendingTool {
+    /// 応答時にエコーバックする request_id。
+    request_id: String,
+    /// 許可時に `updatedInput` として返す入力（そのまま返す）。
+    input: Value,
+    /// 「これからずっと許可」で sticky 許可リストへ入れるルール。
+    rules: Vec<String>,
+}
+
+/// 常駐モードで送信済みの set_model / set_permission_mode 応答待ち（フォールバック判定用）。
+#[derive(Debug, Clone)]
+struct ClaudePendingSettingChange {
+    request_id: String,
+    deadline: Instant,
+    label: String,
+}
+
+/// codex app-server を常駐モードで既定利用するか。`ADDNESS_CODEX_RESIDENT=0` で
+/// 従来の `codex exec --json`（1 ターン 1 プロセス）へ退避する。
+fn codex_appserver_default_enabled() -> bool {
+    match std::env::var("ADDNESS_CODEX_RESIDENT") {
+        Ok(value) => value != "0",
+        Err(_) => true,
+    }
+}
+
+/// 常駐 codex app-server のハンドシェイク/ターン進行フェーズ。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CodexAppServerPhase {
+    /// 未起動、または死亡・回収済み。
+    Idle,
+    /// initialize 送信済み、応答待ち。id を保持。
+    Initializing { request_id: u64 },
+    /// thread/start または thread/resume 送信済み、応答待ち。resume 失敗時のフォールバック判定に使う。
+    StartingThread { request_id: u64, resuming: bool },
+    /// thread 確立済み。turn/start 可能。
+    Ready,
+}
+
+/// codex app-server の thread/settings/update 応答待ち（フォールバック判定用）。
+#[derive(Debug, Clone)]
+struct CodexAppServerSettingChange {
+    request_id: u64,
+    deadline: Instant,
+    label: String,
 }
 
 /// codex 実行ファイルのパスを解決する。
@@ -578,19 +664,6 @@ fn collect_skill_names_from_roots(roots: &[PathBuf]) -> Vec<String> {
     skills.into_iter().collect()
 }
 
-fn session_list_line(index: usize, session: &CodexSessionCandidate) -> String {
-    let short_id = short_session_id(&session.id);
-    let cwd = session
-        .cwd
-        .as_deref()
-        .map(|cwd| format!("  {}", compact_home_path(Path::new(cwd))))
-        .unwrap_or_default();
-    format!(
-        "{index}. {short_id}  {}  {}{cwd}",
-        session.updated_at, session.title
-    )
-}
-
 fn short_session_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
 }
@@ -663,6 +736,11 @@ enum CodexSessionRecord {
         stream: String,
         line: String,
     },
+    /// 会話スレッド ID（Codex thread_id / Claude session_id を共用）の永続化。
+    /// `None` は `/new` によるリセット（tombstone）を表す。
+    ThreadId {
+        id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -691,6 +769,8 @@ struct LoadedCodexSession {
     log: Vec<CodexLogLine>,
     record_count: usize,
     goal_mode: CodexGoalMode,
+    /// ログから復元した会話スレッド ID。最後の `ThreadId` レコードの値。
+    thread_id: Option<String>,
 }
 
 struct CodexPaneSpawnOptions<'a> {
@@ -703,6 +783,19 @@ struct CodexPaneSpawnOptions<'a> {
     dod: String,
     status_label: String,
     session_log_path: Option<PathBuf>,
+    input_history_path: Option<PathBuf>,
+    /// クリップボード画像の保存先（`~/.addness/attachments/`）。テストでは一時ディレクトリを注入する。
+    attachments_dir: Option<PathBuf>,
+}
+
+/// 長文ペーストを入力欄で畳み込んだときの保持データ。
+/// 入力欄にはプレースホルダだけ挿入し、送信時に全文へ展開する。
+#[derive(Debug, Clone)]
+struct StoredPaste {
+    /// 入力欄へ挿入したプレースホルダ文字列（例: `[貼り付け#1: 120行]`）。
+    placeholder: String,
+    /// 展開時に差し戻す全文（改行正規化済み）。
+    full: String,
 }
 
 /// 子ゴール 1 件の表示用情報。
@@ -739,6 +832,12 @@ pub struct ActiveWorkPackage {
 pub struct TerminalNotice {
     pub title: String,
     pub message: String,
+    /// 通知の文脈（ゴール名など）。OS 通知の本文に添える。空なら省略。
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOSのOS通知経路でのみ読む
+    pub context: Option<String>,
+    /// ターン完了通知のターン所要秒。`Some(n)` かつ閾値未満なら通知を抑制する。
+    /// 承認・その他の通知は `None`（常に通知する）。
+    pub turn_elapsed_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -853,6 +952,43 @@ enum CodexDecisionResponse {
     Always,
 }
 
+/// 確認バナー（YesNo）に紐づく、Accept 時に実行するペイン固有アクション。
+/// codex/claude の承認リトライ経路とは別に、Addness 独自の操作を確認付きで走らせるのに使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneDecisionAction {
+    /// 直近チェックポイントへ作業ツリーを戻す（/undo）。
+    Undo,
+}
+
+/// ペインが保持するチェックポイントのスタック上限（超過分は古い ref から掃除する）。
+const CHECKPOINT_STACK_MAX: usize = 10;
+
+/// ターン開始時に取ったチェックポイント（git ref）1 件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Checkpoint {
+    /// 更新した ref 名（例: `refs/addness/checkpoint-<slug>-<seq>`）。
+    ref_name: String,
+    /// 対応するターン番号（表示・確認メッセージ用）。
+    turn: usize,
+}
+
+/// App（ホスト）へ依頼するチェックポイント作成要求。git 実行は非同期ジョブで行う。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointRequest {
+    pub cwd: String,
+    pub ref_name: String,
+    pub turn: usize,
+    pub message: String,
+}
+
+/// App（ホスト）へ依頼する undo（チェックポイント復元）要求。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndoRequest {
+    pub cwd: String,
+    pub ref_name: String,
+    pub turn: usize,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CodexWorkSummary {
     pub implemented: Vec<String>,
@@ -886,6 +1022,72 @@ pub struct CodexTurnPickerItem {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CodexTurnPicker {
     selected_turn: usize,
+}
+
+/// 汎用リストピッカー（モデル・reasoning・approval・sandbox・セッション選択）の 1 項目。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexListPickerItem {
+    /// 一覧に出す主ラベル（モデル名、セッション ID 先頭 8 桁など）。
+    pub label: String,
+    /// 補足（説明、更新時刻+タイトルなど）。空可。
+    pub detail: String,
+    /// 確定時にアクションへ渡す値（`set_model` への引数、セッション ID など）。
+    pub value: String,
+    /// 現在値マーカー。
+    pub current: bool,
+}
+
+/// リストピッカー確定（Enter）時に実行するアクション。既存の setter / ハンドラへ委譲する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexListPickerAction {
+    SetModel,
+    /// Claude では effort。
+    SetReasoning,
+    /// Claude では permission-mode。
+    SetApproval,
+    /// Codex のみ。
+    SetSandbox,
+    /// Enter=resume / f=fork。
+    ResumeSession,
+}
+
+/// 候補一覧から ↑↓ + Enter で選ぶ汎用ピッカー（turn ピッカーと並置するボトムモーダル）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexListPicker {
+    pub title: String,
+    pub action: CodexListPickerAction,
+    pub items: Vec<CodexListPickerItem>,
+    pub selected: usize,
+}
+
+/// ピッカーの初期選択位置（`current` の項目。無ければ先頭）。
+fn list_picker_initial_selection(items: &[CodexListPickerItem]) -> usize {
+    items.iter().position(|item| item.current).unwrap_or(0)
+}
+
+/// 設定ピッカーの `config` 項目に付ける補足説明（それ以外の項目は空）。
+fn config_choice_detail(is_config: bool) -> String {
+    if is_config {
+        "CLI設定に従う".to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// セッション候補をピッカー項目へ変換する。`current` は現在の thread_id と一致する候補。
+fn session_picker_items(
+    candidates: &[CodexSessionCandidate],
+    thread_id: Option<&str>,
+) -> Vec<CodexListPickerItem> {
+    candidates
+        .iter()
+        .map(|session| CodexListPickerItem {
+            label: short_session_id(&session.id).to_string(),
+            detail: format!("{}  {}", session.updated_at, session.title),
+            value: session.id.clone(),
+            current: thread_id == Some(session.id.as_str()),
+        })
+        .collect()
 }
 
 /// 埋め込み codex セッションの状態。
@@ -939,6 +1141,10 @@ pub struct CodexPane {
     /// codex が現在実行中として報告したコマンド。
     current_command: Option<String>,
     current_command_started_at: Option<Instant>,
+    /// 実行中ターンの開始時刻。経過時間表示と完了時の所要時間算出に使う。
+    turn_started_at: Option<Instant>,
+    /// 直近に再描画へ反映した経過秒。秒表示が変わったフレームだけ再描画するために保持する。
+    last_elapsed_tick_secs: Option<u64>,
     /// `codex exec` 通常ターン以外のサブコマンドを実行中ならその表示名。
     child_process_label: Option<String>,
     /// サブコマンドの非JSON stdout/stderr。完了時にまとめてToolログへ出す。
@@ -963,11 +1169,29 @@ pub struct CodexPane {
     /// 最初の実依頼の body 自動記録を済み（再試行しない）とするフラグ。
     body_record_done: bool,
     input_state: CodexInputState,
+    /// 入力欄で畳み込み中の長文ペースト（送信時に全文へ展開してクリア）。
+    pending_pastes: Vec<StoredPaste>,
+    /// 畳み込みペーストの通し番号（プレースホルダの `#N`）。送信でリセットする。
+    paste_seq: usize,
+    /// クリップボード画像の保存先ディレクトリ（`~/.addness/attachments/`）。テストでは注入する。
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // Ctrl+V取り込みはmacOSのみ
+    attachments_dir: Option<PathBuf>,
     /// スラッシュコマンドパレットで選択中の候補インデックス。入力が変わると 0 に戻す。
     slash_palette_selected: usize,
+    /// `@` メンションのファイル候補パレットで選択中のインデックス。入力が変わると 0 に戻す。
+    mention_palette_selected: usize,
+    /// Esc でメンションパレットを閉じた状態。次の入力で解除する。
+    mention_palette_dismissed: bool,
+    /// 入力履歴の保存先（`~/.addness/input-history.jsonl`）。テストでは None。
+    input_history_path: Option<PathBuf>,
+    /// Esc 中断の 1 回目押下（アーム済み）状態。次の Esc で中断する。
+    esc_interrupt_armed: bool,
     queued_prompts: VecDeque<QueuedPrompt>,
     /// `codex exec --json` が返した Codex thread id。2ターン目以降の resume に使う。
     thread_id: Option<String>,
+    /// 表示ログから復元した thread_id を保持中で、まだライブイベントで裏取りできていない状態。
+    /// resume が失敗したら 1 回だけ新規セッションへフォールバックするために使う。
+    thread_id_restored: bool,
     /// いま実行中のターンに対応するユーザー入力。turn.started の見出しに使う。
     current_turn_prompt: Option<String>,
     /// 承認リトライ時に再実行する、Addness文脈注入前の実プロンプト。
@@ -1013,19 +1237,97 @@ pub struct CodexPane {
     diff_view: Option<String>,
     /// 格納済み turn を明示的に選んで展開・格納するためのパネル。
     turn_picker: Option<CodexTurnPicker>,
+    /// 候補一覧から ↑↓ + Enter で確定する汎用ピッカー（モデル・セッション等）。
+    list_picker: Option<CodexListPicker>,
     /// Addness 独自UI上で `codex exec` に注入する永続目標。
     goal_mode: CodexGoalMode,
     pending_decision: Option<CodexDecisionBanner>,
     /// ClaudeCode バックエンドの次ターン設定（codex の `exec_settings` と並置）。
     /// codex 経路では未使用。
     claude_settings: claude::ClaudeExecSettings,
-    /// 承認 Accept で「今回だけ」権限昇格する場合の一時上書き（claude 専用）。
-    /// codex の `one_shot_approval` に相当する claude 版。
-    claude_one_shot_permission: Option<claude::PermissionEscalation>,
+    /// 承認 Accept で「今回だけ」許可するツールルール（`--allowedTools`、claude 専用）。
+    /// 次ターン起動時に消費して空へ戻す。codex の `one_shot_approval` に相当。
+    claude_one_shot_allowed_tools: Vec<String>,
     /// 次ターンを `--fork-session` で開始するか（/fork-* で立てる。1 ターンで消費）。
     claude_fork_next: bool,
-    /// 承認バナー表示中に、Accept/Always で適用する権限昇格レベル（claude 専用）。
-    claude_pending_escalation: Option<claude::PermissionEscalation>,
+    /// 承認バナー表示中に、Accept/Always で適用する `--allowedTools` ルール（claude 専用）。
+    claude_pending_allowed_tools: Vec<String>,
+    /// 承認バナー表示中の拒否内容そのもの（ループガード用、claude 専用）。
+    claude_pending_denials: Vec<claude::ClaudeDenial>,
+    /// 直前の承認リトライで許可した拒否内容（claude 専用）。
+    /// リトライ結果で同一の拒否が再発したらループとみなしてエラー表示する。
+    claude_approved_denials: Vec<claude::ClaudeDenial>,
+    /// 常駐（多ターン 1 プロセス）モードを使うか（ClaudeCode 専用）。
+    /// 既定は環境変数で決まり、常駐 spawn 失敗時はこのセッションだけ false へ落とす。
+    claude_resident_enabled: bool,
+    /// 常駐 Claude Code プロセスのクライアント。None=未起動 / 死亡 / アイドル回収済み。
+    claude_resident: Option<claude_resident::ResidentClient>,
+    /// 常駐プロセスの最終アクティビティ時刻（アイドル回収判定に使う）。
+    claude_resident_last_activity: Option<Instant>,
+    /// interrupt を送ってから result（中断完了）を待つ期限。超えたら kill フォールバック。
+    claude_interrupt_deadline: Option<Instant>,
+    /// interrupt 要求中フラグ。result 受信時に中断完了として扱い、キューを自動開始しない。
+    claude_interrupting: bool,
+    /// 承認バナー表示中の can_use_tool 要求（応答用）。
+    claude_pending_tool: Option<ClaudePendingTool>,
+    /// 送信済みの set_model / set_permission_mode 応答待ち。
+    claude_pending_setting_change: Option<ClaudePendingSettingChange>,
+    /// 設定変更が control_request では反映できず、アイドル時に再起動が必要な状態。
+    claude_resident_restart_pending: bool,
+    /// result の `total_cost_usd`（セッション累積、保存のみ）。
+    claude_total_cost_usd: Option<f64>,
+    /// result の usage 要約（保存のみ）。
+    claude_last_usage: Option<String>,
+    /// result の usage から算出したコンテキスト占有トークン数（ヘッダ/`/usage` 表示用）。
+    claude_context_tokens: Option<u64>,
+    /// system/init が報告する現在の model（保存のみ、表示同期用）。
+    claude_active_model: Option<String>,
+    /// system/init が報告する現在の permissionMode（保存のみ、表示同期用）。
+    claude_active_permission_mode: Option<String>,
+    /// codex app-server 常駐モードを使うか（Codex 専用）。既定は環境変数で決まり、
+    /// spawn / initialize 失敗時はこのセッションだけ false へ落として `codex exec --json` に退避する。
+    codex_appserver_enabled: bool,
+    /// 常駐 codex app-server プロセスのクライアント。None=未起動 / 死亡 / アイドル回収済み。
+    codex_appserver: Option<codex_appserver::AppServerClient>,
+    /// 常駐 app-server のハンドシェイク/ターン進行フェーズ。
+    codex_appserver_phase: CodexAppServerPhase,
+    /// thread 確立を待って送るターン本文（ハンドシェイク完了時に turn/start する）。
+    codex_appserver_pending_turn: Option<String>,
+    /// 保留ターンに添付する画像パス（turn/start の localImage 入力に載せる）。
+    codex_appserver_pending_images: Vec<String>,
+    /// 進行中ターンの turn.id（turn/interrupt に使う）。
+    codex_appserver_turn_id: Option<String>,
+    /// 送信済み turn/start の JSON-RPC id（応答で turn.id を確定するのに使う）。
+    codex_appserver_turn_req_id: Option<u64>,
+    /// 承認バナー表示中のサーバ発リクエスト（応答用）。
+    codex_appserver_pending_approval: Option<codex_appserver::ApprovalRequest>,
+    /// 送信済みの thread/settings/update 応答待ち。
+    codex_appserver_pending_setting: Option<CodexAppServerSettingChange>,
+    /// 設定変更が settings/update では反映できず、アイドル時に再起動が必要な状態。
+    codex_appserver_restart_pending: bool,
+    /// 常駐プロセスの最終アクティビティ時刻（アイドル回収判定に使う）。
+    codex_appserver_last_activity: Option<Instant>,
+    /// interrupt を送ってから turn/completed(interrupted) を待つ期限。超えたら kill フォールバック。
+    codex_appserver_interrupt_deadline: Option<Instant>,
+    /// interrupt 要求中フラグ。turn/completed 受信時に中断完了として扱い、キューを自動開始しない。
+    codex_appserver_interrupting: bool,
+    /// 実行中コマンドのライブ出力バッファ（itemId → 末尾 N 行）。item/completed で解放する。
+    codex_appserver_output: HashMap<String, VecDeque<String>>,
+    /// 現在ライブ出力を受けている commandExecution の itemId（末尾行の描画対象）。
+    codex_appserver_running_item: Option<String>,
+    /// 直近の thread/tokenUsage/updated（保存のみ）。
+    codex_appserver_token_usage: Option<codex_appserver::TokenUsageInfo>,
+    /// ターン単位チェックポイント（git ref）のスタック。末尾が最新。/undo で末尾から遡る。
+    checkpoints: Vec<Checkpoint>,
+    /// チェックポイント ref 名に使う単調増加シーケンス。
+    checkpoint_seq: usize,
+    /// App が非同期で処理するチェックポイント作成要求（ターン開始時にセット）。
+    /// ジョブは 1 件ずつ処理されるため、消化前に複数溜まっても取りこぼさないようキューで持つ。
+    pending_checkpoint_requests: VecDeque<CheckpointRequest>,
+    /// App が非同期で処理する undo（復元）要求（/undo 確認 Accept 時にセット）。
+    pending_undo_request: Option<UndoRequest>,
+    /// 確認バナー（YesNo）に紐づく Accept 時アクション。/undo 確認で使う。
+    pending_decision_action: Option<PaneDecisionAction>,
 }
 
 impl CodexPane {
@@ -1050,6 +1352,8 @@ impl CodexPane {
             cwd,
             addness_bin,
             session_log_path: agent_session_log_path(kind, &goal_id),
+            input_history_path: input_history_file_path(),
+            attachments_dir: attachments_dir_path(),
             goal_id,
             goal_title,
             dod,
@@ -1068,6 +1372,8 @@ impl CodexPane {
             dod,
             status_label,
             session_log_path,
+            input_history_path,
+            attachments_dir,
         } = options;
         let dod_items = split_dod_items(&dod);
         let dod_checks = vec![None; dod_items.len()];
@@ -1081,8 +1387,32 @@ impl CodexPane {
                 log: Vec::new(),
                 record_count: 0,
                 goal_mode: CodexGoalMode::default(),
+                thread_id: None,
             });
         let goal_mode = loaded.goal_mode.clone();
+
+        // 保存されていた thread_id の復元を検討する。Claude はセッション実体が cwd 依存の
+        // ファイルなので、現在の cwd 配下に実体が無ければ復元を破棄して新規で開始する。
+        // Codex は事前検証せず、resume 失敗時のフォールバックで吸収する。
+        enum ThreadRestore {
+            None,
+            Resumed(String),
+            ClaudeMissing,
+        }
+        let thread_restore = match loaded.thread_id.clone() {
+            Some(id) => {
+                if kind == AgentKind::ClaudeCode && !claude::session_file_exists(cwd, &id) {
+                    ThreadRestore::ClaudeMissing
+                } else {
+                    ThreadRestore::Resumed(id)
+                }
+            }
+            None => ThreadRestore::None,
+        };
+        let restored_thread_id = match &thread_restore {
+            ThreadRestore::Resumed(id) => Some(id.clone()),
+            _ => None,
+        };
         let loaded_history_count = loaded.log.len();
         let turn_count = loaded
             .log
@@ -1090,6 +1420,11 @@ impl CodexPane {
             .filter(|line| line.kind == CodexLogKind::Turn)
             .count();
         let collapsed_turns = (1..turn_count).collect::<BTreeSet<_>>();
+
+        let mut input_state = CodexInputState::default();
+        if let Some(path) = input_history_path.as_deref() {
+            input_state.history = load_input_history(path);
+        }
 
         let mut pane = Self {
             kind,
@@ -1121,6 +1456,8 @@ impl CodexPane {
             action: None,
             current_command: None,
             current_command_started_at: None,
+            turn_started_at: None,
+            last_elapsed_tick_secs: None,
             child_process_label: None,
             child_process_output: Vec::new(),
             child_process_error_output: Vec::new(),
@@ -1135,10 +1472,18 @@ impl CodexPane {
             activity: Vec::new(),
             auto_record_attempted: false,
             body_record_done: false,
-            input_state: CodexInputState::default(),
+            input_state,
+            pending_pastes: Vec::new(),
+            paste_seq: 0,
+            attachments_dir,
             slash_palette_selected: 0,
+            mention_palette_selected: 0,
+            mention_palette_dismissed: false,
+            input_history_path,
+            esc_interrupt_armed: false,
             queued_prompts: VecDeque::new(),
-            thread_id: None,
+            thread_id: restored_thread_id.clone(),
+            thread_id_restored: restored_thread_id.is_some(),
             current_turn_prompt: None,
             current_turn_retry_prompt: None,
             turn_count,
@@ -1162,13 +1507,51 @@ impl CodexPane {
             one_shot_approval: None,
             diff_view: None,
             turn_picker: None,
+            list_picker: None,
             pending_decision: None,
             goal_mode,
             dod,
             claude_settings: claude::ClaudeExecSettings::default(),
-            claude_one_shot_permission: None,
+            claude_one_shot_allowed_tools: Vec::new(),
             claude_fork_next: false,
-            claude_pending_escalation: None,
+            claude_pending_allowed_tools: Vec::new(),
+            claude_pending_denials: Vec::new(),
+            claude_approved_denials: Vec::new(),
+            claude_resident_enabled: kind == AgentKind::ClaudeCode
+                && claude_resident_default_enabled(),
+            claude_resident: None,
+            claude_resident_last_activity: None,
+            claude_interrupt_deadline: None,
+            claude_interrupting: false,
+            claude_pending_tool: None,
+            claude_pending_setting_change: None,
+            claude_resident_restart_pending: false,
+            claude_total_cost_usd: None,
+            claude_last_usage: None,
+            claude_context_tokens: None,
+            claude_active_model: None,
+            claude_active_permission_mode: None,
+            codex_appserver_enabled: kind == AgentKind::Codex && codex_appserver_default_enabled(),
+            codex_appserver: None,
+            codex_appserver_phase: CodexAppServerPhase::Idle,
+            codex_appserver_pending_turn: None,
+            codex_appserver_pending_images: Vec::new(),
+            codex_appserver_turn_id: None,
+            codex_appserver_turn_req_id: None,
+            codex_appserver_pending_approval: None,
+            codex_appserver_pending_setting: None,
+            codex_appserver_restart_pending: false,
+            codex_appserver_last_activity: None,
+            codex_appserver_interrupt_deadline: None,
+            codex_appserver_interrupting: false,
+            codex_appserver_output: HashMap::new(),
+            codex_appserver_running_item: None,
+            codex_appserver_token_usage: None,
+            checkpoints: Vec::new(),
+            checkpoint_seq: 0,
+            pending_checkpoint_requests: VecDeque::new(),
+            pending_undo_request: None,
+            pending_decision_action: None,
         };
         let name = kind.display_name();
         if pane.loaded_history_count > 0 {
@@ -1184,6 +1567,24 @@ impl CodexPane {
             CodexLogKind::System,
             format!("{name}入力欄で待機中。入力して Enter で依頼を送信します。"),
         );
+        match thread_restore {
+            ThreadRestore::Resumed(id) => {
+                pane.push_log(
+                    CodexLogKind::System,
+                    format!(
+                        "前回のセッション（{}…）を自動再開します。新規で始める場合は /new",
+                        short_session_id(&id)
+                    ),
+                );
+            }
+            ThreadRestore::ClaudeMissing => {
+                pane.push_log(
+                    CodexLogKind::System,
+                    "前回セッションが見つからないため新規セッションで開始します",
+                );
+            }
+            ThreadRestore::None => {}
+        }
         Ok(pane)
     }
 
@@ -1210,6 +1611,14 @@ impl CodexPane {
         pane.cols = cols.max(1);
         pane.log.clear();
         pane.session_log_path = None;
+        pane.input_history_path = None;
+        pane.attachments_dir = None;
+        pane.pending_pastes.clear();
+        pane.paste_seq = 0;
+        pane.input_state.history.clear();
+        pane.mention_palette_selected = 0;
+        pane.mention_palette_dismissed = false;
+        pane.esc_interrupt_armed = false;
         pane.session_record_count = 0;
         pane.loaded_history_count = 0;
         pane.turn_count = 0;
@@ -1224,9 +1633,44 @@ impl CodexPane {
         pane.exec_settings = CodexExecSettings::default();
         pane.one_shot_approval = None;
         pane.claude_settings = claude::ClaudeExecSettings::default();
-        pane.claude_one_shot_permission = None;
+        pane.claude_one_shot_allowed_tools = Vec::new();
         pane.claude_fork_next = false;
-        pane.claude_pending_escalation = None;
+        pane.claude_pending_allowed_tools = Vec::new();
+        pane.claude_pending_denials = Vec::new();
+        pane.claude_approved_denials = Vec::new();
+        pane.claude_resident_enabled = false;
+        pane.claude_resident = None;
+        pane.claude_resident_last_activity = None;
+        pane.claude_interrupt_deadline = None;
+        pane.claude_interrupting = false;
+        pane.claude_pending_tool = None;
+        pane.claude_pending_setting_change = None;
+        pane.claude_resident_restart_pending = false;
+        pane.claude_total_cost_usd = None;
+        pane.claude_last_usage = None;
+        pane.claude_context_tokens = None;
+        pane.claude_active_model = None;
+        pane.claude_active_permission_mode = None;
+        pane.codex_appserver_enabled = false;
+        pane.codex_appserver = None;
+        pane.codex_appserver_phase = CodexAppServerPhase::Idle;
+        pane.codex_appserver_pending_turn = None;
+        pane.codex_appserver_turn_id = None;
+        pane.codex_appserver_turn_req_id = None;
+        pane.codex_appserver_pending_approval = None;
+        pane.codex_appserver_pending_setting = None;
+        pane.codex_appserver_restart_pending = false;
+        pane.codex_appserver_last_activity = None;
+        pane.codex_appserver_interrupt_deadline = None;
+        pane.codex_appserver_interrupting = false;
+        pane.codex_appserver_output.clear();
+        pane.codex_appserver_running_item = None;
+        pane.codex_appserver_token_usage = None;
+        pane.checkpoints.clear();
+        pane.checkpoint_seq = 0;
+        pane.pending_checkpoint_requests.clear();
+        pane.pending_undo_request = None;
+        pane.pending_decision_action = None;
         pane.diff_view = None;
         pane.addness_body_excerpt = None;
         pane.turn_picker = None;
@@ -1265,6 +1709,15 @@ impl CodexPane {
         let max = self.max_view_scrollback();
         let target = (self.scrollback as isize + delta).max(0) as usize;
         self.scrollback = target.min(max);
+    }
+
+    /// テスト用: 会話ログに Assistant 行を積み、ライブ位置へ戻す（スクロール余地を作る）。
+    #[cfg(test)]
+    pub(crate) fn seed_assistant_log_for_test(&mut self, lines: usize) {
+        for i in 0..lines {
+            self.push_log(CodexLogKind::Assistant, format!("行 {i}"));
+        }
+        self.scroll_to_live();
     }
 
     /// 1 ページ分の行数（スクロール量）。
@@ -1307,6 +1760,66 @@ impl CodexPane {
     pub fn current_command_elapsed_secs(&self) -> Option<u64> {
         self.current_command_started_at
             .map(|t| t.elapsed().as_secs())
+    }
+
+    /// 実行中ターンの経過秒（開始からの秒）。ターン非実行時は None。
+    pub fn turn_elapsed_secs(&self) -> Option<u64> {
+        if self.is_turn_running() {
+            self.turn_started_at.map(|t| t.elapsed().as_secs())
+        } else {
+            None
+        }
+    }
+
+    /// いま表示すべき経過秒。コマンド実行中はコマンド経過、それ以外はターン経過。
+    fn current_display_elapsed_secs(&self) -> Option<u64> {
+        if !self.is_turn_running() {
+            return None;
+        }
+        if self.current_command.is_some() {
+            self.current_command_elapsed_secs()
+        } else {
+            self.turn_elapsed_secs()
+        }
+    }
+
+    /// 状態ラベルに経過時間を添えた表示（例: 「考え中 1:23」）。
+    pub fn run_state_elapsed_label(&self) -> String {
+        let label = self.run_state().label();
+        match self.current_display_elapsed_secs() {
+            Some(secs) => format!("{label} {}", format_elapsed(secs)),
+            None => label.to_string(),
+        }
+    }
+
+    /// ターン開始/終了に応じて経過タイマーを管理し、表示秒が変わったら true を返す。
+    /// タイマー表示のためだけの毎フレーム再描画を避け、秒が繰り上がった時だけ再描画させる。
+    fn manage_turn_timer(&mut self) -> bool {
+        if self.is_turn_running() {
+            if self.turn_started_at.is_none() {
+                self.turn_started_at = Some(Instant::now());
+            }
+        } else {
+            self.turn_started_at = None;
+        }
+        let current = self.current_display_elapsed_secs();
+        if current != self.last_elapsed_tick_secs {
+            self.last_elapsed_tick_secs = current;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 完了したターンの所要時間を控えめな System 行として残す。
+    fn record_turn_duration(&mut self) {
+        if let Some(started) = self.turn_started_at {
+            let secs = started.elapsed().as_secs();
+            self.push_log(
+                CodexLogKind::System,
+                format!("所要 {}", format_elapsed(secs)),
+            );
+        }
     }
 
     pub fn turn_count(&self) -> usize {
@@ -1468,6 +1981,131 @@ impl CodexPane {
         self.slash_palette_selected = 0;
     }
 
+    /// 現在の入力に対する `@` メンションのファイル候補（ペインの cwd 基準の相対パス）。
+    pub fn mention_palette_suggestions(&self) -> Vec<MentionCandidate> {
+        let Some((_, query)) = active_mention(&self.input_state.line, self.input_state.cursor)
+        else {
+            return Vec::new();
+        };
+        mention_candidates(Path::new(&self.cwd), &query)
+    }
+
+    /// `@` メンションのファイル候補パレットを表示 / 操作すべき状態か。
+    pub fn mention_palette_active(&self) -> bool {
+        !self.finished
+            && !self.mention_palette_dismissed
+            && !self.is_search_editing()
+            && self.pending_decision.is_none()
+            && !self.slash_palette_active()
+            && !self.mention_palette_suggestions().is_empty()
+    }
+
+    /// メンションパレットで選択中の候補インデックス（候補数でクランプ済み）。
+    pub fn mention_palette_selected(&self) -> usize {
+        let n = self.mention_palette_suggestions().len();
+        if n == 0 {
+            0
+        } else {
+            self.mention_palette_selected.min(n - 1)
+        }
+    }
+
+    /// メンションパレットの選択を上下に移動する（端で反対側へラップ）。
+    pub fn move_mention_palette_selection(&mut self, delta: isize) {
+        let n = self.mention_palette_suggestions().len();
+        if n == 0 {
+            return;
+        }
+        let cur = self.mention_palette_selected.min(n - 1) as isize;
+        self.mention_palette_selected = (cur + delta).rem_euclid(n as isize) as usize;
+    }
+
+    /// 選択中の候補で `@` 以降を相対パスに置換して確定する。
+    /// ディレクトリならそのまま潜って絞り込みを続け、ファイルなら末尾に空白を付けて確定する。
+    pub fn accept_mention_palette_selection(&mut self) {
+        let candidates = self.mention_palette_suggestions();
+        if candidates.is_empty() {
+            return;
+        }
+        let idx = self.mention_palette_selected.min(candidates.len() - 1);
+        let candidate = candidates[idx].clone();
+        let Some((at, _)) = active_mention(&self.input_state.line, self.input_state.cursor) else {
+            return;
+        };
+        let replacement = if candidate.is_dir {
+            candidate.insert
+        } else {
+            format!("{} ", candidate.insert)
+        };
+        self.input_state
+            .replace_to_cursor(at + '@'.len_utf8(), &replacement);
+        self.mention_palette_selected = 0;
+    }
+
+    /// Esc でメンションパレットだけを閉じる（入力は消さない）。
+    pub fn dismiss_mention_palette(&mut self) {
+        self.mention_palette_dismissed = true;
+    }
+
+    /// Esc 中断の 1 回目押下（アーム）。次の Esc で中断する旨を表示する。
+    pub fn arm_esc_interrupt(&mut self) {
+        self.esc_interrupt_armed = true;
+        self.push_log(
+            CodexLogKind::System,
+            "もう一度 Esc でターンを中断します".to_string(),
+        );
+    }
+
+    /// Esc 中断がアーム済みなら true を返してアームを解除する。
+    pub fn take_esc_interrupt_armed(&mut self) -> bool {
+        std::mem::take(&mut self.esc_interrupt_armed)
+    }
+
+    /// Esc でターンを中断する。実行中でなければ何もしない。
+    pub fn interrupt_turn_by_esc(&mut self) -> bool {
+        if !self.is_turn_running() {
+            return false;
+        }
+        // 常駐モードはまず graceful interrupt を試み、2 秒で完了しなければ update() 側で kill する。
+        if self.claude_resident.is_some() && self.request_claude_interrupt() {
+            self.push_log(CodexLogKind::System, "Esc でターンを中断します".to_string());
+            let queued = self.queued_prompts.len();
+            if queued > 0 {
+                self.push_log(
+                    CodexLogKind::System,
+                    format!("予約{queued}件は保留中（/stop queued で破棄可）"),
+                );
+            }
+            return true;
+        }
+        if self.codex_appserver.is_some() && self.request_codex_appserver_interrupt() {
+            self.push_log(CodexLogKind::System, "Esc でターンを中断します".to_string());
+            let queued = self.queued_prompts.len();
+            if queued > 0 {
+                self.push_log(
+                    CodexLogKind::System,
+                    format!("予約{queued}件は保留中（/stop queued で破棄可）"),
+                );
+            }
+            return true;
+        }
+        self.kill_current_turn();
+        self.push_log(
+            CodexLogKind::System,
+            "Esc でターンを中断しました".to_string(),
+        );
+        // /stop と同様、中断時は予約ターンを自動開始しない。予約が残っていれば保留中である
+        // ことを知らせる。
+        let queued = self.queued_prompts.len();
+        if queued > 0 {
+            self.push_log(
+                CodexLogKind::System,
+                format!("予約{queued}件は保留中（/stop queued で破棄可）"),
+            );
+        }
+        true
+    }
+
     pub fn captures_input_key(&self, key: KeyEvent) -> bool {
         !self.finished
             && self.pending_decision.is_none()
@@ -1540,6 +2178,13 @@ impl CodexPane {
             }
         }
         visible
+    }
+
+    /// ストリーミング中（未完成）の assistant ログ行への参照を返す。
+    /// 描画側で「Markdown 整形せずプレーン表示する行」を識別するために使う。
+    pub fn streaming_assistant_line(&self) -> Option<&CodexLogLine> {
+        self.streaming_assistant_index
+            .and_then(|index| self.log.get(index))
     }
 
     pub fn toggle_visible_turn_collapsed(&mut self) -> bool {
@@ -1659,6 +2304,286 @@ impl CodexPane {
             return false;
         };
         self.toggle_turn_collapsed_by_number(turn)
+    }
+
+    pub fn list_picker_open(&self) -> bool {
+        self.list_picker.is_some()
+    }
+
+    pub fn list_picker(&self) -> Option<&CodexListPicker> {
+        self.list_picker.as_ref()
+    }
+
+    /// 汎用リストピッカーを開く。turn ピッカーと同時には開かない（後勝ちで閉じる）。
+    fn open_list_picker(&mut self, picker: CodexListPicker) {
+        self.turn_picker = None;
+        self.list_picker = Some(picker);
+    }
+
+    pub fn close_list_picker(&mut self) {
+        self.list_picker = None;
+    }
+
+    /// リストピッカーの選択移動（turn ピッカーと同じく clamp・ラップなし）。
+    pub fn move_list_picker_selection(&mut self, delta: isize) {
+        let Some(picker) = self.list_picker.as_mut() else {
+            return;
+        };
+        if picker.items.is_empty() {
+            return;
+        }
+        let max = picker.items.len().saturating_sub(1) as isize;
+        picker.selected = (picker.selected as isize + delta).clamp(0, max) as usize;
+    }
+
+    /// リストピッカーの確定。既存の setter / ハンドラへ委譲する。
+    /// `fork` は ResumeSession のときだけ有効（それ以外のアクションでは無視して開いたまま）。
+    pub fn accept_list_picker(&mut self, fork: bool) {
+        let Some(picker) = self.list_picker.as_ref() else {
+            return;
+        };
+        if fork && picker.action != CodexListPickerAction::ResumeSession {
+            return;
+        }
+        let action = picker.action;
+        let Some(item) = picker.items.get(picker.selected) else {
+            self.list_picker = None;
+            return;
+        };
+        let value = item.value.clone();
+        self.list_picker = None;
+        match action {
+            CodexListPickerAction::SetModel => self.set_model(&value),
+            CodexListPickerAction::SetReasoning => self.handle_reasoning_slash_command(&value),
+            CodexListPickerAction::SetApproval => self.handle_approval_slash_command(&value),
+            CodexListPickerAction::SetSandbox => self.handle_sandbox_slash_command(&value),
+            CodexListPickerAction::ResumeSession => {
+                if self.kind == AgentKind::ClaudeCode {
+                    self.start_claude_resume(Some(&value), fork, "");
+                } else if fork {
+                    self.handle_fork_session_slash_command(&value, false);
+                } else {
+                    self.handle_resume_session_slash_command(&value, false);
+                }
+            }
+        }
+    }
+
+    /// `/model`（引数なし）: kind 別のモデル候補ピッカーを開く。
+    /// model_override 設定中はどれも current にせず、タイトルに現在値を出す。
+    fn open_model_picker(&mut self) {
+        let (items, override_name) = if self.kind == AgentKind::ClaudeCode {
+            let override_name = self.claude_settings.model_override().map(str::to_string);
+            let current = if override_name.is_some() {
+                None
+            } else {
+                Some(self.claude_settings.model_choice())
+            };
+            let items = [
+                claude::ClaudeModelChoice::Config,
+                claude::ClaudeModelChoice::Fable,
+                claude::ClaudeModelChoice::Opus,
+                claude::ClaudeModelChoice::Sonnet,
+                claude::ClaudeModelChoice::Haiku,
+            ]
+            .into_iter()
+            .map(|choice| CodexListPickerItem {
+                label: choice.label().to_string(),
+                detail: config_choice_detail(choice == claude::ClaudeModelChoice::Config),
+                value: choice.label().to_string(),
+                current: current == Some(choice),
+            })
+            .collect::<Vec<_>>();
+            (items, override_name)
+        } else {
+            let override_name = self.exec_settings.model_override.clone();
+            let current = if override_name.is_some() {
+                None
+            } else {
+                Some(self.exec_settings.model)
+            };
+            let items = [
+                CodexModelChoice::Config,
+                CodexModelChoice::Gpt55,
+                CodexModelChoice::Gpt5,
+                CodexModelChoice::O3,
+            ]
+            .into_iter()
+            .map(|choice| CodexListPickerItem {
+                label: choice.label().to_string(),
+                detail: config_choice_detail(choice == CodexModelChoice::Config),
+                value: choice.label().to_string(),
+                current: current == Some(choice),
+            })
+            .collect::<Vec<_>>();
+            (items, override_name)
+        };
+        let title = match override_name {
+            Some(name) => format!(" Model選択 — 現在: {name}（任意名は /model <name>） "),
+            None => " Model選択 — 任意名は /model <name> ".to_string(),
+        };
+        let selected = list_picker_initial_selection(&items);
+        self.open_list_picker(CodexListPicker {
+            title,
+            action: CodexListPickerAction::SetModel,
+            items,
+            selected,
+        });
+    }
+
+    /// `/reasoning` `/effort`（引数なし）: kind 別の推論強度候補ピッカーを開く。
+    fn open_reasoning_picker(&mut self) {
+        let (title, items) = if self.kind == AgentKind::ClaudeCode {
+            let current = self.claude_settings.effort_choice();
+            let items = [
+                claude::ClaudeEffortChoice::Config,
+                claude::ClaudeEffortChoice::Low,
+                claude::ClaudeEffortChoice::Medium,
+                claude::ClaudeEffortChoice::High,
+                claude::ClaudeEffortChoice::XHigh,
+                claude::ClaudeEffortChoice::Max,
+            ]
+            .into_iter()
+            .map(|choice| CodexListPickerItem {
+                label: choice.label().to_string(),
+                detail: config_choice_detail(choice == claude::ClaudeEffortChoice::Config),
+                value: choice.label().to_string(),
+                current: choice == current,
+            })
+            .collect::<Vec<_>>();
+            (" Effort選択 ".to_string(), items)
+        } else {
+            let current = self.exec_settings.reasoning;
+            let items = [
+                CodexReasoningChoice::Config,
+                CodexReasoningChoice::Low,
+                CodexReasoningChoice::Medium,
+                CodexReasoningChoice::High,
+                CodexReasoningChoice::XHigh,
+            ]
+            .into_iter()
+            .map(|choice| CodexListPickerItem {
+                label: choice.label().to_string(),
+                detail: config_choice_detail(choice == CodexReasoningChoice::Config),
+                value: choice.label().to_string(),
+                current: choice == current,
+            })
+            .collect::<Vec<_>>();
+            (" Reasoning選択 ".to_string(), items)
+        };
+        let selected = list_picker_initial_selection(&items);
+        self.open_list_picker(CodexListPicker {
+            title,
+            action: CodexListPickerAction::SetReasoning,
+            items,
+            selected,
+        });
+    }
+
+    /// `/approval` `/permissions`（引数なし）: kind 別の承認モード候補ピッカーを開く。
+    fn open_approval_picker(&mut self) {
+        let (title, items) = if self.kind == AgentKind::ClaudeCode {
+            let current = self.claude_settings.permission_mode_choice();
+            let items = [
+                claude::ClaudePermissionMode::Config,
+                claude::ClaudePermissionMode::Plan,
+                claude::ClaudePermissionMode::AcceptEdits,
+                claude::ClaudePermissionMode::DontAsk,
+                claude::ClaudePermissionMode::BypassPermissions,
+            ]
+            .into_iter()
+            .map(|choice| CodexListPickerItem {
+                label: choice.label().to_string(),
+                detail: config_choice_detail(choice == claude::ClaudePermissionMode::Config),
+                value: choice.label().to_string(),
+                current: choice == current,
+            })
+            .collect::<Vec<_>>();
+            (" Permission-mode選択 ".to_string(), items)
+        } else {
+            let current = self.exec_settings.approval;
+            let items = [
+                CodexApprovalChoice::Config,
+                CodexApprovalChoice::Untrusted,
+                CodexApprovalChoice::OnRequest,
+                CodexApprovalChoice::OnFailure,
+                CodexApprovalChoice::Never,
+            ]
+            .into_iter()
+            .map(|choice| CodexListPickerItem {
+                label: choice.label().to_string(),
+                detail: config_choice_detail(choice == CodexApprovalChoice::Config),
+                value: choice.label().to_string(),
+                current: choice == current,
+            })
+            .collect::<Vec<_>>();
+            (" Approval選択 ".to_string(), items)
+        };
+        let selected = list_picker_initial_selection(&items);
+        self.open_list_picker(CodexListPicker {
+            title,
+            action: CodexListPickerAction::SetApproval,
+            items,
+            selected,
+        });
+    }
+
+    /// `/sandbox`（引数なし・Codex のみ）: sandbox 候補ピッカーを開く。
+    fn open_sandbox_picker(&mut self) {
+        let current = self.exec_settings.sandbox;
+        let items = [
+            CodexSandboxChoice::ReadOnly,
+            CodexSandboxChoice::WorkspaceWrite,
+            CodexSandboxChoice::DangerFullAccess,
+        ]
+        .into_iter()
+        .map(|choice| CodexListPickerItem {
+            label: choice.label().to_string(),
+            detail: String::new(),
+            value: choice.label().to_string(),
+            current: choice == current,
+        })
+        .collect::<Vec<_>>();
+        let selected = list_picker_initial_selection(&items);
+        self.open_list_picker(CodexListPicker {
+            title: " Sandbox選択 ".to_string(),
+            action: CodexListPickerAction::SetSandbox,
+            items,
+            selected,
+        });
+    }
+
+    /// `/sessions` `/resume`（引数なし）: セッション候補ピッカーを開く。
+    /// 候補は `indexed_sessions` にも格納し、従来の `/resume-session <番号>` の
+    /// 番号解決と整合させる。候補 0 件なら開かない。
+    fn open_session_picker(&mut self, limit: usize) {
+        let candidates = if self.kind == AgentKind::ClaudeCode {
+            self.load_claude_session_candidates(limit)
+        } else {
+            match load_codex_session_candidates(limit) {
+                Ok(sessions) => sessions,
+                Err(e) => {
+                    self.push_log(
+                        CodexLogKind::Error,
+                        format!("Codex sessions の読み込みに失敗しました: {e}"),
+                    );
+                    return;
+                }
+            }
+        };
+        if candidates.is_empty() {
+            self.push_log(CodexLogKind::System, "セッションがありません");
+            return;
+        }
+        let items = session_picker_items(&candidates, self.thread_id.as_deref());
+        self.indexed_sessions = candidates;
+        let selected = list_picker_initial_selection(&items);
+        self.open_list_picker(CodexListPicker {
+            title: format!(" {} セッション選択 ", self.kind.display_name()),
+            action: CodexListPickerAction::ResumeSession,
+            items,
+            selected,
+        });
     }
 
     pub fn toggle_old_turns_collapsed(&mut self) {
@@ -1921,6 +2846,7 @@ impl CodexPane {
             self.action = Some(format!("model: {value}"));
             self.push_activity(format!("Claude Code model を {value} に変更"));
             self.push_log(CodexLogKind::System, format!("次回ターンの model: {value}"));
+            self.push_claude_resident_model();
             return;
         }
         self.exec_settings.model_override = None;
@@ -1928,6 +2854,7 @@ impl CodexPane {
         self.action = Some(format!("model: {value}"));
         self.push_activity(format!("Codex model を {value} に変更"));
         self.push_log(CodexLogKind::System, format!("次回ターンの model: {value}"));
+        self.push_codex_appserver_model();
     }
 
     fn set_model(&mut self, value: &str) {
@@ -1936,6 +2863,7 @@ impl CodexPane {
             self.action = Some(format!("model: {value}"));
             self.push_activity(format!("Claude Code model を {value} に変更"));
             self.push_log(CodexLogKind::System, format!("次回ターンの model: {value}"));
+            self.push_claude_resident_model();
             return;
         }
         if let Some(model) = parse_builtin_model_choice(value) {
@@ -1954,6 +2882,7 @@ impl CodexPane {
         self.action = Some(format!("model: {value}"));
         self.push_activity(format!("Codex model を {value} に変更"));
         self.push_log(CodexLogKind::System, format!("次回ターンの model: {value}"));
+        self.push_codex_appserver_model();
     }
 
     pub fn cycle_reasoning(&mut self) {
@@ -1961,10 +2890,7 @@ impl CodexPane {
             let value = self.claude_settings.cycle_effort();
             self.action = Some(format!("effort: {value}"));
             self.push_activity(format!("Claude Code effort を {value} に変更"));
-            self.push_log(
-                CodexLogKind::System,
-                format!("次回ターンの effort: {value}"),
-            );
+            self.note_claude_effort_change(value);
             return;
         }
         let value = self.exec_settings.cycle_reasoning();
@@ -1974,6 +2900,7 @@ impl CodexPane {
             CodexLogKind::System,
             format!("次回ターンの reasoning effort: {value}"),
         );
+        self.push_codex_appserver_effort();
     }
 
     /// ClaudeCode の `/effort` フリーテキスト設定。
@@ -1981,10 +2908,24 @@ impl CodexPane {
         let value = self.claude_settings.set_effort(value);
         self.action = Some(format!("effort: {value}"));
         self.push_activity(format!("Claude Code effort を {value} に変更"));
-        self.push_log(
-            CodexLogKind::System,
-            format!("次回ターンの effort: {value}"),
-        );
+        self.note_claude_effort_change(value);
+    }
+
+    /// effort 変更をログに出し、常駐が生きていれば再起動保留を立てる。
+    /// effort には set_effort 相当の control_request が無いため、常駐は再起動 + resume で反映する。
+    fn note_claude_effort_change(&mut self, value: &str) {
+        if self.claude_resident.is_some() {
+            self.claude_resident_restart_pending = true;
+            self.push_log(
+                CodexLogKind::System,
+                format!("effort を {value} に変更しました（常駐プロセス再接続後に反映）"),
+            );
+        } else {
+            self.push_log(
+                CodexLogKind::System,
+                format!("次回ターンの effort: {value}"),
+            );
+        }
     }
 
     fn set_reasoning(&mut self, value: CodexReasoningChoice) {
@@ -1996,6 +2937,7 @@ impl CodexPane {
             CodexLogKind::System,
             format!("次回ターンの reasoning effort: {value}"),
         );
+        self.push_codex_appserver_effort();
     }
 
     pub fn cycle_approval(&mut self) {
@@ -2007,6 +2949,7 @@ impl CodexPane {
                 CodexLogKind::System,
                 format!("次回ターンの permission-mode: {value}"),
             );
+            self.push_claude_resident_permission_mode();
             return;
         }
         let value = self.exec_settings.cycle_approval();
@@ -2016,6 +2959,7 @@ impl CodexPane {
             CodexLogKind::System,
             format!("次回ターンの approval: {value}"),
         );
+        self.push_codex_appserver_approval();
     }
 
     /// ClaudeCode の permission-mode 設定（`/permissions <mode>`）。
@@ -2027,6 +2971,7 @@ impl CodexPane {
             CodexLogKind::System,
             format!("次回ターンの permission-mode: {value}"),
         );
+        self.push_claude_resident_permission_mode();
     }
 
     fn set_approval(&mut self, value: CodexApprovalChoice) {
@@ -2038,13 +2983,14 @@ impl CodexPane {
             CodexLogKind::System,
             format!("次回ターンの approval: {value}"),
         );
+        self.push_codex_appserver_approval();
     }
 
     pub fn cycle_sandbox(&mut self) {
         if self.kind == AgentKind::ClaudeCode {
             self.push_log(
                 CodexLogKind::System,
-                "Claude Code バックエンドではサンドボックス設定は未対応です",
+                "Claude Code では権限は F4（permission-mode: config/plan/acceptEdits/dontAsk/bypassPermissions）で切り替えます。F5 のサンドボックス設定は使いません",
             );
             return;
         }
@@ -2055,6 +3001,7 @@ impl CodexPane {
             CodexLogKind::System,
             format!("次回ターンの sandbox: {value}"),
         );
+        self.push_codex_appserver_sandbox();
     }
 
     fn set_sandbox(&mut self, value: CodexSandboxChoice) {
@@ -2066,6 +3013,78 @@ impl CodexPane {
             CodexLogKind::System,
             format!("次回ターンの sandbox: {value}"),
         );
+        self.push_codex_appserver_sandbox();
+    }
+
+    /// `/reasoning` `/effort`。引数なしはピッカー、引数ありは従来どおり直接指定。
+    fn handle_reasoning_slash_command(&mut self, args: &str) {
+        if args.is_empty() {
+            self.open_reasoning_picker();
+            return;
+        }
+        if self.kind == AgentKind::ClaudeCode {
+            if let Some(choice) = claude::parse_effort_choice(args) {
+                self.set_claude_effort(choice);
+            } else {
+                self.push_log(
+                    CodexLogKind::Error,
+                    "effort は config / low / medium / high / xhigh / max を指定してください",
+                );
+            }
+        } else if let Some(choice) = parse_reasoning_choice(args) {
+            self.set_reasoning(choice);
+        } else {
+            self.push_log(
+                CodexLogKind::Error,
+                "reasoning は config / low / medium / high / xhigh を指定してください",
+            );
+        }
+    }
+
+    /// `/approval` `/approvals`。引数なしはピッカー、引数ありは従来どおり直接指定。
+    fn handle_approval_slash_command(&mut self, args: &str) {
+        if args.is_empty() {
+            self.open_approval_picker();
+            return;
+        }
+        if self.kind == AgentKind::ClaudeCode {
+            if let Some(mode) = claude::parse_permission_mode(args) {
+                self.set_claude_permission_mode(mode);
+            } else {
+                self.push_log(
+                    CodexLogKind::Error,
+                    "permission-mode は config / plan / acceptEdits / dontAsk / bypassPermissions を指定してください",
+                );
+            }
+        } else if let Some(choice) = parse_approval_choice(args) {
+            self.set_approval(choice);
+        } else {
+            self.push_log(
+                CodexLogKind::Error,
+                "approval は config / untrusted / on-request / on-failure / never を指定してください",
+            );
+        }
+    }
+
+    /// `/sandbox`。Codex は引数なしでピッカー、引数ありで直接指定。
+    /// Claude Code では従来どおり非対応の案内だけ出す（`cycle_sandbox` が案内して no-op）。
+    fn handle_sandbox_slash_command(&mut self, args: &str) {
+        if self.kind == AgentKind::ClaudeCode {
+            self.cycle_sandbox();
+            return;
+        }
+        if args.is_empty() {
+            self.open_sandbox_picker();
+            return;
+        }
+        if let Some(choice) = parse_sandbox_choice(args) {
+            self.set_sandbox(choice);
+        } else {
+            self.push_log(
+                CodexLogKind::Error,
+                "sandbox は read-only / workspace-write / danger-full-access を指定してください",
+            );
+        }
     }
 
     pub fn toggle_web_search(&mut self) {
@@ -2165,6 +3184,21 @@ impl CodexPane {
         self.exec_settings.image_paths.clear();
         self.action = Some("image: cleared".to_string());
         self.push_log(CodexLogKind::System, "画像添付をクリアしました");
+    }
+
+    /// ClaudeCode では画像を CLI 引数で渡せないため、添付画像パスを
+    /// プロンプト末尾に追記して Read ツールで読ませる。消費後はリストをクリアする。
+    fn append_claude_image_paths(&mut self, prompt: String) -> String {
+        if self.kind != AgentKind::ClaudeCode || self.exec_settings.image_paths.is_empty() {
+            return prompt;
+        }
+        let mut out = prompt;
+        out.push_str("\n\n添付画像（Readツールで内容を確認してください）:\n");
+        for path in &self.exec_settings.image_paths {
+            out.push_str(&format!("- {path}\n"));
+        }
+        self.exec_settings.image_paths.clear();
+        out
     }
 
     fn add_writable_dir(&mut self, dir: String) {
@@ -2567,7 +3601,40 @@ impl CodexPane {
                 .unwrap_or(false);
         if should_trim && let Ok(count) = trim_codex_session_log(&path) {
             self.session_record_count = count;
+            // トリムで末尾以外へ押し出された最後の ThreadId が失われうるため、
+            // 生きている thread_id を末尾へ書き直して復元可能に保つ。
+            if let Some(id) = self.thread_id.clone() {
+                let record = CodexSessionRecord::ThreadId { id: Some(id) };
+                if append_codex_session_record(&path, &record).is_ok() {
+                    self.session_record_count = self.session_record_count.saturating_add(1);
+                }
+            }
         }
+    }
+
+    /// thread_id を設定し、変化した場合のみ `ThreadId` レコードを永続化する。
+    /// Claude の init は毎ターン同じ id を再送するため、同値スキップで重複記録を防ぐ。
+    /// ライブイベント/ユーザー操作由来の設定なので、復元フラグは常に解除する。
+    fn set_thread_id(&mut self, id: Option<String>) {
+        self.thread_id_restored = false;
+        if self.thread_id == id {
+            return;
+        }
+        self.thread_id = id.clone();
+        self.persist_session_record(CodexSessionRecord::ThreadId { id });
+    }
+
+    /// 復元した thread_id での resume が失敗したとき、次ターンを新規セッションで開始する。
+    /// 復元フラグが立っているときだけ作用し、tombstone を書いてフラグを下ろす。
+    fn drop_restored_thread_on_failure(&mut self) {
+        if !self.thread_id_restored {
+            return;
+        }
+        self.set_thread_id(None);
+        self.push_log(
+            CodexLogKind::System,
+            "保存されていた前回セッションの再開に失敗したため、次のターンは新規セッションで開始します",
+        );
     }
 
     /// 子ゴールのライブリストを差し替える。新規 ID は一定時間ハイライトする。
@@ -2636,6 +3703,16 @@ impl CodexPane {
             }
         }
 
+        // 常駐 Claude Code プロセスのポーリング（死亡検知・中断/設定タイムアウト・アイドル回収）。
+        // 常駐時は self.child は None なので、下の従来ターン終了検知とは競合しない。
+        if self.kind == AgentKind::ClaudeCode {
+            changed |= self.poll_claude_resident();
+        }
+        // 常駐 codex app-server プロセスのポーリング（死亡検知・中断/設定タイムアウト・アイドル回収）。
+        if self.kind == AgentKind::Codex {
+            changed |= self.poll_codex_appserver();
+        }
+
         if let Some(child) = self.child.as_mut() {
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -2665,6 +3742,8 @@ impl CodexPane {
                             self.push_terminal_notice(format!("{name} コマンド失敗"), message);
                         }
                     } else if !self.turn_finished_by_event {
+                        // イベントで終了検知できなかったフォールバック経路。他 3 経路と同型に
+                        // record_turn_duration() + push_turn_complete_notice() で締める。
                         if status.success() {
                             self.refresh_current_turn_title();
                             self.queue_completed_turn_body_record();
@@ -2672,7 +3751,8 @@ impl CodexPane {
                                 CodexLogKind::System,
                                 format!("{name} ターンが完了しました"),
                             );
-                            self.push_terminal_notice(
+                            self.record_turn_duration();
+                            self.push_turn_complete_notice(
                                 format!("{name} 完了"),
                                 format!("{name} の出力が完了しました"),
                             );
@@ -2681,7 +3761,8 @@ impl CodexPane {
                             self.push_log(CodexLogKind::Error, message.clone());
                             self.refresh_current_turn_title();
                             self.queue_completed_turn_body_record();
-                            self.push_terminal_notice(format!("{name} 失敗"), message);
+                            self.record_turn_duration();
+                            self.push_turn_complete_notice(format!("{name} 失敗"), message);
                         }
                     }
                     self.turn_finished_by_event = false;
@@ -2711,6 +3792,9 @@ impl CodexPane {
                 }
             }
         }
+
+        // 経過時間タイマー: 表示秒が繰り上がったフレームだけ再描画させる。
+        changed |= self.manage_turn_timer();
 
         changed
     }
@@ -2743,7 +3827,21 @@ impl CodexPane {
             return;
         }
         self.persist_raw_event("stderr", trimmed);
-        if let Some(decision) = decision_banner("stderr", Some(trimmed)) {
+        // 古い claude CLI が `--include-partial-messages` を拒否した場合、ストリーミングを
+        // 無効化して現在のターンを一度だけ自動再試行する（sticky フラグで無限ループを防ぐ）。
+        if self.kind == AgentKind::ClaudeCode
+            && !self.claude_settings.no_partial_messages()
+            && claude::stderr_indicates_no_partial_messages(trimmed)
+        {
+            self.disable_claude_partial_messages_and_retry();
+            return;
+        }
+        // 旧 stderr ヒューリスティック承認はワンショット専用（常駐 app-server / 常駐 Claude では
+        // 承認はサーバ発リクエスト / can_use_tool の正規経路で届くため使わない）。
+        if self.codex_appserver.is_none()
+            && self.claude_resident.is_none()
+            && let Some(decision) = decision_banner("stderr", Some(trimmed))
+        {
             self.set_pending_decision(decision);
         }
         if self.child_process_label.is_some() {
@@ -2780,6 +3878,13 @@ impl CodexPane {
             return;
         }
 
+        // 常駐 app-server の JSON-RPC メッセージ（"jsonrpc":"2.0" を持つ）は別経路で処理する。
+        // ワンショット exec の snake_case イベント・codex サブコマンド JSON には jsonrpc が無い。
+        if self.codex_appserver.is_some() && value.get("jsonrpc").is_some() {
+            self.handle_codex_appserver_message(&value);
+            return;
+        }
+
         if let Some(summary) = token_usage_summary(&value) {
             self.last_token_usage_label = Some(summary);
         }
@@ -2793,7 +3898,7 @@ impl CodexPane {
         match event_type.as_str() {
             "thread.started" => {
                 if let Some(thread_id) = string_at_any(&value, &["thread_id", "threadId", "id"]) {
-                    self.thread_id = Some(thread_id.clone());
+                    self.set_thread_id(Some(thread_id));
                     self.push_log(CodexLogKind::System, "Codex セッションを開始しました");
                 } else {
                     self.push_log(CodexLogKind::System, "Codex セッションを開始しました");
@@ -2831,7 +3936,8 @@ impl CodexPane {
                 self.queue_completed_turn_body_record();
                 self.action = Some("応答完了".to_string());
                 self.push_log(CodexLogKind::System, "Codex の応答が完了しました");
-                self.push_terminal_notice("Codex 完了", "Codex の出力が完了しました");
+                self.record_turn_duration();
+                self.push_turn_complete_notice("Codex 完了", "Codex の出力が完了しました");
             }
             "turn.failed" => {
                 self.turn_running = false;
@@ -2846,7 +3952,8 @@ impl CodexPane {
                 self.push_log(CodexLogKind::Error, message.clone());
                 self.refresh_current_turn_title();
                 self.queue_completed_turn_body_record();
-                self.push_terminal_notice("Codex 失敗", message);
+                self.push_turn_complete_notice("Codex 失敗", message);
+                self.drop_restored_thread_on_failure();
             }
             "error" => {
                 let message = nested_error_message(&value)
@@ -2854,6 +3961,7 @@ impl CodexPane {
                     .unwrap_or_else(|| "Codex エラー".to_string());
                 self.push_log(CodexLogKind::Error, message.clone());
                 self.push_terminal_notice("Codex エラー", message);
+                self.drop_restored_thread_on_failure();
             }
             _ => self.handle_generic_json_event(&event_type, &value),
         }
@@ -2866,7 +3974,14 @@ impl CodexPane {
                 if claude::event_subtype(value) == Some("init") {
                     if let Some(session_id) = claude::session_id(value) {
                         // session_id は codex の thread_id フィールドを共用する。
-                        self.thread_id = Some(session_id);
+                        self.set_thread_id(Some(session_id));
+                    }
+                    // 毎ターン再送される init から現在の model/permissionMode を表示同期用に保存。
+                    if let Some(model) = value.get("model").and_then(Value::as_str) {
+                        self.claude_active_model = Some(model.to_string());
+                    }
+                    if let Some(mode) = value.get("permissionMode").and_then(Value::as_str) {
+                        self.claude_active_permission_mode = Some(mode.to_string());
                     }
                     self.begin_claude_turn();
                 }
@@ -2874,17 +3989,38 @@ impl CodexPane {
             }
             "assistant" => self.handle_claude_assistant(value),
             "user" => self.handle_claude_tool_results(value),
+            "control_request" => self.handle_claude_control_request(value),
+            "control_cancel_request" => self.handle_claude_control_cancel(value),
+            "control_response" => self.handle_claude_control_response(value),
             "result" => {
+                // total_cost_usd / usage / session_id を保存する（表示は後続タスク）。
+                if let Some(cost) = value.get("total_cost_usd").and_then(Value::as_f64) {
+                    self.claude_total_cost_usd = Some(cost);
+                }
+                if let Some(ctx) = claude::context_tokens(value) {
+                    self.claude_context_tokens = Some(ctx);
+                }
+                if let Some(session_id) = claude::session_id(value) {
+                    self.set_thread_id(Some(session_id));
+                }
                 let result = claude::parse_result(value);
                 self.handle_claude_result(result);
+            }
+            "stream_event" => {
+                // `--include-partial-messages` の text_delta をトークン単位で逐次表示する。
+                // thinking_delta / input_json_delta 等はここでは表示しない（完成形で出す）。
+                if let Some(delta) = claude::stream_text_delta(value) {
+                    self.append_assistant_delta(delta);
+                }
             }
             "error" => {
                 let message =
                     first_text_field(value).unwrap_or_else(|| "Claude Code エラー".to_string());
                 self.push_log(CodexLogKind::Error, message.clone());
                 self.push_terminal_notice("Claude Code エラー", message);
+                self.drop_restored_thread_on_failure();
             }
-            // rate_limit_event / stream_event など未知・非表示イベントは無視する。
+            // rate_limit_event など未知・非表示イベントは無視する。
             _ => {}
         }
     }
@@ -2912,11 +4048,20 @@ impl CodexPane {
     }
 
     fn handle_claude_assistant(&mut self, value: &Value) {
+        // 逐次表示していたストリーミング行のインデックス（あれば）。
+        // 最初の Text ブロックはこの行を完成形テキストで上書き（置換）し、2 番目以降の
+        // Text ブロックは新しい Assistant 行として push する。単一 Text ブロック（現行 CLI の
+        // 実挙動）では従来どおり逐次表示行がそのまま活きる見た目になり、複数 Text ブロックが
+        // 1 イベントに同梱されても欠落・連結が起きない。
+        let mut streaming_index = self.streaming_assistant_index.take();
         for block in claude::assistant_blocks(value) {
             match block {
                 claude::ClaudeBlock::Text(text) => {
-                    self.streaming_assistant_index = None;
-                    self.push_log(CodexLogKind::Assistant, text);
+                    if let Some(index) = streaming_index.take() {
+                        self.overwrite_assistant_line(index, text);
+                    } else {
+                        self.push_log(CodexLogKind::Assistant, text);
+                    }
                 }
                 claude::ClaudeBlock::Thinking(text) => {
                     // reasoning 相当。Event 種別（薄色）で控えめに出す。
@@ -2925,19 +4070,54 @@ impl CodexPane {
                         format!("(思考) {}", compact_one_line(&text, 2_000)),
                     );
                 }
-                claude::ClaudeBlock::ToolUse { name, summary } => {
+                claude::ClaudeBlock::ToolUse {
+                    name,
+                    summary,
+                    edit_patch,
+                } => {
                     if let Some(summary) = &summary {
                         self.current_command = Some(compact_tool_text(summary));
                         self.current_command_started_at = Some(Instant::now());
                     }
                     self.action = Some(format!("ツール実行: {name}"));
-                    let label = match &summary {
-                        Some(summary) => format!("{name} {}", compact_tool_text(summary)),
-                        None => name.clone(),
-                    };
-                    self.push_log(CodexLogKind::Tool, label);
+                    // Edit/Write は変更内容を色付き差分プレビュー行（見出し + diff）として残す。
+                    // ラベル行と重複しないよう、パッチがあればそれをツール実行行にする。
+                    if let Some(patch) = edit_patch {
+                        self.push_log(CodexLogKind::Tool, patch);
+                    } else {
+                        let label = match &summary {
+                            Some(summary) => format!("{name} {}", compact_tool_text(summary)),
+                            None => name.clone(),
+                        };
+                        self.push_log(CodexLogKind::Tool, label);
+                    }
                 }
             }
+        }
+    }
+
+    /// ストリーミング済みの Assistant 行を完成形テキストで置換する。
+    /// 行が既に trim 等で消えていれば新しい行として push する。
+    fn overwrite_assistant_line(&mut self, index: usize, text: String) {
+        let current = match self.log.get(index) {
+            Some(line) => line.text.clone(),
+            None => {
+                self.push_log(CodexLogKind::Assistant, text);
+                return;
+            }
+        };
+        if current == text {
+            return;
+        }
+        // ストリーミング済みテキストの続き（差分サフィックス）なら delta として永続化して
+        // 再読込時の整合を保つ。前方一致しない場合はメモリ上のみ置換する。
+        let suffix = text.strip_prefix(current.as_str()).map(str::to_string);
+        if let Some(line) = self.log.get_mut(index) {
+            line.text = text;
+        }
+        self.invalidate_rendered_history_metrics();
+        if let Some(suffix) = suffix {
+            self.persist_session_record(CodexSessionRecord::AssistantDelta { text: suffix });
         }
     }
 
@@ -2961,6 +4141,7 @@ impl CodexPane {
 
     fn handle_claude_result(&mut self, result: claude::ClaudeResult) {
         if let Some(usage) = result.usage_label {
+            self.claude_last_usage = Some(usage.clone());
             self.last_token_usage_label = Some(usage);
         }
         self.turn_running = false;
@@ -2970,27 +4151,65 @@ impl CodexPane {
         self.streaming_assistant_index = None;
         self.refresh_current_turn_title();
         self.queue_completed_turn_body_record();
+        self.record_turn_duration();
+        self.claude_resident_last_activity = Some(Instant::now());
+
+        // 常駐モードで interrupt 要求中に来た result（aborted_streaming）は中断完了として扱う。
+        // 既存仕様どおり、中断時はキューを自動開始しない。
+        if self.claude_interrupting {
+            self.claude_interrupting = false;
+            self.claude_interrupt_deadline = None;
+            self.pending_decision = None;
+            self.claude_pending_tool = None;
+            self.current_turn_prompt = None;
+            self.current_turn_retry_prompt = None;
+            self.action = Some("中断完了".to_string());
+            self.push_log(CodexLogKind::System, "ターンを中断しました");
+            let queued = self.queued_prompts.len();
+            if queued > 0 {
+                self.push_log(
+                    CodexLogKind::System,
+                    format!("予約{queued}件は保留中（/stop queued で破棄可）"),
+                );
+            }
+            return;
+        }
 
         if !result.denials.is_empty() {
+            // 常駐モードでは承認は can_use_tool で解決するため denials は基本来ない。
+            // 来た場合（ワンショット経路）は従来どおりリトライバナーを出す。
             self.set_claude_permission_decision(&result.denials);
             return;
         }
+
+        // 拒否なく完了 → ループガードの承認控えをクリアする。
+        self.claude_approved_denials.clear();
 
         if result.is_error {
             let message = result
                 .text
                 .unwrap_or_else(|| "Claude Code ターンが失敗しました".to_string());
             self.push_log(CodexLogKind::Error, message.clone());
-            self.push_terminal_notice("Claude Code 失敗", message);
+            self.push_turn_complete_notice("Claude Code 失敗", message);
+            // result に有効な session_id が含まれていれば site③ が復元フラグを解除済みなので、
+            // ここでの drop は「session_id を伴わないエラー」時のみ発火する。
+            self.drop_restored_thread_on_failure();
         } else {
             self.action = Some("応答完了".to_string());
             self.push_log(CodexLogKind::System, "Claude Code の応答が完了しました");
-            self.push_terminal_notice("Claude Code 完了", "Claude Code の出力が完了しました");
+            self.push_turn_complete_notice("Claude Code 完了", "Claude Code の出力が完了しました");
+        }
+
+        // 常駐モードはプロセスが終了しないので、ここでキュー再開を駆動する
+        // （ワンショットは update() のプロセス終了検知が駆動するため二重にしない）。
+        if self.claude_resident.is_some() {
+            self.current_turn_prompt = None;
+            self.current_turn_retry_prompt = None;
+            self.start_next_queued_turn_if_idle();
         }
     }
 
     fn set_claude_permission_decision(&mut self, denials: &[claude::ClaudeDenial]) {
-        self.claude_pending_escalation = Some(claude::escalation_for_denials(denials));
         let summary = denials
             .iter()
             .map(|denial| match &denial.target {
@@ -3001,7 +4220,37 @@ impl CodexPane {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        let message = format!("ツール実行権限が拒否されました: {summary}。許可して続行しますか？");
+
+        // ループガード: 直前の承認リトライで許可したのと同じ拒否だけが再発した場合、
+        // 生成した許可ルールでは通せていない。バナーを再表示せずエラーで知らせる。
+        let approved = std::mem::take(&mut self.claude_approved_denials);
+        if !approved.is_empty() && denials.iter().all(|d| approved.contains(d)) {
+            self.claude_pending_allowed_tools.clear();
+            self.claude_pending_denials.clear();
+            self.push_log(
+                CodexLogKind::Error,
+                format!(
+                    "許可ルールでは通せませんでした: {summary}。F4 で permission-mode の変更を検討してください"
+                ),
+            );
+            self.push_terminal_notice(
+                "Claude Code 権限エラー",
+                "許可ルールでは通せませんでした。F4 で permission-mode の変更を検討してください",
+            );
+            return;
+        }
+
+        // 拒否された具体的なツールだけを許可するルールを生成する。
+        let rules = claude::allowed_tool_rules(denials);
+        self.claude_pending_allowed_tools = rules.clone();
+        self.claude_pending_denials = denials.to_vec();
+        let allow = if rules.is_empty() {
+            String::new()
+        } else {
+            format!(" 許可: {}", rules.join(", "))
+        };
+        let message =
+            format!("ツール実行権限が拒否されました: {summary}。{allow} を許可して続行しますか？");
         self.set_pending_decision(CodexDecisionBanner::new(
             CodexDecisionKind::Permission,
             message,
@@ -3010,22 +4259,35 @@ impl CodexPane {
 
     /// 承認 Accept/Always 後に `--resume` で続行ターンを開始する。
     fn resolve_claude_decision(&mut self, response: CodexDecisionResponse, response_label: &str) {
+        // 常駐モードの can_use_tool 応答はプロセスへ control_response を返してその場で続行する
+        // （ワンショットのような resume 再実行はしない）。
+        if self.claude_pending_tool.is_some() {
+            self.resolve_claude_resident_tool(response, response_label);
+            return;
+        }
         self.action = Some(format!("確認応答: {response_label}"));
         self.push_activity(format!("確認待ちに {response_label} で応答"));
-        let escalation = self
-            .claude_pending_escalation
-            .take()
-            .unwrap_or(claude::PermissionEscalation::SkipPermissions);
+        let rules = std::mem::take(&mut self.claude_pending_allowed_tools);
+        let denials = std::mem::take(&mut self.claude_pending_denials);
+        let rules_label = if rules.is_empty() {
+            String::new()
+        } else {
+            format!("（{}）", rules.join(", "))
+        };
         match response {
             CodexDecisionResponse::Accept => {
-                self.claude_one_shot_permission = Some(escalation);
-                self.start_claude_approval_retry("今回だけ許可");
+                // リトライ結果で同一の拒否が再発したらループとみなすため許可内容を控える。
+                self.claude_approved_denials = denials;
+                self.claude_one_shot_allowed_tools = rules;
+                self.start_claude_approval_retry(&format!("今回だけ許可{rules_label}"));
             }
             CodexDecisionResponse::Always => {
-                self.claude_settings.apply_sticky_escalation(escalation);
-                self.start_claude_approval_retry("これからずっと許可");
+                self.claude_approved_denials = denials;
+                self.claude_settings.add_allowed_tools(&rules);
+                self.start_claude_approval_retry(&format!("これからずっと許可{rules_label}"));
             }
             CodexDecisionResponse::Deny => {
+                self.claude_approved_denials.clear();
                 self.push_terminal_notice("Claude Code 確認応答", "拒否したため作業を中断します");
                 self.push_log(CodexLogKind::System, "拒否したため入力待ちに戻ります");
                 self.start_next_queued_turn_if_idle();
@@ -3050,6 +4312,1565 @@ impl CodexPane {
         self.push_log(CodexLogKind::User, prompt.to_string());
         self.input_state.record_submitted(prompt);
         self.start_turn(prompt);
+    }
+
+    /// 古い claude CLI 検出時: ストリーミング用フラグを sticky で無効化し、
+    /// 現在のターンを一度だけ自動再試行する。再試行対象が無ければ次ターンから自然に無効になる。
+    fn disable_claude_partial_messages_and_retry(&mut self) {
+        self.claude_settings.disable_partial_messages();
+        self.push_log(
+            CodexLogKind::System,
+            "お使いのclaude CLIはストリーミング表示に未対応のため無効化しました（アップデート推奨）",
+        );
+        // フラグは既に立っているので、再試行ターンの stderr では再発火しない（1 回だけ）。
+        self.retry_current_turn_after_permission_change("ストリーミング無効化");
+    }
+
+    // -----------------------------------------------------------------------
+    // 常駐（多ターン 1 プロセス）モード
+    // -----------------------------------------------------------------------
+
+    /// このターンを常駐経路で送るか（ClaudeCode かつ常駐有効）。
+    fn claude_resident_active(&self) -> bool {
+        self.kind == AgentKind::ClaudeCode && self.claude_resident_enabled
+    }
+
+    /// 常駐 claude プロセスを spawn する（stdout/stderr は既存の line reader で読む）。
+    fn spawn_claude_resident(&mut self) -> Result<claude_resident::ResidentClient> {
+        let mut cmd = Command::new(&self.codex_bin);
+        for arg in claude::resident_args(
+            self.thread_id.as_deref(),
+            &self.claude_settings,
+            self.claude_fork_next,
+            addness_tui_developer_instructions(),
+        ) {
+            cmd.arg(arg);
+        }
+        cmd.current_dir(&self.cwd);
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        self.apply_agent_env(&mut cmd);
+
+        let mut child = cmd
+            .spawn()
+            .context("Claude Code 常駐プロセスの起動に失敗しました")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("Claude Code 常駐プロセス stdout の取得に失敗しました")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("Claude Code 常駐プロセス stderr の取得に失敗しました")?;
+        spawn_line_reader(stdout, self.tx.clone(), false);
+        spawn_line_reader(stderr, self.tx.clone(), true);
+        claude_resident::ResidentClient::new(child)
+    }
+
+    /// 常駐モードでターンを開始する（既存プロセスがあれば再利用、無ければ spawn）。
+    /// spawn 自体に失敗した場合はワンショットへフォールバックする。
+    fn start_claude_resident_turn(&mut self, prompt: &str, display_prompt: &str) {
+        self.esc_interrupt_armed = false;
+        if self.is_turn_running() {
+            self.push_log(
+                CodexLogKind::System,
+                "前の Claude Code ターンがまだ実行中です",
+            );
+            return;
+        }
+
+        // グレースフル終了中の常駐は使わず、確実に終了させてから作り直す。
+        if let Some(resident) = self.claude_resident.as_mut()
+            && resident.closing
+        {
+            resident.kill();
+            self.claude_resident = None;
+        }
+
+        if self.claude_resident.is_none() {
+            match self.spawn_claude_resident() {
+                Ok(client) => {
+                    self.claude_resident = Some(client);
+                    self.claude_fork_next = false;
+                    let resume = if self.thread_id.is_some() {
+                        "（--resume で再接続）"
+                    } else {
+                        ""
+                    };
+                    self.push_log(
+                        CodexLogKind::System,
+                        format!("Claude Code 常駐プロセスを起動しました{resume}"),
+                    );
+                }
+                Err(e) => {
+                    // 常駐 spawn 失敗 → このセッションはワンショットへ退避する。
+                    self.claude_resident_enabled = false;
+                    self.push_log(
+                        CodexLogKind::System,
+                        format!("常駐プロセスの起動に失敗したためワンショットで実行します: {e}"),
+                    );
+                    self.start_oneshot_turn(prompt, display_prompt);
+                    return;
+                }
+            }
+        }
+
+        let full_prompt = self.prompt_with_addness_context(prompt);
+        let full_prompt = self.append_claude_image_paths(full_prompt);
+        let sent = self
+            .claude_resident
+            .as_ref()
+            .is_some_and(|resident| resident.send_user_message(&full_prompt));
+        if !sent {
+            // writer が死んでいる → プロセス死亡として扱い、次ターンで再接続する。
+            self.push_log(
+                CodexLogKind::Error,
+                "常駐プロセスへの送信に失敗しました。次のターンで再接続します",
+            );
+            self.handle_claude_resident_death();
+            return;
+        }
+
+        self.turn_running = true;
+        self.turn_finished_by_event = false;
+        self.pending_decision = None;
+        self.diff_view = None;
+        self.claude_interrupting = false;
+        self.claude_interrupt_deadline = None;
+        self.claude_one_shot_allowed_tools = Vec::new();
+        self.current_turn_prompt = Some(display_prompt.to_string());
+        self.current_turn_retry_prompt = Some(prompt.to_string());
+        self.claude_resident_last_activity = Some(Instant::now());
+        self.scroll_to_live();
+    }
+
+    /// 常駐 claude プロセスのポーリング（毎フレーム `update()` から呼ぶ）。
+    /// 死亡検知・interrupt タイムアウト・設定変更タイムアウト・アイドル回収を扱う。
+    fn poll_claude_resident(&mut self) -> bool {
+        // 1. 終了検知（死亡 or グレースフルクローズ完了）。
+        let waited = match self.claude_resident.as_mut() {
+            Some(resident) => resident.try_wait(),
+            None => return false,
+        };
+        match waited {
+            Ok(Some(_status)) => {
+                let closing = self
+                    .claude_resident
+                    .as_ref()
+                    .map(|r| r.closing)
+                    .unwrap_or(false);
+                self.claude_resident = None;
+                if closing {
+                    self.push_log(
+                        CodexLogKind::System,
+                        "アイドルのため Claude Code 常駐プロセスを終了しました（次のターンで再接続）",
+                    );
+                } else {
+                    self.handle_claude_resident_death();
+                }
+                return true;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                self.claude_resident = None;
+                self.push_log(
+                    CodexLogKind::Error,
+                    format!("Claude Code 常駐プロセスの状態確認に失敗しました: {e}"),
+                );
+                self.handle_claude_resident_death();
+                return true;
+            }
+        }
+
+        // 2. interrupt グレースフル待ちのタイムアウト → kill フォールバック。
+        if let Some(deadline) = self.claude_interrupt_deadline
+            && Instant::now() >= deadline
+        {
+            if let Some(resident) = self.claude_resident.as_mut() {
+                resident.kill();
+            }
+            self.claude_resident = None;
+            self.claude_interrupt_deadline = None;
+            self.claude_interrupting = false;
+            // kill フォールバックでも Addness へ作業メモを記録する（current_turn_prompt を消す前に）。
+            self.queue_completed_turn_body_record();
+            self.turn_running = false;
+            self.current_command = None;
+            self.current_command_started_at = None;
+            self.streaming_assistant_index = None;
+            self.pending_decision = None;
+            self.claude_pending_tool = None;
+            self.current_turn_prompt = None;
+            self.current_turn_retry_prompt = None;
+            self.push_log(
+                CodexLogKind::System,
+                "中断が2秒以内に完了しなかったため常駐プロセスを終了しました（次のターンで再接続）",
+            );
+            return true;
+        }
+
+        // 3. 設定変更（set_model / set_permission_mode）応答のタイムアウト → 再起動フォールバック。
+        if let Some(change) = self.claude_pending_setting_change.as_ref()
+            && Instant::now() >= change.deadline
+        {
+            let label = change.label.clone();
+            self.claude_pending_setting_change = None;
+            self.claude_resident_restart_pending = true;
+            self.push_log(
+                CodexLogKind::System,
+                format!("{label}の応答がタイムアウトしました。次のアイドルで再起動します"),
+            );
+            return true;
+        }
+
+        // 4. アイドル時: 設定変更の再起動保留があればグレースフルに閉じる（次ターンで再 spawn）。
+        if self.claude_resident_restart_pending
+            && !self.turn_running
+            && self.pending_decision.is_none()
+            && self.claude_pending_tool.is_none()
+        {
+            self.claude_resident_restart_pending = false;
+            if let Some(resident) = self.claude_resident.as_mut() {
+                resident.begin_close();
+            }
+            self.push_log(
+                CodexLogKind::System,
+                "設定を反映するため常駐プロセスを再起動します（次のターンで再接続）",
+            );
+            return true;
+        }
+
+        // 5. アイドル回収（無操作が続いたらメモリ節約のため閉じる）。
+        if !self.turn_running
+            && self.pending_decision.is_none()
+            && self.claude_pending_tool.is_none()
+            && let Some(last) = self.claude_resident_last_activity
+            && last.elapsed() >= CLAUDE_RESIDENT_IDLE_TIMEOUT
+        {
+            self.claude_resident_last_activity = None;
+            if let Some(resident) = self.claude_resident.as_mut() {
+                resident.begin_close();
+            }
+            return true;
+        }
+
+        false
+    }
+
+    /// 常駐プロセスが予期せず死んだときの処理。実行中ターンはエラー終了扱い。
+    fn handle_claude_resident_death(&mut self) {
+        self.claude_resident = None;
+        self.claude_interrupt_deadline = None;
+        self.claude_interrupting = false;
+        self.claude_pending_setting_change = None;
+        let was_running = self.turn_running;
+        if was_running {
+            // 実行中の死亡/切断でも Addness へ作業メモを記録する（current_turn_prompt を消す前に）。
+            self.queue_completed_turn_body_record();
+        }
+        self.turn_running = false;
+        self.current_command = None;
+        self.current_command_started_at = None;
+        self.streaming_assistant_index = None;
+        self.pending_decision = None;
+        self.claude_pending_tool = None;
+        self.current_turn_prompt = None;
+        self.current_turn_retry_prompt = None;
+        if was_running {
+            self.refresh_current_turn_title();
+        }
+        let message = "Claude Code プロセスが終了しました。次のターンで再接続します";
+        self.push_log(CodexLogKind::Error, message);
+        self.push_terminal_notice("Claude Code 切断", message);
+        // 復元した session_id が init で裏取りされる前に死んだ場合は resume 失敗とみなし、
+        // 同じ --resume で死亡を繰り返さないよう新規セッションへフォールバックする。
+        self.drop_restored_thread_on_failure();
+        // 中断・死亡時はキューを自動開始しない（ユーザー判断を待つ）。
+    }
+
+    /// 常駐モードで実行中ターンへ interrupt（グレースフル中断）を送る。
+    /// 送れたら 2 秒の完了待ちを開始し `true` を返す。
+    fn request_claude_interrupt(&mut self) -> bool {
+        if self.claude_resident.is_none() {
+            return false;
+        }
+        let sent = self
+            .claude_resident
+            .as_mut()
+            .and_then(|resident| resident.send_interrupt())
+            .is_some();
+        if !sent {
+            return false;
+        }
+        self.claude_interrupting = true;
+        self.claude_interrupt_deadline = Some(Instant::now() + CLAUDE_INTERRUPT_GRACE);
+        self.claude_resident_last_activity = Some(Instant::now());
+        self.push_log(
+            CodexLogKind::System,
+            "中断を要求しました（2秒以内に完了しなければ再起動します）",
+        );
+        true
+    }
+
+    /// 常駐モードの can_use_tool 制御要求を処理する。
+    /// セッション許可ルールにマッチすればバナーを出さず自動許可、そうでなければバナー表示。
+    fn handle_claude_control_request(&mut self, value: &Value) {
+        let Some(claude_resident::ResidentControl::CanUseTool(request)) =
+            claude_resident::parse_control(value)
+        else {
+            return;
+        };
+        self.claude_resident_last_activity = Some(Instant::now());
+
+        // セッション内許可ルールにマッチ → 届いた時点でバナーなし自動許可。
+        if claude_resident::tool_matches_rules(
+            &request.tool_name,
+            &request.input,
+            self.claude_settings.sticky_allowed_tools(),
+        ) {
+            if let Some(resident) = self.claude_resident.as_ref() {
+                resident.send_allow(&request.request_id, &request.input);
+            }
+            self.push_log(
+                CodexLogKind::Tool,
+                format!("{} を自動許可（セッション許可ルール）", request.tool_name),
+            );
+            return;
+        }
+
+        // バナー表示（既存 CodexDecisionBanner を流用）。
+        let rules = claude_resident::rules_for_request(&request.tool_name, &request.input);
+        let summary = claude::tool_use_summary(&request.tool_name, &request.input);
+        let target = summary
+            .as_deref()
+            .map(|s| format!("（{}）", compact_one_line(s, 80)))
+            .unwrap_or_default();
+        let allow = if rules.is_empty() {
+            String::new()
+        } else {
+            format!(" 常に許可の対象: {}", rules.join(", "))
+        };
+        let message = format!(
+            "ツール実行の許可を求めています: {}{target}。{allow}",
+            request.tool_name
+        );
+        self.claude_pending_tool = Some(ClaudePendingTool {
+            request_id: request.request_id,
+            input: request.input,
+            rules,
+        });
+        self.set_pending_decision(CodexDecisionBanner::new(
+            CodexDecisionKind::Permission,
+            message,
+        ));
+    }
+
+    /// 承認要求のキャンセル（中断時など）。該当バナーを閉じ、応答は送らない。
+    fn handle_claude_control_cancel(&mut self, value: &Value) {
+        let Some(claude_resident::ResidentControl::Cancel { request_id }) =
+            claude_resident::parse_control(value)
+        else {
+            return;
+        };
+        if self
+            .claude_pending_tool
+            .as_ref()
+            .is_some_and(|pending| pending.request_id == request_id)
+        {
+            self.claude_pending_tool = None;
+            self.pending_decision = None;
+            self.push_log(CodexLogKind::System, "ツール承認要求がキャンセルされました");
+        }
+    }
+
+    /// 自前で送った control_request（set_model / set_permission_mode）への応答処理。
+    fn handle_claude_control_response(&mut self, value: &Value) {
+        let Some(claude_resident::ResidentControl::Response(response)) =
+            claude_resident::parse_control(value)
+        else {
+            return;
+        };
+        let Some(change) = self.claude_pending_setting_change.as_ref() else {
+            return;
+        };
+        if change.request_id != response.request_id {
+            return;
+        }
+        let label = change.label.clone();
+        self.claude_pending_setting_change = None;
+        if response.success {
+            self.push_log(CodexLogKind::System, format!("{label}を反映しました"));
+        } else {
+            let detail = response.error.unwrap_or_else(|| "エラー".to_string());
+            self.claude_resident_restart_pending = true;
+            self.push_log(
+                CodexLogKind::System,
+                format!("{label}の実行時反映に失敗（{detail}）。次のアイドルで再起動します"),
+            );
+        }
+    }
+
+    /// 常駐モードの承認バナーへの応答を control_response としてプロセスへ返す。
+    /// ワンショットのような resume 再実行はせず、進行中ターンをその場で続行させる。
+    fn resolve_claude_resident_tool(
+        &mut self,
+        response: CodexDecisionResponse,
+        response_label: &str,
+    ) {
+        let Some(pending) = self.claude_pending_tool.take() else {
+            return;
+        };
+        self.action = Some(format!("確認応答: {response_label}"));
+        self.push_activity(format!("ツール承認に {response_label} で応答"));
+        self.claude_resident_last_activity = Some(Instant::now());
+        let Some(resident) = self.claude_resident.as_ref() else {
+            return;
+        };
+        match response {
+            CodexDecisionResponse::Accept => {
+                resident.send_allow(&pending.request_id, &pending.input);
+                self.push_log(CodexLogKind::System, "今回だけ許可して続行します");
+            }
+            CodexDecisionResponse::Always => {
+                resident.send_allow(&pending.request_id, &pending.input);
+                let rules_label = if pending.rules.is_empty() {
+                    String::new()
+                } else {
+                    format!("（{}）", pending.rules.join(", "))
+                };
+                self.claude_settings.add_allowed_tools(&pending.rules);
+                self.push_log(
+                    CodexLogKind::System,
+                    format!("これからずっと許可{rules_label}して続行します"),
+                );
+            }
+            CodexDecisionResponse::Deny => {
+                resident.send_deny(&pending.request_id, "ユーザーが拒否しました");
+                self.push_log(
+                    CodexLogKind::System,
+                    "拒否しました（Claude はこのツールなしで続行します）",
+                );
+            }
+        }
+    }
+
+    /// F2（model）を常駐プロセスへ set_model control_request で反映する。
+    /// 具体値が無い（config）場合は再起動フォールバックへ回す。
+    fn push_claude_resident_model(&mut self) {
+        if self.claude_resident.is_none() {
+            return;
+        }
+        let Some(model) = self
+            .claude_settings
+            .effective_model_arg()
+            .map(str::to_string)
+        else {
+            self.claude_resident_restart_pending = true;
+            return;
+        };
+        let request_id = self
+            .claude_resident
+            .as_mut()
+            .and_then(|resident| resident.send_set_model(&model));
+        match request_id {
+            Some(request_id) => {
+                self.claude_pending_setting_change = Some(ClaudePendingSettingChange {
+                    request_id,
+                    deadline: Instant::now() + CLAUDE_SETTING_CHANGE_GRACE,
+                    label: format!("model 変更（{model}）"),
+                });
+            }
+            None => self.claude_resident_restart_pending = true,
+        }
+    }
+
+    /// F4（permission-mode）を常駐プロセスへ set_permission_mode control_request で反映する。
+    fn push_claude_resident_permission_mode(&mut self) {
+        if self.claude_resident.is_none() {
+            return;
+        }
+        let Some(mode) = self
+            .claude_settings
+            .effective_permission_mode_arg()
+            .map(str::to_string)
+        else {
+            self.claude_resident_restart_pending = true;
+            return;
+        };
+        let request_id = self
+            .claude_resident
+            .as_mut()
+            .and_then(|resident| resident.send_set_permission_mode(&mode));
+        match request_id {
+            Some(request_id) => {
+                self.claude_pending_setting_change = Some(ClaudePendingSettingChange {
+                    request_id,
+                    deadline: Instant::now() + CLAUDE_SETTING_CHANGE_GRACE,
+                    label: format!("permission-mode 変更（{mode}）"),
+                });
+            }
+            None => self.claude_resident_restart_pending = true,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Codex app-server 常駐モード
+    // -----------------------------------------------------------------------
+
+    fn codex_appserver_active(&self) -> bool {
+        self.kind == AgentKind::Codex && self.codex_appserver_enabled
+    }
+
+    /// 常駐 codex app-server を spawn する（stdout/stderr は既存の line reader で読む）。
+    fn spawn_codex_appserver(&mut self) -> Result<codex_appserver::AppServerClient> {
+        let mut cmd = Command::new(&self.codex_bin);
+        cmd.arg("app-server");
+        cmd.current_dir(&self.cwd);
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        self.apply_agent_env(&mut cmd);
+
+        let mut child = cmd
+            .spawn()
+            .context("codex app-server 常駐プロセスの起動に失敗しました")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("codex app-server 常駐プロセス stdout の取得に失敗しました")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("codex app-server 常駐プロセス stderr の取得に失敗しました")?;
+        spawn_line_reader(stdout, self.tx.clone(), false);
+        spawn_line_reader(stderr, self.tx.clone(), true);
+        codex_appserver::AppServerClient::new(child)
+    }
+
+    /// 現在の CodexExecSettings から thread/start・thread/resume 用の設定を組み立てる。
+    fn codex_appserver_thread_config(&self) -> codex_appserver::ThreadConfig {
+        let settings = &self.exec_settings;
+        // dangerously-bypass-approvals-and-sandbox 相当は never + danger-full-access で表す。
+        let (approval, sandbox) = if settings.bypass_approvals_and_sandbox {
+            (Some("never".to_string()), "danger-full-access".to_string())
+        } else {
+            (
+                settings.approval.cli_arg().map(str::to_string),
+                settings.sandbox.cli_arg().to_string(),
+            )
+        };
+        codex_appserver::ThreadConfig {
+            cwd: Some(self.cwd.clone()),
+            model: settings.model_cli_arg().map(str::to_string),
+            approval_policy: approval,
+            sandbox: Some(sandbox),
+            developer_instructions: Some(addness_tui_developer_instructions().to_string()),
+        }
+    }
+
+    /// turn/start に載せる reasoning effort（None は codex の既定）。
+    fn codex_appserver_effort(&self) -> Option<String> {
+        self.exec_settings
+            .reasoning
+            .config_value()
+            .map(str::to_string)
+    }
+
+    /// 常駐モードでターンを開始する（既存プロセスがあれば再利用、無ければ spawn しハンドシェイク）。
+    fn start_codex_appserver_turn(&mut self, prompt: &str, display_prompt: &str) {
+        self.esc_interrupt_armed = false;
+        if self.is_turn_running() {
+            self.push_log(CodexLogKind::System, "前の Codex ターンがまだ実行中です");
+            return;
+        }
+        // グレースフル終了中の常駐は使わず、確実に終了させてから作り直す。
+        if let Some(client) = self.codex_appserver.as_mut()
+            && client.closing
+        {
+            client.kill();
+            self.codex_appserver = None;
+            self.codex_appserver_phase = CodexAppServerPhase::Idle;
+        }
+
+        let full_prompt = self.prompt_with_addness_context(prompt);
+
+        if self.codex_appserver.is_none() {
+            match self.spawn_codex_appserver() {
+                Ok(client) => {
+                    self.codex_appserver = Some(client);
+                    self.codex_appserver_phase = CodexAppServerPhase::Idle;
+                    if !self.send_codex_appserver_initialize() {
+                        // writer が死んでいる → ワンショットへ退避する。
+                        self.codex_appserver = None;
+                        self.codex_appserver_phase = CodexAppServerPhase::Idle;
+                        self.codex_appserver_enabled = false;
+                        self.push_log(
+                            CodexLogKind::Error,
+                            "常駐プロセスへの initialize 送信に失敗したためワンショットで実行します",
+                        );
+                        self.start_oneshot_turn(prompt, display_prompt);
+                        return;
+                    }
+                    let resume = if self.thread_id.is_some() {
+                        "（thread/resume で再接続）"
+                    } else {
+                        ""
+                    };
+                    self.push_log(
+                        CodexLogKind::System,
+                        format!("Codex app-server 常駐プロセスを起動しました{resume}"),
+                    );
+                }
+                Err(e) => {
+                    self.codex_appserver_enabled = false;
+                    self.push_log(
+                        CodexLogKind::System,
+                        format!("常駐プロセスの起動に失敗したためワンショットで実行します: {e}"),
+                    );
+                    self.start_oneshot_turn(prompt, display_prompt);
+                    return;
+                }
+            }
+        }
+
+        self.codex_appserver_pending_turn = Some(full_prompt);
+        // 添付画像は turn/start へ渡すため退避してから入力欄をクリアする。
+        self.codex_appserver_pending_images = std::mem::take(&mut self.exec_settings.image_paths);
+        self.turn_running = true;
+        self.turn_finished_by_event = false;
+        self.pending_decision = None;
+        self.diff_view = None;
+        self.codex_appserver_interrupting = false;
+        self.codex_appserver_interrupt_deadline = None;
+        self.current_turn_prompt = Some(display_prompt.to_string());
+        self.current_turn_retry_prompt = Some(prompt.to_string());
+        self.codex_appserver_last_activity = Some(Instant::now());
+        self.scroll_to_live();
+
+        // すでに thread 確立済みなら即座に turn/start する。未確立ならハンドシェイク完了時に送る。
+        if self.codex_appserver_phase == CodexAppServerPhase::Ready {
+            self.flush_codex_appserver_pending_turn();
+        }
+    }
+
+    /// initialize リクエストを送り、フェーズを Initializing にする。送信可否を返す。
+    fn send_codex_appserver_initialize(&mut self) -> bool {
+        let Some(client) = self.codex_appserver.as_mut() else {
+            return false;
+        };
+        let id = client.next_id();
+        let request =
+            codex_appserver::initialize_request(id, "addness-tui", env!("CARGO_PKG_VERSION"));
+        if client.send_value(&request) {
+            self.codex_appserver_phase = CodexAppServerPhase::Initializing { request_id: id };
+            true
+        } else {
+            false
+        }
+    }
+
+    /// thread 確立後に保留していたターン本文を turn/start で送る。
+    fn flush_codex_appserver_pending_turn(&mut self) {
+        let Some(text) = self.codex_appserver_pending_turn.take() else {
+            return;
+        };
+        let Some(thread_id) = self.thread_id.clone() else {
+            self.handle_codex_appserver_death();
+            return;
+        };
+        let effort = self.codex_appserver_effort();
+        let images = std::mem::take(&mut self.codex_appserver_pending_images);
+        let Some(client) = self.codex_appserver.as_mut() else {
+            return;
+        };
+        let id = client.next_id();
+        let request =
+            codex_appserver::turn_start_request(id, &thread_id, &text, effort.as_deref(), &images);
+        if client.send_value(&request) {
+            self.codex_appserver_turn_req_id = Some(id);
+            self.codex_appserver_last_activity = Some(Instant::now());
+        } else {
+            self.push_log(
+                CodexLogKind::Error,
+                "常駐プロセスへの turn/start 送信に失敗しました。次のターンで再接続します",
+            );
+            self.handle_codex_appserver_death();
+        }
+    }
+
+    /// 常駐プロセスへ initialized 通知 → thread/start（or resume）を送る。
+    fn send_codex_appserver_start_thread(&mut self) {
+        let config = self.codex_appserver_thread_config();
+        let resume_target = self.thread_id.clone();
+        let Some(client) = self.codex_appserver.as_mut() else {
+            return;
+        };
+        if !client.send_value(&codex_appserver::initialized_notification()) {
+            self.handle_codex_appserver_death();
+            return;
+        }
+        let id = client.next_id();
+        let (request, resuming) = match resume_target.as_deref() {
+            Some(thread_id) => (
+                codex_appserver::thread_resume_request(id, thread_id, &config),
+                true,
+            ),
+            None => (codex_appserver::thread_start_request(id, &config), false),
+        };
+        if client.send_value(&request) {
+            self.codex_appserver_phase = CodexAppServerPhase::StartingThread {
+                request_id: id,
+                resuming,
+            };
+        } else {
+            self.handle_codex_appserver_death();
+        }
+    }
+
+    /// resume に失敗したとき、新規 thread/start で作り直す。
+    fn send_codex_appserver_fresh_thread(&mut self) {
+        let config = self.codex_appserver_thread_config();
+        let Some(client) = self.codex_appserver.as_mut() else {
+            return;
+        };
+        let id = client.next_id();
+        let request = codex_appserver::thread_start_request(id, &config);
+        if client.send_value(&request) {
+            self.codex_appserver_phase = CodexAppServerPhase::StartingThread {
+                request_id: id,
+                resuming: false,
+            };
+        } else {
+            self.handle_codex_appserver_death();
+        }
+    }
+
+    /// 常駐 codex app-server の JSON-RPC メッセージを処理する。
+    fn handle_codex_appserver_message(&mut self, value: &Value) {
+        let Some(message) = codex_appserver::parse_message(value) else {
+            return;
+        };
+        self.codex_appserver_last_activity = Some(Instant::now());
+        match message {
+            codex_appserver::ServerMessage::Response { id, result, error } => {
+                self.handle_codex_appserver_response(id, result, error);
+            }
+            codex_appserver::ServerMessage::Approval(request) => {
+                self.handle_codex_appserver_approval(request);
+            }
+            codex_appserver::ServerMessage::UnhandledRequest { id, method } => {
+                if let Some(client) = self.codex_appserver.as_ref() {
+                    client.send_value(&codex_appserver::error_response(
+                        &id,
+                        -32601,
+                        "method not supported by addness-tui",
+                    ));
+                }
+                self.push_log(
+                    CodexLogKind::Event,
+                    format!("Codex 未対応リクエストにエラー応答: {method}"),
+                );
+            }
+            codex_appserver::ServerMessage::Notification(notification) => {
+                self.handle_codex_appserver_notification(notification);
+            }
+        }
+    }
+
+    fn handle_codex_appserver_response(
+        &mut self,
+        id: u64,
+        result: Option<Value>,
+        error: Option<codex_appserver::JsonRpcError>,
+    ) {
+        // 1. initialize 応答。
+        if let CodexAppServerPhase::Initializing { request_id } = self.codex_appserver_phase
+            && request_id == id
+        {
+            if let Some(error) = error {
+                self.push_log(
+                    CodexLogKind::Error,
+                    format!("initialize に失敗しました（{}）", error.message),
+                );
+                self.fallback_codex_appserver_to_oneshot();
+                return;
+            }
+            self.send_codex_appserver_start_thread();
+            return;
+        }
+
+        // 2. thread/start・thread/resume 応答。
+        if let CodexAppServerPhase::StartingThread {
+            request_id,
+            resuming,
+        } = self.codex_appserver_phase
+            && request_id == id
+        {
+            if let Some(error) = error {
+                if resuming {
+                    self.push_log(
+                        CodexLogKind::System,
+                        format!(
+                            "thread/resume に失敗（{}）。新規スレッドで開始します",
+                            error.message
+                        ),
+                    );
+                    self.send_codex_appserver_fresh_thread();
+                } else {
+                    self.push_log(
+                        CodexLogKind::Error,
+                        format!("thread/start に失敗しました（{}）", error.message),
+                    );
+                    self.fallback_codex_appserver_to_oneshot();
+                }
+                return;
+            }
+            if let Some(thread_id) = result
+                .as_ref()
+                .and_then(codex_appserver::thread_id_from_response)
+            {
+                self.set_thread_id(Some(thread_id));
+            }
+            self.codex_appserver_phase = CodexAppServerPhase::Ready;
+            self.push_log(CodexLogKind::System, "Codex セッションを開始しました");
+            self.flush_codex_appserver_pending_turn();
+            return;
+        }
+
+        // 3. turn/start 応答（turn.id 確定）。
+        if self.codex_appserver_turn_req_id == Some(id) {
+            self.codex_appserver_turn_req_id = None;
+            if let Some(error) = error {
+                self.push_log(
+                    CodexLogKind::Error,
+                    format!("Codex ターンの開始に失敗しました（{}）", error.message),
+                );
+                self.finish_codex_appserver_turn_failed();
+                return;
+            }
+            if let Some(turn_id) = result
+                .as_ref()
+                .and_then(codex_appserver::turn_id_from_response)
+            {
+                self.codex_appserver_turn_id = Some(turn_id);
+            }
+            return;
+        }
+
+        // 4. thread/settings/update 応答。
+        if let Some(change) = self.codex_appserver_pending_setting.as_ref()
+            && change.request_id == id
+        {
+            let label = change.label.clone();
+            self.codex_appserver_pending_setting = None;
+            if let Some(error) = error {
+                self.codex_appserver_restart_pending = true;
+                self.push_log(
+                    CodexLogKind::System,
+                    format!(
+                        "{label}の実行時反映に失敗（{}）。次のアイドルで再起動します",
+                        error.message
+                    ),
+                );
+            } else {
+                self.push_log(CodexLogKind::System, format!("{label}を反映しました"));
+            }
+        }
+
+        // それ以外（interrupt の {} 応答など）は無視する。
+    }
+
+    fn handle_codex_appserver_notification(&mut self, notification: codex_appserver::Notification) {
+        use codex_appserver::Notification as N;
+        match notification {
+            N::TurnStarted => self.begin_codex_appserver_turn(),
+            N::TurnCompleted { status } => self.handle_codex_appserver_turn_completed(&status),
+            N::AgentMessageDelta { delta } => self.append_assistant_delta(&delta),
+            N::ReasoningDelta { text } => {
+                if !text.trim().is_empty() {
+                    self.push_log(
+                        CodexLogKind::Event,
+                        format!("(思考) {}", compact_one_line(&text, 2_000)),
+                    );
+                }
+            }
+            N::ItemStarted(item) => self.handle_codex_appserver_item_started(item),
+            N::ItemCompleted(item) => self.handle_codex_appserver_item_completed(item),
+            N::CommandOutputDelta { item_id, delta } => {
+                self.record_codex_appserver_output(&item_id, &delta);
+            }
+            N::TokenUsage(usage) => self.record_codex_appserver_token_usage(usage),
+            N::Error { message } => {
+                self.push_log(CodexLogKind::Error, message.clone());
+                self.push_terminal_notice("Codex エラー", message);
+            }
+            N::Ignored => {}
+        }
+    }
+
+    /// turn/started（ターン境界の始まり）で見出し行を出す。
+    fn begin_codex_appserver_turn(&mut self) {
+        if self.turn_count > 0 {
+            self.collapsed_turns.insert(self.turn_count);
+        }
+        self.current_command = None;
+        self.current_command_started_at = None;
+        self.action = Some("依頼を確認中".to_string());
+        self.turn_count = self.turn_count.saturating_add(1);
+        let label = self
+            .current_turn_prompt
+            .as_deref()
+            .or_else(|| self.last_prompt())
+            .map(compact_turn_prompt)
+            .filter(|prompt| !prompt.is_empty())
+            .map(|prompt| format!("Turn {} - {prompt}", self.turn_count))
+            .unwrap_or_else(|| format!("Turn {}", self.turn_count));
+        self.push_log(CodexLogKind::Turn, label);
+    }
+
+    fn handle_codex_appserver_turn_completed(&mut self, status: &str) {
+        self.turn_running = false;
+        self.turn_finished_by_event = true;
+        self.current_command = None;
+        self.current_command_started_at = None;
+        self.streaming_assistant_index = None;
+        self.codex_appserver_turn_id = None;
+        self.codex_appserver_turn_req_id = None;
+        self.codex_appserver_output.clear();
+        self.codex_appserver_running_item = None;
+        self.codex_appserver_last_activity = Some(Instant::now());
+        self.record_turn_duration();
+
+        // interrupt 要求中に来た完了は中断完了として扱い、キューを自動開始しない。
+        if self.codex_appserver_interrupting || status == "interrupted" {
+            self.codex_appserver_interrupting = false;
+            self.codex_appserver_interrupt_deadline = None;
+            self.pending_decision = None;
+            self.codex_appserver_pending_approval = None;
+            self.current_turn_prompt = None;
+            self.current_turn_retry_prompt = None;
+            self.action = Some("中断完了".to_string());
+            self.refresh_current_turn_title();
+            self.push_log(CodexLogKind::System, "ターンを中断しました");
+            let queued = self.queued_prompts.len();
+            if queued > 0 {
+                self.push_log(
+                    CodexLogKind::System,
+                    format!("予約{queued}件は保留中（Enter で開始 / /stop queued で破棄）"),
+                );
+            }
+            return;
+        }
+
+        self.pending_decision = None;
+        self.codex_appserver_pending_approval = None;
+        self.refresh_current_turn_title();
+        self.queue_completed_turn_body_record();
+        if status == "failed" {
+            let message = "Codex ターンが失敗しました".to_string();
+            self.push_log(CodexLogKind::Error, message.clone());
+            self.push_turn_complete_notice("Codex 失敗", message);
+        } else {
+            self.action = Some("応答完了".to_string());
+            self.push_log(CodexLogKind::System, "Codex の応答が完了しました");
+            self.push_turn_complete_notice("Codex 完了", "Codex の出力が完了しました");
+        }
+        self.current_turn_prompt = None;
+        self.current_turn_retry_prompt = None;
+        self.start_next_queued_turn_if_idle();
+    }
+
+    /// turn/start 応答がエラーだったときにターンを失敗終了させる。
+    fn finish_codex_appserver_turn_failed(&mut self) {
+        self.turn_running = false;
+        self.current_command = None;
+        self.current_command_started_at = None;
+        self.streaming_assistant_index = None;
+        self.codex_appserver_turn_id = None;
+        self.pending_decision = None;
+        self.codex_appserver_pending_approval = None;
+        self.codex_appserver_pending_turn = None;
+        self.refresh_current_turn_title();
+        self.current_turn_prompt = None;
+        self.current_turn_retry_prompt = None;
+        self.push_terminal_notice("Codex 失敗", "Codex ターンの開始に失敗しました");
+        self.start_next_queued_turn_if_idle();
+    }
+
+    fn handle_codex_appserver_item_started(&mut self, item: codex_appserver::ThreadItemInfo) {
+        use codex_appserver::ThreadItemKind as K;
+        match item.kind {
+            K::CommandExecution { command, .. } => {
+                self.current_command = Some(compact_tool_text(&command));
+                self.current_command_started_at = Some(Instant::now());
+                self.refresh_action_from_text(&command);
+                self.codex_appserver_running_item = Some(item.id.clone());
+                self.codex_appserver_output.insert(item.id, VecDeque::new());
+                self.push_log(
+                    CodexLogKind::Tool,
+                    format!("$ {}", compact_tool_text(&command)),
+                );
+            }
+            K::McpToolCall { server, tool, .. } => {
+                let label = format!("{server}.{tool}");
+                self.current_command = Some(label.clone());
+                self.current_command_started_at = Some(Instant::now());
+                self.action = Some(format!("ツール実行: {label}"));
+                self.push_log(CodexLogKind::Tool, format!("MCP {label}"));
+            }
+            K::FileChange { changes, .. } => {
+                let paths = codex_appserver_change_paths(&changes);
+                let label = codex_appserver_paths_label(&paths);
+                self.push_log(CodexLogKind::Tool, format!("ファイル変更 {label}"));
+            }
+            // reasoning / agentMessage はデルタ・完了で扱う。
+            _ => {}
+        }
+    }
+
+    fn handle_codex_appserver_item_completed(&mut self, item: codex_appserver::ThreadItemInfo) {
+        use codex_appserver::ThreadItemKind as K;
+        match item.kind {
+            K::CommandExecution {
+                command,
+                exit_code,
+                duration_ms,
+                ..
+            } => {
+                self.current_command = None;
+                self.current_command_started_at = None;
+                self.codex_appserver_output.remove(&item.id);
+                if self.codex_appserver_running_item.as_deref() == Some(item.id.as_str()) {
+                    self.codex_appserver_running_item = None;
+                }
+                let exit = exit_code
+                    .map(|code| format!("exit {code}"))
+                    .unwrap_or_else(|| "終了".to_string());
+                let duration = duration_ms.map(|ms| format!(" {ms}ms")).unwrap_or_default();
+                let state = if exit_code == Some(0) { "OK" } else { "FAIL" };
+                self.push_log(
+                    CodexLogKind::Tool,
+                    format!("{state} {} ({exit}{duration})", compact_tool_text(&command)),
+                );
+            }
+            K::AgentMessage { text, .. } => {
+                // デルタで逐次表示済みならストリーミング行を確定するだけ。
+                if self.streaming_assistant_index.is_some() {
+                    self.streaming_assistant_index = None;
+                } else if !text.trim().is_empty() {
+                    self.push_log(CodexLogKind::Assistant, text);
+                }
+            }
+            K::Reasoning { summary, content } => {
+                let text = if !summary.is_empty() {
+                    summary.join(" ")
+                } else {
+                    content.join(" ")
+                };
+                if !text.trim().is_empty() {
+                    self.push_log(
+                        CodexLogKind::Event,
+                        format!("(思考) {}", compact_one_line(&text, 2_000)),
+                    );
+                }
+            }
+            K::FileChange { changes, status } => {
+                let paths = codex_appserver_change_paths(&changes);
+                let label = codex_appserver_paths_label(&paths);
+                let status = status.unwrap_or_else(|| "完了".to_string());
+                self.push_log(CodexLogKind::Tool, format!("ファイル変更 {status} {label}"));
+                // unified diff を持つ変更は、見出し + 色付き差分プレビュー行として残す。
+                if let Some(patch) = codex_filechange_patch_text(&changes) {
+                    self.push_log(CodexLogKind::Tool, patch);
+                }
+            }
+            K::McpToolCall {
+                server,
+                tool,
+                status,
+            } => {
+                self.current_command = None;
+                self.current_command_started_at = None;
+                let status = status.unwrap_or_else(|| "完了".to_string());
+                self.push_log(CodexLogKind::Tool, format!("MCP {server}.{tool} {status}"));
+            }
+            K::Other(_) => {}
+        }
+    }
+
+    /// 実行中コマンドの stdout ストリーミングを末尾 N 行のリングバッファへ蓄積する。
+    fn record_codex_appserver_output(&mut self, item_id: &str, delta: &str) {
+        let buffer = self
+            .codex_appserver_output
+            .entry(item_id.to_string())
+            .or_default();
+        // delta は複数行を含みうる。行ごとにリングバッファへ push し、末尾 N 行だけ残す。
+        for line in delta.split_inclusive('\n') {
+            let line = line.trim_end_matches('\n');
+            if line.is_empty() {
+                continue;
+            }
+            let sanitized = sanitize_terminal_line(line);
+            if sanitized.trim().is_empty() {
+                continue;
+            }
+            buffer.push_back(compact_one_line(&sanitized, 200));
+            while buffer.len() > CODEX_APPSERVER_OUTPUT_TAIL_LINES {
+                buffer.pop_front();
+            }
+        }
+        self.codex_appserver_running_item = Some(item_id.to_string());
+    }
+
+    /// 実行中コマンドのライブ出力（末尾 N 行）。描画側が実行中 Tool 行の下に薄色で出す。
+    pub fn codex_appserver_live_output(&self) -> Vec<String> {
+        self.codex_appserver_running_item
+            .as_ref()
+            .and_then(|item| self.codex_appserver_output.get(item))
+            .map(|buffer| buffer.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn record_codex_appserver_token_usage(&mut self, usage: codex_appserver::TokenUsageInfo) {
+        let mut parts = Vec::new();
+        if let Some(total) = usage.total_tokens {
+            parts.push(format!("total {total}"));
+        }
+        if let Some(last) = usage.last_total_tokens {
+            parts.push(format!("last {last}"));
+        }
+        if let Some(window) = usage.model_context_window {
+            parts.push(format!("context {window}"));
+        }
+        if !parts.is_empty() {
+            self.last_token_usage_label = Some(parts.join(" / "));
+        }
+        self.codex_appserver_token_usage = Some(usage);
+    }
+
+    /// サーバ発の承認リクエストを既存 CodexDecisionBanner で提示する。
+    fn handle_codex_appserver_approval(&mut self, request: codex_appserver::ApprovalRequest) {
+        use codex_appserver::ApprovalKind as K;
+        let (heading, allow_hint) = match request.kind {
+            K::Command => ("コマンド実行の許可を求めています", "許可すると実行します"),
+            K::FileChange => ("ファイル変更の許可を求めています", "許可すると適用します"),
+            K::Permissions => ("権限昇格の許可を求めています", "許可すると権限を付与します"),
+        };
+        let target = compact_one_line(&request.summary, 100);
+        let session = if request.allows_session() {
+            " l=このセッション中は許可"
+        } else {
+            ""
+        };
+        let message = format!("{heading}: {target}。{allow_hint}。{session}");
+        self.codex_appserver_pending_approval = Some(request);
+        self.codex_appserver_last_activity = Some(Instant::now());
+        self.set_pending_decision(CodexDecisionBanner::new(
+            CodexDecisionKind::Permission,
+            message,
+        ));
+    }
+
+    /// 承認バナーの応答を JSON-RPC result としてプロセスへ返す（進行中ターンをその場で続行させる）。
+    fn resolve_codex_appserver_approval(
+        &mut self,
+        response: CodexDecisionResponse,
+        response_label: &str,
+    ) {
+        use codex_appserver::ApprovalKind as K;
+        let Some(request) = self.codex_appserver_pending_approval.take() else {
+            return;
+        };
+        self.action = Some(format!("確認応答: {response_label}"));
+        self.push_activity(format!("ツール承認に {response_label} で応答"));
+        self.codex_appserver_last_activity = Some(Instant::now());
+        let allows_session = request.allows_session();
+        let Some(client) = self.codex_appserver.as_ref() else {
+            return;
+        };
+        let reply = match request.kind {
+            K::Command | K::FileChange => {
+                let decision = match response {
+                    CodexDecisionResponse::Accept => "accept",
+                    CodexDecisionResponse::Always if allows_session => "acceptForSession",
+                    CodexDecisionResponse::Always => "accept",
+                    CodexDecisionResponse::Deny => "decline",
+                };
+                codex_appserver::approval_result(&request.id, decision)
+            }
+            K::Permissions => {
+                // permissions は decline が無く、付与プロファイル + scope で応答する。
+                let (granted, scope) = match response {
+                    CodexDecisionResponse::Accept => (
+                        request
+                            .requested_permissions
+                            .clone()
+                            .unwrap_or(serde_json::json!({})),
+                        "turn",
+                    ),
+                    CodexDecisionResponse::Always => (
+                        request
+                            .requested_permissions
+                            .clone()
+                            .unwrap_or(serde_json::json!({})),
+                        "session",
+                    ),
+                    // 拒否は「何も付与しない」で表す。
+                    CodexDecisionResponse::Deny => (serde_json::json!({}), "turn"),
+                };
+                codex_appserver::permissions_result(&request.id, granted, scope)
+            }
+        };
+        client.send_value(&reply);
+        match response {
+            CodexDecisionResponse::Accept => {
+                self.push_log(CodexLogKind::System, "今回だけ許可して続行します")
+            }
+            CodexDecisionResponse::Always => {
+                self.push_log(CodexLogKind::System, "このセッション中は許可して続行します")
+            }
+            CodexDecisionResponse::Deny => self.push_log(
+                CodexLogKind::System,
+                "拒否しました（Codex はこの操作なしで続行します）",
+            ),
+        }
+    }
+
+    /// 常駐モードで実行中ターンへ turn/interrupt（グレースフル中断）を送る。
+    /// 送れたら 2 秒の完了待ちを開始し `true` を返す。
+    fn request_codex_appserver_interrupt(&mut self) -> bool {
+        let (Some(thread_id), Some(turn_id)) =
+            (self.thread_id.clone(), self.codex_appserver_turn_id.clone())
+        else {
+            return false;
+        };
+        let Some(client) = self.codex_appserver.as_mut() else {
+            return false;
+        };
+        let id = client.next_id();
+        let request = codex_appserver::turn_interrupt_request(id, &thread_id, &turn_id);
+        if !client.send_value(&request) {
+            return false;
+        }
+        self.codex_appserver_interrupting = true;
+        self.codex_appserver_interrupt_deadline =
+            Some(Instant::now() + CODEX_APPSERVER_INTERRUPT_GRACE);
+        self.codex_appserver_last_activity = Some(Instant::now());
+        self.push_log(
+            CodexLogKind::System,
+            "中断を要求しました（2秒以内に完了しなければ再起動します）",
+        );
+        true
+    }
+
+    /// 常駐 codex app-server のポーリング（毎フレーム `update()` から呼ぶ）。
+    fn poll_codex_appserver(&mut self) -> bool {
+        // 1. 終了検知（死亡 or グレースフルクローズ完了）。
+        let waited = match self.codex_appserver.as_mut() {
+            Some(client) => client.try_wait(),
+            None => return false,
+        };
+        match waited {
+            Ok(Some(_status)) => {
+                let closing = self
+                    .codex_appserver
+                    .as_ref()
+                    .map(|c| c.closing)
+                    .unwrap_or(false);
+                self.codex_appserver = None;
+                self.codex_appserver_phase = CodexAppServerPhase::Idle;
+                if closing {
+                    self.push_log(
+                        CodexLogKind::System,
+                        "アイドルのため Codex app-server 常駐プロセスを終了しました（次のターンで再接続）",
+                    );
+                } else {
+                    self.handle_codex_appserver_death();
+                }
+                return true;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                self.codex_appserver = None;
+                self.codex_appserver_phase = CodexAppServerPhase::Idle;
+                self.push_log(
+                    CodexLogKind::Error,
+                    format!("Codex app-server 常駐プロセスの状態確認に失敗しました: {e}"),
+                );
+                self.handle_codex_appserver_death();
+                return true;
+            }
+        }
+
+        // 2. interrupt グレースフル待ちのタイムアウト → kill フォールバック。
+        if let Some(deadline) = self.codex_appserver_interrupt_deadline
+            && Instant::now() >= deadline
+        {
+            if let Some(client) = self.codex_appserver.as_mut() {
+                client.kill();
+            }
+            self.codex_appserver = None;
+            self.codex_appserver_phase = CodexAppServerPhase::Idle;
+            self.codex_appserver_interrupt_deadline = None;
+            self.codex_appserver_interrupting = false;
+            self.turn_running = false;
+            self.current_command = None;
+            self.current_command_started_at = None;
+            self.streaming_assistant_index = None;
+            self.pending_decision = None;
+            self.codex_appserver_pending_approval = None;
+            self.codex_appserver_turn_id = None;
+            self.codex_appserver_pending_turn = None;
+            self.current_turn_prompt = None;
+            self.current_turn_retry_prompt = None;
+            self.push_log(
+                CodexLogKind::System,
+                "中断が2秒以内に完了しなかったため常駐プロセスを終了しました（次のターンで再接続）",
+            );
+            return true;
+        }
+
+        // 3. 設定変更応答のタイムアウト → 再起動フォールバック。
+        if let Some(change) = self.codex_appserver_pending_setting.as_ref()
+            && Instant::now() >= change.deadline
+        {
+            let label = change.label.clone();
+            self.codex_appserver_pending_setting = None;
+            self.codex_appserver_restart_pending = true;
+            self.push_log(
+                CodexLogKind::System,
+                format!("{label}の応答がタイムアウトしました。次のアイドルで再起動します"),
+            );
+            return true;
+        }
+
+        // 4. アイドル時: 再起動保留があればグレースフルに閉じる（次ターンで再 spawn）。
+        if self.codex_appserver_restart_pending
+            && !self.turn_running
+            && self.pending_decision.is_none()
+            && self.codex_appserver_pending_approval.is_none()
+        {
+            self.codex_appserver_restart_pending = false;
+            if let Some(client) = self.codex_appserver.as_mut() {
+                client.begin_close();
+            }
+            self.push_log(
+                CodexLogKind::System,
+                "設定を反映するため常駐プロセスを再起動します（次のターンで再接続）",
+            );
+            return true;
+        }
+
+        // 5. アイドル回収（無操作が続いたら閉じる）。
+        if !self.turn_running
+            && self.pending_decision.is_none()
+            && self.codex_appserver_pending_approval.is_none()
+            && let Some(last) = self.codex_appserver_last_activity
+            && last.elapsed() >= CODEX_APPSERVER_IDLE_TIMEOUT
+        {
+            self.codex_appserver_last_activity = None;
+            if let Some(client) = self.codex_appserver.as_mut() {
+                client.begin_close();
+            }
+            return true;
+        }
+
+        false
+    }
+
+    /// 常駐プロセスが予期せず死んだときの処理。実行中ターンはエラー終了扱い。
+    fn handle_codex_appserver_death(&mut self) {
+        self.codex_appserver = None;
+        self.codex_appserver_phase = CodexAppServerPhase::Idle;
+        self.codex_appserver_interrupt_deadline = None;
+        self.codex_appserver_interrupting = false;
+        self.codex_appserver_pending_setting = None;
+        self.codex_appserver_pending_approval = None;
+        self.codex_appserver_pending_turn = None;
+        self.codex_appserver_pending_images.clear();
+        self.codex_appserver_turn_id = None;
+        self.codex_appserver_turn_req_id = None;
+        self.codex_appserver_restart_pending = false;
+        self.codex_appserver_output.clear();
+        self.codex_appserver_running_item = None;
+        let was_running = self.turn_running;
+        if was_running {
+            // 実行中の死亡/切断でも Addness へ作業メモを記録する（current_turn_prompt を消す前に）。
+            self.queue_completed_turn_body_record();
+        }
+        self.turn_running = false;
+        self.current_command = None;
+        self.current_command_started_at = None;
+        self.streaming_assistant_index = None;
+        self.pending_decision = None;
+        self.current_turn_prompt = None;
+        self.current_turn_retry_prompt = None;
+        if was_running {
+            self.refresh_current_turn_title();
+        }
+        let message = "Codex プロセスが終了しました。次のターンで再接続します";
+        self.push_log(CodexLogKind::Error, message);
+        self.push_terminal_notice("Codex 切断", message);
+    }
+
+    /// initialize / thread/start に失敗したとき、常駐を諦めてワンショットで同じターンを実行する。
+    fn fallback_codex_appserver_to_oneshot(&mut self) {
+        if let Some(mut client) = self.codex_appserver.take() {
+            client.kill();
+        }
+        self.codex_appserver_phase = CodexAppServerPhase::Idle;
+        self.codex_appserver_enabled = false;
+        self.codex_appserver_pending_turn = None;
+        self.codex_appserver_turn_id = None;
+        self.codex_appserver_turn_req_id = None;
+        let retry = self.current_turn_retry_prompt.clone();
+        let display = self.current_turn_prompt.clone();
+        // 進行中ターン状態をいったんクリアしてからワンショットへ切り替える。
+        self.turn_running = false;
+        self.current_turn_prompt = None;
+        self.current_turn_retry_prompt = None;
+        self.push_log(
+            CodexLogKind::System,
+            "常駐初期化に失敗したためワンショットで実行します",
+        );
+        // 常駐 turn/start へ渡せなかった添付画像はワンショットの -i 引数へ戻す。
+        if !self.codex_appserver_pending_images.is_empty() {
+            self.exec_settings.image_paths =
+                std::mem::take(&mut self.codex_appserver_pending_images);
+        }
+        if let Some(prompt) = retry {
+            let display = display.unwrap_or_else(|| prompt.clone());
+            self.start_oneshot_turn(&prompt, &display);
+        }
+    }
+
+    /// 常駐 codex app-server を強制終了し状態をクリアする（`/stop` kill・ペイン切替など）。
+    fn teardown_codex_appserver(&mut self) {
+        if let Some(mut client) = self.codex_appserver.take() {
+            client.kill();
+        }
+        self.codex_appserver_phase = CodexAppServerPhase::Idle;
+        self.codex_appserver_interrupt_deadline = None;
+        self.codex_appserver_interrupting = false;
+        self.codex_appserver_pending_setting = None;
+        self.codex_appserver_pending_approval = None;
+        self.codex_appserver_pending_turn = None;
+        self.codex_appserver_pending_images.clear();
+        self.codex_appserver_turn_id = None;
+        self.codex_appserver_turn_req_id = None;
+        self.codex_appserver_restart_pending = false;
+        self.codex_appserver_output.clear();
+        self.codex_appserver_running_item = None;
+    }
+
+    /// F2（model）を thread/settings/update で反映する。具体値が無ければ再起動フォールバック。
+    fn push_codex_appserver_model(&mut self) {
+        let value = self.exec_settings.model_cli_arg().map(str::to_string);
+        let update = codex_appserver::SettingsUpdate {
+            model: value.clone(),
+            ..Default::default()
+        };
+        self.push_codex_appserver_setting(update, "model 変更", value.is_some());
+    }
+
+    /// F3（effort）を thread/settings/update で反映する。
+    fn push_codex_appserver_effort(&mut self) {
+        let value = self.codex_appserver_effort();
+        let update = codex_appserver::SettingsUpdate {
+            effort: value.clone(),
+            ..Default::default()
+        };
+        self.push_codex_appserver_setting(update, "effort 変更", value.is_some());
+    }
+
+    /// F4（approval）を thread/settings/update で反映する。
+    fn push_codex_appserver_approval(&mut self) {
+        let value = if self.exec_settings.bypass_approvals_and_sandbox {
+            Some("never".to_string())
+        } else {
+            self.exec_settings.approval.cli_arg().map(str::to_string)
+        };
+        let update = codex_appserver::SettingsUpdate {
+            approval_policy: value.clone(),
+            ..Default::default()
+        };
+        self.push_codex_appserver_setting(update, "approval 変更", value.is_some());
+    }
+
+    /// F5（sandbox）を thread/settings/update で反映する。
+    fn push_codex_appserver_sandbox(&mut self) {
+        let value = if self.exec_settings.bypass_approvals_and_sandbox {
+            "danger-full-access".to_string()
+        } else {
+            self.exec_settings.sandbox.cli_arg().to_string()
+        };
+        let update = codex_appserver::SettingsUpdate {
+            sandbox: Some(value),
+            ..Default::default()
+        };
+        self.push_codex_appserver_setting(update, "sandbox 変更", true);
+    }
+
+    /// thread/settings/update を送る共通処理。具体値が無い（config）場合は再起動フォールバック。
+    fn push_codex_appserver_setting(
+        &mut self,
+        update: codex_appserver::SettingsUpdate,
+        label: &str,
+        had_value: bool,
+    ) {
+        // 常駐が無い / thread 未確立なら次の thread/start が新設定を載せるので何もしない。
+        if self.codex_appserver.is_none()
+            || self.codex_appserver_phase != CodexAppServerPhase::Ready
+            || self.thread_id.is_none()
+        {
+            return;
+        }
+        if !had_value {
+            // config へ戻す変更は settings/update では表現できないため再起動で反映する。
+            self.codex_appserver_restart_pending = true;
+            return;
+        }
+        let thread_id = self.thread_id.clone().unwrap_or_default();
+        let Some(client) = self.codex_appserver.as_mut() else {
+            return;
+        };
+        let id = client.next_id();
+        let Some(request) = codex_appserver::settings_update_request(id, &thread_id, &update)
+        else {
+            return;
+        };
+        if client.send_value(&request) {
+            self.codex_appserver_pending_setting = Some(CodexAppServerSettingChange {
+                request_id: id,
+                deadline: Instant::now() + CODEX_APPSERVER_SETTING_CHANGE_GRACE,
+                label: label.to_string(),
+            });
+        } else {
+            self.codex_appserver_restart_pending = true;
+        }
+    }
+
+    /// 起動する子プロセスへ Addness 文脈の環境変数を設定する（3 系統の spawn で共有）。
+    fn apply_agent_env(&self, cmd: &mut Command) {
+        // 後方互換: codex のときだけ従来の ADDNESS_TUI_CODEX を維持する。
+        if self.kind == AgentKind::Codex {
+            cmd.env("ADDNESS_TUI_CODEX", "1");
+        }
+        cmd.env("ADDNESS_TUI_BACKEND", self.kind.backend_env_value());
+        cmd.env("ADDNESS_GOAL_ID", &self.goal_id);
+        cmd.env("ADDNESS_GOAL_TITLE", &self.goal_title);
+        cmd.env("ADDNESS_GOAL_STATUS", &self.status_label);
+        cmd.env("ADDNESS_GOAL_DOD", &self.dod);
+        cmd.env("ADDNESS_TASK_GOAL_ID", &self.goal_id);
+        cmd.env("ADDNESS_TASK_GOAL_TITLE", &self.goal_title);
+        cmd.env("ADDNESS_PARENT_GOAL_ID", &self.parent_goal_id);
+        cmd.env("ADDNESS_PARENT_GOAL_TITLE", &self.parent_goal_title);
+        cmd.env(
+            "ADDNESS_WORKTREE_BRANCH",
+            git_branch_label(Path::new(&self.cwd)),
+        );
+        cmd.env("ADDNESS_BIN", &self.addness_bin);
     }
 
     fn handle_generic_json_event(&mut self, event_type: &str, value: &Value) {
@@ -3141,6 +5962,8 @@ impl CodexPane {
     }
 
     fn set_pending_decision(&mut self, decision: CodexDecisionBanner) {
+        // 新しいバナーは既定でペイン固有アクションを持たない（/undo だけが直後に立てる）。
+        self.pending_decision_action = None;
         let message = decision.message.clone();
         self.pending_decision = Some(decision);
         let name = self.kind.display_name();
@@ -3154,6 +5977,11 @@ impl CodexPane {
         auto: bool,
     ) {
         self.pending_decision = None;
+        // Addness 独自アクション（/undo など）に紐づく確認は codex/claude 経路へ流さず個別処理する。
+        if let Some(pane_action) = self.pending_decision_action.take() {
+            self.resolve_pane_decision_action(pane_action, response);
+            return;
+        }
         let response_label = decision.label_for_response(response);
         if auto {
             self.action = Some(format!("確認自動応答: {response_label}"));
@@ -3168,6 +5996,12 @@ impl CodexPane {
 
         if self.kind == AgentKind::ClaudeCode {
             self.resolve_claude_decision(response, response_label);
+            return;
+        }
+
+        // 常駐 app-server の承認は JSON-RPC result を返してその場で続行する（resume 再実行しない）。
+        if self.codex_appserver_pending_approval.is_some() {
+            self.resolve_codex_appserver_approval(response, response_label);
             return;
         }
 
@@ -3264,10 +6098,159 @@ impl CodexPane {
         self.pending_notices.pop_front()
     }
 
+    // ----- ターン単位チェックポイント / undo -----
+
+    /// ターン開始時（ユーザープロンプト実行時）にチェックポイント作成を予約する。
+    /// 実際の git 操作はホスト（App）が非同期ジョブで行う。
+    fn request_checkpoint(&mut self) {
+        let slug = checkpoint_slug(&self.goal_id);
+        let seq = self.checkpoint_seq;
+        self.checkpoint_seq = self.checkpoint_seq.saturating_add(1);
+        let ref_name = checkpoint_ref_name(&slug, seq);
+        // turn_count はターンが実際に始まると増える。ここでは次ターン番号を見込みで使う。
+        let turn = self.turn_count.saturating_add(1);
+        // 上限（4 件）を超えたら最古を捨てて無制限に溜まらないようにする。
+        const MAX_PENDING_CHECKPOINTS: usize = 4;
+        while self.pending_checkpoint_requests.len() >= MAX_PENDING_CHECKPOINTS {
+            self.pending_checkpoint_requests.pop_front();
+        }
+        self.pending_checkpoint_requests
+            .push_back(CheckpointRequest {
+                cwd: self.cwd.clone(),
+                ref_name,
+                turn,
+                message: format!("addness-checkpoint-turn-{turn}"),
+            });
+    }
+
+    /// ホストがチェックポイント作成要求を取り出す（キュー先頭から 1 件ずつ）。
+    pub fn take_checkpoint_request(&mut self) -> Option<CheckpointRequest> {
+        self.pending_checkpoint_requests.pop_front()
+    }
+
+    /// ホストが undo（復元）要求を取り出す。
+    pub fn take_undo_request(&mut self) -> Option<UndoRequest> {
+        self.pending_undo_request.take()
+    }
+
+    /// 作成済みチェックポイント ref をスタックへ記録し、上限超過で掃除すべき ref 名を返す。
+    pub fn record_checkpoint(&mut self, ref_name: String, turn: usize) -> Vec<String> {
+        let evicted = push_checkpoint_with_evictions(
+            &mut self.checkpoints,
+            Checkpoint { ref_name, turn },
+            CHECKPOINT_STACK_MAX,
+        );
+        evicted.into_iter().map(|cp| cp.ref_name).collect()
+    }
+
+    /// undo 結果をペインへ通知する（ホストの非同期ジョブ完了時に呼ぶ）。
+    pub fn note_undo_result(&mut self, turn: usize, error: Option<String>) {
+        match error {
+            None => {
+                self.action = Some("undo 完了".to_string());
+                self.push_log(
+                    CodexLogKind::System,
+                    format!(
+                        "turn {turn} のチェックポイントへ作業ツリーを戻しました。チェックポイント以降に新規作成したファイルは残っています。"
+                    ),
+                );
+            }
+            Some(e) => {
+                self.push_log(CodexLogKind::Error, format!("undo に失敗しました: {e}"));
+            }
+        }
+    }
+
+    /// `/undo` コマンド。直近チェックポイントへ戻す前に YesNo 確認バナーを出す。
+    fn handle_undo_slash_command(&mut self) {
+        if self.checkpoints.is_empty() {
+            self.push_log(CodexLogKind::System, "チェックポイントがありません");
+            return;
+        }
+        // 実行中のターンに割り込んで作業ツリーを書き換えると危険なので受け付けない。
+        if self.is_turn_running() {
+            self.push_log(
+                CodexLogKind::System,
+                "ターン実行中は /undo できません。完了を待つか /stop で中断してください",
+            );
+            return;
+        }
+        if self.pending_decision.is_some() {
+            self.push_log(
+                CodexLogKind::System,
+                "確認応答の待機中です。先に応答してから /undo してください",
+            );
+            return;
+        }
+        let turn = self.checkpoints.last().map(|cp| cp.turn).unwrap_or(0);
+        let message = format!(
+            "turn {turn} のチェックポイントへこのペインの作業ディレクトリ配下を戻します（新規作成ファイルは残ります）。よろしいですか？"
+        );
+        // set_pending_decision がアクションをクリアするため、バナー設定後に立てる。
+        self.set_pending_decision(CodexDecisionBanner::new(CodexDecisionKind::YesNo, message));
+        self.pending_decision_action = Some(PaneDecisionAction::Undo);
+    }
+
+    /// YesNo 確認に対するペイン固有アクションの解決。
+    fn resolve_pane_decision_action(
+        &mut self,
+        action: PaneDecisionAction,
+        response: CodexDecisionResponse,
+    ) {
+        match action {
+            PaneDecisionAction::Undo => match response {
+                CodexDecisionResponse::Accept => self.request_undo(),
+                _ => {
+                    self.action = Some("undo 取消".to_string());
+                    self.push_log(CodexLogKind::System, "undo を取り消しました");
+                }
+            },
+        }
+    }
+
+    /// スタック末尾のチェックポイントを取り出し、復元要求をホストへ渡す。
+    fn request_undo(&mut self) {
+        let Some(cp) = self.checkpoints.pop() else {
+            self.push_log(CodexLogKind::System, "チェックポイントがありません");
+            return;
+        };
+        self.push_log(
+            CodexLogKind::System,
+            format!("turn {} のチェックポイントへ復元を開始します", cp.turn),
+        );
+        self.pending_undo_request = Some(UndoRequest {
+            cwd: self.cwd.clone(),
+            ref_name: cp.ref_name,
+            turn: cp.turn,
+        });
+    }
+
+    /// 通知の文脈ラベル（ゴール名）。空なら None。
+    fn notice_context(&self) -> Option<String> {
+        let title = self.goal_title.trim();
+        (!title.is_empty()).then(|| title.to_string())
+    }
+
     fn push_terminal_notice(&mut self, title: impl Into<String>, message: impl Into<String>) {
+        let context = self.notice_context();
         self.pending_notices.push_back(TerminalNotice {
             title: title.into(),
             message: message.into(),
+            context,
+            turn_elapsed_secs: None,
+        });
+    }
+
+    /// ターン完了（正常/失敗）通知。ターン所要秒を添えて、短いターンの通知抑制に使う。
+    fn push_turn_complete_notice(&mut self, title: impl Into<String>, message: impl Into<String>) {
+        let context = self.notice_context();
+        // turn_started_at はこの時点でまだ保持されている（manage_turn_timer が別途クリアする）。
+        let elapsed = self.turn_started_at.map(|t| t.elapsed().as_secs());
+        self.pending_notices.push_back(TerminalNotice {
+            title: title.into(),
+            message: message.into(),
+            context,
+            turn_elapsed_secs: elapsed,
         });
     }
 
@@ -3294,6 +6277,13 @@ impl CodexPane {
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('c' | 'C'))
         {
+            // Esc 経路と同様、常駐はまず graceful interrupt を試み、駄目なら kill に落とす。
+            if self.claude_resident.is_some() && self.request_claude_interrupt() {
+                return;
+            }
+            if self.codex_appserver.is_some() && self.request_codex_appserver_interrupt() {
+                return;
+            }
             self.kill_current_turn();
             self.start_next_queued_turn_if_idle();
             return;
@@ -3303,14 +6293,25 @@ impl CodexPane {
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && matches!(key.code, KeyCode::Char('c' | 'C'))
             {
+                if self.claude_resident.is_some() && self.request_claude_interrupt() {
+                    return;
+                }
+                if self.codex_appserver.is_some() && self.request_codex_appserver_interrupt() {
+                    return;
+                }
                 self.kill_current_turn();
             }
             return;
         }
 
+        // 通常の入力キーが来たら Esc 中断のアームは解除する。
+        self.esc_interrupt_armed = false;
         let observed = self.input_state.observe_key(key);
         // 入力が変わったらパレットの選択を先頭へ戻す（↑↓/Tab は app 側で消費済み）。
         self.slash_palette_selected = 0;
+        self.mention_palette_selected = 0;
+        // 入力が動いたらメンションパレットの一時非表示（Esc）を解除して再表示できるようにする。
+        self.mention_palette_dismissed = false;
         let Some(submitted) = observed else {
             return;
         };
@@ -3321,7 +6322,76 @@ impl CodexPane {
         if self.finished || self.pending_decision.is_some() {
             return;
         }
-        self.input_state.insert_text(text);
+        let normalized = normalize_input_text(text);
+        if paste_should_fold(&normalized) {
+            // 長文は入力欄にプレースホルダだけ挿入し、全文はペイン側に保持する。
+            self.paste_seq += 1;
+            let line_count = paste_line_count(&normalized);
+            let placeholder = paste_placeholder(self.paste_seq, &normalized);
+            self.input_state.insert_text(&placeholder);
+            self.pending_pastes.push(StoredPaste {
+                placeholder,
+                full: normalized,
+            });
+            self.action = Some(format!("貼り付けを折り畳み: {line_count}行"));
+        } else {
+            self.input_state.insert_text(text);
+        }
+    }
+
+    /// 送信直前に、入力行中のプレースホルダを保持中の全文へ展開する。
+    /// ユーザーが編集して完全一致しなくなったプレースホルダはそのまま送る。
+    /// 展開後は保持データと通し番号をクリアする。
+    fn expand_pending_pastes(&mut self, line: String) -> String {
+        if self.pending_pastes.is_empty() {
+            return line;
+        }
+        let expanded = expand_paste_placeholders(&line, &self.pending_pastes);
+        self.pending_pastes.clear();
+        self.paste_seq = 0;
+        expanded
+    }
+
+    /// Ctrl+V: クリップボードの画像を `~/.addness/attachments/` へ保存し、入力欄にパスを挿入する。
+    /// macOS 以外は未対応。外部コマンド失敗はメッセージ表示のみ（パニック・ハングしない）。
+    pub fn attach_clipboard_image(&mut self) {
+        if self.finished || self.pending_decision.is_some() {
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let Some(dir) = self.attachments_dir.clone() else {
+                self.push_log(CodexLogKind::Error, "画像の保存先ディレクトリが未設定です");
+                return;
+            };
+            match capture_clipboard_image_to_dir(&dir) {
+                Ok(Some(path)) => {
+                    let path_str = path.display().to_string();
+                    self.input_state.insert_text(&path_str);
+                    self.action = Some("クリップボード画像を添付".to_string());
+                    self.push_log(
+                        CodexLogKind::System,
+                        format!("クリップボード画像を保存しパスを挿入しました: {path_str}"),
+                    );
+                }
+                Ok(None) => {
+                    self.push_log(CodexLogKind::System, "クリップボードに画像がありません");
+                }
+                Err(e) => {
+                    self.push_log(
+                        CodexLogKind::Error,
+                        format!("クリップボード画像の取得に失敗しました: {e}"),
+                    );
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.push_log(
+                CodexLogKind::System,
+                "クリップボード画像の添付はこの環境では未対応です",
+            );
+        }
     }
 
     /// TUI 側の操作からシステムプロンプト（F9 再開など）を codex に送信する。
@@ -3335,11 +6405,29 @@ impl CodexPane {
         self.start_turn(&submitted);
     }
 
+    /// 送信されたユーザー入力を入力履歴（メモリ＋ファイル）へ記録する。
+    /// 直前と同一・空・`/exit` は記録しない。
+    fn record_input_history(&mut self, submitted: &str) {
+        if submitted == "/exit" {
+            return;
+        }
+        if self.input_state.push_history(submitted.to_string())
+            && let Some(path) = self.input_history_path.clone()
+        {
+            let _ = append_input_history(&path, submitted);
+        }
+    }
+
     fn submit_user_line(&mut self, submitted: &str) {
         let submitted = normalize_submitted_line(submitted);
         if submitted.is_empty() {
             return;
         }
+
+        // 畳み込んだ長文ペーストのプレースホルダを全文へ展開してから履歴・実行へ渡す。
+        let submitted = self.expand_pending_pastes(submitted);
+
+        self.record_input_history(&submitted);
 
         if self.handle_local_slash_command(&submitted) {
             return;
@@ -3406,12 +6494,17 @@ impl CodexPane {
             return;
         }
 
+        // ターン開始（ユーザープロンプト送信）ごとにチェックポイントを予約する。
+        self.request_checkpoint();
         let exec_prompt = self.prompt_with_goal_mode(&submitted);
         self.start_turn_with_display_prompt(&exec_prompt, &display_prompt);
     }
 
     fn finish_from_exit_command(&mut self) {
         self.finished = true;
+        // 常駐/子プロセスを即座に落とす（アイドル回収を待たない）。turn_running も
+        // false になり、should_close_after_exit_command が成立してクローズ経路へ進む。
+        self.teardown_all_processes();
         self.queued_prompts.clear();
         self.pending_decision = None;
         self.current_command = None;
@@ -3430,6 +6523,24 @@ impl CodexPane {
     }
 
     fn start_turn_with_display_prompt(&mut self, prompt: &str, display_prompt: &str) {
+        // ClaudeCode の常駐モードは 1 プロセスで多ターンを回す（別経路）。
+        if self.claude_resident_active() {
+            self.start_claude_resident_turn(prompt, display_prompt);
+            return;
+        }
+        // Codex の app-server 常駐モードも 1 プロセスで多ターンを回す（別経路）。
+        if self.codex_appserver_active() {
+            self.start_codex_appserver_turn(prompt, display_prompt);
+            return;
+        }
+        self.start_oneshot_turn(prompt, display_prompt);
+    }
+
+    /// ワンショット（1 ターン 1 プロセス）でターンを開始する。codex 経路と、常駐を無効化した
+    /// / 常駐 spawn に失敗した ClaudeCode 経路で使う。
+    fn start_oneshot_turn(&mut self, prompt: &str, display_prompt: &str) {
+        // 新しいターンでは前ターンの Esc 中断アームを持ち越さない。
+        self.esc_interrupt_armed = false;
         let name = self.kind.display_name();
         if self.is_turn_running() {
             self.push_log(
@@ -3441,9 +6552,10 @@ impl CodexPane {
 
         let retry_prompt = prompt.to_string();
         let prompt = self.prompt_with_addness_context(prompt);
+        let prompt = self.append_claude_image_paths(prompt);
         let command_result = self.spawn_exec_process(&prompt);
         self.one_shot_approval = None;
-        self.claude_one_shot_permission = None;
+        self.claude_one_shot_allowed_tools = Vec::new();
         self.claude_fork_next = false;
         match command_result {
             Ok(child) => {
@@ -3679,7 +6791,21 @@ impl CodexPane {
                 self.handle_side_slash_command(args);
                 true
             }
-            "fork" | "codex-fork" => {
+            "fork" => {
+                if self.kind == AgentKind::ClaudeCode {
+                    // Claude では bare /fork を /fork-last（引数なし）/ /fork-session（引数あり）へ委譲。
+                    if args.is_empty() {
+                        self.handle_fork_last_slash_command("", false);
+                    } else {
+                        self.handle_fork_session_slash_command(args, false);
+                    }
+                } else {
+                    self.handle_root_session_command_slash_command("fork", args);
+                }
+                true
+            }
+            "codex-fork" => {
+                // codex 専用（Claude では start_codex_subcommand のガードで拒否される）。
                 self.handle_root_session_command_slash_command("fork", args);
                 true
             }
@@ -3749,58 +6875,18 @@ impl CodexPane {
             }
             "model" => {
                 if args.is_empty() {
-                    self.cycle_model();
+                    self.open_model_picker();
                 } else {
                     self.set_model(args);
                 }
                 true
             }
             "reasoning" | "effort" => {
-                if self.kind == AgentKind::ClaudeCode {
-                    if args.is_empty() {
-                        self.cycle_reasoning();
-                    } else if let Some(choice) = claude::parse_effort_choice(args) {
-                        self.set_claude_effort(choice);
-                    } else {
-                        self.push_log(
-                            CodexLogKind::Error,
-                            "effort は config / low / medium / high / xhigh / max を指定してください",
-                        );
-                    }
-                } else if args.is_empty() {
-                    self.cycle_reasoning();
-                } else if let Some(choice) = parse_reasoning_choice(args) {
-                    self.set_reasoning(choice);
-                } else {
-                    self.push_log(
-                        CodexLogKind::Error,
-                        "reasoning は config / low / medium / high / xhigh を指定してください",
-                    );
-                }
+                self.handle_reasoning_slash_command(args);
                 true
             }
             "approval" | "approvals" => {
-                if self.kind == AgentKind::ClaudeCode {
-                    if args.is_empty() {
-                        self.cycle_approval();
-                    } else if let Some(mode) = claude::parse_permission_mode(args) {
-                        self.set_claude_permission_mode(mode);
-                    } else {
-                        self.push_log(
-                            CodexLogKind::Error,
-                            "permission-mode は config / plan / acceptEdits / dontAsk / bypassPermissions を指定してください",
-                        );
-                    }
-                } else if args.is_empty() {
-                    self.cycle_approval();
-                } else if let Some(choice) = parse_approval_choice(args) {
-                    self.set_approval(choice);
-                } else {
-                    self.push_log(
-                        CodexLogKind::Error,
-                        "approval は config / untrusted / on-request / on-failure / never を指定してください",
-                    );
-                }
+                self.handle_approval_slash_command(args);
                 true
             }
             "permissions" | "permission" => {
@@ -3848,16 +6934,7 @@ impl CodexPane {
                 true
             }
             "sandbox" => {
-                if self.kind == AgentKind::ClaudeCode || args.is_empty() {
-                    self.cycle_sandbox();
-                } else if let Some(choice) = parse_sandbox_choice(args) {
-                    self.set_sandbox(choice);
-                } else {
-                    self.push_log(
-                        CodexLogKind::Error,
-                        "sandbox は read-only / workspace-write / danger-full-access を指定してください",
-                    );
-                }
+                self.handle_sandbox_slash_command(args);
                 true
             }
             "search" | "web-search" => {
@@ -3993,6 +7070,14 @@ impl CodexPane {
                 true
             }
             "resume" => {
+                if args.is_empty() {
+                    self.open_session_picker(20);
+                } else {
+                    self.handle_resume_session_slash_command(args, false);
+                }
+                true
+            }
+            "resume-memo" => {
                 self.submit_system_line(resume_prompt());
                 true
             }
@@ -4006,6 +7091,16 @@ impl CodexPane {
             }
             "usage" | "tokens" | "token-usage" => {
                 self.push_slash_usage();
+                true
+            }
+            "undo" => {
+                self.handle_undo_slash_command();
+                true
+            }
+            "exit" | "quit" => {
+                // ターン実行中でも即終了させる（キュー予約に回さない）。
+                self.input_state.exit_command_sent = true;
+                self.finish_from_exit_command();
                 true
             }
             _ => false,
@@ -4050,13 +7145,23 @@ impl CodexPane {
             );
             return;
         }
-        self.thread_id = None;
+        // アイドル常駐が生きていると thread_id を捨てても旧セッションを継続してしまうため、
+        // 新規セッション開始の前に常駐を落として次ターンを新 spawn で始める。
+        self.teardown_claude_resident();
+        self.teardown_codex_appserver();
+        self.set_thread_id(None);
         self.current_turn_prompt = None;
         self.current_turn_retry_prompt = None;
         self.current_command = None;
         self.current_command_started_at = None;
         self.streaming_assistant_index = None;
         self.pending_decision = None;
+        // 旧セッションの checkpoint/予約を持ち越さない（新セッションで /undo が旧 checkpoint へ
+        // 巻き戻る事故を防ぐ。finished ペインのファクトリと同じ 3 フィールドを揃えてクリア）。
+        self.checkpoints.clear();
+        self.checkpoint_seq = 0;
+        self.pending_checkpoint_requests.clear();
+        self.queued_prompts.clear();
         self.action = Some(format!("新しい{name}セッション"));
         self.push_log(
             CodexLogKind::System,
@@ -4079,7 +7184,13 @@ impl CodexPane {
 
     fn handle_stop_slash_command(&mut self, args: &str) {
         if self.is_turn_running() {
-            self.kill_current_turn();
+            if self.claude_resident.is_some() && self.request_claude_interrupt() {
+                // graceful interrupt を送った。完了は result / タイムアウトで検知する。
+            } else if self.codex_appserver.is_some() && self.request_codex_appserver_interrupt() {
+                // graceful interrupt を送った。完了は turn/completed / タイムアウトで検知する。
+            } else {
+                self.kill_current_turn();
+            }
         } else {
             let name = self.kind.display_name();
             self.push_log(
@@ -4511,7 +7622,15 @@ impl CodexPane {
                 None => return,
             },
         };
-        self.thread_id = Some(session_id.clone());
+        // アイドル常駐が生きていると新 thread_id/--fork-session が無視されるため、
+        // resume/fork の前に必ず常駐を落として新規 spawn で反映させる。
+        self.teardown_claude_resident();
+        // 旧セッションの承認バナー・予約・実行中ターン情報を持ち越さない（/new と揃える）。
+        self.pending_decision = None;
+        self.queued_prompts.clear();
+        self.current_turn_prompt = None;
+        self.current_turn_retry_prompt = None;
+        self.set_thread_id(Some(session_id.clone()));
         self.claude_fork_next = fork;
         let verb = if fork { "fork" } else { "resume" };
         self.push_log(
@@ -4553,37 +7672,7 @@ impl CodexPane {
             .filter(|n| *n > 0)
             .unwrap_or(12)
             .min(50);
-        if self.kind == AgentKind::ClaudeCode {
-            self.indexed_sessions = self.load_claude_session_candidates(limit);
-            self.push_codex_sessions_list();
-            return;
-        }
-        match load_codex_session_candidates(limit) {
-            Ok(sessions) => {
-                self.indexed_sessions = sessions;
-                self.push_codex_sessions_list();
-            }
-            Err(e) => self.push_log(
-                CodexLogKind::Error,
-                format!("Codex sessions の読み込みに失敗しました: {e}"),
-            ),
-        }
-    }
-
-    fn push_codex_sessions_list(&mut self) {
-        let name = self.kind.display_name();
-        if self.indexed_sessions.is_empty() {
-            self.push_log(CodexLogKind::System, format!("{name} sessions: none"));
-            return;
-        }
-        let lines = self
-            .indexed_sessions
-            .iter()
-            .enumerate()
-            .map(|(idx, session)| session_list_line(idx + 1, session))
-            .collect::<Vec<_>>()
-            .join("\n");
-        self.push_log(CodexLogKind::System, format!("{name} sessions:\n{lines}"));
+        self.open_session_picker(limit);
     }
 
     fn handle_resume_last_slash_command(&mut self, args: &str, include_all: bool) {
@@ -4916,7 +8005,11 @@ impl CodexPane {
 
     fn handle_permissions_slash_command(&mut self, args: &str) {
         let args = args.trim();
-        if args.is_empty() || matches!(args, "show" | "status") {
+        if args.is_empty() {
+            self.open_approval_picker();
+            return;
+        }
+        if matches!(args, "show" | "status") {
             self.push_permissions_status();
             return;
         }
@@ -4978,10 +8071,16 @@ impl CodexPane {
 
     fn push_permissions_status(&mut self) {
         if self.kind == AgentKind::ClaudeCode {
+            let allow = self.claude_settings.sticky_allowed_tools();
+            let allow_label = if allow.is_empty() {
+                "なし".to_string()
+            } else {
+                allow.join(", ")
+            };
             self.push_log(
                 CodexLogKind::System,
                 format!(
-                    "Permissions: permission-mode={}",
+                    "Permissions: permission-mode={} / 常に許可={allow_label}",
                     self.claude_settings.permission_label()
                 ),
             );
@@ -5461,7 +8560,12 @@ impl CodexPane {
             lines.extend(numbered_or_none(&self.exec_settings.image_paths));
             lines.push(String::new());
             lines.push("Add dirs:".to_string());
-            lines.extend(numbered_or_none(&self.exec_settings.additional_dirs));
+            let add_dirs = if self.kind == AgentKind::ClaudeCode {
+                self.claude_settings.additional_dirs()
+            } else {
+                &self.exec_settings.additional_dirs
+            };
+            lines.extend(numbered_or_none(add_dirs));
             self.push_log(CodexLogKind::System, lines.join("\n"));
             return;
         }
@@ -5684,12 +8788,101 @@ impl CodexPane {
         );
     }
 
+    /// codex ヘッダに常設表示する「コスト | ctx N%」相当のラベル。未取得なら None。
+    pub fn usage_header_label(&self) -> Option<String> {
+        match self.kind {
+            AgentKind::ClaudeCode => {
+                let mut parts = Vec::new();
+                if let Some(cost) = self.claude_total_cost_usd {
+                    parts.push(format!("${cost:.4}"));
+                }
+                if let Some(used) = self.claude_context_tokens {
+                    let window =
+                        claude_context_window_for_model(self.claude_active_model.as_deref());
+                    if let Some(pct) = context_percent(used, window) {
+                        parts.push(format!("ctx {pct}%"));
+                    }
+                }
+                (!parts.is_empty()).then(|| parts.join(" | "))
+            }
+            AgentKind::Codex => {
+                let usage = self.codex_appserver_token_usage.as_ref()?;
+                let mut parts = Vec::new();
+                if let Some(total) = usage.total_tokens {
+                    parts.push(format!("{} tok", format_token_count(total)));
+                    if let Some(window) = usage.model_context_window
+                        && let Some(pct) = context_percent(total, window)
+                    {
+                        parts.push(format!("ctx {pct}%"));
+                    }
+                }
+                (!parts.is_empty()).then(|| parts.join(" | "))
+            }
+        }
+    }
+
     fn push_slash_usage(&mut self) {
         let name = self.kind.display_name();
-        let usage = self.last_token_usage_label.clone().unwrap_or_else(|| {
-            format!("まだ取得できていません。{name} turn 実行後に表示されます。")
-        });
-        self.push_log(CodexLogKind::System, format!("トークン: {usage}"));
+        let mut lines = vec![format!("{name} 使用状況:")];
+        match self.kind {
+            AgentKind::ClaudeCode => {
+                match self.claude_total_cost_usd {
+                    Some(cost) => lines.push(format!("  累計コスト: ${cost:.4}")),
+                    None => lines.push("  累計コスト: 未取得".to_string()),
+                }
+                if let Some(usage) = &self.claude_last_usage {
+                    lines.push(format!("  直近usage: {usage}"));
+                }
+                match self.claude_context_tokens {
+                    Some(used) => {
+                        let window =
+                            claude_context_window_for_model(self.claude_active_model.as_deref());
+                        let pct = context_percent(used, window)
+                            .map(|p| format!("{p}%"))
+                            .unwrap_or_else(|| "-".to_string());
+                        let remain = window.saturating_sub(used);
+                        lines.push(format!(
+                            "  コンテキスト: {} / {} ({pct}, 残り {})",
+                            format_token_count(used),
+                            format_token_count(window),
+                            format_token_count(remain)
+                        ));
+                    }
+                    None => lines.push("  コンテキスト: 未取得".to_string()),
+                }
+            }
+            AgentKind::Codex => match &self.codex_appserver_token_usage {
+                Some(usage) => {
+                    if let Some(total) = usage.total_tokens {
+                        lines.push(format!("  累計トークン: {}", format_token_count(total)));
+                    }
+                    if let Some(last) = usage.last_total_tokens {
+                        lines.push(format!("  直近ターン: {}", format_token_count(last)));
+                    }
+                    if let (Some(total), Some(window)) =
+                        (usage.total_tokens, usage.model_context_window)
+                    {
+                        let pct = context_percent(total, window)
+                            .map(|p| format!("{p}%"))
+                            .unwrap_or_else(|| "-".to_string());
+                        let remain = window.saturating_sub(total);
+                        lines.push(format!(
+                            "  コンテキスト: {} / {} ({pct}, 残り {})",
+                            format_token_count(total),
+                            format_token_count(window),
+                            format_token_count(remain)
+                        ));
+                    }
+                }
+                None => match &self.last_token_usage_label {
+                    Some(usage) => lines.push(format!("  トークン: {usage}")),
+                    None => lines.push(format!(
+                        "  まだ取得できていません。{name} turn 実行後に表示されます。"
+                    )),
+                },
+            },
+        }
+        self.push_log(CodexLogKind::System, lines.join("\n"));
     }
 
     fn push_debug_config(&mut self) {
@@ -5709,13 +8902,39 @@ impl CodexPane {
         self.push_log(
             CodexLogKind::System,
             format!(
-                "設定詳細:\ncodex_bin={}\n作業フォルダ={}\ncodex_home={codex_home}\nセッション={thread}\nturn={}\n設定={}\n履歴={history}\nconfig_overrides:\n  - {config}",
+                "設定詳細:\ncodex_bin={}\n作業フォルダ={}\ncodex_home={codex_home}\nセッション={thread}\nturn={}\n設定={}\n履歴={history}\nconfig_overrides:\n  - {config}{}",
                 compact_home_path(&self.codex_bin),
                 self.cwd,
                 self.turn_count,
                 self.settings_label(),
+                self.claude_resident_debug_suffix(),
             ),
         );
+    }
+
+    /// `/debug-config` に付ける常駐 Claude Code の状態（保存済み cost/usage/model 等）。
+    /// ClaudeCode 以外では空文字。
+    fn claude_resident_debug_suffix(&self) -> String {
+        if self.kind != AgentKind::ClaudeCode {
+            return String::new();
+        }
+        let resident = if self.claude_resident.is_some() {
+            "resident(alive)"
+        } else if self.claude_resident_enabled {
+            "resident(idle/none)"
+        } else {
+            "oneshot"
+        };
+        let model = self.claude_active_model.as_deref().unwrap_or("-");
+        let mode = self.claude_active_permission_mode.as_deref().unwrap_or("-");
+        let cost = self
+            .claude_total_cost_usd
+            .map(|c| format!("${c:.4}"))
+            .unwrap_or_else(|| "-".to_string());
+        let usage = self.claude_last_usage.as_deref().unwrap_or("-");
+        format!(
+            "\nclaude_mode={resident}\nactive_model={model}\nactive_permission={mode}\ntotal_cost={cost}\nlast_usage={usage}"
+        )
     }
 
     fn push_feedback_draft(&mut self, message: &str) {
@@ -6088,8 +9307,10 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
         }
         self.push_log(CodexLogKind::System, "予約した入力を実行します");
         if queued.apply_goal_mode {
+            // run_submitted_line_with_display 側で request_checkpoint する。
             self.run_submitted_line_with_display(queued.submitted, queued.display_prompt);
         } else {
+            self.request_checkpoint();
             self.start_turn_with_display_prompt(&queued.submitted, &queued.display_prompt);
         }
         true
@@ -6109,7 +9330,7 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
                 for arg in claude::exec_args(
                     self.thread_id.as_deref(),
                     &self.claude_settings,
-                    self.claude_one_shot_permission,
+                    &self.claude_one_shot_allowed_tools,
                     self.claude_fork_next,
                     addness_tui_developer_instructions(),
                 ) {
@@ -6122,24 +9343,7 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
-        // 後方互換: codex のときだけ従来の ADDNESS_TUI_CODEX を維持する。
-        if self.kind == AgentKind::Codex {
-            cmd.env("ADDNESS_TUI_CODEX", "1");
-        }
-        cmd.env("ADDNESS_TUI_BACKEND", self.kind.backend_env_value());
-        cmd.env("ADDNESS_GOAL_ID", &self.goal_id);
-        cmd.env("ADDNESS_GOAL_TITLE", &self.goal_title);
-        cmd.env("ADDNESS_GOAL_STATUS", &self.status_label);
-        cmd.env("ADDNESS_GOAL_DOD", &self.dod);
-        cmd.env("ADDNESS_TASK_GOAL_ID", &self.goal_id);
-        cmd.env("ADDNESS_TASK_GOAL_TITLE", &self.goal_title);
-        cmd.env("ADDNESS_PARENT_GOAL_ID", &self.parent_goal_id);
-        cmd.env("ADDNESS_PARENT_GOAL_TITLE", &self.parent_goal_title);
-        cmd.env(
-            "ADDNESS_WORKTREE_BRANCH",
-            git_branch_label(Path::new(&self.cwd)),
-        );
-        cmd.env("ADDNESS_BIN", &self.addness_bin);
+        self.apply_agent_env(&mut cmd);
 
         let name = self.kind.display_name();
         let mut child = cmd
@@ -6187,24 +9391,7 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
-        // 後方互換: codex のときだけ従来の ADDNESS_TUI_CODEX を維持する。
-        if self.kind == AgentKind::Codex {
-            cmd.env("ADDNESS_TUI_CODEX", "1");
-        }
-        cmd.env("ADDNESS_TUI_BACKEND", self.kind.backend_env_value());
-        cmd.env("ADDNESS_GOAL_ID", &self.goal_id);
-        cmd.env("ADDNESS_GOAL_TITLE", &self.goal_title);
-        cmd.env("ADDNESS_GOAL_STATUS", &self.status_label);
-        cmd.env("ADDNESS_GOAL_DOD", &self.dod);
-        cmd.env("ADDNESS_TASK_GOAL_ID", &self.goal_id);
-        cmd.env("ADDNESS_TASK_GOAL_TITLE", &self.goal_title);
-        cmd.env("ADDNESS_PARENT_GOAL_ID", &self.parent_goal_id);
-        cmd.env("ADDNESS_PARENT_GOAL_TITLE", &self.parent_goal_title);
-        cmd.env(
-            "ADDNESS_WORKTREE_BRANCH",
-            git_branch_label(Path::new(&self.cwd)),
-        );
-        cmd.env("ADDNESS_BIN", &self.addness_bin);
+        self.apply_agent_env(&mut cmd);
 
         let mut child = cmd
             .spawn()
@@ -6231,6 +9418,10 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
             let _ = child.wait();
         }
         self.child = None;
+        // 常駐 Claude Code プロセスも終了させる（次ターンで --resume 再接続する）。
+        self.teardown_claude_resident();
+        // 常駐 codex app-server プロセスも終了させる（次ターンで thread/resume 再接続する）。
+        self.teardown_codex_appserver();
         self.turn_running = false;
         self.current_command = None;
         self.current_command_started_at = None;
@@ -6278,18 +9469,39 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
     /// codex プロセスを終了させる（ペインを閉じる時に呼ぶ）。
     /// kill 後に wait してゾンビプロセス化を防ぐ。
     pub fn kill(&mut self) {
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        self.child = None;
-        self.turn_running = false;
+        self.teardown_all_processes();
         self.current_command = None;
         self.current_command_started_at = None;
         self.pending_decision = None;
         self.current_turn_prompt = None;
         self.current_turn_retry_prompt = None;
         self.queued_prompts.clear();
+    }
+
+    /// 常駐/子プロセスをすべて終了させ、`turn_running` を落とす（プロセスの後始末のみ）。
+    /// 状態クリアを伴う `kill()` と、`/exit`・`/quit` の即時終了経路で共有する。
+    fn teardown_all_processes(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.child = None;
+        self.teardown_claude_resident();
+        // 常駐 codex app-server プロセスも終了させる（kill_current_turn と同様に孤児化を防ぐ）。
+        self.teardown_codex_appserver();
+        self.turn_running = false;
+    }
+
+    /// 常駐 Claude Code プロセスを終了させ、常駐関連の一時状態をリセットする。
+    fn teardown_claude_resident(&mut self) {
+        if let Some(mut resident) = self.claude_resident.take() {
+            resident.kill();
+        }
+        self.claude_interrupt_deadline = None;
+        self.claude_interrupting = false;
+        self.claude_pending_tool = None;
+        self.claude_pending_setting_change = None;
+        self.claude_resident_restart_pending = false;
     }
 
     /// DoD を更新する。内容が変わった場合のみ項目・判定を作り直し `true` を返す。
@@ -6344,6 +9556,7 @@ TUI helpers:
   /remember|/memo <内容> - Addness bodyの作業メモへ保存
   /handoff [メモ] - 現在の会話をAddness bodyへ再開用に保存
   /diff, /history, /turn [picker|N|all|old|close N|toggle N], /rollout, /debug-config, /ps, /stop [all], /btw
+  /undo - ターン開始時のチェックポイントへこのペインの作業ディレクトリ配下を戻す（新規作成ファイルは残る）
   /feedback [message], /test-approval [message], /compact [notes], /plan [task]
   /resume, /status, /usage, /help, /exit"#
 }
@@ -6398,6 +9611,7 @@ TUI helpers:
   /remember|/memo <内容> - Addness bodyのCodex作業メモへ保存
   /handoff [メモ] - 現在の会話をAddness bodyへ再開用に保存
   /diff, /history, /turn [picker|N|all|old|close N|toggle N], /rollout, /debug-config, /ps, /stop [all], /btw
+  /undo - ターン開始時のチェックポイントへこのペインの作業ディレクトリ配下を戻す（新規作成ファイルは残る）
   /feedback [message], /test-approval [message], /compact [notes], /plan [task]
   /resume, /status, /usage, /help, /exit"#
 }
@@ -6408,14 +9622,20 @@ struct CodexInputState {
     cursor: usize,
     exit_command_sent: bool,
     last_prompt: Option<String>,
+    /// 送信済みプロンプトの履歴（古い順。末尾が最新）。↑↓で呼び戻す。
+    history: Vec<String>,
+    /// 履歴の閲覧位置。None=閲覧していない（下書き編集中）。Some(i)=history[i]を表示中。
+    history_pos: Option<usize>,
+    /// 履歴閲覧に入る前の編集中テキスト。閲覧を最新より先へ抜けたときに復元する。
+    history_draft: Option<String>,
 }
 
 impl CodexInputState {
     fn record_submitted(&mut self, submitted: &str) {
-        if !submitted.is_empty() && submitted != "/exit" {
+        if !submitted.is_empty() && !is_exit_prompt(submitted) {
             self.last_prompt = Some(submitted.to_string());
         }
-        if submitted == "/exit" {
+        if is_exit_prompt(submitted) {
             self.exit_command_sent = true;
         }
     }
@@ -6438,7 +9658,10 @@ impl CodexInputState {
             | KeyCode::Right
             | KeyCode::Home
             | KeyCode::End => true,
-            KeyCode::Up | KeyCode::Down => self.line.contains('\n'),
+            // 複数行入力中は行間移動、単一行でも履歴があれば↑で呼び戻せるよう捕捉する。
+            KeyCode::Up => self.line.contains('\n') || !self.history.is_empty(),
+            // ↓は複数行の行間移動か、履歴閲覧中の前進（新しい方/下書きへ）のときだけ捕捉する。
+            KeyCode::Down => self.line.contains('\n') || self.history_pos.is_some(),
             _ => false,
         }
     }
@@ -6461,8 +9684,8 @@ impl CodexInputState {
             KeyCode::Delete => self.delete_at_cursor(),
             KeyCode::Left => self.move_prev_char(),
             KeyCode::Right => self.move_next_char(),
-            KeyCode::Up => self.move_vertical(true),
-            KeyCode::Down => self.move_vertical(false),
+            KeyCode::Up => self.move_up(),
+            KeyCode::Down => self.move_down(),
             KeyCode::Home => self.move_line_start(),
             KeyCode::End => self.move_line_end(),
             KeyCode::Enter => {
@@ -6484,12 +9707,14 @@ impl CodexInputState {
     }
 
     fn insert_text(&mut self, text: &str) {
+        self.detach_history();
         let normalized = normalize_input_text(text);
         self.line.insert_str(self.cursor, &normalized);
         self.cursor += normalized.len();
     }
 
     fn insert_char(&mut self, ch: char) {
+        self.detach_history();
         self.line.insert(self.cursor, ch);
         self.cursor += ch.len_utf8();
     }
@@ -6498,6 +9723,7 @@ impl CodexInputState {
         let Some(prev) = prev_char_boundary(&self.line, self.cursor) else {
             return;
         };
+        self.detach_history();
         self.line.drain(prev..self.cursor);
         self.cursor = prev;
     }
@@ -6506,7 +9732,102 @@ impl CodexInputState {
         let Some(next) = next_char_boundary(&self.line, self.cursor) else {
             return;
         };
+        self.detach_history();
         self.line.drain(self.cursor..next);
+    }
+
+    /// カーソル手前の `from` からカーソルまでを `replacement` で置き換える（@メンション確定に使う）。
+    fn replace_to_cursor(&mut self, from: usize, replacement: &str) {
+        if from > self.cursor || !self.line.is_char_boundary(from) {
+            return;
+        }
+        self.detach_history();
+        self.line.replace_range(from..self.cursor, replacement);
+        self.cursor = from + replacement.len();
+    }
+
+    /// 履歴閲覧を終了し、下書き退避を破棄する（編集で下書きが確定したとき）。
+    fn detach_history(&mut self) {
+        self.history_pos = None;
+        self.history_draft = None;
+    }
+
+    /// 送信済みプロンプトを履歴末尾へ追加する。直前と同一なら追加しない。
+    /// 追加したら true。上限を超えた古い分は捨てる。
+    fn push_history(&mut self, entry: String) -> bool {
+        if entry.is_empty() {
+            return false;
+        }
+        if self.history.last().is_some_and(|last| last == &entry) {
+            return false;
+        }
+        self.history.push(entry);
+        if self.history.len() > INPUT_HISTORY_MAX {
+            let overflow = self.history.len() - INPUT_HISTORY_MAX;
+            self.history.drain(0..overflow);
+        }
+        true
+    }
+
+    /// ↑: 先頭行なら履歴を遡り、そうでなければ行間を上へ移動する。
+    fn move_up(&mut self) {
+        let (start, _) = self.current_line_bounds();
+        if start == 0 {
+            self.recall_history_prev();
+        } else {
+            self.move_vertical(true);
+        }
+    }
+
+    /// ↓: 末尾行なら履歴を進め（最新の先で下書きへ）、そうでなければ行間を下へ移動する。
+    fn move_down(&mut self) {
+        let (_, end) = self.current_line_bounds();
+        if end == self.line.len() {
+            self.recall_history_next();
+        } else {
+            self.move_vertical(false);
+        }
+    }
+
+    /// 履歴を 1 件古い方へ辿る。閲覧開始時は現在の入力を下書きへ退避する。
+    fn recall_history_prev(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        let idx = match self.history_pos {
+            None => {
+                self.history_draft = Some(self.line.clone());
+                self.history.len() - 1
+            }
+            Some(0) => return,
+            Some(pos) => pos - 1,
+        };
+        self.history_pos = Some(idx);
+        self.set_line_from_history(idx);
+    }
+
+    /// 履歴を 1 件新しい方へ辿る。最新の先へ進むと退避した下書きへ戻る。
+    fn recall_history_next(&mut self) {
+        match self.history_pos {
+            None => {}
+            Some(pos) if pos + 1 < self.history.len() => {
+                self.history_pos = Some(pos + 1);
+                self.set_line_from_history(pos + 1);
+            }
+            Some(_) => {
+                let draft = self.history_draft.take().unwrap_or_default();
+                self.line = draft;
+                self.cursor = self.line.len();
+                self.history_pos = None;
+            }
+        }
+    }
+
+    fn set_line_from_history(&mut self, idx: usize) {
+        if let Some(entry) = self.history.get(idx) {
+            self.line = entry.clone();
+            self.cursor = self.line.len();
+        }
     }
 
     fn move_prev_char(&mut self) {
@@ -6570,11 +9891,157 @@ impl CodexInputState {
     fn clear(&mut self) {
         self.line.clear();
         self.cursor = 0;
+        self.history_pos = None;
+        self.history_draft = None;
     }
 }
 
 fn normalize_input_text(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// 長文ペーストを入力欄で畳み込む閾値（行数）。これを超えるとプレースホルダ化する。
+const PASTE_FOLD_LINES: usize = 10;
+/// 長文ペーストを入力欄で畳み込む閾値（文字数）。これを超えるとプレースホルダ化する。
+const PASTE_FOLD_CHARS: usize = 800;
+
+/// ペーストの行数（改行区切りのセグメント数）。空文字列は 0 行。
+fn paste_line_count(text: &str) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    text.split('\n').count()
+}
+
+/// ペーストを畳み込むべきか（10 行超 または 800 文字超）。
+fn paste_should_fold(normalized: &str) -> bool {
+    paste_line_count(normalized) > PASTE_FOLD_LINES || normalized.chars().count() > PASTE_FOLD_CHARS
+}
+
+/// 入力欄へ挿入するプレースホルダ文字列を作る（例: `[貼り付け#1: 120行]`）。
+fn paste_placeholder(index: usize, normalized: &str) -> String {
+    format!("[貼り付け#{index}: {}行]", paste_line_count(normalized))
+}
+
+/// 入力行中のプレースホルダを、保持中の全文へ展開する（純粋関数）。
+/// プレースホルダがそのまま残っている（完全一致する）ものだけ差し替える。
+/// ユーザーが編集して一致しなくなったものはそのまま残す。
+fn expand_paste_placeholders(line: &str, pastes: &[StoredPaste]) -> String {
+    let mut out = line.to_string();
+    for paste in pastes {
+        if out.contains(paste.placeholder.as_str()) {
+            out = out.replace(paste.placeholder.as_str(), &paste.full);
+        }
+    }
+    out
+}
+
+/// クリップボード画像の保存先（`~/.addness/attachments/`）。
+fn attachments_dir_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".addness").join("attachments"))
+}
+
+/// `clip-<N>.png` の連番を解析する。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // クリップボード保存はmacOSのみ
+fn parse_clip_index(name: &str) -> Option<usize> {
+    name.strip_prefix("clip-")?
+        .strip_suffix(".png")?
+        .parse()
+        .ok()
+}
+
+/// 既存ファイル名一覧から次の `clip-<N>.png` を決める（純粋関数）。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // クリップボード保存はmacOSのみ
+fn next_clip_filename(existing: &[String]) -> String {
+    let max = existing
+        .iter()
+        .filter_map(|name| parse_clip_index(name))
+        .max()
+        .unwrap_or(0);
+    format!("clip-{}.png", max + 1)
+}
+
+/// ディレクトリ内の既存 `clip-*.png` を調べ、次の保存先パスを返す。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // クリップボード保存はmacOSのみ
+fn next_clip_path(dir: &Path) -> PathBuf {
+    let existing: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect();
+    dir.join(next_clip_filename(&existing))
+}
+
+/// macOS: クリップボードの PNG を `dir` 内の次の連番へ保存する。
+/// 画像が無ければ `Ok(None)`、保存できたら `Ok(Some(path))`、外部コマンド失敗は `Err`。
+#[cfg(target_os = "macos")]
+fn capture_clipboard_image_to_dir(dir: &Path) -> std::io::Result<Option<PathBuf>> {
+    std::fs::create_dir_all(dir)?;
+    let path = next_clip_path(dir);
+    if run_osascript_write_clipboard_png(&path, std::time::Duration::from_secs(5))? {
+        Ok(Some(path))
+    } else {
+        Ok(None)
+    }
+}
+
+/// macOS: `osascript` でクリップボードの PNG をファイルへ書き出す。
+/// 書き出せたら `Ok(true)`、画像が無ければ `Ok(false)`。タイムアウト付き（ハング防止）。
+#[cfg(target_os = "macos")]
+fn run_osascript_write_clipboard_png(
+    path: &Path,
+    timeout: std::time::Duration,
+) -> std::io::Result<bool> {
+    use std::io::Read;
+    // パスに `"` や `\` が含まれても AppleScript 文字列リテラルを壊さないようエスケープする。
+    let escaped_path = super::app::applescript_string_escape(&path.display().to_string());
+    let script = format!(
+        r#"set outFile to POSIX file "{escaped_path}"
+try
+    set pngData to (the clipboard as «class PNGf»)
+on error
+    return "NO_IMAGE"
+end try
+set fh to open for access outFile with write permission
+set eof fh to 0
+write pngData to fh
+close access fh
+return "OK""#
+    );
+    let mut child = Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let mut out = String::new();
+            if let Some(mut so) = child.stdout.take() {
+                let _ = so.read_to_string(&mut out);
+            }
+            if status.success() && out.trim() == "OK" && path.exists() {
+                return Ok(true);
+            }
+            // 画像なし・書き込み失敗時は中途半端なファイルを残さない。
+            let _ = std::fs::remove_file(path);
+            return Ok(false);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(path);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "osascript がタイムアウトしました",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 fn prev_char_boundary(text: &str, cursor: usize) -> Option<usize> {
@@ -6622,6 +10089,305 @@ fn byte_index_for_width(text: &str, start: usize, end: usize, target_width: usiz
         }
     }
     candidate
+}
+
+/// fileChange の変更パス一覧を 1 行のラベルにまとめる（先頭数件 + 残り件数）。
+fn codex_appserver_paths_label(paths: &[String]) -> String {
+    if paths.is_empty() {
+        return "(パス不明)".to_string();
+    }
+    let shown = paths.len().min(3);
+    let mut label = paths[..shown].join(", ");
+    if paths.len() > shown {
+        label.push_str(&format!(" ほか{}件", paths.len() - shown));
+    }
+    compact_one_line(&label, 120)
+}
+
+/// fileChange の各変更からパスだけを取り出す。
+fn codex_appserver_change_paths(changes: &[codex_appserver::FileChangeDetail]) -> Vec<String> {
+    changes.iter().map(|c| c.path.clone()).collect()
+}
+
+/// apply_patch テキスト 1 セクションに含める差分本文行の上限。
+/// 表示側（code_edit_diff_preview）でさらに 8 行へ切り詰めるが、
+/// ログ・セッション記録の肥大化を防ぐためにここでも上限を設ける。
+const CODEX_PATCH_SECTION_MAX_LINES: usize = 40;
+
+/// codex 互換の apply_patch テキスト（`EDIT ` 接頭辞付き）を組み立てる。
+/// `sections` は (ヘッダ行, 本文行) で、本文行は既に `+`/`-`/`@@` 接頭辞付き。
+/// 空なら None。描画は既存の `code_edit_display_text` が担当する（色付き差分プレビュー）。
+fn build_apply_patch_text(sections: &[(String, Vec<String>)]) -> Option<String> {
+    if sections.is_empty() {
+        return None;
+    }
+    let mut out = vec!["EDIT *** Begin Patch".to_string()];
+    for (header, body) in sections {
+        out.push(header.clone());
+        for line in body {
+            out.push(line.clone());
+        }
+    }
+    out.push("*** End Patch".to_string());
+    Some(out.join("\n"))
+}
+
+/// 生テキストを行分割し、各行へ `prefix` を付けて最大 `max` 行まで返す。
+/// 空テキストは空の差分として扱う。
+fn prefixed_diff_lines(text: &str, prefix: char, max: usize) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    text.replace('\r', "")
+        .split('\n')
+        .take(max)
+        .map(|line| format!("{prefix}{line}"))
+        .collect()
+}
+
+/// Claude の Edit / MultiEdit / Write の tool_use input から差分プレビュー用の
+/// apply_patch テキストを組み立てる純粋関数。対象外ツールや情報不足なら None。
+fn claude_edit_patch_text(name: &str, input: &Value) -> Option<String> {
+    let path = input
+        .get("file_path")
+        .and_then(Value::as_str)
+        .filter(|p| !p.is_empty())?;
+    match name {
+        "Write" => {
+            let content = input.get("content").and_then(Value::as_str).unwrap_or("");
+            let body = prefixed_diff_lines(content, '+', CODEX_PATCH_SECTION_MAX_LINES);
+            build_apply_patch_text(&[(format!("*** Add File: {path}"), body)])
+        }
+        "Edit" => {
+            let old = input
+                .get("old_string")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let new = input
+                .get("new_string")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let body = edit_pair_body(old, new);
+            if body.is_empty() {
+                return None;
+            }
+            build_apply_patch_text(&[(format!("*** Update File: {path}"), body)])
+        }
+        "MultiEdit" => {
+            let edits = input.get("edits").and_then(Value::as_array)?;
+            let mut body = Vec::new();
+            for edit in edits {
+                let old = edit.get("old_string").and_then(Value::as_str).unwrap_or("");
+                let new = edit.get("new_string").and_then(Value::as_str).unwrap_or("");
+                body.extend(edit_pair_body(old, new));
+            }
+            if body.is_empty() {
+                return None;
+            }
+            build_apply_patch_text(&[(format!("*** Update File: {path}"), body)])
+        }
+        _ => None,
+    }
+}
+
+/// 旧行を `-`、新行を `+` として並べた差分本文を作る（行単位 diff は取らない）。
+fn edit_pair_body(old: &str, new: &str) -> Vec<String> {
+    let half = CODEX_PATCH_SECTION_MAX_LINES / 2;
+    let mut body = Vec::new();
+    if !old.is_empty() {
+        body.extend(prefixed_diff_lines(old, '-', half));
+    }
+    if !new.is_empty() {
+        body.extend(prefixed_diff_lines(new, '+', half));
+    }
+    body
+}
+
+/// codex 常駐 fileChange の unified diff から apply_patch テキストを組み立てる。
+fn codex_filechange_patch_text(changes: &[codex_appserver::FileChangeDetail]) -> Option<String> {
+    let mut sections = Vec::new();
+    for change in changes {
+        let header = match change.change_type.as_str() {
+            "add" => format!("*** Add File: {}", change.path),
+            "delete" => format!("*** Delete File: {}", change.path),
+            _ => format!("*** Update File: {}", change.path),
+        };
+        let body: Vec<String> = change
+            .diff
+            .replace('\r', "")
+            .split('\n')
+            .filter(|line| is_meaningful_diff_line(line))
+            .take(CODEX_PATCH_SECTION_MAX_LINES)
+            .map(str::to_string)
+            .collect();
+        if body.is_empty() {
+            continue;
+        }
+        sections.push((header, body));
+    }
+    build_apply_patch_text(&sections)
+}
+
+/// unified diff からファイルヘッダ等のノイズ行を除き、`@@`/`+`/`-` の意味行だけ残す。
+fn is_meaningful_diff_line(line: &str) -> bool {
+    if line.starts_with("+++")
+        || line.starts_with("---")
+        || line.starts_with("diff ")
+        || line.starts_with("index ")
+        || line.starts_with("new file")
+        || line.starts_with("deleted file")
+        || line.starts_with("rename ")
+        || line.starts_with("similarity ")
+        || line.starts_with("\\ No newline")
+    {
+        return false;
+    }
+    line.starts_with("@@") || line.starts_with('+') || line.starts_with('-')
+}
+
+/// 経過秒を mm:ss（1時間以上は h:mm:ss）で整形する純粋関数。
+fn format_elapsed(secs: u64) -> String {
+    let hours = secs / 3600;
+    let minutes = (secs % 3600) / 60;
+    let seconds = secs % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
+}
+
+/// トークン数を k / M で丸めた短い表示にする（例: 12711 → "12.7k"、1_500_000 → "1.5M"）。
+fn format_token_count(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// 使用トークン / コンテキスト長からパーセント（0-100、四捨五入）を返す。window が 0 なら None。
+fn context_percent(used: u64, window: u64) -> Option<u8> {
+    if window == 0 {
+        return None;
+    }
+    let pct = (used as f64 / window as f64 * 100.0).round();
+    Some(pct.clamp(0.0, 100.0) as u8)
+}
+
+/// モデル名から想定コンテキスト長を返す。既知マップに無ければ 200k と仮定する。
+fn claude_context_window_for_model(model: Option<&str>) -> u64 {
+    const DEFAULT_WINDOW: u64 = 200_000;
+    let Some(model) = model else {
+        return DEFAULT_WINDOW;
+    };
+    let lower = model.to_ascii_lowercase();
+    // 1M コンテキストのモデル（例: `...[1m]` / `...-1m`）だけ別枠にする。
+    if lower.contains("[1m]") || lower.contains("-1m") {
+        1_000_000
+    } else {
+        DEFAULT_WINDOW
+    }
+}
+
+/// goal_id からチェックポイント ref に使える slug を作る（英数と '-' のみ、他は '-'）。
+/// 連続する '-' はまとめ、前後の '-' は落とす。空になった場合は "pane"。
+fn checkpoint_slug(goal_id: &str) -> String {
+    let mut slug = String::with_capacity(goal_id.len());
+    let mut last_dash = false;
+    for ch in goal_id.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash {
+            slug.push('-');
+            last_dash = true;
+        }
+    }
+    let trimmed = slug.trim_matches('-');
+    if trimmed.is_empty() {
+        "pane".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// チェックポイント ref 名を組み立てる。
+fn checkpoint_ref_name(slug: &str, seq: usize) -> String {
+    format!("refs/addness/checkpoint-{slug}-{seq}")
+}
+
+/// `git status --porcelain` 出力に作業ツリー/インデックスの変更があるか。
+pub(super) fn git_status_has_changes(porcelain: &str) -> bool {
+    porcelain.lines().any(|line| !line.trim().is_empty())
+}
+
+/// チェックポイントをスタックへ push し、上限超過分（古い順）を返す（呼び出し側が ref を掃除する）。
+fn push_checkpoint_with_evictions(
+    stack: &mut Vec<Checkpoint>,
+    checkpoint: Checkpoint,
+    max: usize,
+) -> Vec<Checkpoint> {
+    stack.push(checkpoint);
+    let mut evicted = Vec::new();
+    while stack.len() > max.max(1) {
+        evicted.push(stack.remove(0));
+    }
+    evicted
+}
+
+/// 端末出力から ANSI エスケープ列と制御文字を取り除く。ライブ出力の表示前に使う。
+fn sanitize_terminal_line(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            match chars.peek() {
+                Some('[') => {
+                    // CSI: パラメータ・中間バイトを読み飛ばし、終端バイト(0x40-0x7E)まで消費。
+                    chars.next();
+                    while let Some(&c) = chars.peek() {
+                        chars.next();
+                        if ('\u{40}'..='\u{7e}').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    // OSC: BEL(0x07) か ST(ESC \) まで。
+                    chars.next();
+                    while let Some(&c) = chars.peek() {
+                        if c == '\u{7}' {
+                            chars.next();
+                            break;
+                        }
+                        if c == '\u{1b}' {
+                            chars.next();
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
+                            break;
+                        }
+                        chars.next();
+                    }
+                }
+                Some(_) => {
+                    // ESC X（2バイトのエスケープ）。
+                    chars.next();
+                }
+                None => {}
+            }
+            continue;
+        }
+        if ch == '\t' {
+            out.push(' ');
+        } else if !ch.is_control() {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 fn spawn_line_reader<R>(reader: R, tx: Sender<CodexProcessEvent>, stderr: bool)
@@ -6847,6 +10613,123 @@ fn agent_session_log_path(kind: AgentKind, goal_id: &str) -> Option<PathBuf> {
     })
 }
 
+/// 入力履歴の保存先（全ゴール共通。シェル履歴に相当）。
+fn input_history_file_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".addness").join("input-history.jsonl"))
+}
+
+/// 入力履歴ファイルを読み込む（古い順。末尾が最新）。上限を超える古い分は捨てる。
+fn load_input_history(path: &Path) -> Vec<String> {
+    let Ok(file) = File::open(path) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_str::<String>(trimmed) {
+            out.push(entry);
+        }
+    }
+    if out.len() > INPUT_HISTORY_MAX {
+        let overflow = out.len() - INPUT_HISTORY_MAX;
+        out.drain(0..overflow);
+    }
+    out
+}
+
+/// 入力履歴を 1 件追記する（改行を含むプロンプトも JSON エスケープで 1 行に収まる）。
+fn append_input_history(path: &Path, entry: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!("入力履歴ディレクトリを作成できません: {}", parent.display())
+        })?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("入力履歴ファイルを開けません: {}", path.display()))?;
+    serde_json::to_writer(&mut file, entry).context("入力履歴のJSON化に失敗しました")?;
+    writeln!(file).context("入力履歴の書き込みに失敗しました")?;
+    Ok(())
+}
+
+/// 入力欄の `@` メンション候補 1 件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MentionCandidate {
+    /// 入力欄へ挿入する相対パス（ディレクトリは末尾 `/`）。
+    insert: String,
+    /// パレット表示に使う文字列（現状は insert と同じ）。
+    pub display: String,
+    pub is_dir: bool,
+}
+
+/// カーソル手前で入力中の `@` メンションを検出する。
+/// 返り値は (`@` のバイト位置, `@` 以降の入力文字列)。
+/// `@` の直前が英数字（メールアドレス等）の場合や、`@` 以降に空白を含む場合は None。
+fn active_mention(line: &str, cursor: usize) -> Option<(usize, String)> {
+    let before = line.get(..cursor)?;
+    let at = before.rfind('@')?;
+    let query = &before[at + '@'.len_utf8()..];
+    if query.chars().any(char::is_whitespace) {
+        return None;
+    }
+    // メールアドレス（foo@bar）の誤爆だけをガードしたいので、直前文字は ASCII 英数字と
+    // ローカルパートで使われる記号に限定する。CJK など非 ASCII 直後（例:「見て@src」）は
+    // メンションとして扱いパレットを出す。
+    if at > 0
+        && let Some(prev) = before[..at].chars().next_back()
+        && (prev.is_ascii_alphanumeric() || matches!(prev, '.' | '_' | '-' | '+'))
+    {
+        return None;
+    }
+    Some((at, query.to_string()))
+}
+
+/// `@` メンションのクエリからファイル候補を作る。
+/// `cwd` 基準で、クエリの末尾 `/` までをディレクトリ、残りを絞り込み接頭辞として扱う。
+/// 前方一致を優先し、続けて部分一致を最大件数まで並べる。
+fn mention_candidates(cwd: &Path, query: &str) -> Vec<MentionCandidate> {
+    // cwd 基準の相対パスだけを列挙する。絶対パス（`/etc/...`）や `..` を含むクエリは
+    // cwd 外へ出てしまうため候補を空にし、パレットを出さない。
+    if query.starts_with('/') || query.split('/').any(|component| component == "..") {
+        return Vec::new();
+    }
+    let (sub, prefix) = match query.rfind('/') {
+        Some(idx) => (&query[..=idx], &query[idx + 1..]),
+        None => ("", query),
+    };
+    let dir = if sub.is_empty() {
+        cwd.to_path_buf()
+    } else {
+        cwd.join(sub)
+    };
+    let prefix_lower = prefix.to_lowercase();
+    let mut prefix_hits = Vec::new();
+    let mut substr_hits = Vec::new();
+    for entry in super::file_picker::read_dir_entries(&dir) {
+        let name_lower = entry.name.to_lowercase();
+        let rel = format!("{sub}{}", entry.name);
+        let insert = if entry.is_dir { format!("{rel}/") } else { rel };
+        let candidate = MentionCandidate {
+            display: insert.clone(),
+            insert,
+            is_dir: entry.is_dir,
+        };
+        if prefix_lower.is_empty() || name_lower.starts_with(&prefix_lower) {
+            prefix_hits.push(candidate);
+        } else if name_lower.contains(&prefix_lower) {
+            substr_hits.push(candidate);
+        }
+    }
+    prefix_hits.extend(substr_hits);
+    prefix_hits.truncate(MENTION_PALETTE_MAX);
+    prefix_hits
+}
+
 fn safe_path_component(value: &str) -> String {
     let mut out = String::new();
     for ch in value.chars() {
@@ -6914,6 +10797,7 @@ fn load_codex_session(path: &Path) -> Result<LoadedCodexSession> {
                 log: Vec::new(),
                 record_count: 0,
                 goal_mode: CodexGoalMode::default(),
+                thread_id: None,
             });
         }
         Err(e) => {
@@ -6923,6 +10807,7 @@ fn load_codex_session(path: &Path) -> Result<LoadedCodexSession> {
 
     let mut log = Vec::new();
     let mut goal_mode = CodexGoalMode::default();
+    let mut thread_id = None;
     let mut record_count = 0usize;
     for line in BufReader::new(file).lines().map_while(Result::ok) {
         if line.trim().is_empty() {
@@ -6949,6 +10834,10 @@ fn load_codex_session(path: &Path) -> Result<LoadedCodexSession> {
             CodexSessionRecord::GoalMode { objective, paused } => {
                 goal_mode = CodexGoalMode { objective, paused };
             }
+            CodexSessionRecord::ThreadId { id } => {
+                // 最後の値を残す。tombstone（None）も最後ならそのまま反映する。
+                thread_id = id;
+            }
             CodexSessionRecord::RawEvent { .. } => {}
         }
         if log.len() > CODEX_SESSION_HISTORY_MAX_LOG_LINES {
@@ -6961,6 +10850,7 @@ fn load_codex_session(path: &Path) -> Result<LoadedCodexSession> {
         log,
         record_count,
         goal_mode,
+        thread_id,
     })
 }
 
@@ -8491,6 +12381,8 @@ mod tests {
             cwd: &cwd,
             addness_bin: "addness",
             session_log_path: None,
+            input_history_path: None,
+            attachments_dir: None,
             goal_id: "goal/claude".to_string(),
             goal_title: "Claude goal".to_string(),
             dod: String::new(),
@@ -8498,6 +12390,17 @@ mod tests {
         })
         .unwrap();
         pane.log.clear();
+        // 既定は常駐だが、プロセス起動を伴わないユニットテストではワンショット経路を検証する。
+        // 常駐固有の遷移は claude_resident_pane() を使う専用テストで検証する。
+        pane.claude_resident_enabled = false;
+        pane
+    }
+
+    /// 常駐クライアントを差し込んだ ClaudeCode ペイン（実プロセスは起動しない）。
+    /// `set_resident_for_test` でダミー `Child` を入れ、常駐固有の状態遷移を検証する。
+    fn claude_resident_pane() -> CodexPane {
+        let mut pane = claude_pane();
+        pane.claude_resident_enabled = true;
         pane
     }
 
@@ -8509,6 +12412,23 @@ mod tests {
         }));
         assert_eq!(pane.thread_id.as_deref(), Some("sid-1"));
         assert!(pane.log.iter().any(|line| line.kind == CodexLogKind::Turn));
+    }
+
+    #[test]
+    fn claude_stderr_unknown_partial_flag_disables_streaming_once() {
+        let mut pane = claude_pane();
+        // 再試行対象プロンプトは無い状態にし、spawn せず判定・フラグ・ログのみ確認する。
+        pane.current_turn_retry_prompt = None;
+        assert!(!pane.claude_settings.no_partial_messages());
+
+        pane.handle_stderr_line("error: unknown option '--include-partial-messages'");
+        assert!(pane.claude_settings.no_partial_messages());
+        let disabled_msg = |line: &CodexLogLine| line.text.contains("ストリーミング表示に未対応");
+        assert_eq!(pane.log.iter().filter(|l| disabled_msg(l)).count(), 1);
+
+        // 2 回目の同種 stderr ではフラグ済みなので再発火せず、無効化ログも増えない（無限ループ防止）。
+        pane.handle_stderr_line("error: unknown option '--include-partial-messages'");
+        assert_eq!(pane.log.iter().filter(|l| disabled_msg(l)).count(), 1);
     }
 
     #[test]
@@ -8538,9 +12458,33 @@ mod tests {
         assert!(pane.log.iter().any(|line| line.kind == CodexLogKind::Tool
             && line.text.contains("Bash")
             && line.text.contains("cargo test")));
+        // Write は色付き差分プレビュー用の apply_patch 行として残る（Add File 見出し）。
         assert!(pane.log.iter().any(|line| line.kind == CodexLogKind::Tool
-            && line.text.contains("Write")
-            && line.text.contains("/tmp/x.rs")));
+            && line.text.starts_with("EDIT ")
+            && line.text.contains("*** Add File: /tmp/x.rs")));
+    }
+
+    #[test]
+    fn claude_edit_tool_use_emits_colored_diff_line() {
+        let mut pane = claude_pane();
+        pane.handle_json_event(serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [
+                {"type": "tool_use", "name": "Edit", "input": {
+                    "file_path": "src/x.rs",
+                    "old_string": "let a = 1;",
+                    "new_string": "let a = 2;"
+                }}
+            ]}
+        }));
+        let edit_line = pane
+            .log
+            .iter()
+            .find(|line| line.kind == CodexLogKind::Tool && line.text.starts_with("EDIT "))
+            .expect("EDIT 行が残る");
+        assert!(edit_line.text.contains("*** Update File: src/x.rs"));
+        assert!(edit_line.text.contains("-let a = 1;"));
+        assert!(edit_line.text.contains("+let a = 2;"));
     }
 
     #[test]
@@ -8573,10 +12517,9 @@ mod tests {
         let banner = pane.pending_decision.as_ref().expect("banner");
         assert_eq!(banner.kind, CodexDecisionKind::Permission);
         assert!(banner.message.contains("Write"));
-        assert_eq!(
-            pane.claude_pending_escalation,
-            Some(claude::PermissionEscalation::AcceptEdits)
-        );
+        // 拒否された Write ツールだけを許可するルールが用意される。
+        assert_eq!(pane.claude_pending_allowed_tools, vec!["Write".to_string()]);
+        assert!(banner.message.contains("許可: Write"));
     }
 
     #[test]
@@ -8587,15 +12530,17 @@ mod tests {
             "type": "result", "subtype": "success", "is_error": false, "result": "done",
             "session_id": "sid-1",
             "permission_denials": [
-                {"tool_name": "Bash", "tool_use_id": "t1", "tool_input": {"command": "rm -rf x"}}
+                {"tool_name": "Bash", "tool_use_id": "t1", "tool_input": {"command": "git push origin main"}}
             ]
         }));
-        // Bash を含むので全許可へ昇格する。
+        // Bash はコマンド先頭語のプレフィックスルールとして許可候補になる。
         assert_eq!(
-            pane.claude_pending_escalation,
-            Some(claude::PermissionEscalation::SkipPermissions)
+            pane.claude_pending_allowed_tools,
+            vec!["Bash(git push:*)".to_string()]
         );
         pane.handle_decision_key(key(KeyCode::Char('a')));
+        // Accept で今回だけのルールが確定し、pending は消費される。
+        assert!(pane.claude_pending_allowed_tools.is_empty());
         // 続行プロンプトがユーザー表示として積まれ、resume 対象の session_id が保持される。
         assert!(
             pane.log
@@ -8603,6 +12548,505 @@ mod tests {
                 .any(|line| line.kind == CodexLogKind::User && line.text.contains("許可しました"))
         );
         assert_eq!(pane.thread_id.as_deref(), Some("sid-1"));
+    }
+
+    #[test]
+    fn claude_always_adds_sticky_allowed_tool() {
+        let mut pane = claude_pane();
+        pane.thread_id = Some("sid-1".to_string());
+        pane.handle_json_event(serde_json::json!({
+            "type": "result", "subtype": "success", "is_error": false, "result": "done",
+            "session_id": "sid-1",
+            "permission_denials": [
+                {"tool_name": "Write", "tool_use_id": "t1", "tool_input": {"file_path": "/a.rs"}}
+            ]
+        }));
+        // l（これからずっと許可）で sticky 許可リストへ入る。
+        pane.handle_decision_key(key(KeyCode::Char('l')));
+        assert!(pane.settings_label().contains("allow:1"));
+        // 今回だけの一時ルールには入らない。
+        assert!(pane.claude_one_shot_allowed_tools.is_empty());
+    }
+
+    // -- 常駐モード（実プロセスは cat のダミー）--------------------------------
+
+    /// 常駐クライアント（ダミー）を差し込む。生成不可な環境では None を返す。
+    fn with_dummy_resident(pane: &mut CodexPane) -> bool {
+        match claude_resident::ResidentClient::spawn_dummy() {
+            Some(client) => {
+                pane.claude_resident = Some(client);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn can_use_tool_event(request_id: &str, tool: &str, input: serde_json::Value) -> Value {
+        serde_json::json!({
+            "type": "control_request",
+            "request_id": request_id,
+            "request": {"subtype": "can_use_tool", "tool_name": tool, "input": input}
+        })
+    }
+
+    #[test]
+    fn claude_resident_can_use_tool_auto_allows_matching_rule() {
+        let mut pane = claude_resident_pane();
+        if !with_dummy_resident(&mut pane) {
+            return;
+        }
+        // セッション許可ルールに Edit を入れておく。
+        pane.claude_settings
+            .add_allowed_tools(&["Edit".to_string()]);
+        pane.handle_json_event(can_use_tool_event(
+            "req-a",
+            "Edit",
+            serde_json::json!({"file_path": "/a.rs"}),
+        ));
+        // マッチしたのでバナーを出さず自動許可（pending_tool は立たない）。
+        assert!(pane.pending_decision.is_none());
+        assert!(pane.claude_pending_tool.is_none());
+        assert!(pane.log.iter().any(|l| l.text.contains("自動許可")));
+    }
+
+    #[test]
+    fn claude_resident_can_use_tool_raises_banner_and_always_adds_sticky() {
+        let mut pane = claude_resident_pane();
+        if !with_dummy_resident(&mut pane) {
+            return;
+        }
+        pane.handle_json_event(can_use_tool_event(
+            "req-b",
+            "Bash",
+            serde_json::json!({"command": "rm -rf x"}),
+        ));
+        // 未許可なのでバナーが立ち、応答用に pending_tool を保持する。
+        let banner = pane.pending_decision.as_ref().expect("banner");
+        assert_eq!(banner.kind, CodexDecisionKind::Permission);
+        assert_eq!(
+            pane.claude_pending_tool
+                .as_ref()
+                .map(|p| p.request_id.clone()),
+            Some("req-b".to_string())
+        );
+        // l（これからずっと許可）で sticky に Bash(rm:*) が入り、バナー/pending が消える。
+        pane.handle_decision_key(key(KeyCode::Char('l')));
+        assert!(pane.pending_decision.is_none());
+        assert!(pane.claude_pending_tool.is_none());
+        assert!(
+            pane.claude_settings
+                .sticky_allowed_tools()
+                .iter()
+                .any(|r| r == "Bash(rm:*)")
+        );
+    }
+
+    #[test]
+    fn claude_resident_cancel_closes_banner_without_response() {
+        let mut pane = claude_resident_pane();
+        if !with_dummy_resident(&mut pane) {
+            return;
+        }
+        pane.handle_json_event(can_use_tool_event(
+            "req-c",
+            "Write",
+            serde_json::json!({"file_path": "/a.rs"}),
+        ));
+        assert!(pane.pending_decision.is_some());
+        // 同一 request_id のキャンセルでバナーを閉じ、pending をクリアする。
+        pane.handle_json_event(serde_json::json!({
+            "type": "control_cancel_request", "request_id": "req-c"
+        }));
+        assert!(pane.pending_decision.is_none());
+        assert!(pane.claude_pending_tool.is_none());
+    }
+
+    #[test]
+    fn claude_resident_esc_sends_graceful_interrupt() {
+        let mut pane = claude_resident_pane();
+        if !with_dummy_resident(&mut pane) {
+            return;
+        }
+        pane.turn_running = true;
+        assert!(pane.interrupt_turn_by_esc());
+        // graceful interrupt を送り、2 秒の完了待ちへ入る（まだ kill しない）。
+        assert!(pane.claude_interrupting);
+        assert!(pane.claude_interrupt_deadline.is_some());
+        assert!(pane.claude_resident.is_some());
+        assert!(pane.turn_running);
+    }
+
+    #[test]
+    fn claude_resident_result_after_interrupt_completes_without_queue() {
+        let mut pane = claude_resident_pane();
+        if !with_dummy_resident(&mut pane) {
+            return;
+        }
+        pane.turn_running = true;
+        pane.claude_interrupting = true;
+        pane.claude_interrupt_deadline = Some(Instant::now() + CLAUDE_INTERRUPT_GRACE);
+        pane.queued_prompts
+            .push_back(QueuedPrompt::user("次の依頼".to_string()));
+        pane.handle_json_event(serde_json::json!({
+            "type": "result", "subtype": "error_during_execution",
+            "is_error": true, "result": null, "terminal_reason": "aborted_streaming",
+            "session_id": "sid-1"
+        }));
+        // 中断完了として扱い、キューは自動開始しない（保留）。
+        assert!(!pane.claude_interrupting);
+        assert!(pane.claude_interrupt_deadline.is_none());
+        assert!(!pane.turn_running);
+        assert_eq!(pane.queued_prompts.len(), 1);
+        assert!(pane.log.iter().any(|l| l.text.contains("中断しました")));
+    }
+
+    #[test]
+    fn claude_resident_death_marks_turn_error() {
+        let mut pane = claude_resident_pane();
+        if !with_dummy_resident(&mut pane) {
+            return;
+        }
+        pane.turn_running = true;
+        pane.handle_claude_resident_death();
+        assert!(pane.claude_resident.is_none());
+        assert!(!pane.turn_running);
+        assert!(
+            pane.log
+                .iter()
+                .any(|l| l.kind == CodexLogKind::Error && l.text.contains("プロセスが終了"))
+        );
+    }
+
+    #[test]
+    fn claude_resident_normal_result_starts_queued_turn() {
+        let mut pane = claude_resident_pane();
+        if !with_dummy_resident(&mut pane) {
+            return;
+        }
+        pane.thread_id = Some("sid-1".to_string());
+        pane.turn_running = true;
+        // 実プロセスは cat なので次ターンの実起動はしないが、キューが消費されることを確認する。
+        pane.queued_prompts
+            .push_back(QueuedPrompt::direct("依頼".to_string(), "依頼".to_string()));
+        pane.handle_json_event(serde_json::json!({
+            "type": "result", "subtype": "success", "is_error": false, "result": "done",
+            "session_id": "sid-1", "total_cost_usd": 0.0088,
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        }));
+        // cost/usage を保存する。
+        assert_eq!(pane.claude_total_cost_usd, Some(0.0088));
+        assert!(pane.claude_last_usage.is_some());
+        // キューが消費されて次ターンへ進む（実プロセスは cat のため送信のみ）。
+        assert_eq!(pane.queued_prompts.len(), 0);
+    }
+
+    // -- Codex app-server 常駐モード（実プロセスは cat のダミー）--------------
+
+    /// app-server 常駐（ダミー・Ready 相当）を差し込んだ Codex ペインを作る。
+    /// 生成不可な環境では None。
+    fn codex_appserver_pane() -> Option<CodexPane> {
+        let mut pane = CodexPane::test_with_output(10, 80, 0, "");
+        pane.finished = false;
+        pane.kind = AgentKind::Codex;
+        pane.codex_appserver_enabled = true;
+        let client = codex_appserver::AppServerClient::spawn_dummy()?;
+        pane.codex_appserver = Some(client);
+        pane.codex_appserver_phase = CodexAppServerPhase::Ready;
+        pane.thread_id = Some("th-1".to_string());
+        Some(pane)
+    }
+
+    #[test]
+    fn codex_appserver_routes_jsonrpc_to_resident_handler() {
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        // turn/started で見出し行が立つ。
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0", "method": "turn/started", "params": {"threadId": "th-1"}
+        }));
+        assert!(pane.log.iter().any(|l| l.kind == CodexLogKind::Turn));
+    }
+
+    #[test]
+    fn codex_appserver_command_item_updates_running_command() {
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        pane.turn_running = true;
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0", "method": "item/started",
+            "params": {"item": {"id": "call_1", "type": "commandExecution", "command": "cargo build"}}
+        }));
+        assert!(pane.current_command.is_some());
+        // ライブ出力デルタが末尾行バッファに載る。
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0", "method": "item/commandExecution/outputDelta",
+            "params": {"itemId": "call_1", "delta": "compiling...\n"}
+        }));
+        assert_eq!(
+            pane.codex_appserver_live_output(),
+            vec!["compiling...".to_string()]
+        );
+        // 完了で current_command とバッファを解放し、確定行を残す。
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0", "method": "item/completed",
+            "params": {"item": {"id": "call_1", "type": "commandExecution", "command": "cargo build", "exitCode": 0, "durationMs": 900, "status": "completed"}}
+        }));
+        assert!(pane.current_command.is_none());
+        assert!(pane.codex_appserver_live_output().is_empty());
+        assert!(
+            pane.log
+                .iter()
+                .any(|l| l.kind == CodexLogKind::Tool && l.text.contains("OK"))
+        );
+    }
+
+    #[test]
+    fn codex_appserver_agent_message_delta_streams_and_completes() {
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        pane.turn_running = true;
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0", "method": "item/agentMessage/delta",
+            "params": {"itemId": "m1", "delta": "答えは"}
+        }));
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0", "method": "item/agentMessage/delta",
+            "params": {"itemId": "m1", "delta": "2です"}
+        }));
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0", "method": "item/completed",
+            "params": {"item": {"id": "m1", "type": "agentMessage", "text": "答えは2です", "phase": "final_answer"}}
+        }));
+        assert!(
+            pane.log
+                .iter()
+                .any(|l| l.kind == CodexLogKind::Assistant && l.text.contains("答えは2です"))
+        );
+    }
+
+    #[test]
+    fn codex_appserver_turn_completed_finishes_turn() {
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        pane.turn_running = true;
+        pane.codex_appserver_turn_id = Some("turn-1".to_string());
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0", "method": "turn/completed",
+            "params": {"threadId": "th-1", "turn": {"id": "turn-1", "status": "completed", "items": []}}
+        }));
+        // キューが無ければターンは終了状態になる。
+        assert!(!pane.turn_running);
+        assert!(pane.codex_appserver_turn_id.is_none());
+        assert!(pane.log.iter().any(|l| l.text.contains("応答が完了")));
+    }
+
+    #[test]
+    fn codex_appserver_turn_completed_consumes_queue() {
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        pane.turn_running = true;
+        pane.codex_appserver_turn_id = Some("turn-1".to_string());
+        pane.queued_prompts
+            .push_back(QueuedPrompt::direct("次".to_string(), "次".to_string()));
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0", "method": "turn/completed",
+            "params": {"threadId": "th-1", "turn": {"id": "turn-1", "status": "completed", "items": []}}
+        }));
+        // 通常完了はキューを消費して次ターンへ進む（ダミーは送信のみ）。
+        assert_eq!(pane.queued_prompts.len(), 0);
+    }
+
+    #[test]
+    fn codex_appserver_esc_sends_graceful_interrupt() {
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        pane.turn_running = true;
+        pane.codex_appserver_turn_id = Some("turn-1".to_string());
+        assert!(pane.interrupt_turn_by_esc());
+        assert!(pane.codex_appserver_interrupting);
+        assert!(pane.codex_appserver_interrupt_deadline.is_some());
+        assert!(pane.turn_running);
+    }
+
+    #[test]
+    fn codex_appserver_interrupted_completion_holds_queue() {
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        pane.turn_running = true;
+        pane.codex_appserver_interrupting = true;
+        pane.codex_appserver_interrupt_deadline =
+            Some(Instant::now() + CODEX_APPSERVER_INTERRUPT_GRACE);
+        pane.queued_prompts
+            .push_back(QueuedPrompt::direct("次".to_string(), "次".to_string()));
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0", "method": "turn/completed",
+            "params": {"threadId": "th-1", "turn": {"id": "turn-1", "status": "interrupted", "items": []}}
+        }));
+        assert!(!pane.codex_appserver_interrupting);
+        assert!(!pane.turn_running);
+        // 中断はキューを自動開始しない（保留）。
+        assert_eq!(pane.queued_prompts.len(), 1);
+        assert!(pane.log.iter().any(|l| l.text.contains("中断しました")));
+    }
+
+    #[test]
+    fn codex_appserver_command_approval_replies_with_decision() {
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        pane.turn_running = true;
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0", "id": 0, "method": "item/commandExecution/requestApproval",
+            "params": {"itemId": "call_1", "command": "rm -rf x", "availableDecisions": ["accept", "acceptForSession", "decline"]}
+        }));
+        let banner = pane.pending_decision.as_ref().expect("banner");
+        assert_eq!(banner.kind, CodexDecisionKind::Permission);
+        assert!(pane.codex_appserver_pending_approval.is_some());
+        // a（許可）で応答し、バナーと pending を解消する。
+        pane.handle_decision_key(key(KeyCode::Char('a')));
+        assert!(pane.pending_decision.is_none());
+        assert!(pane.codex_appserver_pending_approval.is_none());
+    }
+
+    #[test]
+    fn codex_appserver_token_usage_saved() {
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0", "method": "thread/tokenUsage/updated",
+            "params": {"threadId": "th-1", "tokenUsage": {"total": {"totalTokens": 100}, "last": {"totalTokens": 20}, "modelContextWindow": 4096}}
+        }));
+        assert!(pane.codex_appserver_token_usage.is_some());
+        assert!(
+            pane.last_token_usage_label
+                .as_deref()
+                .unwrap()
+                .contains("total 100")
+        );
+    }
+
+    #[test]
+    fn codex_appserver_death_marks_turn_error() {
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        pane.turn_running = true;
+        pane.handle_codex_appserver_death();
+        assert!(pane.codex_appserver.is_none());
+        assert!(!pane.turn_running);
+        assert_eq!(pane.codex_appserver_phase, CodexAppServerPhase::Idle);
+        assert!(
+            pane.log
+                .iter()
+                .any(|l| l.kind == CodexLogKind::Error && l.text.contains("プロセスが終了"))
+        );
+    }
+
+    #[test]
+    fn codex_appserver_settings_change_sends_update_when_ready() {
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        // 具体値のある model 変更は settings/update を送り、応答待ちになる。
+        pane.exec_settings.model = CodexModelChoice::Gpt5;
+        pane.push_codex_appserver_model();
+        assert!(pane.codex_appserver_pending_setting.is_some());
+        // config（値なし）へ戻す approval 変更は settings/update では表せず再起動保留になる。
+        pane.exec_settings.approval = CodexApprovalChoice::Config;
+        pane.codex_appserver_pending_setting = None;
+        pane.push_codex_appserver_approval();
+        assert!(pane.codex_appserver_restart_pending);
+    }
+
+    #[test]
+    fn claude_stream_text_delta_shown_once() {
+        let mut pane = claude_pane();
+        // 部分メッセージのトークンを 2 つ流す。
+        pane.handle_json_event(serde_json::json!({
+            "type": "stream_event",
+            "event": {"type": "content_block_delta", "index": 0,
+                      "delta": {"type": "text_delta", "text": "こん"}}
+        }));
+        pane.handle_json_event(serde_json::json!({
+            "type": "stream_event",
+            "event": {"type": "content_block_delta", "index": 0,
+                      "delta": {"type": "text_delta", "text": "にちは"}}
+        }));
+        // 完成形の assistant イベントが後から来る。
+        pane.handle_json_event(serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "こんにちは"}]}
+        }));
+        let assistant_lines: Vec<_> = pane
+            .log
+            .iter()
+            .filter(|line| line.kind == CodexLogKind::Assistant)
+            .collect();
+        // 逐次表示した 1 行だけが残り、二重表示されない。
+        assert_eq!(assistant_lines.len(), 1);
+        assert_eq!(assistant_lines[0].text, "こんにちは");
+    }
+
+    #[test]
+    fn claude_assistant_multiple_text_blocks_are_not_merged() {
+        let mut pane = claude_pane();
+        // まず 1 ブロック目をストリーミング表示する。
+        pane.handle_json_event(serde_json::json!({
+            "type": "stream_event",
+            "event": {"type": "content_block_delta", "index": 0,
+                      "delta": {"type": "text_delta", "text": "最初のブロック"}}
+        }));
+        // 1 イベントに Text ブロックが 2 つ同梱される（防御ケース）。
+        pane.handle_json_event(serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [
+                {"type": "text", "text": "最初のブロック"},
+                {"type": "text", "text": "二番目のブロック"}
+            ]}
+        }));
+        let assistant_lines: Vec<_> = pane
+            .log
+            .iter()
+            .filter(|line| line.kind == CodexLogKind::Assistant)
+            .collect();
+        // 1 ブロック目はストリーミング行を上書き、2 ブロック目は別行に。連結・欠落しない。
+        assert_eq!(assistant_lines.len(), 2);
+        assert_eq!(assistant_lines[0].text, "最初のブロック");
+        assert_eq!(assistant_lines[1].text, "二番目のブロック");
+    }
+
+    #[test]
+    fn claude_repeated_denial_after_approval_shows_error_not_banner() {
+        let mut pane = claude_pane();
+        pane.thread_id = Some("sid-1".to_string());
+        let denial_event = serde_json::json!({
+            "type": "result", "subtype": "success", "is_error": false, "result": "done",
+            "session_id": "sid-1",
+            "permission_denials": [
+                {"tool_name": "Bash", "tool_use_id": "t1", "tool_input": {"command": "rm -rf x"}}
+            ]
+        });
+        // 1 回目: バナーが出るので Accept で承認しリトライする。
+        pane.handle_json_event(denial_event.clone());
+        assert!(pane.pending_decision.is_some());
+        pane.handle_decision_key(key(KeyCode::Char('a')));
+        assert!(pane.pending_decision.is_none());
+
+        // リトライ結果で同一の拒否が再発 → バナーを再表示せずエラーで知らせる（ループ回避）。
+        pane.handle_json_event(denial_event);
+        assert!(pane.pending_decision.is_none());
+        assert!(
+            pane.log.iter().any(|l| l.kind == CodexLogKind::Error
+                && l.text.contains("許可ルールでは通せませんでした"))
+        );
     }
 
     #[test]
@@ -8614,12 +13058,12 @@ mod tests {
         assert!(pane.settings_label().contains("effort:low"));
         pane.cycle_approval();
         assert!(pane.settings_label().contains("permission:plan"));
-        // F5（sandbox）は Claude では no-op で通知だけ。
+        // F5（sandbox）は Claude では F4 へ案内する通知だけ。
         pane.cycle_sandbox();
         assert!(
             pane.log
                 .iter()
-                .any(|line| line.text.contains("サンドボックス設定は未対応"))
+                .any(|line| line.text.contains("F4") && line.text.contains("permission-mode"))
         );
     }
 
@@ -8708,6 +13152,172 @@ mod tests {
         assert_eq!(pane.slash_palette_selected(), 0);
     }
 
+    #[test]
+    fn paste_fold_threshold_boundaries() {
+        // 10 行ちょうど・800 文字ちょうどは畳み込まない（超えたら畳み込む）。
+        let ten_lines = (0..10)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(paste_line_count(&ten_lines), 10);
+        assert!(!paste_should_fold(&ten_lines));
+        let eleven_lines = (0..11)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(paste_line_count(&eleven_lines), 11);
+        assert!(paste_should_fold(&eleven_lines));
+
+        let exactly_800 = "a".repeat(800);
+        assert!(!paste_should_fold(&exactly_800));
+        let over_800 = "a".repeat(801);
+        assert!(paste_should_fold(&over_800));
+    }
+
+    #[test]
+    fn paste_placeholder_reports_line_count() {
+        let text = "l1\nl2\nl3";
+        assert_eq!(paste_placeholder(1, text), "[貼り付け#1: 3行]");
+        assert_eq!(paste_placeholder(2, "solo"), "[貼り付け#2: 1行]");
+    }
+
+    #[test]
+    fn expand_paste_placeholders_replaces_matching_and_keeps_edited() {
+        let pastes = vec![
+            StoredPaste {
+                placeholder: "[貼り付け#1: 3行]".to_string(),
+                full: "l1\nl2\nl3".to_string(),
+            },
+            StoredPaste {
+                placeholder: "[貼り付け#2: 2行]".to_string(),
+                full: "a\nb".to_string(),
+            },
+        ];
+        let line = "前 [貼り付け#1: 3行] 中 [貼り付け#2: 2行] 後";
+        assert_eq!(
+            expand_paste_placeholders(line, &pastes),
+            "前 l1\nl2\nl3 中 a\nb 後"
+        );
+        // 編集されて一致しないプレースホルダは展開せずそのまま残す。
+        let edited = "[貼り付け#1: 9行] のこり";
+        assert_eq!(expand_paste_placeholders(edited, &pastes), edited);
+    }
+
+    #[test]
+    fn paste_input_folds_long_and_expands_on_submit() {
+        let mut pane = live_pane();
+        let long = (0..15)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        pane.paste_input(&long);
+        assert_eq!(pane.input_line(), "[貼り付け#1: 15行]");
+        assert_eq!(pane.pending_pastes.len(), 1);
+
+        // 2 件目は #2 として区別する。
+        pane.paste_input(&long);
+        assert!(pane.input_line().contains("[貼り付け#2: 15行]"));
+        assert_eq!(pane.pending_pastes.len(), 2);
+
+        // 送信時展開: プレースホルダが全文へ戻り、保持データはクリアされる。
+        let line = pane.input_line().to_string();
+        let expanded = pane.expand_pending_pastes(line);
+        assert!(expanded.contains("line0\nline1"));
+        assert!(!expanded.contains("[貼り付け#"));
+        assert!(pane.pending_pastes.is_empty());
+        assert_eq!(pane.paste_seq, 0);
+    }
+
+    #[test]
+    fn paste_input_short_inserts_directly() {
+        let mut pane = live_pane();
+        pane.paste_input("short paste");
+        assert_eq!(pane.input_line(), "short paste");
+        assert!(pane.pending_pastes.is_empty());
+    }
+
+    #[test]
+    fn next_clip_filename_increments_past_existing() {
+        assert_eq!(next_clip_filename(&[]), "clip-1.png");
+        let existing = vec![
+            "clip-1.png".to_string(),
+            "clip-3.png".to_string(),
+            "other.png".to_string(),
+        ];
+        assert_eq!(next_clip_filename(&existing), "clip-4.png");
+    }
+
+    #[test]
+    fn next_clip_path_uses_injected_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "addness-clip-test-{}-{}",
+            std::process::id(),
+            "nextpath"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("clip-1.png"), b"x").unwrap();
+        std::fs::write(dir.join("clip-3.png"), b"x").unwrap();
+        let path = next_clip_path(&dir);
+        assert_eq!(path.parent().unwrap(), dir.as_path());
+        assert_eq!(path.file_name().unwrap().to_str().unwrap(), "clip-4.png");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn attach_clipboard_image_on_non_macos_reports_unsupported() {
+        // macOS 以外では未対応メッセージを出す（osascript は呼ばない）。
+        #[cfg(not(target_os = "macos"))]
+        {
+            let mut pane = live_pane();
+            pane.attach_clipboard_image();
+            assert!(pane.log.iter().any(|line| line.text.contains("未対応")));
+        }
+    }
+
+    #[test]
+    fn append_claude_image_paths_appends_and_clears_for_claude() {
+        let mut pane = claude_pane();
+        pane.exec_settings.image_paths = vec!["/tmp/a.png".to_string(), "/tmp/b.png".to_string()];
+        let out = pane.append_claude_image_paths("元のプロンプト".to_string());
+        assert!(out.starts_with("元のプロンプト"));
+        assert!(out.contains("添付画像（Readツールで内容を確認してください）:"));
+        assert!(out.contains("- /tmp/a.png"));
+        assert!(out.contains("- /tmp/b.png"));
+        // 消費後はリストがクリアされる。
+        assert!(pane.exec_settings.image_paths.is_empty());
+    }
+
+    #[test]
+    fn append_claude_image_paths_noop_for_codex() {
+        let mut pane = live_pane();
+        assert_eq!(pane.kind, AgentKind::Codex);
+        pane.exec_settings.image_paths = vec!["/tmp/a.png".to_string()];
+        let out = pane.append_claude_image_paths("元のプロンプト".to_string());
+        // Codex ではプロンプト不変・リスト保持（--image 引数で消費するため）。
+        assert_eq!(out, "元のプロンプト");
+        assert_eq!(
+            pane.exec_settings.image_paths,
+            vec!["/tmp/a.png".to_string()]
+        );
+    }
+
+    #[test]
+    fn image_slash_command_visible_for_claude() {
+        assert!(slash_command_visible_for_kind(
+            "/image",
+            AgentKind::ClaudeCode
+        ));
+        assert!(slash_command_visible_for_kind(
+            "/attachments",
+            AgentKind::ClaudeCode
+        ));
+        assert!(slash_command_visible_for_kind(
+            "/fork",
+            AgentKind::ClaudeCode
+        ));
+    }
+
     fn submit_line(pane: &mut CodexPane, text: &str) {
         for ch in text.chars() {
             pane.input(key(KeyCode::Char(ch)));
@@ -8738,6 +13348,93 @@ mod tests {
         state.record_submitted(&submitted);
 
         assert!(state.exit_command_sent);
+    }
+
+    #[test]
+    fn record_submitted_marks_exit_for_quit_and_exit_aliases() {
+        for cmd in ["/quit", "/exit"] {
+            let mut state = CodexInputState::default();
+            state.record_submitted(cmd);
+            assert!(
+                state.exit_command_sent,
+                "{cmd} should mark exit_command_sent"
+            );
+            assert!(
+                state.last_prompt.is_none(),
+                "{cmd} should not be recorded as last_prompt"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_exit_finishes_immediately_even_when_turn_running() {
+        let mut pane = claude_pane();
+        pane.turn_running = true;
+        pane.queued_prompts
+            .push_back(QueuedPrompt::user("queued".to_string()));
+
+        let handled = pane.handle_local_slash_command("/exit");
+
+        assert!(handled, "/exit should be handled locally");
+        assert!(pane.finished);
+        assert!(pane.queued_prompts.is_empty());
+        assert!(pane.input_state.exit_command_sent);
+        assert!(!pane.turn_running);
+        assert!(pane.should_close_after_exit_command());
+    }
+
+    #[test]
+    fn dispatch_quit_alias_finishes_and_marks_exit() {
+        let mut pane = claude_pane();
+
+        let handled = pane.handle_local_slash_command("/quit");
+
+        assert!(handled, "/quit should be handled locally");
+        assert!(pane.finished);
+        assert!(pane.input_state.exit_command_sent);
+        assert!(pane.should_close_after_exit_command());
+    }
+
+    #[test]
+    fn new_thread_clears_checkpoints_and_queued_prompts() {
+        let mut pane = claude_pane();
+        pane.checkpoints.push(Checkpoint {
+            ref_name: "refs/addness/checkpoint-x-0".to_string(),
+            turn: 1,
+        });
+        pane.checkpoint_seq = 3;
+        pane.pending_checkpoint_requests
+            .push_back(CheckpointRequest {
+                cwd: ".".to_string(),
+                ref_name: "refs/addness/checkpoint-x-1".to_string(),
+                turn: 2,
+                message: "cp".to_string(),
+            });
+        pane.queued_prompts
+            .push_back(QueuedPrompt::user("queued".to_string()));
+
+        pane.handle_new_thread_slash_command();
+
+        assert!(pane.checkpoints.is_empty());
+        assert_eq!(pane.checkpoint_seq, 0);
+        assert!(pane.pending_checkpoint_requests.is_empty());
+        assert!(pane.queued_prompts.is_empty());
+    }
+
+    #[test]
+    fn start_claude_resume_clears_pending_decision_and_queued_prompts() {
+        let mut pane = claude_pane();
+        pane.pending_decision = Some(CodexDecisionBanner::new(
+            CodexDecisionKind::Approval,
+            "承認待ち".to_string(),
+        ));
+        pane.queued_prompts
+            .push_back(QueuedPrompt::user("queued".to_string()));
+
+        pane.start_claude_resume(Some("session-123"), false, "続きをお願いします");
+
+        assert!(pane.pending_decision.is_none());
+        assert!(pane.queued_prompts.is_empty());
     }
 
     #[test]
@@ -8795,6 +13492,256 @@ mod tests {
     }
 
     #[test]
+    fn input_history_dedupes_consecutive_and_caps_length() {
+        let mut state = CodexInputState::default();
+        assert!(state.push_history("a".to_string()));
+        assert!(!state.push_history("a".to_string()));
+        assert!(state.push_history("b".to_string()));
+        assert!(!state.push_history(String::new()));
+        assert_eq!(state.history, vec!["a".to_string(), "b".to_string()]);
+
+        let mut capped = CodexInputState::default();
+        for i in 0..(INPUT_HISTORY_MAX + 20) {
+            capped.push_history(format!("cmd{i}"));
+        }
+        assert_eq!(capped.history.len(), INPUT_HISTORY_MAX);
+        assert_eq!(capped.history.first().unwrap(), "cmd20");
+        assert_eq!(
+            capped.history.last().unwrap(),
+            &format!("cmd{}", INPUT_HISTORY_MAX + 19)
+        );
+    }
+
+    #[test]
+    fn input_history_up_recalls_saving_draft_and_down_restores_it() {
+        let mut state = CodexInputState::default();
+        state.push_history("first".to_string());
+        state.push_history("second".to_string());
+        // 下書きを入力してから履歴を遡る。
+        state.insert_text("draft");
+        state.observe_key(key(KeyCode::Up));
+        assert_eq!(state.line, "second");
+        assert_eq!(state.cursor, "second".len());
+        state.observe_key(key(KeyCode::Up));
+        assert_eq!(state.line, "first");
+        // 最古より先へは遡れない。
+        state.observe_key(key(KeyCode::Up));
+        assert_eq!(state.line, "first");
+        // 下方向で新しい方へ戻り、最後に下書きへ復帰する。
+        state.observe_key(key(KeyCode::Down));
+        assert_eq!(state.line, "second");
+        state.observe_key(key(KeyCode::Down));
+        assert_eq!(state.line, "draft");
+        assert!(state.history_pos.is_none());
+    }
+
+    #[test]
+    fn input_history_edit_while_browsing_detaches() {
+        let mut state = CodexInputState::default();
+        state.push_history("recalled".to_string());
+        state.observe_key(key(KeyCode::Up));
+        assert_eq!(state.line, "recalled");
+        assert!(state.history_pos.is_some());
+        // 閲覧中に編集すると、その内容が新たな編集対象になる（履歴閲覧から離脱）。
+        state.observe_key(key(KeyCode::Char('!')));
+        assert_eq!(state.line, "recalled!");
+        assert!(state.history_pos.is_none());
+        assert!(state.history_draft.is_none());
+    }
+
+    #[test]
+    fn input_history_multiline_moves_between_lines_before_recall() {
+        let mut state = CodexInputState::default();
+        state.push_history("older".to_string());
+        state.insert_text("top\nbottom");
+        // カーソルは末尾（bottom 行）。↑ はまず行間移動する。
+        state.observe_key(key(KeyCode::Up));
+        assert_eq!(state.line, "top\nbottom");
+        assert!(state.history_pos.is_none());
+        // 先頭行から更に↑で履歴へ。
+        state.observe_key(key(KeyCode::Up));
+        assert_eq!(state.line, "older");
+    }
+
+    #[test]
+    fn active_mention_detects_and_rejects_email_like() {
+        assert_eq!(
+            active_mention("見て @src/ma", "見て @src/ma".len()),
+            Some(("見て ".len(), "src/ma".to_string()))
+        );
+        // 行頭の @ も有効。
+        assert_eq!(
+            active_mention("@main", "@main".len()),
+            Some((0, "main".to_string()))
+        );
+        // CJK 直後の @（メールアドレスではない）は候補を出す。
+        assert_eq!(
+            active_mention("見て@src", "見て@src".len()),
+            Some(("見て".len(), "src".to_string()))
+        );
+        // 直前が ASCII 英数字（メールアドレス等）は候補を出さない。
+        assert_eq!(active_mention("user@host", "user@host".len()), None);
+        // 直前がローカルパート記号（.）でも候補を出さない。
+        assert_eq!(active_mention("foo.bar@host", "foo.bar@host".len()), None);
+        // @ 以降に空白があれば確定済みとみなす。
+        assert_eq!(active_mention("@src file", "@src file".len()), None);
+        // @ が無ければ None。
+        assert_eq!(active_mention("plain", "plain".len()), None);
+    }
+
+    #[test]
+    fn mention_candidates_prefix_before_substring_and_dir_marker() {
+        let dir = std::env::temp_dir().join(format!(
+            "addness-mention-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(dir.join("srcbin")).unwrap();
+        std::fs::write(dir.join("main.rs"), "").unwrap();
+        std::fs::write(dir.join("mainframe.txt"), "").unwrap();
+        std::fs::write(dir.join("README.md"), "").unwrap();
+        std::fs::write(dir.join(".hidden"), "").unwrap();
+
+        let cands = mention_candidates(&dir, "main");
+        let inserts: Vec<&str> = cands.iter().map(|c| c.insert.as_str()).collect();
+        // 前方一致（main.rs / mainframe.txt）が並ぶ。隠しファイルは出ない。
+        assert!(inserts.contains(&"main.rs"));
+        assert!(inserts.contains(&"mainframe.txt"));
+        assert!(!inserts.iter().any(|i| i.contains(".hidden")));
+
+        // 空クエリはディレクトリ優先。ディレクトリは末尾 '/'。
+        let all = mention_candidates(&dir, "");
+        assert_eq!(all.first().unwrap().insert, "srcbin/");
+        assert!(all.first().unwrap().is_dir);
+
+        // サブディレクトリへ潜る場合は相対パスを保つ。
+        std::fs::write(dir.join("srcbin").join("lib.rs"), "").unwrap();
+        let sub = mention_candidates(&dir, "srcbin/li");
+        assert_eq!(sub.first().unwrap().insert, "srcbin/lib.rs");
+
+        // 絶対パス（/ 始まり）や `..` を含むクエリは cwd 外に出るため候補を空にする。
+        assert!(mention_candidates(&dir, "/etc/pas").is_empty());
+        assert!(mention_candidates(&dir, "..").is_empty());
+        assert!(mention_candidates(&dir, "../").is_empty());
+        assert!(mention_candidates(&dir, "srcbin/../..").is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mention_palette_accepts_file_and_descends_into_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "addness-mention-pane-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        std::fs::write(dir.join("docs").join("guide.md"), "").unwrap();
+
+        let mut pane = CodexPane::test_with_output(8, 40, 0, "");
+        pane.finished = false;
+        pane.cwd = dir.display().to_string();
+
+        for ch in "見て @do".chars() {
+            pane.input(key(KeyCode::Char(ch)));
+        }
+        assert!(pane.mention_palette_active());
+        // ディレクトリ確定は潜って絞り込みを続ける（末尾 '/'）。
+        pane.accept_mention_palette_selection();
+        assert_eq!(pane.input_line(), "見て @docs/");
+        assert!(pane.mention_palette_active());
+        // ファイル確定は末尾に空白を付けてパレットを閉じる。
+        pane.accept_mention_palette_selection();
+        assert_eq!(pane.input_line(), "見て @docs/guide.md ");
+        assert!(!pane.mention_palette_active());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mention_palette_esc_dismisses_until_next_input() {
+        let dir = std::env::temp_dir().join(format!(
+            "addness-mention-esc-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("alpha.txt"), "").unwrap();
+
+        let mut pane = CodexPane::test_with_output(8, 40, 0, "");
+        pane.finished = false;
+        pane.cwd = dir.display().to_string();
+        for ch in "@al".chars() {
+            pane.input(key(KeyCode::Char(ch)));
+        }
+        assert!(pane.mention_palette_active());
+        pane.dismiss_mention_palette();
+        assert!(!pane.mention_palette_active());
+        // 追加入力で再表示される。
+        pane.input(key(KeyCode::Char('p')));
+        assert!(pane.mention_palette_active());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn esc_interrupt_requires_two_presses() {
+        let mut pane = CodexPane::test_with_output(8, 40, 0, "");
+        pane.finished = false;
+        pane.turn_running = true;
+
+        assert!(!pane.take_esc_interrupt_armed());
+        pane.arm_esc_interrupt();
+        assert!(pane.log.iter().any(|l| l.text.contains("もう一度 Esc")));
+        assert!(pane.take_esc_interrupt_armed());
+        assert!(!pane.take_esc_interrupt_armed());
+
+        assert!(pane.interrupt_turn_by_esc());
+        assert!(!pane.is_turn_running());
+        assert!(
+            pane.log
+                .iter()
+                .any(|l| l.text.contains("Esc でターンを中断しました"))
+        );
+    }
+
+    #[test]
+    fn esc_interrupt_does_not_auto_start_queued_turn() {
+        let mut pane = CodexPane::test_with_output(8, 40, 0, "");
+        pane.finished = false;
+        pane.turn_running = true;
+        // 予約ターンを 1 件積んでおく。
+        pane.queued_prompts
+            .push_back(QueuedPrompt::user("次の依頼".to_string()));
+
+        assert!(pane.interrupt_turn_by_esc());
+        assert!(!pane.is_turn_running());
+        // /stop と同様、予約ターンは自動開始されず保留される。
+        assert_eq!(pane.queued_prompts.len(), 1);
+        assert!(pane.log.iter().any(|l| l.text.contains("予約1件は保留中")));
+    }
+
+    #[test]
+    fn input_history_persists_to_file_and_reloads() {
+        let path = std::env::temp_dir().join(format!(
+            "addness-input-history-{}-{}.jsonl",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        append_input_history(&path, "最初の依頼").unwrap();
+        append_input_history(&path, "複数行\n依頼").unwrap();
+        let loaded = load_input_history(&path);
+        assert_eq!(
+            loaded,
+            vec!["最初の依頼".to_string(), "複数行\n依頼".to_string()]
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn input_during_running_queues_next_turn() {
         let mut pane = CodexPane::test_with_output(8, 20, 0, "");
         pane.finished = false;
@@ -8819,7 +13766,8 @@ mod tests {
     }
 
     #[test]
-    fn queued_exit_finishes_when_turn_becomes_idle() {
+    fn exit_finishes_immediately_even_during_running_turn() {
+        // `/exit` はターン実行中でも即終了させる（キュー予約に回さない）。
         let mut pane = CodexPane::test_with_output(8, 20, 0, "");
         pane.finished = false;
         pane.turn_running = true;
@@ -8829,14 +13777,11 @@ mod tests {
         }
         pane.input(key(KeyCode::Enter));
 
-        assert!(!pane.finished);
-        assert_eq!(pane.queued_prompt_count(), 1);
-
-        pane.turn_running = false;
-        assert!(pane.start_next_queued_turn_if_idle());
-
         assert!(pane.finished);
         assert_eq!(pane.queued_prompt_count(), 0);
+        assert!(!pane.turn_running);
+        assert!(pane.input_state.exit_command_sent);
+        assert!(pane.should_close_after_exit_command());
     }
 
     #[test]
@@ -9347,6 +14292,8 @@ mod tests {
                 dod: String::new(),
                 status_label: "TEST".to_string(),
                 session_log_path: Some(history_path),
+                input_history_path: None,
+                attachments_dir: None,
             })
             .unwrap();
             pane.handle_stdout_line(r#"{"type":"agent_message.delta","delta":"hel"}"#);
@@ -9368,6 +14315,8 @@ mod tests {
             dod: String::new(),
             status_label: "TEST".to_string(),
             session_log_path: Some(history_path),
+            input_history_path: None,
+            attachments_dir: None,
         })
         .unwrap();
 
@@ -9380,6 +14329,135 @@ mod tests {
         assert!(pane.history_label().contains("保存中"));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    /// テスト用の一時 JSONL パス。
+    fn thread_id_temp_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "addness-thread-id-{tag}-{}-{}.jsonl",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ))
+    }
+
+    /// session_log_path を注入した Codex ペイン（実プロセスは起動しない）。
+    fn codex_pane_with_log(path: PathBuf) -> CodexPane {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        CodexPane::spawn_inner(CodexPaneSpawnOptions {
+            kind: AgentKind::Codex,
+            codex_bin: Path::new("codex"),
+            cwd: &cwd,
+            addness_bin: "addness",
+            goal_id: "goal/thread".to_string(),
+            goal_title: "Thread goal".to_string(),
+            dod: String::new(),
+            status_label: "TEST".to_string(),
+            session_log_path: Some(path),
+            input_history_path: None,
+            attachments_dir: None,
+        })
+        .unwrap()
+    }
+
+    fn count_thread_id_records(path: &Path) -> usize {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains(r#""record":"thread_id""#))
+            .count()
+    }
+
+    #[test]
+    fn load_codex_session_restores_last_thread_id() {
+        let path = thread_id_temp_path("load-last");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            "{\"record\":\"thread_id\",\"id\":\"t1\"}\n{\"record\":\"thread_id\",\"id\":\"t2\"}\n",
+        )
+        .unwrap();
+
+        let loaded = load_codex_session(&path).unwrap();
+        assert_eq!(loaded.thread_id.as_deref(), Some("t2"));
+
+        // 末尾に tombstone(None) を書くと復元値も None になる。
+        std::fs::write(
+            &path,
+            "{\"record\":\"thread_id\",\"id\":\"t1\"}\n{\"record\":\"thread_id\",\"id\":null}\n",
+        )
+        .unwrap();
+        let loaded = load_codex_session(&path).unwrap();
+        assert_eq!(loaded.thread_id, None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_codex_session_skips_unknown_records() {
+        let path = thread_id_temp_path("unknown");
+        let _ = std::fs::remove_file(&path);
+        // 未知レコード（旧バイナリ互換）を挟んでも読込は壊れず、既知レコードは反映される。
+        std::fs::write(
+            &path,
+            "{\"record\":\"log\",\"kind\":\"System\",\"text\":\"hi\"}\n{\"record\":\"future_variant\",\"foo\":123}\n{\"record\":\"thread_id\",\"id\":\"t9\"}\n",
+        )
+        .unwrap();
+
+        let loaded = load_codex_session(&path).unwrap();
+        assert_eq!(loaded.thread_id.as_deref(), Some("t9"));
+        assert!(
+            loaded
+                .log
+                .iter()
+                .any(|line| line.kind == CodexLogKind::System && line.text == "hi")
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn set_thread_id_dedupes_and_persists_only_changes() {
+        let path = thread_id_temp_path("dedupe");
+        let _ = std::fs::remove_file(&path);
+        let mut pane = codex_pane_with_log(path.clone());
+        assert_eq!(count_thread_id_records(&path), 0);
+
+        pane.set_thread_id(Some("t1".to_string()));
+        pane.set_thread_id(Some("t1".to_string())); // 同値: 記録しない
+        assert_eq!(count_thread_id_records(&path), 1);
+
+        pane.set_thread_id(Some("t2".to_string())); // 変化: 1件追記
+        assert_eq!(count_thread_id_records(&path), 2);
+
+        pane.set_thread_id(None); // tombstone: 1件追記
+        assert_eq!(count_thread_id_records(&path), 3);
+        assert_eq!(pane.thread_id, None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn drop_restored_thread_on_failure_only_when_restored() {
+        let path = thread_id_temp_path("drop");
+        let _ = std::fs::remove_file(&path);
+        let mut pane = codex_pane_with_log(path.clone());
+
+        // 復元フラグが立っていなければ何もしない。
+        pane.thread_id = Some("live-1".to_string());
+        pane.thread_id_restored = false;
+        pane.drop_restored_thread_on_failure();
+        assert_eq!(pane.thread_id.as_deref(), Some("live-1"));
+        assert_eq!(count_thread_id_records(&path), 0);
+
+        // 復元フラグが立っていれば thread_id をクリアし tombstone を書く。
+        pane.thread_id = Some("restored-1".to_string());
+        pane.thread_id_restored = true;
+        pane.drop_restored_thread_on_failure();
+        assert_eq!(pane.thread_id, None);
+        assert!(!pane.thread_id_restored);
+        assert_eq!(count_thread_id_records(&path), 1);
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -9753,10 +14831,20 @@ mod tests {
         let mut pane = CodexPane::test_with_output(8, 80, 0, "");
         pane.finished = false;
 
+        // 引数なしはピッカーを開くだけで設定は変えない。
         submit_line(&mut pane, "/model");
-        submit_line(&mut pane, "/reasoning");
-        submit_line(&mut pane, "/approval");
-        submit_line(&mut pane, "/sandbox");
+        assert!(pane.list_picker_open());
+        pane.close_list_picker();
+        assert_eq!(
+            pane.settings_label().split(' ').next(),
+            Some("model:config")
+        );
+
+        // 引数ありは従来どおり直接指定で反映される。
+        submit_line(&mut pane, "/model gpt-5.5");
+        submit_line(&mut pane, "/reasoning low");
+        submit_line(&mut pane, "/approval untrusted");
+        submit_line(&mut pane, "/sandbox danger-full-access");
         submit_line(&mut pane, "/settings");
 
         assert_eq!(pane.turn_count(), 0);
@@ -10809,5 +15897,481 @@ mod tests {
 
         assert!(prompt.contains("0: A"));
         assert!(prompt.contains("1: B"));
+    }
+
+    #[test]
+    fn format_elapsed_formats_minutes_and_hours() {
+        assert_eq!(format_elapsed(0), "0:00");
+        assert_eq!(format_elapsed(45), "0:45");
+        assert_eq!(format_elapsed(83), "1:23");
+        assert_eq!(format_elapsed(3600), "1:00:00");
+        assert_eq!(format_elapsed(3723), "1:02:03");
+    }
+
+    #[test]
+    fn format_token_count_rounds_k_and_m() {
+        assert_eq!(format_token_count(0), "0");
+        assert_eq!(format_token_count(999), "999");
+        assert_eq!(format_token_count(12_711), "12.7k");
+        assert_eq!(format_token_count(1_000), "1.0k");
+        assert_eq!(format_token_count(1_500_000), "1.5M");
+    }
+
+    #[test]
+    fn context_percent_computes_and_guards_zero_window() {
+        assert_eq!(context_percent(45_000, 100_000), Some(45));
+        assert_eq!(context_percent(0, 200_000), Some(0));
+        assert_eq!(context_percent(200_000, 200_000), Some(100));
+        // 上限 100% でクランプする。
+        assert_eq!(context_percent(300_000, 200_000), Some(100));
+        assert_eq!(context_percent(10, 0), None);
+    }
+
+    #[test]
+    fn claude_context_window_maps_default_and_1m() {
+        assert_eq!(claude_context_window_for_model(None), 200_000);
+        assert_eq!(
+            claude_context_window_for_model(Some("claude-sonnet-4-5")),
+            200_000
+        );
+        assert_eq!(
+            claude_context_window_for_model(Some("claude-opus-4-8[1m]")),
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn usage_header_label_claude_shows_cost_and_ctx() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.kind = AgentKind::ClaudeCode;
+        assert_eq!(pane.usage_header_label(), None);
+        pane.claude_total_cost_usd = Some(0.0123);
+        pane.claude_context_tokens = Some(90_000);
+        pane.claude_active_model = Some("claude-sonnet-4-5".to_string());
+        assert_eq!(
+            pane.usage_header_label().as_deref(),
+            Some("$0.0123 | ctx 45%")
+        );
+    }
+
+    #[test]
+    fn checkpoint_slug_sanitizes_goal_id() {
+        assert_eq!(checkpoint_slug("abc123"), "abc123");
+        assert_eq!(
+            checkpoint_slug("11111111-2222-3333-4444-555555555555"),
+            "11111111-2222-3333-4444-555555555555"
+        );
+        assert_eq!(checkpoint_slug("Foo/Bar_Baz"), "foo-bar-baz");
+        assert_eq!(checkpoint_slug("--@@--"), "pane");
+        assert_eq!(checkpoint_slug(""), "pane");
+    }
+
+    #[test]
+    fn checkpoint_ref_name_builds_namespaced_ref() {
+        assert_eq!(
+            checkpoint_ref_name("goal-1", 3),
+            "refs/addness/checkpoint-goal-1-3"
+        );
+    }
+
+    #[test]
+    fn git_status_has_changes_detects_nonblank_lines() {
+        assert!(!git_status_has_changes(""));
+        assert!(!git_status_has_changes("\n  \n"));
+        assert!(git_status_has_changes(" M src/main.rs"));
+        assert!(git_status_has_changes("?? new.txt\n"));
+    }
+
+    #[test]
+    fn push_checkpoint_evicts_oldest_over_limit() {
+        let mut stack = Vec::new();
+        let mut evicted_total = Vec::new();
+        for i in 0..12 {
+            let evicted = push_checkpoint_with_evictions(
+                &mut stack,
+                Checkpoint {
+                    ref_name: format!("refs/addness/checkpoint-p-{i}"),
+                    turn: i,
+                },
+                CHECKPOINT_STACK_MAX,
+            );
+            evicted_total.extend(evicted);
+        }
+        // 上限 10 件を保持、古い 2 件（turn 0,1）が押し出される。
+        assert_eq!(stack.len(), CHECKPOINT_STACK_MAX);
+        assert_eq!(stack.first().unwrap().turn, 2);
+        assert_eq!(stack.last().unwrap().turn, 11);
+        assert_eq!(
+            evicted_total.iter().map(|c| c.turn).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn undo_slash_without_checkpoint_reports_missing() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.finished = false;
+        submit_line(&mut pane, "/undo");
+        assert!(pane.log.iter().any(|line| {
+            line.kind == CodexLogKind::System && line.text.contains("チェックポイントがありません")
+        }));
+        assert!(pane.decision_banner().is_none());
+    }
+
+    #[test]
+    fn undo_slash_with_checkpoint_prompts_and_pops_on_accept() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.finished = false;
+        pane.record_checkpoint("refs/addness/checkpoint-p-0".to_string(), 1);
+        pane.record_checkpoint("refs/addness/checkpoint-p-1".to_string(), 2);
+
+        submit_line(&mut pane, "/undo");
+        let banner = pane.decision_banner().expect("確認バナーが出る");
+        assert_eq!(banner.kind, CodexDecisionKind::YesNo);
+
+        // Accept で undo 要求が積まれ、最新チェックポイント（turn 2）が pop される。
+        pane.handle_decision_key(KeyEvent::from(KeyCode::Char('y')));
+        let req = pane.take_undo_request().expect("undo 要求が積まれる");
+        assert_eq!(req.turn, 2);
+        assert_eq!(req.ref_name, "refs/addness/checkpoint-p-1");
+        assert_eq!(pane.checkpoints.len(), 1);
+    }
+
+    #[test]
+    fn undo_slash_deny_keeps_checkpoint() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.finished = false;
+        pane.record_checkpoint("refs/addness/checkpoint-p-0".to_string(), 1);
+        submit_line(&mut pane, "/undo");
+        pane.handle_decision_key(KeyEvent::from(KeyCode::Char('n')));
+        assert!(pane.take_undo_request().is_none());
+        assert_eq!(pane.checkpoints.len(), 1);
+    }
+
+    #[test]
+    fn undo_appears_in_slash_command_list() {
+        assert!(SLASH_COMMANDS.iter().any(|(name, _)| *name == "/undo"));
+        // /undo は codex 専用ではない（両バックエンドで使える）。
+        assert!(!CODEX_ONLY_SLASH_COMMANDS.contains(&"/undo"));
+    }
+
+    #[test]
+    fn checkpoint_requests_queue_and_drain_in_order() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        // ジョブ消化前に複数のチェックポイントが予約されても取りこぼさない。
+        pane.request_checkpoint();
+        pane.request_checkpoint();
+        pane.request_checkpoint();
+        let first = pane.take_checkpoint_request().expect("1件目");
+        let second = pane.take_checkpoint_request().expect("2件目");
+        let third = pane.take_checkpoint_request().expect("3件目");
+        // 先入れ先出しで seq（turn 見込み番号）が単調増加する。
+        assert!(first.turn <= second.turn && second.turn <= third.turn);
+        assert!(pane.take_checkpoint_request().is_none());
+    }
+
+    #[test]
+    fn checkpoint_requests_are_capped() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        // 上限 4 件を超える予約は最古が捨てられ、無制限には溜まらない。
+        for _ in 0..8 {
+            pane.request_checkpoint();
+        }
+        let mut count = 0;
+        while pane.take_checkpoint_request().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 4);
+    }
+
+    #[test]
+    fn usage_header_label_codex_shows_tokens_and_ctx() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.kind = AgentKind::Codex;
+        assert_eq!(pane.usage_header_label(), None);
+        pane.codex_appserver_token_usage = Some(codex_appserver::TokenUsageInfo {
+            total_tokens: Some(12_711),
+            last_total_tokens: Some(42),
+            model_context_window: Some(258_400),
+        });
+        assert_eq!(
+            pane.usage_header_label().as_deref(),
+            Some("12.7k tok | ctx 5%")
+        );
+    }
+
+    #[test]
+    fn sanitize_terminal_line_strips_ansi_and_control() {
+        // CSI カラーコード・OSC・制御文字を除去し、タブは空白へ。
+        let input = "\u{1b}[31mred\u{1b}[0m\ttext\u{7}end\u{1b}]0;title\u{7}!";
+        assert_eq!(sanitize_terminal_line(input), "red textend!");
+        assert_eq!(sanitize_terminal_line("plain"), "plain");
+    }
+
+    #[test]
+    fn claude_edit_patch_text_builds_update_patch() {
+        let input = serde_json::json!({
+            "file_path": "src/x.rs",
+            "old_string": "old1\nold2",
+            "new_string": "new1"
+        });
+        let patch = claude_edit_patch_text("Edit", &input).unwrap();
+        assert!(patch.starts_with("EDIT *** Begin Patch"));
+        assert!(patch.contains("*** Update File: src/x.rs"));
+        assert!(patch.contains("-old1"));
+        assert!(patch.contains("-old2"));
+        assert!(patch.contains("+new1"));
+        assert!(patch.contains("*** End Patch"));
+    }
+
+    #[test]
+    fn claude_edit_patch_text_builds_add_patch_for_write() {
+        let input = serde_json::json!({
+            "file_path": "src/new.rs",
+            "content": "line1\nline2"
+        });
+        let patch = claude_edit_patch_text("Write", &input).unwrap();
+        assert!(patch.contains("*** Add File: src/new.rs"));
+        assert!(patch.contains("+line1"));
+        assert!(patch.contains("+line2"));
+        // Edit/Write 以外や file_path 無しは対象外。
+        assert!(claude_edit_patch_text("Bash", &input).is_none());
+        assert!(claude_edit_patch_text("Edit", &serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn claude_edit_patch_text_caps_long_content() {
+        let content = (0..100)
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let input = serde_json::json!({ "file_path": "big.rs", "content": content });
+        let patch = claude_edit_patch_text("Write", &input).unwrap();
+        // 本文行はセクション上限（40行）までに抑える（全文は出さない）。
+        let plus_lines = patch.lines().filter(|l| l.starts_with('+')).count();
+        assert_eq!(plus_lines, CODEX_PATCH_SECTION_MAX_LINES);
+    }
+
+    #[test]
+    fn codex_filechange_patch_text_from_unified_diff() {
+        let changes = vec![
+            codex_appserver::FileChangeDetail {
+                path: "src/a.rs".to_string(),
+                change_type: "update".to_string(),
+                diff: "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n".to_string(),
+            },
+            codex_appserver::FileChangeDetail {
+                path: "src/b.rs".to_string(),
+                change_type: "add".to_string(),
+                diff: "+added line\n".to_string(),
+            },
+        ];
+        let patch = codex_filechange_patch_text(&changes).unwrap();
+        assert!(patch.contains("*** Update File: src/a.rs"));
+        assert!(patch.contains("*** Add File: src/b.rs"));
+        assert!(patch.contains("@@ -1,2 +1,2 @@"));
+        assert!(patch.contains("-old"));
+        assert!(patch.contains("+new"));
+        assert!(patch.contains("+added line"));
+        // ファイルヘッダ（--- / +++）はノイズとして除去する。
+        assert!(!patch.contains("--- a/src/a.rs"));
+        assert!(!patch.contains("+++ b/src/a.rs"));
+    }
+
+    #[test]
+    fn codex_filechange_patch_text_empty_without_diff() {
+        let changes = vec![codex_appserver::FileChangeDetail {
+            path: "src/a.rs".to_string(),
+            change_type: "update".to_string(),
+            diff: String::new(),
+        }];
+        assert!(codex_filechange_patch_text(&changes).is_none());
+    }
+
+    #[test]
+    fn model_slash_without_args_opens_picker_with_current_marker_claude() {
+        let mut pane = claude_pane();
+        assert!(pane.handle_local_slash_command("/model"));
+        let picker = pane.list_picker().expect("model picker");
+        assert_eq!(picker.action, CodexListPickerAction::SetModel);
+        let labels = picker
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, ["config", "fable", "opus", "sonnet", "haiku"]);
+        assert!(picker.items[0].current, "既定は config が現在値");
+        assert_eq!(picker.selected, 0);
+    }
+
+    #[test]
+    fn model_picker_accept_applies_selection_claude() {
+        let mut pane = claude_pane();
+        assert!(pane.handle_local_slash_command("/model"));
+        pane.move_list_picker_selection(2); // config -> opus
+        pane.accept_list_picker(false);
+        assert!(pane.list_picker().is_none());
+        assert_eq!(pane.claude_settings.effective_model_arg(), Some("opus"));
+    }
+
+    #[test]
+    fn model_picker_lists_codex_choices_and_applies_selection() {
+        let mut pane = live_pane();
+        pane.exec_settings.model = CodexModelChoice::Gpt5;
+        assert!(pane.handle_local_slash_command("/model"));
+        let picker = pane.list_picker().expect("model picker");
+        let labels = picker
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, ["config", "gpt-5.5", "gpt-5", "o3"]);
+        assert!(picker.items[2].current, "現在値 gpt-5 にマーカー");
+        assert_eq!(picker.selected, 2, "初期選択は現在値");
+        pane.move_list_picker_selection(-1); // gpt-5 -> gpt-5.5
+        pane.accept_list_picker(false);
+        assert_eq!(pane.exec_settings.model, CodexModelChoice::Gpt55);
+        assert!(pane.exec_settings.model_override.is_none());
+    }
+
+    #[test]
+    fn model_picker_shows_override_in_title_without_current_marker() {
+        let mut pane = live_pane();
+        pane.exec_settings.model_override = Some("my-custom-model".to_string());
+        assert!(pane.handle_local_slash_command("/model"));
+        let picker = pane.list_picker().expect("model picker");
+        assert!(picker.title.contains("my-custom-model"));
+        assert!(picker.items.iter().all(|item| !item.current));
+        assert_eq!(picker.selected, 0);
+    }
+
+    #[test]
+    fn reasoning_picker_accept_sets_claude_effort() {
+        let mut pane = claude_pane();
+        assert!(pane.handle_local_slash_command("/effort"));
+        let picker = pane.list_picker().expect("effort picker");
+        assert_eq!(picker.action, CodexListPickerAction::SetReasoning);
+        pane.move_list_picker_selection(3); // config -> high
+        pane.accept_list_picker(false);
+        assert!(pane.list_picker().is_none());
+        assert!(pane.claude_settings.label().contains("effort:high"));
+    }
+
+    #[test]
+    fn permissions_slash_without_args_opens_permission_picker_claude() {
+        let mut pane = claude_pane();
+        assert!(pane.handle_local_slash_command("/permissions"));
+        let picker = pane.list_picker().expect("permission picker");
+        assert_eq!(picker.action, CodexListPickerAction::SetApproval);
+        let labels = picker
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            [
+                "config",
+                "plan",
+                "acceptEdits",
+                "dontAsk",
+                "bypassPermissions"
+            ]
+        );
+        pane.move_list_picker_selection(1); // config -> plan
+        pane.accept_list_picker(false);
+        assert_eq!(pane.claude_settings.permission_label(), "plan");
+    }
+
+    #[test]
+    fn sandbox_picker_accept_sets_codex_sandbox() {
+        let mut pane = live_pane();
+        assert!(pane.handle_local_slash_command("/sandbox"));
+        let picker = pane.list_picker().expect("sandbox picker");
+        assert_eq!(picker.action, CodexListPickerAction::SetSandbox);
+        assert_eq!(picker.selected, 1, "既定 workspace-write が現在値");
+        pane.move_list_picker_selection(-1); // -> read-only
+        pane.accept_list_picker(false);
+        assert_eq!(pane.exec_settings.sandbox, CodexSandboxChoice::ReadOnly);
+    }
+
+    #[test]
+    fn list_picker_fork_accept_ignored_for_settings_picker() {
+        let mut pane = claude_pane();
+        assert!(pane.handle_local_slash_command("/model"));
+        pane.accept_list_picker(true);
+        assert!(
+            pane.list_picker().is_some(),
+            "ResumeSession 以外では f を無視して開いたままにする"
+        );
+    }
+
+    #[test]
+    fn session_picker_items_mark_current_thread() {
+        let candidates = vec![
+            CodexSessionCandidate {
+                id: "11111111-2222-3333-4444-555555555555".to_string(),
+                title: "first".to_string(),
+                updated_at: "2026-07-08T10:00:00Z".to_string(),
+                cwd: None,
+            },
+            CodexSessionCandidate {
+                id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string(),
+                title: "second".to_string(),
+                updated_at: "2026-07-07T09:00:00Z".to_string(),
+                cwd: None,
+            },
+        ];
+        let items = session_picker_items(&candidates, Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
+        assert_eq!(items[0].label, "11111111");
+        assert!(!items[0].current);
+        assert!(items[1].current);
+        assert_eq!(items[1].value, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+        assert!(items[0].detail.contains("first"));
+        assert!(items[0].detail.contains("2026-07-08"));
+        assert_eq!(list_picker_initial_selection(&items), 1);
+    }
+
+    #[test]
+    fn bare_resume_opens_session_picker_instead_of_memo_prompt() {
+        let mut pane = claude_pane();
+        assert!(pane.handle_local_slash_command("/resume"));
+        // 旧挙動の定型プロンプト送信はしない。
+        assert!(
+            !pane
+                .log
+                .iter()
+                .any(|line| line.text.contains("前回の続きから再開してください"))
+        );
+        // 候補があればセッションピッカー、無ければ案内ログのみ（実行環境のセッション有無に依存）。
+        match pane.list_picker() {
+            Some(picker) => assert_eq!(picker.action, CodexListPickerAction::ResumeSession),
+            None => assert!(
+                pane.log
+                    .iter()
+                    .any(|line| line.text.contains("セッションがありません"))
+            ),
+        }
+    }
+
+    #[test]
+    fn resume_memo_sends_legacy_resume_prompt() {
+        let mut pane = claude_pane();
+        assert!(pane.handle_local_slash_command("/resume-memo"));
+        assert!(pane.list_picker().is_none());
+        assert!(
+            pane.log
+                .iter()
+                .any(|line| line.text.contains("前回の続きから再開してください"))
+        );
+    }
+
+    #[test]
+    fn opening_list_picker_closes_turn_picker() {
+        let mut pane = claude_pane();
+        pane.turn_picker = Some(CodexTurnPicker { selected_turn: 1 });
+        assert!(pane.handle_local_slash_command("/model"));
+        assert!(!pane.turn_picker_open());
+        assert!(pane.list_picker_open());
     }
 }

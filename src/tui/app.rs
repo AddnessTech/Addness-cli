@@ -618,6 +618,7 @@ fn should_emit_notice(turn_elapsed_secs: Option<u64>, threshold_secs: u64) -> bo
 /// AppleScript の文字列リテラルへ安全に埋め込めるようエスケープする。
 /// `\` と `"` をエスケープし、改行類は空白へ潰す（osascript には引数で渡すためシェル注入は起きない）。
 /// `agent` モジュール（クリップボード PNG 書き出し）でも共有する。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // osascript呼び出しはmacOSのみ
 pub(super) fn applescript_string_escape(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {

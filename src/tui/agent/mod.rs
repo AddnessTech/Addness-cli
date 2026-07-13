@@ -833,6 +833,7 @@ pub struct TerminalNotice {
     pub title: String,
     pub message: String,
     /// 通知の文脈（ゴール名など）。OS 通知の本文に添える。空なら省略。
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOSのOS通知経路でのみ読む
     pub context: Option<String>,
     /// ターン完了通知のターン所要秒。`Some(n)` かつ閾値未満なら通知を抑制する。
     /// 承認・その他の通知は `None`（常に通知する）。
@@ -1173,6 +1174,7 @@ pub struct CodexPane {
     /// 畳み込みペーストの通し番号（プレースホルダの `#N`）。送信でリセットする。
     paste_seq: usize,
     /// クリップボード画像の保存先ディレクトリ（`~/.addness/attachments/`）。テストでは注入する。
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // Ctrl+V取り込みはmacOSのみ
     attachments_dir: Option<PathBuf>,
     /// スラッシュコマンドパレットで選択中の候補インデックス。入力が変わると 0 に戻す。
     slash_palette_selected: usize,
@@ -9940,6 +9942,7 @@ fn attachments_dir_path() -> Option<PathBuf> {
 }
 
 /// `clip-<N>.png` の連番を解析する。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // クリップボード保存はmacOSのみ
 fn parse_clip_index(name: &str) -> Option<usize> {
     name.strip_prefix("clip-")?
         .strip_suffix(".png")?
@@ -9948,6 +9951,7 @@ fn parse_clip_index(name: &str) -> Option<usize> {
 }
 
 /// 既存ファイル名一覧から次の `clip-<N>.png` を決める（純粋関数）。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // クリップボード保存はmacOSのみ
 fn next_clip_filename(existing: &[String]) -> String {
     let max = existing
         .iter()
@@ -9958,6 +9962,7 @@ fn next_clip_filename(existing: &[String]) -> String {
 }
 
 /// ディレクトリ内の既存 `clip-*.png` を調べ、次の保存先パスを返す。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // クリップボード保存はmacOSのみ
 fn next_clip_path(dir: &Path) -> PathBuf {
     let existing: Vec<String> = std::fs::read_dir(dir)
         .into_iter()

@@ -688,7 +688,7 @@ pub(super) fn load_session_candidates_from(
             .unwrap_or(std::time::UNIX_EPOCH);
         files.push((path, mtime));
     }
-    files.sort_by(|a, b| b.1.cmp(&a.1));
+    files.sort_by_key(|(_, mtime)| std::cmp::Reverse(*mtime));
     files.truncate(limit);
     files
         .into_iter()

@@ -133,6 +133,11 @@ pub(super) fn parse_effort_choice(value: &str) -> Option<ClaudeEffortChoice> {
 }
 
 /// F4 で巡回する permission-mode。`config` は `--permission-mode` を付けない。
+///
+/// `DangerouslySkipPermissions` だけは `--permission-mode` の値ではなく、独立した起動フラグ
+/// `--dangerously-skip-permissions`（全権限チェックをバイパス）を使う。起動時フラグなので
+/// 常駐プロセスのランタイム切替（`set_permission_mode` control_request）はできず、この variant
+/// へ/から切り替える場合は常駐プロセスの再起動で反映する（`mod.rs` 側で処理）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ClaudePermissionMode {
     Config,
@@ -140,6 +145,7 @@ pub(super) enum ClaudePermissionMode {
     AcceptEdits,
     DontAsk,
     BypassPermissions,
+    DangerouslySkipPermissions,
 }
 
 impl ClaudePermissionMode {
@@ -149,7 +155,8 @@ impl ClaudePermissionMode {
             Self::Plan => Self::AcceptEdits,
             Self::AcceptEdits => Self::DontAsk,
             Self::DontAsk => Self::BypassPermissions,
-            Self::BypassPermissions => Self::Config,
+            Self::BypassPermissions => Self::DangerouslySkipPermissions,
+            Self::DangerouslySkipPermissions => Self::Config,
         }
     }
 
@@ -160,10 +167,13 @@ impl ClaudePermissionMode {
             Self::AcceptEdits => "acceptEdits",
             Self::DontAsk => "dontAsk",
             Self::BypassPermissions => "bypassPermissions",
+            Self::DangerouslySkipPermissions => "skip-permissions（危険・全許可）",
         }
     }
 
-    /// `--permission-mode` に渡す値。`config` は None。
+    /// `--permission-mode` に渡す値。`config` と `skip-permissions` は None。
+    /// `skip-permissions` は `--permission-mode` の値ではなく独立フラグ
+    /// `--dangerously-skip-permissions` を使う（`push_permission_mode_args` 参照）。
     fn cli_arg(self) -> Option<&'static str> {
         match self {
             Self::Config => None,
@@ -171,7 +181,13 @@ impl ClaudePermissionMode {
             Self::AcceptEdits => Some("acceptEdits"),
             Self::DontAsk => Some("dontAsk"),
             Self::BypassPermissions => Some("bypassPermissions"),
+            Self::DangerouslySkipPermissions => None,
         }
+    }
+
+    /// 独立起動フラグ `--dangerously-skip-permissions` を使う variant か。
+    pub(super) fn is_dangerously_skip(self) -> bool {
+        matches!(self, Self::DangerouslySkipPermissions)
     }
 }
 
@@ -183,6 +199,13 @@ pub(super) fn parse_permission_mode(value: &str) -> Option<ClaudePermissionMode>
         "dontask" | "dont-ask" | "auto" => Some(ClaudePermissionMode::DontAsk),
         "bypasspermissions" | "bypass" | "bypass-permissions" => {
             Some(ClaudePermissionMode::BypassPermissions)
+        }
+        // ラベル（ピッカーの value）自身も受け付け、選択→parse の往復を成立させる。
+        "skip"
+        | "skip-permissions"
+        | "dangerously-skip-permissions"
+        | "skip-permissions（危険・全許可）" => {
+            Some(ClaudePermissionMode::DangerouslySkipPermissions)
         }
         _ => None,
     }
@@ -251,8 +274,9 @@ impl ClaudeExecSettings {
             .or_else(|| self.model.cli_arg())
     }
 
-    /// `--permission-mode` に相当する現在の実効値。`config`（既定）なら None。
-    /// 常駐モードの `set_permission_mode` control_request 送信可否の判定に使う。
+    /// `--permission-mode` に相当する現在の実効値。`config`（既定）と `skip-permissions` は None。
+    /// 常駐モードの `set_permission_mode` control_request 送信可否の判定に使う（None なら再起動）。
+    /// `skip-permissions` は起動時フラグでランタイム切替不可のため None を返す。
     pub(super) fn effective_permission_mode_arg(&self) -> Option<&str> {
         self.permission_mode.cli_arg()
     }
@@ -394,10 +418,7 @@ pub(super) fn exec_args(
     } else {
         settings.permission_mode
     };
-    if let Some(mode) = effective_mode.cli_arg() {
-        args.push(OsString::from("--permission-mode"));
-        args.push(OsString::from(mode));
-    }
+    push_permission_mode_args(&mut args, effective_mode);
 
     // 権限: sticky 許可リスト + 今回だけの許可ルールを `--allowedTools` へ（重複除去）。
     push_allowed_tools_args(
@@ -441,10 +462,7 @@ pub(super) fn resident_args(
     args.push(OsString::from("stdio"));
     push_resume_args(&mut args, session_id, fork);
     push_model_and_effort_args(&mut args, settings);
-    if let Some(mode) = settings.permission_mode.cli_arg() {
-        args.push(OsString::from("--permission-mode"));
-        args.push(OsString::from(mode));
-    }
+    push_permission_mode_args(&mut args, settings.permission_mode);
     // 常駐では sticky 許可リストのみを付与する（今回だけの許可は can_use_tool 応答で処理）。
     push_allowed_tools_args(&mut args, settings.sticky_allowed_tools.iter());
     push_add_dir_args(&mut args, settings);
@@ -467,6 +485,17 @@ fn push_resume_args(args: &mut Vec<OsString>, session_id: Option<&str>, fork: bo
         if fork {
             args.push(OsString::from("--fork-session"));
         }
+    }
+}
+
+/// permission-mode を args へ追加する。`skip-permissions` は `--permission-mode` の値ではなく
+/// 独立起動フラグ `--dangerously-skip-permissions` を出力する。`config` は何も付けない。
+fn push_permission_mode_args(args: &mut Vec<OsString>, mode: ClaudePermissionMode) {
+    if mode.is_dangerously_skip() {
+        args.push(OsString::from("--dangerously-skip-permissions"));
+    } else if let Some(mode) = mode.cli_arg() {
+        args.push(OsString::from("--permission-mode"));
+        args.push(OsString::from(mode));
     }
 }
 
@@ -1222,7 +1251,48 @@ mod tests {
         assert_eq!(s.cycle_permission_mode(), "acceptEdits");
         assert_eq!(s.cycle_permission_mode(), "dontAsk");
         assert_eq!(s.cycle_permission_mode(), "bypassPermissions");
+        assert_eq!(
+            s.cycle_permission_mode(),
+            "skip-permissions（危険・全許可）"
+        );
         assert_eq!(s.cycle_permission_mode(), "config");
+    }
+
+    #[test]
+    fn exec_args_skip_permissions_uses_dedicated_flag() {
+        let mut settings = ClaudeExecSettings::default();
+        settings.set_permission_mode(ClaudePermissionMode::DangerouslySkipPermissions);
+        let args = os(&exec_args(None, &settings, &[], false, "x"));
+        // 独立フラグを出力し、--permission-mode は付けない。
+        assert!(args.iter().any(|a| a == "--dangerously-skip-permissions"));
+        assert!(!args.iter().any(|a| a == "--permission-mode"));
+        assert!(!args.iter().any(|a| a == "skip-permissions（危険・全許可）"));
+    }
+
+    #[test]
+    fn resident_args_skip_permissions_uses_dedicated_flag() {
+        let mut settings = ClaudeExecSettings::default();
+        settings.set_permission_mode(ClaudePermissionMode::DangerouslySkipPermissions);
+        let args = os(&resident_args(None, &settings, false, "x"));
+        assert!(args.iter().any(|a| a == "--dangerously-skip-permissions"));
+        assert!(!args.iter().any(|a| a == "--permission-mode"));
+    }
+
+    #[test]
+    fn parse_permission_mode_skip_aliases() {
+        for alias in [
+            "skip",
+            "skip-permissions",
+            "dangerously-skip-permissions",
+            "SKIP-PERMISSIONS",
+            "skip-permissions（危険・全許可）",
+        ] {
+            assert_eq!(
+                parse_permission_mode(alias),
+                Some(ClaudePermissionMode::DangerouslySkipPermissions),
+                "alias={alias}"
+            );
+        }
     }
 
     #[test]
@@ -1516,18 +1586,19 @@ mod tests {
         // resident_args / exec_args / push_* ヘルパが渡すフラグ。
         // 隠しフラグ（--permission-prompt-tool）は help に出ないため対象外。
         const REQUIRED: &[&str] = &[
-            "--print",                    // -p 非対話モード
-            "--output-format",            // stream-json 出力
-            "--input-format",             // 常駐（双方向）stream-json 入力
-            "--include-partial-messages", // トークン単位ストリーミング
-            "--verbose",                  // stream-json 全イベント出力
-            "--permission-mode",          // 権限モード
-            "--resume",                   // セッション継続
-            "--fork-session",             // resume 時のセッション複製
-            "--model",                    // モデル指定
-            "--effort",                   // effort 指定
-            "--add-dir",                  // 書込許可ディレクトリ追加
-            "--append-system-prompt",     // Addness 手順注入
+            "--print",                        // -p 非対話モード
+            "--output-format",                // stream-json 出力
+            "--input-format",                 // 常駐（双方向）stream-json 入力
+            "--include-partial-messages",     // トークン単位ストリーミング
+            "--verbose",                      // stream-json 全イベント出力
+            "--permission-mode",              // 権限モード
+            "--dangerously-skip-permissions", // 全権限スキップ（起動時フラグ）
+            "--resume",                       // セッション継続
+            "--fork-session",                 // resume 時のセッション複製
+            "--model",                        // モデル指定
+            "--effort",                       // effort 指定
+            "--add-dir",                      // 書込許可ディレクトリ追加
+            "--append-system-prompt",         // Addness 手順注入
         ];
         let missing: Vec<&str> = REQUIRED
             .iter()

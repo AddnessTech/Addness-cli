@@ -1,7 +1,7 @@
 name: Upstream Sync
 
 # 上流ツール（anthropics/claude-code, openai/codex）の新リリースを検知し、
-# 本リポジトリの TUI 統合に関係する変更を Claude が自動実装して PR を出す。
+# 本リポジトリの TUI 統合に関係する変更を Codex が自動実装して PR を出す。
 # 仕組みの詳細は docs/upstream-sync.md、判定基準は docs/upstream-surface.md を参照。
 
 on:
@@ -335,18 +335,25 @@ jobs:
             echo "UPSTREAM_SYNC_PROMPT_EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Claude による分析・実装
-        uses: anthropics/claude-code-action@v1
+      # 分析・実装には安定版 latest の codex を使う。プローブステップは TARGET=codex のとき
+      # NEW_VERSION の codex を入れるため、ここで安定 latest を上書きインストールする。
+      - name: Codex CLI インストール（分析用・安定 latest）
+        run: npm install -g @openai/codex
+
+      - name: Codex による分析・実装
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          prompt: ${{ steps.prompt.outputs.prompt }}
-          claude_args: |
-            --model claude-sonnet-5
-            --allowedTools "Bash(cargo:*),Bash(git:*),Bash(gh label:*),Bash(gh pr create:*),Bash(gh issue create:*),Read,Write,Edit,Glob,Grep"
-            --max-turns 120
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          CODEX_PROMPT: ${{ steps.prompt.outputs.prompt }}
+        run: |
+          set -euo pipefail
+          # 非対話認証: API キーを stdin 経由で渡す（codex login --help の例:
+          # `printenv OPENAI_API_KEY | codex login --with-api-key`）。キーは出力しない。
+          printenv OPENAI_API_KEY | codex login --with-api-key
+          # 非対話実行: CI 内でファイル編集・cargo 実行・git push・gh pr create ができるよう
+          # 承認・サンドボックスをバイパスする（externally sandboxed な CI 向けフラグ）。
+          # プロンプトはシェル展開で壊れないよう stdin 経由で安全に渡す（`-` で stdin から読む）。
+          printf '%s' "$CODEX_PROMPT" | codex exec --dangerously-bypass-approvals-and-sandbox -
 
       - name: state 更新
         env:

@@ -377,9 +377,30 @@ pub(super) enum ServerMessage {
     Notification(Notification),
 }
 
+/// JSON-RPC メッセージらしい形かを判定する（常駐経路への振り分け用の純粋関数）。
+///
+/// codex 0.142.5 の app-server は応答・通知に `"jsonrpc":"2.0"` を付けないため、
+/// `jsonrpc` キーの有無だけでは判定できない。判定基準:
+/// - `jsonrpc` キーがある
+/// - または `method` が文字列
+/// - または（`id` があり、かつ `result` か `error` を持つ）
+///
+/// ワンショット codex exec の snake_case イベント（`{"type":"thread.started",...}` のような
+/// `type` 持ち・`method`/`result`/`error` なし）は false になる。
+pub(super) fn looks_like_jsonrpc(value: &Value) -> bool {
+    value.get("jsonrpc").is_some()
+        || value.get("method").and_then(Value::as_str).is_some()
+        || (value.get("id").is_some()
+            && (value.get("result").is_some() || value.get("error").is_some()))
+}
+
 /// 1 行の JSON-RPC メッセージをパースする。JSON-RPC でなければ None。
 pub(super) fn parse_message(value: &Value) -> Option<ServerMessage> {
-    if value.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+    // codex 0.142.5 の app-server は `"jsonrpc":"2.0"` を省略する。無い場合は許容し、
+    // 明示されている場合のみ "2.0" 以外を弾く。
+    if let Some(version) = value.get("jsonrpc")
+        && version.as_str() != Some("2.0")
+    {
         return None;
     }
     let has_id = value.get("id").is_some();
@@ -1189,6 +1210,73 @@ mod tests {
         // ワンショット codex の snake_case イベントは JSON-RPC ではない。
         let v = json!({"type": "thread.started", "thread_id": "abc"});
         assert_eq!(parse_message(&v), None);
+    }
+
+    #[test]
+    fn parse_message_without_jsonrpc_field() {
+        // codex 0.142.5 は応答・通知・サーバ発リクエストに "jsonrpc":"2.0" を付けない。
+        // 応答（id + result）。
+        let resp = json!({"id": 1, "result": {"thread": {"id": "abc"}}});
+        match parse_message(&resp) {
+            Some(ServerMessage::Response { id, result, error }) => {
+                assert_eq!(id, 1);
+                assert!(error.is_none());
+                assert_eq!(
+                    thread_id_from_response(&result.unwrap()).as_deref(),
+                    Some("abc")
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // 通知（method のみ）。
+        let notif = json!({"method": "turn/started", "params": {"threadId": "t"}});
+        assert_eq!(
+            parse_message(&notif),
+            Some(ServerMessage::Notification(Notification::TurnStarted))
+        );
+        // サーバ発リクエスト（method + id、承認要求）。
+        let approval = json!({
+            "id": 0,
+            "method": "item/commandExecution/requestApproval",
+            "params": {"itemId": "call_1", "command": "ls", "availableDecisions": ["accept", "decline"]}
+        });
+        match parse_message(&approval) {
+            Some(ServerMessage::Approval(req)) => {
+                assert_eq!(req.kind, ApprovalKind::Command);
+                assert_eq!(req.id, json!(0));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_message_rejects_wrong_jsonrpc_version() {
+        // jsonrpc が明示されているのに "2.0" でない場合は弾く。
+        let v = json!({"jsonrpc": "1.0", "id": 1, "result": {}});
+        assert_eq!(parse_message(&v), None);
+    }
+
+    #[test]
+    fn looks_like_jsonrpc_detects_shapes() {
+        // jsonrpc あり。
+        assert!(looks_like_jsonrpc(&json!({"jsonrpc": "2.0", "id": 1})));
+        // jsonrpc 無し・method 文字列。
+        assert!(looks_like_jsonrpc(&json!({"method": "turn/started"})));
+        // jsonrpc 無し・id + result。
+        assert!(looks_like_jsonrpc(&json!({"id": 1, "result": {}})));
+        // jsonrpc 無し・id + error。
+        assert!(looks_like_jsonrpc(
+            &json!({"id": 1, "error": {"code": -1, "message": "x"}})
+        ));
+        // ワンショット exec の snake_case イベント（type 持ち・method/result/error なし）は false。
+        assert!(!looks_like_jsonrpc(
+            &json!({"type": "thread.started", "thread_id": "abc"})
+        ));
+        assert!(!looks_like_jsonrpc(
+            &json!({"type": "item.completed", "item": {"id": "x"}})
+        ));
+        // id だけ（result/error なし）も JSON-RPC とは見なさない。
+        assert!(!looks_like_jsonrpc(&json!({"id": 1})));
     }
 
     #[test]

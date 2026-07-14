@@ -166,6 +166,10 @@ const CODEX_APPSERVER_INTERRUPT_GRACE: Duration = CLAUDE_INTERRUPT_GRACE;
 const CODEX_APPSERVER_SETTING_CHANGE_GRACE: Duration = CLAUDE_SETTING_CHANGE_GRACE;
 /// 常駐 codex app-server をアイドル回収するまでの無操作時間（RSS 約38MB だが Claude 側と揃える）。
 const CODEX_APPSERVER_IDLE_TIMEOUT: Duration = CLAUDE_RESIDENT_IDLE_TIMEOUT;
+/// 常駐 codex app-server のハンドシェイク（initialize / thread/start・resume）および
+/// turn/start 応答を待つ上限。codex 0.142.5 が想定外の応答形を返して固まった場合の保険で、
+/// 超えたらワンショットへフォールバックして「考え中」フリーズを回避する。
+const CODEX_APPSERVER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 /// 実行中コマンドのライブ出力バッファに保持する末尾行数。
 const CODEX_APPSERVER_OUTPUT_TAIL_LINES: usize = 3;
 /// @メンションのファイル候補を一度に表示する最大件数。
@@ -1309,6 +1313,9 @@ pub struct CodexPane {
     codex_appserver_last_activity: Option<Instant>,
     /// interrupt を送ってから turn/completed(interrupted) を待つ期限。超えたら kill フォールバック。
     codex_appserver_interrupt_deadline: Option<Instant>,
+    /// ハンドシェイク（initialize / thread/start・resume）と turn/start 応答を待つ期限。
+    /// 進捗（各送信成功）のたびに延長し、turn/start 応答受信で消す。超えたらワンショットへフォールバック。
+    codex_appserver_handshake_deadline: Option<Instant>,
     /// interrupt 要求中フラグ。turn/completed 受信時に中断完了として扱い、キューを自動開始しない。
     codex_appserver_interrupting: bool,
     /// 実行中コマンドのライブ出力バッファ（itemId → 末尾 N 行）。item/completed で解放する。
@@ -1543,6 +1550,7 @@ impl CodexPane {
             codex_appserver_restart_pending: false,
             codex_appserver_last_activity: None,
             codex_appserver_interrupt_deadline: None,
+            codex_appserver_handshake_deadline: None,
             codex_appserver_interrupting: false,
             codex_appserver_output: HashMap::new(),
             codex_appserver_running_item: None,
@@ -1662,6 +1670,7 @@ impl CodexPane {
         pane.codex_appserver_restart_pending = false;
         pane.codex_appserver_last_activity = None;
         pane.codex_appserver_interrupt_deadline = None;
+        pane.codex_appserver_handshake_deadline = None;
         pane.codex_appserver_interrupting = false;
         pane.codex_appserver_output.clear();
         pane.codex_appserver_running_item = None;
@@ -3878,9 +3887,10 @@ impl CodexPane {
             return;
         }
 
-        // 常駐 app-server の JSON-RPC メッセージ（"jsonrpc":"2.0" を持つ）は別経路で処理する。
-        // ワンショット exec の snake_case イベント・codex サブコマンド JSON には jsonrpc が無い。
-        if self.codex_appserver.is_some() && value.get("jsonrpc").is_some() {
+        // 常駐 app-server の JSON-RPC メッセージは別経路で処理する。codex 0.142.5 は
+        // 応答・通知に "jsonrpc":"2.0" を付けないため、キーの有無ではなく形で判定する。
+        // ワンショット exec の snake_case イベント・codex サブコマンド JSON は looks_like_jsonrpc が false。
+        if self.codex_appserver.is_some() && codex_appserver::looks_like_jsonrpc(&value) {
             self.handle_codex_appserver_message(&value);
             return;
         }
@@ -4964,6 +4974,8 @@ impl CodexPane {
             codex_appserver::initialize_request(id, "addness-tui", env!("CARGO_PKG_VERSION"));
         if client.send_value(&request) {
             self.codex_appserver_phase = CodexAppServerPhase::Initializing { request_id: id };
+            self.codex_appserver_handshake_deadline =
+                Some(Instant::now() + CODEX_APPSERVER_HANDSHAKE_TIMEOUT);
             true
         } else {
             false
@@ -4990,6 +5002,8 @@ impl CodexPane {
         if client.send_value(&request) {
             self.codex_appserver_turn_req_id = Some(id);
             self.codex_appserver_last_activity = Some(Instant::now());
+            self.codex_appserver_handshake_deadline =
+                Some(Instant::now() + CODEX_APPSERVER_HANDSHAKE_TIMEOUT);
         } else {
             self.push_log(
                 CodexLogKind::Error,
@@ -5023,6 +5037,8 @@ impl CodexPane {
                 request_id: id,
                 resuming,
             };
+            self.codex_appserver_handshake_deadline =
+                Some(Instant::now() + CODEX_APPSERVER_HANDSHAKE_TIMEOUT);
         } else {
             self.handle_codex_appserver_death();
         }
@@ -5041,6 +5057,8 @@ impl CodexPane {
                 request_id: id,
                 resuming: false,
             };
+            self.codex_appserver_handshake_deadline =
+                Some(Instant::now() + CODEX_APPSERVER_HANDSHAKE_TIMEOUT);
         } else {
             self.handle_codex_appserver_death();
         }
@@ -5138,9 +5156,10 @@ impl CodexPane {
             return;
         }
 
-        // 3. turn/start 応答（turn.id 確定）。
+        // 3. turn/start 応答（turn.id 確定）。ここでハンドシェイク/ターン開始の待ちが完了する。
         if self.codex_appserver_turn_req_id == Some(id) {
             self.codex_appserver_turn_req_id = None;
+            self.codex_appserver_handshake_deadline = None;
             if let Some(error) = error {
                 self.push_log(
                     CodexLogKind::Error,
@@ -5631,7 +5650,22 @@ impl CodexPane {
             return true;
         }
 
-        // 3. 設定変更応答のタイムアウト → 再起動フォールバック。
+        // 3. ハンドシェイク / turn/start 応答のタイムアウト → ワンショットへフォールバック。
+        // codex 0.142.5 が想定外の応答形を返して固まっても、ここで自動復旧して
+        // 「考え中」フリーズを解消する。
+        if let Some(deadline) = self.codex_appserver_handshake_deadline
+            && Instant::now() >= deadline
+        {
+            self.codex_appserver_handshake_deadline = None;
+            self.push_log(
+                CodexLogKind::Error,
+                "Codex app-server の応答が15秒以内に得られなかったためワンショットで実行します",
+            );
+            self.fallback_codex_appserver_to_oneshot();
+            return true;
+        }
+
+        // 4. 設定変更応答のタイムアウト → 再起動フォールバック。
         if let Some(change) = self.codex_appserver_pending_setting.as_ref()
             && Instant::now() >= change.deadline
         {
@@ -5645,7 +5679,7 @@ impl CodexPane {
             return true;
         }
 
-        // 4. アイドル時: 再起動保留があればグレースフルに閉じる（次ターンで再 spawn）。
+        // 5. アイドル時: 再起動保留があればグレースフルに閉じる（次ターンで再 spawn）。
         if self.codex_appserver_restart_pending
             && !self.turn_running
             && self.pending_decision.is_none()
@@ -5662,7 +5696,7 @@ impl CodexPane {
             return true;
         }
 
-        // 5. アイドル回収（無操作が続いたら閉じる）。
+        // 6. アイドル回収（無操作が続いたら閉じる）。
         if !self.turn_running
             && self.pending_decision.is_none()
             && self.codex_appserver_pending_approval.is_none()
@@ -5684,6 +5718,7 @@ impl CodexPane {
         self.codex_appserver = None;
         self.codex_appserver_phase = CodexAppServerPhase::Idle;
         self.codex_appserver_interrupt_deadline = None;
+        self.codex_appserver_handshake_deadline = None;
         self.codex_appserver_interrupting = false;
         self.codex_appserver_pending_setting = None;
         self.codex_appserver_pending_approval = None;
@@ -5721,6 +5756,7 @@ impl CodexPane {
         }
         self.codex_appserver_phase = CodexAppServerPhase::Idle;
         self.codex_appserver_enabled = false;
+        self.codex_appserver_handshake_deadline = None;
         self.codex_appserver_pending_turn = None;
         self.codex_appserver_turn_id = None;
         self.codex_appserver_turn_req_id = None;
@@ -5752,6 +5788,7 @@ impl CodexPane {
         }
         self.codex_appserver_phase = CodexAppServerPhase::Idle;
         self.codex_appserver_interrupt_deadline = None;
+        self.codex_appserver_handshake_deadline = None;
         self.codex_appserver_interrupting = false;
         self.codex_appserver_pending_setting = None;
         self.codex_appserver_pending_approval = None;
@@ -12964,6 +13001,76 @@ mod tests {
         pane.codex_appserver_pending_setting = None;
         pane.push_codex_appserver_approval();
         assert!(pane.codex_appserver_restart_pending);
+    }
+
+    #[test]
+    fn codex_appserver_initialize_response_without_jsonrpc_advances_handshake() {
+        // codex 0.142.5 は initialize 応答に "jsonrpc":"2.0" を付けない。
+        // jsonrpc 無しの `{"id":N,"result":{...}}` でも Initializing→StartingThread へ進むこと。
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        pane.codex_appserver_phase = CodexAppServerPhase::Initializing { request_id: 5 };
+        pane.handle_json_event(serde_json::json!({
+            "id": 5, "result": {"userAgent": "codex"}
+        }));
+        // initialized 通知 → thread/resume（thread_id あり）を送り StartingThread へ遷移する。
+        assert!(matches!(
+            pane.codex_appserver_phase,
+            CodexAppServerPhase::StartingThread { .. }
+        ));
+    }
+
+    #[test]
+    fn codex_appserver_notification_without_jsonrpc_is_routed() {
+        // jsonrpc 無しの通知 `{"method":"turn/started",...}` が常駐経路で処理されること。
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        pane.handle_json_event(serde_json::json!({
+            "method": "turn/started", "params": {"threadId": "th-1"}
+        }));
+        assert!(pane.log.iter().any(|l| l.kind == CodexLogKind::Turn));
+    }
+
+    #[test]
+    fn codex_appserver_handshake_timeout_falls_back_to_oneshot() {
+        // ハンドシェイク応答が来ないまま deadline を過ぎたら、ワンショットへフォールバックして
+        // 「考え中」フリーズを解消する。
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        // フォールバックのワンショット再実行で実 codex を起動しないよう、実在しないパスにする。
+        pane.codex_bin = PathBuf::from("/nonexistent/addness-codex-test-bin");
+        pane.codex_appserver_phase = CodexAppServerPhase::Initializing { request_id: 1 };
+        pane.turn_running = true;
+        pane.current_turn_prompt = Some("依頼".to_string());
+        pane.current_turn_retry_prompt = Some("依頼".to_string());
+        // deadline を過去にして poll を呼ぶ。
+        pane.codex_appserver_handshake_deadline = Some(Instant::now() - Duration::from_secs(1));
+        assert!(pane.poll_codex_appserver());
+        // 常駐は破棄され、フォールバックのため deadline も enabled も落ちる。
+        assert!(pane.codex_appserver.is_none());
+        assert!(pane.codex_appserver_handshake_deadline.is_none());
+        assert!(!pane.codex_appserver_enabled);
+        assert!(
+            pane.log
+                .iter()
+                .any(|l| l.kind == CodexLogKind::Error && l.text.contains("15秒以内"))
+        );
+    }
+
+    #[test]
+    fn codex_appserver_ready_idle_has_no_handshake_deadline() {
+        // Ready かつ turn 応答待ちでもない平常時に deadline が残らないこと（誤フォールバック防止）。
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        assert_eq!(pane.codex_appserver_phase, CodexAppServerPhase::Ready);
+        assert!(pane.codex_appserver_handshake_deadline.is_none());
+        // poll を回してもフォールバックは起きない。
+        assert!(!pane.poll_codex_appserver());
+        assert!(pane.codex_appserver.is_some());
     }
 
     #[test]

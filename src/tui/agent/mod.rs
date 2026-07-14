@@ -16421,7 +16421,7 @@ mod tests {
                 "acceptEdits",
                 "dontAsk",
                 "bypassPermissions",
-                "skip-permissions（危険・全許可）"
+                "skip-permissions（危険・原則許可）"
             ]
         );
         pane.move_list_picker_selection(1); // config -> plan

@@ -135,7 +135,8 @@ pub(super) fn parse_effort_choice(value: &str) -> Option<ClaudeEffortChoice> {
 /// F4 で巡回する permission-mode。`config` は `--permission-mode` を付けない。
 ///
 /// `DangerouslySkipPermissions` だけは `--permission-mode` の値ではなく、独立した起動フラグ
-/// `--dangerously-skip-permissions`（全権限チェックをバイパス）を使う。起動時フラグなので
+/// `--dangerously-skip-permissions`（原則として権限チェックをバイパス）を使う。
+/// Claude Code 2.1.208 以降は壊滅的な削除など一部の操作では確認が残る。起動時フラグなので
 /// 常駐プロセスのランタイム切替（`set_permission_mode` control_request）はできず、この variant
 /// へ/から切り替える場合は常駐プロセスの再起動で反映する（`mod.rs` 側で処理）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,7 +168,7 @@ impl ClaudePermissionMode {
             Self::AcceptEdits => "acceptEdits",
             Self::DontAsk => "dontAsk",
             Self::BypassPermissions => "bypassPermissions",
-            Self::DangerouslySkipPermissions => "skip-permissions（危険・全許可）",
+            Self::DangerouslySkipPermissions => "skip-permissions（危険・原則許可）",
         }
     }
 
@@ -204,6 +205,8 @@ pub(super) fn parse_permission_mode(value: &str) -> Option<ClaudePermissionMode>
         "skip"
         | "skip-permissions"
         | "dangerously-skip-permissions"
+        | "skip-permissions（危険・原則許可）"
+        // 2.1.207 以前の表示値も、設定復元との互換性のため受け付ける。
         | "skip-permissions（危険・全許可）" => {
             Some(ClaudePermissionMode::DangerouslySkipPermissions)
         }
@@ -1253,7 +1256,7 @@ mod tests {
         assert_eq!(s.cycle_permission_mode(), "bypassPermissions");
         assert_eq!(
             s.cycle_permission_mode(),
-            "skip-permissions（危険・全許可）"
+            "skip-permissions（危険・原則許可）"
         );
         assert_eq!(s.cycle_permission_mode(), "config");
     }
@@ -1266,7 +1269,11 @@ mod tests {
         // 独立フラグを出力し、--permission-mode は付けない。
         assert!(args.iter().any(|a| a == "--dangerously-skip-permissions"));
         assert!(!args.iter().any(|a| a == "--permission-mode"));
-        assert!(!args.iter().any(|a| a == "skip-permissions（危険・全許可）"));
+        assert!(
+            !args
+                .iter()
+                .any(|a| a == "skip-permissions（危険・原則許可）")
+        );
     }
 
     #[test]
@@ -1285,6 +1292,7 @@ mod tests {
             "skip-permissions",
             "dangerously-skip-permissions",
             "SKIP-PERMISSIONS",
+            "skip-permissions（危険・原則許可）",
             "skip-permissions（危険・全許可）",
         ] {
             assert_eq!(

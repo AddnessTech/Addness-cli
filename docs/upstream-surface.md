@@ -30,7 +30,7 @@
 | `--model <name>` | モデル指定（下記 1.2） | `exec_args` |
 | `--effort <level>` | effort 指定（下記 1.3） | `exec_args` |
 | `--permission-mode <mode>` | 権限モード指定（下記 1.4） | `exec_args` |
-| `--dangerously-skip-permissions` | 全許可（sticky / one-shot 昇格） | `exec_args` |
+| `--dangerously-skip-permissions` | 原則許可（sticky / one-shot 昇格。壊滅的な削除等は確認され得る） | `exec_args` |
 | `--add-dir <dir>` | 書込許可ディレクトリ追加（複数可） | `exec_args` |
 | `--append-system-prompt <text>` | Addness 手順を毎ターン注入 | `exec_args` |
 

@@ -2499,11 +2499,16 @@ impl CodexPane {
                 claude::ClaudePermissionMode::AcceptEdits,
                 claude::ClaudePermissionMode::DontAsk,
                 claude::ClaudePermissionMode::BypassPermissions,
+                claude::ClaudePermissionMode::DangerouslySkipPermissions,
             ]
             .into_iter()
             .map(|choice| CodexListPickerItem {
                 label: choice.label().to_string(),
-                detail: config_choice_detail(choice == claude::ClaudePermissionMode::Config),
+                detail: if choice.is_dangerously_skip() {
+                    "全権限チェックをバイパス（危険）".to_string()
+                } else {
+                    config_choice_detail(choice == claude::ClaudePermissionMode::Config)
+                },
                 value: choice.label().to_string(),
                 current: choice == current,
             })
@@ -2951,6 +2956,7 @@ impl CodexPane {
 
     pub fn cycle_approval(&mut self) {
         if self.kind == AgentKind::ClaudeCode {
+            let previous = self.claude_settings.permission_mode_choice();
             let value = self.claude_settings.cycle_permission_mode();
             self.action = Some(format!("permission: {value}"));
             self.push_activity(format!("Claude Code permission-mode を {value} に変更"));
@@ -2958,7 +2964,7 @@ impl CodexPane {
                 CodexLogKind::System,
                 format!("次回ターンの permission-mode: {value}"),
             );
-            self.push_claude_resident_permission_mode();
+            self.push_claude_resident_permission_mode(previous);
             return;
         }
         let value = self.exec_settings.cycle_approval();
@@ -2973,6 +2979,7 @@ impl CodexPane {
 
     /// ClaudeCode の permission-mode 設定（`/permissions <mode>`）。
     fn set_claude_permission_mode(&mut self, value: claude::ClaudePermissionMode) {
+        let previous = self.claude_settings.permission_mode_choice();
         let value = self.claude_settings.set_permission_mode(value);
         self.action = Some(format!("permission: {value}"));
         self.push_activity(format!("Claude Code permission-mode を {value} に変更"));
@@ -2980,7 +2987,7 @@ impl CodexPane {
             CodexLogKind::System,
             format!("次回ターンの permission-mode: {value}"),
         );
-        self.push_claude_resident_permission_mode();
+        self.push_claude_resident_permission_mode(previous);
     }
 
     fn set_approval(&mut self, value: CodexApprovalChoice) {
@@ -2999,7 +3006,7 @@ impl CodexPane {
         if self.kind == AgentKind::ClaudeCode {
             self.push_log(
                 CodexLogKind::System,
-                "Claude Code では権限は F4（permission-mode: config/plan/acceptEdits/dontAsk/bypassPermissions）で切り替えます。F5 のサンドボックス設定は使いません",
+                "Claude Code では権限は F4（permission-mode: config/plan/acceptEdits/dontAsk/bypassPermissions/skip-permissions）で切り替えます。F5 のサンドボックス設定は使いません",
             );
             return;
         }
@@ -3062,7 +3069,7 @@ impl CodexPane {
             } else {
                 self.push_log(
                     CodexLogKind::Error,
-                    "permission-mode は config / plan / acceptEdits / dontAsk / bypassPermissions を指定してください",
+                    "permission-mode は config / plan / acceptEdits / dontAsk / bypassPermissions / skip-permissions を指定してください",
                 );
             }
         } else if let Some(choice) = parse_approval_choice(args) {
@@ -4796,8 +4803,21 @@ impl CodexPane {
     }
 
     /// F4（permission-mode）を常駐プロセスへ set_permission_mode control_request で反映する。
-    fn push_claude_resident_permission_mode(&mut self) {
+    ///
+    /// `--dangerously-skip-permissions` は起動時フラグでランタイム切替できないため、この variant
+    /// へ/から切り替えた場合は control_request を送らず `claude_resident_restart_pending` を立てて
+    /// 次のアイドルで常駐プロセスを再起動させる（`previous` は切替前のモード）。
+    fn push_claude_resident_permission_mode(&mut self, previous: claude::ClaudePermissionMode) {
         if self.claude_resident.is_none() {
+            return;
+        }
+        let current = self.claude_settings.permission_mode_choice();
+        if current.is_dangerously_skip() || previous.is_dangerously_skip() {
+            self.claude_resident_restart_pending = true;
+            self.push_log(
+                CodexLogKind::System,
+                "skip-permissions は起動時フラグのため、常駐プロセスを次のアイドルで再起動して反映します",
+            );
             return;
         }
         let Some(mode) = self
@@ -8057,7 +8077,7 @@ impl CodexPane {
             } else {
                 self.push_log(
                     CodexLogKind::Error,
-                    "permissions は config / plan / acceptEdits / dontAsk / bypassPermissions を指定してください",
+                    "permissions は config / plan / acceptEdits / dontAsk / bypassPermissions / skip-permissions を指定してください",
                 );
             }
             return;
@@ -9584,7 +9604,7 @@ Claude Code sessions:
   /fork-last [prompt], /fork-session <N|id> [prompt] - fork a session directly
 Claude Code options for next turn:
   /settings, /cd <dir>, /model [name|config], /reasoning|/effort [level]
-  /permissions|/approval [mode] - permission-mode: config/plan/acceptEdits/dontAsk/bypassPermissions
+  /permissions|/approval [mode] - permission-mode: config/plan/acceptEdits/dontAsk/bypassPermissions/skip-permissions
   /add-dir <path|list|clear>
 TUI helpers:
   /goal <目標>, /goal pause, /goal resume, /goal clear
@@ -12624,6 +12644,24 @@ mod tests {
             "request_id": request_id,
             "request": {"subtype": "can_use_tool", "tool_name": tool, "input": input}
         })
+    }
+
+    #[test]
+    fn claude_resident_skip_permissions_switch_sets_restart_pending() {
+        let mut pane = claude_resident_pane();
+        if !with_dummy_resident(&mut pane) {
+            return;
+        }
+        // 他モード（acceptEdits）へ切替はランタイム反映のため再起動は立たない。
+        pane.set_claude_permission_mode(claude::ClaudePermissionMode::AcceptEdits);
+        assert!(!pane.claude_resident_restart_pending);
+        // acceptEdits → skip-permissions は起動時フラグなので再起動保留が立つ。
+        pane.set_claude_permission_mode(claude::ClaudePermissionMode::DangerouslySkipPermissions);
+        assert!(pane.claude_resident_restart_pending);
+        // 保留をクリアし、skip-permissions → 他モードの逆方向でも再起動保留が立つ。
+        pane.claude_resident_restart_pending = false;
+        pane.set_claude_permission_mode(claude::ClaudePermissionMode::Plan);
+        assert!(pane.claude_resident_restart_pending);
     }
 
     #[test]
@@ -16382,7 +16420,8 @@ mod tests {
                 "plan",
                 "acceptEdits",
                 "dontAsk",
-                "bypassPermissions"
+                "bypassPermissions",
+                "skip-permissions（危険・全許可）"
             ]
         );
         pane.move_list_picker_selection(1); // config -> plan

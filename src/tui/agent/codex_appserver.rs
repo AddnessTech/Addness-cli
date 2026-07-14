@@ -1294,4 +1294,173 @@ mod tests {
             .unwrap_or(false);
         assert!(!alive, "drop 後も子プロセスが生存している");
     }
+
+    // -----------------------------------------------------------------------
+    // 上流プローブ（#[ignore]・実 codex バイナリ相手）
+    //
+    // 通常の `cargo test` では走らない。CI の upstream-sync が新バージョンの実
+    // バイナリをインストールした上で `--ignored` 付きで実行し、チェンジログに
+    // 現れない統合サーフェスの破壊的変更（例: 0.142.5 の `jsonrpc` フィールド欠落）を
+    // 実測検知する。ローカル実行: `cargo test upstream_probe_ -- --ignored`。
+    // バイナリは `ADDNESS_PROBE_CODEX_BIN`（未設定時 `codex`）で差し替え可能。
+    // -----------------------------------------------------------------------
+
+    /// プローブ対象の codex バイナリ。`ADDNESS_PROBE_CODEX_BIN` 優先、無ければ `codex`。
+    fn probe_codex_bin() -> String {
+        std::env::var("ADDNESS_PROBE_CODEX_BIN").unwrap_or_else(|_| "codex".to_string())
+    }
+
+    /// パニック時も子プロセスを確実に kill + wait するためのガード。
+    struct ProbeChildGuard(std::process::Child);
+    impl Drop for ProbeChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// 実 `codex app-server` を spawn して initialize ハンドシェイクを実測する。
+    /// stdout の読み取りは別スレッド + mpsc + recv_timeout で行い、本スレッドを
+    /// ハングさせない。応答（`Response { id: 1, .. }`）が来るまで通知行を読み飛ばす。
+    #[test]
+    #[ignore = "実 codex バイナリが必要（CI の upstream-sync が --ignored で実行）"]
+    fn upstream_probe_codex_appserver_handshake() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let bin = probe_codex_bin();
+        let child = std::process::Command::new(&bin)
+            .arg("app-server")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap_or_else(|e| panic!("codex app-server の起動に失敗しました（bin={bin}）: {e}"));
+        let mut child = ProbeChildGuard(child);
+
+        let mut stdin = child.0.stdin.take().expect("app-server stdin");
+        let stdout = child.0.stdout.take().expect("app-server stdout");
+
+        // stdout を別スレッドで 1 行ずつ読み、mpsc へ流す（本スレッドをハングさせない）。
+        let (tx, rx) = mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break, // EOF
+                    Ok(_) => {
+                        if tx.send(line.clone()).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // initialize リクエストを stdin へ送る（auth 不要な範囲に留める）。
+        let req = initialize_request(1, "addness-probe", env!("CARGO_PKG_VERSION"));
+        let payload = serde_json::to_string(&req).expect("initialize をシリアライズできません");
+        (|| -> std::io::Result<()> {
+            stdin.write_all(payload.as_bytes())?;
+            stdin.write_all(b"\n")?;
+            stdin.flush()
+        })()
+        .expect("initialize リクエストの送信に失敗しました");
+
+        // 応答行を最大10秒待つ。通知（method 持ち）が先行しうるので最大10行読み飛ばす。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut got_response = false;
+        for _ in 0..10 {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let Ok(line) = rx.recv_timeout(remaining) else {
+                break; // タイムアウト or 送信側切断
+            };
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(trimmed).unwrap_or_else(|e| {
+                panic!("app-server 出力が JSON ではありません: {trimmed:?}（{e}）")
+            });
+            assert!(
+                looks_like_jsonrpc(&value),
+                "app-server 出力が JSON-RPC 形に見えません: {trimmed}"
+            );
+            match parse_message(&value) {
+                Some(ServerMessage::Response { id: 1, error, .. }) => {
+                    assert!(
+                        error.is_none(),
+                        "initialize が JSON-RPC エラーを返しました: {error:?}"
+                    );
+                    got_response = true;
+                    break;
+                }
+                // 通知・サーバ発リクエストなどは Response が来るまで読み飛ばす。
+                _ => continue,
+            }
+        }
+
+        drop(stdin); // stdin をクローズ（reader スレッドは kill 後の EOF で終了する）。
+        assert!(
+            got_response,
+            "10秒以内に initialize の Response(id=1) を受信できませんでした（bin={bin}）"
+        );
+        // child は ProbeChildGuard の Drop で kill + wait される。
+    }
+
+    /// 実 `codex exec --help` / `codex --help` に、本リポジトリがワンショット/常駐で
+    /// 渡すサブコマンド・フラグが存在することを確認する（`codex.rs` の引数ビルダー由来）。
+    #[test]
+    #[ignore = "実 codex バイナリが必要（CI の upstream-sync が --ignored で実行）"]
+    fn upstream_probe_codex_cli_flags() {
+        let bin = probe_codex_bin();
+        let exec_help = probe_help(&bin, &["exec", "--help"]);
+        let root_help = probe_help(&bin, &["--help"]);
+        let combined = format!("{exec_help}\n{root_help}");
+
+        // codex_exec_args / codex_exec_resume_args / push_global_exec_settings /
+        // push_optional_exec_settings が組み立てるサブコマンド・フラグ。
+        const REQUIRED: &[&str] = &[
+            "exec",                                       // exec サブコマンド
+            "resume",                                     // exec resume サブコマンド
+            "--json",                                     // イベントを JSON Lines で受信
+            "--model",                                    // -m モデル指定
+            "--sandbox",                                  // -s サンドボックス
+            "--image",                                    // -i 画像入力
+            "--color",                                    // カラー出力
+            "--cd",                                       // -C 作業ディレクトリ
+            "--add-dir",                                  // 書込許可ディレクトリ追加
+            "--config",              // -c key=value（developer_instructions 等）
+            "--ask-for-approval",    // -a 承認ポリシー
+            "--search",              // Web 検索
+            "--skip-git-repo-check", // git リポジトリ外での実行
+            "--ignore-user-config",  // ユーザ設定を無視
+            "--dangerously-bypass-approvals-and-sandbox", // 承認/サンドボックス全バイパス
+        ];
+        let missing: Vec<&str> = REQUIRED
+            .iter()
+            .copied()
+            .filter(|flag| !combined.contains(flag))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "codex help に存在しないフラグ/サブコマンド: {missing:?}（bin={bin}）"
+        );
+    }
+
+    /// 指定バイナリを与えた引数で実行し、stdout+stderr を連結して返す（help 取得用）。
+    fn probe_help(bin: &str, args: &[&str]) -> String {
+        let output = std::process::Command::new(bin)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("{bin} {args:?} の実行に失敗しました: {e}"));
+        let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
+        text
+    }
 }

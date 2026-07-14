@@ -1488,4 +1488,55 @@ mod tests {
         });
         assert!(first_user_text(&value).is_none());
     }
+
+    // -----------------------------------------------------------------------
+    // 上流プローブ（#[ignore]・実 claude バイナリ相手）
+    //
+    // 通常の `cargo test` では走らない。CI の upstream-sync が新バージョンの実
+    // バイナリをインストールした上で `--ignored` 付きで実行し、チェンジログに
+    // 現れないフラグの改名・廃止を実測検知する。
+    // ローカル実行: `cargo test upstream_probe_ -- --ignored`。
+    // バイナリは `ADDNESS_PROBE_CLAUDE_BIN`（未設定時 `claude`）で差し替え可能。
+    // -----------------------------------------------------------------------
+
+    /// 実 `claude --help` に、本リポジトリが `resident_args` / `exec_args` で渡す
+    /// フラグが存在することを確認する。
+    #[test]
+    #[ignore = "実 claude バイナリが必要（CI の upstream-sync が --ignored で実行）"]
+    fn upstream_probe_claude_cli_flags() {
+        let bin =
+            std::env::var("ADDNESS_PROBE_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
+        let output = std::process::Command::new(&bin)
+            .arg("--help")
+            .output()
+            .unwrap_or_else(|e| panic!("{bin} --help の実行に失敗しました: {e}"));
+        let mut help = String::from_utf8_lossy(&output.stdout).into_owned();
+        help.push_str(&String::from_utf8_lossy(&output.stderr));
+
+        // resident_args / exec_args / push_* ヘルパが渡すフラグ。
+        // 隠しフラグ（--permission-prompt-tool）は help に出ないため対象外。
+        const REQUIRED: &[&str] = &[
+            "--print",                    // -p 非対話モード
+            "--output-format",            // stream-json 出力
+            "--input-format",             // 常駐（双方向）stream-json 入力
+            "--include-partial-messages", // トークン単位ストリーミング
+            "--verbose",                  // stream-json 全イベント出力
+            "--permission-mode",          // 権限モード
+            "--resume",                   // セッション継続
+            "--fork-session",             // resume 時のセッション複製
+            "--model",                    // モデル指定
+            "--effort",                   // effort 指定
+            "--add-dir",                  // 書込許可ディレクトリ追加
+            "--append-system-prompt",     // Addness 手順注入
+        ];
+        let missing: Vec<&str> = REQUIRED
+            .iter()
+            .copied()
+            .filter(|flag| !help.contains(flag))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "claude --help に存在しないフラグ: {missing:?}（bin={bin}）"
+        );
+    }
 }

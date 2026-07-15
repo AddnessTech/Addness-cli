@@ -12,8 +12,8 @@ use crate::config::{Credentials, DEFAULT_API_URL, Settings};
 use api::ApiClient;
 use cli::commands::{
     activity, assignment, chat, comment, configure, deliverable, detect, diagnosis, goal,
-    invitation, invoice, issue, kpi, link, login, media, member, notification, org, referral,
-    search, sharetree, skills, streak, summary, today, update, user,
+    invitation, invoice, issue, kpi, link, login, media, member, notification, org, personal,
+    referral, search, sharetree, skills, streak, summary, today, update, user,
 };
 
 #[derive(Parser)]
@@ -182,6 +182,11 @@ enum Commands {
         #[command(subcommand)]
         command: media::MediaCommands,
     },
+    /// Manage your personal space (now/today docs, Markdown editing, agent sessions, projects)
+    Personal {
+        #[command(subcommand)]
+        command: personal::PersonalCommands,
+    },
     /// Detect goal ID from current git branch name
     DetectGoal {
         /// Output as JSON
@@ -224,6 +229,7 @@ fn command_outputs_json(command: &Commands) -> bool {
         Commands::Invoice { command } => invoice_outputs_json(command),
         Commands::ShareTree { command } => sharetree_outputs_json(command),
         Commands::Media { command } => media_outputs_json(command),
+        Commands::Personal { command } => personal_outputs_json(command),
         Commands::Org { command } => org_outputs_json(command),
         Commands::Goal { command } => goal_outputs_json(command),
         Commands::Comment { command } => comment_outputs_json(command),
@@ -374,6 +380,38 @@ fn media_outputs_json(command: &media::MediaCommands) -> bool {
         media::MediaCommands::View { json, .. } | media::MediaCommands::Upload { json, .. } => {
             *json
         }
+    }
+}
+
+fn personal_outputs_json(command: &personal::PersonalCommands) -> bool {
+    match command {
+        personal::PersonalCommands::Now { json }
+        | personal::PersonalCommands::Today { json, .. }
+        | personal::PersonalCommands::TodayAppend { json, .. }
+        | personal::PersonalCommands::Day { json, .. }
+        | personal::PersonalCommands::TextPatch { json, .. }
+        | personal::PersonalCommands::EnsureOrganization { json } => *json,
+        personal::PersonalCommands::Reset { json, force } => *json && *force,
+        personal::PersonalCommands::Markdown { command } => match command {
+            personal::MarkdownCommands::Analyze { json, .. }
+            | personal::MarkdownCommands::ReplaceSection { json, .. }
+            | personal::MarkdownCommands::UpsertSection { json, .. }
+            | personal::MarkdownCommands::UpsertListItem { json, .. }
+            | personal::MarkdownCommands::ReplaceDocument { json, .. }
+            | personal::MarkdownCommands::AppendLogEntry { json, .. } => *json,
+        },
+        personal::PersonalCommands::AgentSession { command } => match command {
+            personal::AgentSessionCommands::List { json, .. }
+            | personal::AgentSessionCommands::Create { json, .. }
+            | personal::AgentSessionCommands::Get { json, .. }
+            | personal::AgentSessionCommands::Update { json, .. } => *json,
+        },
+        personal::PersonalCommands::Project { command } => match command {
+            personal::ProjectCommands::List { json, .. }
+            | personal::ProjectCommands::Create { json, .. }
+            | personal::ProjectCommands::Get { json, .. }
+            | personal::ProjectCommands::Update { json, .. } => *json,
+        },
     }
 }
 
@@ -785,6 +823,10 @@ async fn main() -> Result<()> {
         Some(Commands::Media { command }) => {
             let client = build_client()?;
             media::handle_media(command, &client).await
+        }
+        Some(Commands::Personal { command }) => {
+            let client = build_client()?;
+            personal::handle_personal(command, &client).await
         }
         Some(Commands::DetectGoal { json }) => detect::handle_detect_goal(*json),
         Some(Commands::Update { check }) => update::handle_update(*check).await,

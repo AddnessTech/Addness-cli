@@ -3751,6 +3751,9 @@ fn codex_header_lines(pane: &CodexPane, max_width: usize, max_rows: usize) -> Ve
     if pane.collapsed_turn_count() > 0 {
         parts.push(format!("格納{}", pane.collapsed_turn_count()));
     }
+    if pane.subagent_running_count() > 0 {
+        parts.push(format!("Sub:{}", pane.subagent_running_count()));
+    }
     if pane.diff_view().is_some() {
         parts.push("差分表示中".to_string());
     }
@@ -5194,6 +5197,30 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
             )));
         }
     }
+    // サブエージェント稼働状況（Claude Code の Task/Agent ツール起動）。
+    // 実行中件数の集計行 + 実行中を優先した各エージェントの行を、パネル高さに応じて表示する。
+    let subagent_running = pane.subagent_running_count();
+    let subagent_visible = codex_subagent_visible_count(area.height);
+    let subagent_lines = pane.subagent_status_lines(subagent_visible);
+    if !subagent_lines.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("サブエージェント ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(
+                format!("{subagent_running}体稼働中"),
+                if subagent_running > 0 {
+                    Style::default().fg(COLOR_WARN)
+                } else {
+                    Style::default().fg(COLOR_MUTED)
+                },
+            ),
+        ]));
+        for label in &subagent_lines {
+            lines.push(Line::from(Span::styled(
+                ellipsize_width(&format!("  {label}"), prompt_width),
+                Style::default().fg(COLOR_MUTED),
+            )));
+        }
+    }
     // 実行中コマンドのライブ出力（末尾最大3行）を薄色ブロックで添える。
     // コマンド完了で消え、確定した Tool 行だけがログに残る。
     let live_output = pane.codex_appserver_live_output();
@@ -5257,6 +5284,19 @@ fn codex_recent_action_visible_count(height: u16) -> usize {
         9..=10 => 2,
         11..=13 => 3,
         14..=17 => 4,
+        _ => 5,
+    }
+}
+
+/// パネル高さに応じて、状態パネルに表示するサブエージェント一覧の件数を決める。
+/// `codex_recent_action_visible_count` と同じ段階を踏むが、直近アクションの後に追加される
+/// セクションのため、低い高さではより控えめ（1 件から）に出す。
+fn codex_subagent_visible_count(height: u16) -> usize {
+    match height {
+        0..=8 => 0,
+        9..=10 => 1,
+        11..=13 => 2,
+        14..=17 => 3,
         _ => 5,
     }
 }
@@ -5384,9 +5424,9 @@ mod tests {
         codex_decision_choice_line, codex_decision_input_lines, codex_decision_title_hint,
         codex_diff_lines, codex_header_line, codex_header_lines, codex_input_prompt_render,
         codex_log_entry_lines, codex_log_lines, codex_markdown_styles,
-        codex_recent_action_visible_count, codex_runtime_status, codex_visible_log_lines,
-        codex_work_label, draw_status_bar, ellipsize_width, markdown, prompt_preview,
-        run_spinner_glyph, summarize_tool_display_text,
+        codex_recent_action_visible_count, codex_runtime_status, codex_subagent_visible_count,
+        codex_visible_log_lines, codex_work_label, draw_status_bar, ellipsize_width, markdown,
+        prompt_preview, run_spinner_glyph, summarize_tool_display_text,
     };
     use crate::api::ApiClient;
     use crate::tui::agent::{
@@ -6073,6 +6113,37 @@ mod tests {
         assert_eq!(codex_recent_action_visible_count(17), 4);
         assert_eq!(codex_recent_action_visible_count(18), 5);
         assert_eq!(codex_recent_action_visible_count(u16::MAX), 5);
+    }
+
+    #[test]
+    fn codex_header_lines_show_running_subagent_count() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.test_add_running_subagent("調査タスク");
+        pane.test_add_running_subagent("実装タスク");
+
+        let text = line_text(&codex_header_line(&pane, 200));
+        assert!(text.contains("Sub:2"));
+    }
+
+    #[test]
+    fn codex_header_lines_omit_sub_count_when_no_subagent_running() {
+        let pane = CodexPane::test_with_output(8, 80, 0, "");
+        let text = line_text(&codex_header_line(&pane, 200));
+        assert!(!text.contains("Sub:"));
+    }
+
+    #[test]
+    fn codex_subagent_visible_count_scales_with_panel_height() {
+        assert_eq!(codex_subagent_visible_count(0), 0);
+        assert_eq!(codex_subagent_visible_count(8), 0);
+        assert_eq!(codex_subagent_visible_count(9), 1);
+        assert_eq!(codex_subagent_visible_count(10), 1);
+        assert_eq!(codex_subagent_visible_count(11), 2);
+        assert_eq!(codex_subagent_visible_count(13), 2);
+        assert_eq!(codex_subagent_visible_count(14), 3);
+        assert_eq!(codex_subagent_visible_count(17), 3);
+        assert_eq!(codex_subagent_visible_count(18), 5);
+        assert_eq!(codex_subagent_visible_count(u16::MAX), 5);
     }
 
     #[test]

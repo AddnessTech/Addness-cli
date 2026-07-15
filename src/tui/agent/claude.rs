@@ -619,7 +619,35 @@ pub(super) enum ClaudeBlock {
         summary: Option<String>,
         /// Edit/Write/MultiEdit のとき、色付き差分プレビュー用の apply_patch テキスト。
         edit_patch: Option<String>,
+        /// tool_use の `id`（対応する tool_result との紐付けに使う）。
+        id: Option<String>,
+        /// `Task` / `Agent` ツールならサブエージェント起動情報。
+        subagent: Option<SubagentLaunch>,
     },
+}
+
+/// `Task` / `Agent` ツール呼び出しから読み取ったサブエージェント起動情報。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SubagentLaunch {
+    /// 状態パネルに表示するラベル（description 優先、無ければ prompt / subagent_type）。
+    pub(super) label: String,
+    /// `subagent_type`（例: general-purpose, Explore 等）。
+    pub(super) agent_type: Option<String>,
+}
+
+/// tool_use の `name`/`input` から、サブエージェント起動（`Task`/`Agent`）を検知する。
+/// 対象外のツールは None。
+pub(super) fn subagent_launch(name: &str, input: &Value) -> Option<SubagentLaunch> {
+    if name != "Task" && name != "Agent" {
+        return None;
+    }
+    let str_field = |key: &str| input.get(key).and_then(Value::as_str).map(str::to_string);
+    let agent_type = str_field("subagent_type");
+    let label = str_field("description")
+        .or_else(|| str_field("prompt").map(|prompt| super::compact_one_line(&prompt, 80)))
+        .or_else(|| agent_type.clone())
+        .unwrap_or_else(|| name.to_string());
+    Some(SubagentLaunch { label, agent_type })
 }
 
 /// assistant イベントの content を順序どおりに分解する。
@@ -657,14 +685,18 @@ pub(super) fn assistant_blocks(value: &Value) -> Vec<ClaudeBlock> {
                     .and_then(Value::as_str)
                     .unwrap_or("tool")
                     .to_string();
+                let id = item.get("id").and_then(Value::as_str).map(str::to_string);
                 let input = item.get("input");
                 let summary = input.and_then(|input| tool_use_summary(&name, input));
                 let edit_patch =
                     input.and_then(|input| super::claude_edit_patch_text(&name, input));
+                let subagent = input.and_then(|input| subagent_launch(&name, input));
                 blocks.push(ClaudeBlock::ToolUse {
                     name,
                     summary,
                     edit_patch,
+                    id,
+                    subagent,
                 });
             }
             _ => {}
@@ -699,6 +731,8 @@ pub(super) fn tool_use_summary(name: &str, input: &Value) -> Option<String> {
 pub(super) struct ClaudeToolResult {
     pub(super) text: String,
     pub(super) is_error: bool,
+    /// 対応する tool_use の `id`（`tool_use_id`）。サブエージェント状態遷移の紐付けに使う。
+    pub(super) tool_use_id: Option<String>,
 }
 
 /// user イベントの tool_result ブロックを取り出す。
@@ -720,7 +754,15 @@ pub(super) fn tool_results(value: &Value) -> Vec<ClaudeToolResult> {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let text = tool_result_text(item.get("content"));
-        results.push(ClaudeToolResult { text, is_error });
+        let tool_use_id = item
+            .get("tool_use_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        results.push(ClaudeToolResult {
+            text,
+            is_error,
+            tool_use_id,
+        });
     }
     results
 }
@@ -1358,6 +1400,8 @@ mod tests {
                 name: "Bash".to_string(),
                 summary: Some("ls -la".to_string()),
                 edit_patch: None,
+                id: Some("t1".to_string()),
+                subagent: None,
             }
         );
         assert_eq!(
@@ -1369,8 +1413,62 @@ mod tests {
                 edit_patch: Some(
                     "EDIT *** Begin Patch\n*** Add File: /tmp/x.rs\n*** End Patch".to_string()
                 ),
+                id: Some("t2".to_string()),
+                subagent: None,
             }
         );
+    }
+
+    #[test]
+    fn assistant_blocks_task_tool_detected_as_subagent_launch() {
+        let value = json!({
+            "type": "assistant",
+            "message": {"content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_01",
+                    "name": "Task",
+                    "input": {
+                        "description": "stream-jsonイベント調査",
+                        "prompt": "detailed prompt...",
+                        "subagent_type": "Explore"
+                    }
+                }
+            ]}
+        });
+        let blocks = assistant_blocks(&value);
+        assert_eq!(
+            blocks[0],
+            ClaudeBlock::ToolUse {
+                name: "Task".to_string(),
+                summary: Some("stream-jsonイベント調査".to_string()),
+                edit_patch: None,
+                id: Some("toolu_01".to_string()),
+                subagent: Some(SubagentLaunch {
+                    label: "stream-jsonイベント調査".to_string(),
+                    agent_type: Some("Explore".to_string()),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn subagent_launch_ignores_non_task_agent_tools() {
+        let input = json!({"description": "何か", "subagent_type": "Explore"});
+        assert_eq!(subagent_launch("Bash", &input), None);
+    }
+
+    #[test]
+    fn subagent_launch_falls_back_to_prompt_then_subagent_type() {
+        let with_prompt =
+            json!({"prompt": "長いプロンプト本文", "subagent_type": "general-purpose"});
+        let launch = subagent_launch("Task", &with_prompt).expect("subagent launch");
+        assert_eq!(launch.label, "長いプロンプト本文");
+        assert_eq!(launch.agent_type.as_deref(), Some("general-purpose"));
+
+        let type_only = json!({"subagent_type": "general-purpose"});
+        let launch = subagent_launch("Agent", &type_only).expect("subagent launch");
+        assert_eq!(launch.label, "general-purpose");
     }
 
     #[test]
@@ -1385,6 +1483,7 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(results[0].is_error);
         assert_eq!(results[0].text, "boom");
+        assert_eq!(results[0].tool_use_id.as_deref(), Some("t1"));
     }
 
     #[test]

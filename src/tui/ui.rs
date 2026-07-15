@@ -2628,8 +2628,9 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
 
         let mut lines: Vec<Line> = Vec::new();
 
-        // 「いま参照/書込中」インジケータ（codex の操作をリアルタイム表示）
-        if let Some(action) = &pane.action {
+        // 「いま参照/書込中」インジケータ（codex の操作をリアルタイム表示）。
+        // ターン内の作業インジケータを優先し、なければ設定変更等の恒常メッセージを見せる。
+        if let Some(action) = pane.work_action().or_else(|| pane.status_note()) {
             lines.push(Line::from(Span::styled(
                 format!("» {action}"),
                 Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD),
@@ -4847,7 +4848,7 @@ fn codex_current_activity_label(pane: &CodexPane, max_width: usize) -> String {
                 "{spin} {}{elapsed}{live}{input_hint}",
                 codex_command_activity_summary(command)
             )
-        } else if let Some(action) = pane.action.as_deref() {
+        } else if let Some(action) = pane.work_action() {
             format!("{spin} 作業中: {action}{input_hint}")
         } else {
             format!(
@@ -4859,7 +4860,7 @@ fn codex_current_activity_label(pane: &CodexPane, max_width: usize) -> String {
         codex_work_label(
             pane.finished,
             pane.assessing,
-            pane.action.as_deref(),
+            pane.status_note(),
             pane.last_prompt(),
             max_width,
         )
@@ -5364,7 +5365,7 @@ fn elapsed_compact(t: Instant) -> String {
 fn codex_work_label(
     finished: bool,
     assessing: bool,
-    action: Option<&str>,
+    status_note: Option<&str>,
     last_prompt: Option<&str>,
     max_width: usize,
 ) -> String {
@@ -5374,8 +5375,8 @@ fn codex_work_label(
     if assessing {
         return ellipsize_width("DoD自動判定", max_width);
     }
-    if let Some(action) = action {
-        return ellipsize_width(action, max_width);
+    if let Some(note) = status_note {
+        return ellipsize_width(note, max_width);
     }
     if let Some(prompt) = last_prompt {
         return prompt_preview(&format!("依頼対応: {prompt}"), max_width);
@@ -5662,7 +5663,7 @@ mod tests {
     fn codex_header_lines_make_current_activity_primary() {
         let mut pane = CodexPane::test_with_output(8, 80, 0, "");
         pane.finished = false;
-        pane.action = Some("ファイルを確認中".to_string());
+        pane.set_status_note("ファイルを確認中");
 
         let lines = codex_header_lines(&pane, 120, 2)
             .iter()
@@ -6088,7 +6089,7 @@ mod tests {
     fn codex_runtime_status_shows_current_action() {
         let mut pane = CodexPane::test_with_output(8, 20, 0, "");
         pane.finished = false;
-        pane.action = Some("ゴール文脈を読込中".to_string());
+        pane.set_status_note("ゴール文脈を読込中");
 
         let status = codex_runtime_status(&pane, 80);
 
@@ -6165,7 +6166,7 @@ mod tests {
         let mut pane = CodexPane::test_with_output(8, 20, 0, "");
         pane.finished = false;
         pane.test_set_turn_running(true);
-        pane.action = Some("作業中".to_string());
+        pane.set_work_action("作業中");
 
         let label = codex_current_activity_label(&pane, 80);
         assert!(label.starts_with(run_spinner_glyph(0)));
@@ -6204,18 +6205,58 @@ mod tests {
     }
 
     #[test]
-    fn codex_work_label_prefers_action_over_last_prompt() {
+    fn codex_work_label_prefers_status_note_over_last_prompt() {
         assert_eq!(
-            codex_work_label(false, false, Some("ゴールを更新中"), Some("実装して"), 80),
-            "ゴールを更新中"
+            codex_work_label(false, false, Some("model: gpt-5"), Some("実装して"), 80),
+            "model: gpt-5"
         );
     }
 
     #[test]
-    fn codex_work_label_uses_last_prompt_when_no_action() {
+    fn codex_work_label_uses_last_prompt_when_no_status_note() {
         let label = codex_work_label(false, false, None, Some("この不具合を直して"), 80);
 
         assert_eq!(label, "依頼対応: この不具合を直して");
+    }
+
+    #[test]
+    fn codex_current_activity_label_falls_back_command_then_work_action_then_generic() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.finished = false;
+        pane.test_set_turn_running(true);
+
+        // work_action も current_command も無い → 汎用文言。
+        let generic = codex_current_activity_label(&pane, 120);
+        assert!(generic.contains("考えています"), "label={generic}");
+
+        // work_action があればそれを使う。
+        pane.set_work_action("ツール実行: Bash");
+        let with_action = codex_current_activity_label(&pane, 120);
+        assert!(
+            with_action.contains("作業中: ツール実行: Bash"),
+            "label={with_action}"
+        );
+
+        // current_command があれば work_action より優先する。
+        pane.test_set_current_command("cargo test");
+        let with_command = codex_current_activity_label(&pane, 120);
+        assert!(
+            with_command.contains("テストを実行中"),
+            "label={with_command}"
+        );
+        assert!(!with_command.contains("作業中:"), "label={with_command}");
+    }
+
+    #[test]
+    fn codex_current_activity_label_uses_status_note_when_idle() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.finished = false;
+        pane.set_status_note("model: gpt-5");
+        // 実行中に残った作業インジケータがあっても、非実行中の表示には使わない。
+        pane.set_work_action("ツール実行: Bash");
+
+        let label = codex_current_activity_label(&pane, 120);
+        assert_eq!(label, "model: gpt-5");
     }
 
     #[test]

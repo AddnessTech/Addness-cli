@@ -18,7 +18,7 @@ pub use activity::{
 };
 pub use comment::ListCommentsParams;
 pub use notification::ListNotificationsParams;
-pub use org::CreateOrganizationParams;
+pub use org::{CreateOrganizationParams, ListAllOrganizationsParams};
 pub use user::ListUsersParams;
 
 use anyhow::{Context, Result};

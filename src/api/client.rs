@@ -1,9 +1,11 @@
 mod activity;
+mod api_key;
 mod assignment;
 mod chat;
 mod codex_job;
 mod comment;
 mod deliverable;
+mod desktop_auth;
 mod diagnosis;
 mod goal;
 mod goal_execution;

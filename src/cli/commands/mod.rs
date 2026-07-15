@@ -1,10 +1,12 @@
 pub mod activity;
+pub mod api_key;
 pub mod assignment;
 pub mod chat;
 pub mod codex_job;
 pub mod comment;
 pub mod configure;
 pub mod deliverable;
+pub mod desktop_auth;
 pub mod detect;
 pub mod diagnosis;
 pub mod execution;

@@ -1,9 +1,11 @@
 mod activity;
+mod api_key;
 mod assignment;
 mod chat;
 mod codex_job;
 mod comment;
 mod deliverable;
+mod desktop_auth;
 mod diagnosis;
 mod goal;
 mod goal_execution;
@@ -27,11 +29,13 @@ mod tool;
 mod user;
 
 pub use activity::*;
+pub use api_key::*;
 pub use assignment::*;
 pub use chat::*;
 pub use codex_job::*;
 pub use comment::*;
 pub use deliverable::*;
+pub use desktop_auth::*;
 pub use diagnosis::*;
 pub use goal::*;
 pub use goal_execution::*;

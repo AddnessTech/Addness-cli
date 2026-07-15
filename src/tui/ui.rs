@@ -3751,6 +3751,9 @@ fn codex_header_lines(pane: &CodexPane, max_width: usize, max_rows: usize) -> Ve
     if pane.collapsed_turn_count() > 0 {
         parts.push(format!("格納{}", pane.collapsed_turn_count()));
     }
+    if pane.subagent_running_count() > 0 {
+        parts.push(format!("Sub:{}", pane.subagent_running_count()));
+    }
     if pane.diff_view().is_some() {
         parts.push("差分表示中".to_string());
     }
@@ -5176,6 +5179,48 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
             Span::styled(assistant, assistant_style),
         ]));
     }
+    // 直近アクション履歴（パンくず）。「今」は最新 1 件しか見せないため、コマンドが高速連続
+    // 実行されると途中のアクションが一瞬で上書きされ見逃される。パネル高さに応じて件数を絞って
+    // 直近 N 件を古い順に添える。
+    let recent_actions = pane.recent_action_breadcrumbs();
+    let recent_actions_visible = codex_recent_action_visible_count(area.height);
+    if recent_actions_visible > 0 && !recent_actions.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "直近",
+            Style::default().fg(COLOR_MUTED),
+        )));
+        let start = recent_actions.len().saturating_sub(recent_actions_visible);
+        for label in &recent_actions[start..] {
+            lines.push(Line::from(Span::styled(
+                ellipsize_width(&format!("  {label}"), prompt_width),
+                Style::default().fg(COLOR_MUTED),
+            )));
+        }
+    }
+    // サブエージェント稼働状況（Claude Code の Task/Agent ツール起動）。
+    // 実行中件数の集計行 + 実行中を優先した各エージェントの行を、パネル高さに応じて表示する。
+    let subagent_running = pane.subagent_running_count();
+    let subagent_visible = codex_subagent_visible_count(area.height);
+    let subagent_lines = pane.subagent_status_lines(subagent_visible);
+    if !subagent_lines.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("サブエージェント ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(
+                format!("{subagent_running}体稼働中"),
+                if subagent_running > 0 {
+                    Style::default().fg(COLOR_WARN)
+                } else {
+                    Style::default().fg(COLOR_MUTED)
+                },
+            ),
+        ]));
+        for label in &subagent_lines {
+            lines.push(Line::from(Span::styled(
+                ellipsize_width(&format!("  {label}"), prompt_width),
+                Style::default().fg(COLOR_MUTED),
+            )));
+        }
+    }
     // 実行中コマンドのライブ出力（末尾最大3行）を薄色ブロックで添える。
     // コマンド完了で消え、確定した Tool 行だけがログに残る。
     let live_output = pane.codex_appserver_live_output();
@@ -5226,6 +5271,34 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
         )
         .wrap(ratatui::widgets::Wrap { trim: true });
     frame.render_widget(panel, area);
+}
+
+/// パネル高さに応じて、状態パネルに表示する直近アクションパンくずの件数を決める。
+/// 実際の呼び出し元（draw 関数）ではパネル高さは 8/10/12 の 3 段階（`chunks[0].height` に応じて
+/// 選ばれる）が中心のため、その範囲では 0〜3 件に絞り、他の固定セクション（状態/表示/記憶/同期/
+/// 設定やショートカット等）を圧迫しないようにする。将来パネルがより高くなった場合は最大 5 件
+/// （リングバッファの保持上限 `RECENT_ACTIONS_CAP`）まで増やす。
+fn codex_recent_action_visible_count(height: u16) -> usize {
+    match height {
+        0..=8 => 0,
+        9..=10 => 2,
+        11..=13 => 3,
+        14..=17 => 4,
+        _ => 5,
+    }
+}
+
+/// パネル高さに応じて、状態パネルに表示するサブエージェント一覧の件数を決める。
+/// `codex_recent_action_visible_count` と同じ段階を踏むが、直近アクションの後に追加される
+/// セクションのため、低い高さではより控えめ（1 件から）に出す。
+fn codex_subagent_visible_count(height: u16) -> usize {
+    match height {
+        0..=8 => 0,
+        9..=10 => 1,
+        11..=13 => 2,
+        14..=17 => 3,
+        _ => 5,
+    }
 }
 
 fn codex_dashboard_shortcut_lines(max_width: usize) -> Vec<Line<'static>> {
@@ -5350,7 +5423,8 @@ mod tests {
         codex_child_goal_lines, codex_current_activity_label, codex_dashboard_shortcut_lines,
         codex_decision_choice_line, codex_decision_input_lines, codex_decision_title_hint,
         codex_diff_lines, codex_header_line, codex_header_lines, codex_input_prompt_render,
-        codex_log_entry_lines, codex_log_lines, codex_markdown_styles, codex_runtime_status,
+        codex_log_entry_lines, codex_log_lines, codex_markdown_styles,
+        codex_recent_action_visible_count, codex_runtime_status, codex_subagent_visible_count,
         codex_visible_log_lines, codex_work_label, draw_status_bar, ellipsize_width, markdown,
         prompt_preview, run_spinner_glyph, summarize_tool_display_text,
     };
@@ -6021,6 +6095,55 @@ mod tests {
         assert!(status.contains("入力待ち"));
         assert!(status.contains("表示:会話"));
         assert!(status.contains("ゴール文脈を読込中"));
+    }
+
+    #[test]
+    fn codex_recent_action_visible_count_scales_with_panel_height() {
+        // パネルが低いときは直近アクションのパンくずを表示せず、他の固定セクションを圧迫しない。
+        assert_eq!(codex_recent_action_visible_count(0), 0);
+        assert_eq!(codex_recent_action_visible_count(8), 0);
+        // 実際の呼び出し元で使われる高さ（8/10/12）では 0〜3 件に収まる。
+        assert_eq!(codex_recent_action_visible_count(9), 2);
+        assert_eq!(codex_recent_action_visible_count(10), 2);
+        assert_eq!(codex_recent_action_visible_count(11), 3);
+        assert_eq!(codex_recent_action_visible_count(12), 3);
+        assert_eq!(codex_recent_action_visible_count(13), 3);
+        // 高さが増えるにつれ、リングバッファの保持上限 5 件まで段階的に表示件数を増やす。
+        assert_eq!(codex_recent_action_visible_count(14), 4);
+        assert_eq!(codex_recent_action_visible_count(17), 4);
+        assert_eq!(codex_recent_action_visible_count(18), 5);
+        assert_eq!(codex_recent_action_visible_count(u16::MAX), 5);
+    }
+
+    #[test]
+    fn codex_header_lines_show_running_subagent_count() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.test_add_running_subagent("調査タスク");
+        pane.test_add_running_subagent("実装タスク");
+
+        let text = line_text(&codex_header_line(&pane, 200));
+        assert!(text.contains("Sub:2"));
+    }
+
+    #[test]
+    fn codex_header_lines_omit_sub_count_when_no_subagent_running() {
+        let pane = CodexPane::test_with_output(8, 80, 0, "");
+        let text = line_text(&codex_header_line(&pane, 200));
+        assert!(!text.contains("Sub:"));
+    }
+
+    #[test]
+    fn codex_subagent_visible_count_scales_with_panel_height() {
+        assert_eq!(codex_subagent_visible_count(0), 0);
+        assert_eq!(codex_subagent_visible_count(8), 0);
+        assert_eq!(codex_subagent_visible_count(9), 1);
+        assert_eq!(codex_subagent_visible_count(10), 1);
+        assert_eq!(codex_subagent_visible_count(11), 2);
+        assert_eq!(codex_subagent_visible_count(13), 2);
+        assert_eq!(codex_subagent_visible_count(14), 3);
+        assert_eq!(codex_subagent_visible_count(17), 3);
+        assert_eq!(codex_subagent_visible_count(18), 5);
+        assert_eq!(codex_subagent_visible_count(u16::MAX), 5);
     }
 
     #[test]

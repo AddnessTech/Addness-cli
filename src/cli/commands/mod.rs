@@ -1,4 +1,5 @@
 pub mod activity;
+pub mod api_key;
 pub mod assignment;
 pub mod chat;
 pub mod codex_job;

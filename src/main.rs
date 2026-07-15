@@ -87,7 +87,7 @@ enum Commands {
         #[command(subcommand)]
         command: member::MemberCommands,
     },
-    /// Send Codex work notifications via goal comments and terminal notices
+    /// Send notifications, manage read status, and manage subscription channels
     Notification {
         #[command(subcommand)]
         command: notification::NotificationCommands,
@@ -263,7 +263,19 @@ fn member_outputs_json(command: &member::MemberCommands) -> bool {
 
 fn notification_outputs_json(command: &notification::NotificationCommands) -> bool {
     match command {
-        notification::NotificationCommands::Send { json, .. } => *json,
+        notification::NotificationCommands::Send { json, .. }
+        | notification::NotificationCommands::List { json, .. }
+        | notification::NotificationCommands::Count { json, .. }
+        | notification::NotificationCommands::CountsByGoal { json, .. }
+        | notification::NotificationCommands::MarkRead { json, .. }
+        | notification::NotificationCommands::MarkUnread { json, .. }
+        | notification::NotificationCommands::MarkAllRead { json, .. } => *json,
+        notification::NotificationCommands::Subscription { command } => match command {
+            notification::SubscriptionCommands::List { json }
+            | notification::SubscriptionCommands::Add { json, .. }
+            | notification::SubscriptionCommands::Update { json, .. }
+            | notification::SubscriptionCommands::EmailDestinations { json } => *json,
+        },
     }
 }
 

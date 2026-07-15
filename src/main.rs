@@ -12,7 +12,7 @@ use crate::config::{Credentials, DEFAULT_API_URL, Settings};
 use api::ApiClient;
 use cli::commands::{
     activity, assignment, comment, configure, deliverable, detect, goal, invitation, kpi, link,
-    login, member, notification, org, skills, streak, summary, today, update,
+    login, member, notification, org, skills, streak, summary, today, update, user,
 };
 
 #[derive(Parser)]
@@ -86,6 +86,11 @@ enum Commands {
     Member {
         #[command(subcommand)]
         command: member::MemberCommands,
+    },
+    /// Manage your Addness user profile, settings, and account
+    User {
+        #[command(subcommand)]
+        command: user::UserCommands,
     },
     /// Send notifications, manage read status, and manage subscription channels
     Notification {
@@ -168,6 +173,7 @@ fn command_outputs_json(command: &Commands) -> bool {
         Commands::Assignment { command } => assignment_outputs_json(command),
         Commands::Kpi { command } => kpi_outputs_json(command),
         Commands::Member { command } => member_outputs_json(command),
+        Commands::User { command } => user_outputs_json(command),
         Commands::Notification { command } => notification_outputs_json(command),
         Commands::Invitation { command } => invitation_outputs_json(command),
         Commands::Activity { command } => activity_outputs_json(command),
@@ -276,6 +282,22 @@ fn kpi_outputs_json(command: &kpi::KpiCommands) -> bool {
 
 fn member_outputs_json(command: &member::MemberCommands) -> bool {
     matches!(command, member::MemberCommands::List { json: true, .. })
+}
+
+fn user_outputs_json(command: &user::UserCommands) -> bool {
+    match command {
+        user::UserCommands::Me { json }
+        | user::UserCommands::Get { json, .. }
+        | user::UserCommands::Update { json, .. }
+        | user::UserCommands::List { json, .. }
+        | user::UserCommands::Create { json, .. }
+        | user::UserCommands::Memberships { json } => *json,
+        user::UserCommands::Rm { .. } => false,
+        user::UserCommands::Settings { command } => match command {
+            user::UserSettingsCommands::Get { json }
+            | user::UserSettingsCommands::Update { json, .. } => *json,
+        },
+    }
 }
 
 fn notification_outputs_json(command: &notification::NotificationCommands) -> bool {
@@ -445,6 +467,10 @@ async fn main() -> Result<()> {
         Some(Commands::Member { command }) => {
             let client = build_client()?;
             member::handle_member(command, &client).await
+        }
+        Some(Commands::User { command }) => {
+            let client = build_client()?;
+            user::handle_user(command, &client).await
         }
         Some(Commands::Notification { command }) => {
             let client = build_client()?;

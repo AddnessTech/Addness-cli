@@ -1,5 +1,6 @@
 mod activity;
 mod assignment;
+mod chat;
 mod comment;
 mod deliverable;
 mod goal;
@@ -15,6 +16,7 @@ mod user;
 
 pub use activity::*;
 pub use assignment::*;
+pub use chat::*;
 pub use comment::*;
 pub use deliverable::*;
 pub use goal::*;

@@ -1,5 +1,6 @@
 mod activity;
 mod assignment;
+mod chat;
 mod comment;
 mod deliverable;
 mod goal;
@@ -17,6 +18,7 @@ pub use activity::{
     ActivityLogByGoalParams, ActivityLogByMemberParams, ActivityLogSummaryParams,
     GoalActivitySummaryParams,
 };
+pub use chat::{ChatMessageListParams, ChatRoomListParams, ChatSearchParams};
 pub use comment::{ListAllCommentsParams, ListCommentsParams};
 pub use issue::{GoalSectionListParams, IssueListParams};
 pub use member::BrowseMembersParams;
@@ -428,6 +430,12 @@ impl ApiClient {
     pub(super) async fn post_empty<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
         let (url, req) = self.request(Method::POST, path, true)?;
         self.send_json(req, &url).await
+    }
+
+    /// POST with no request body, expects 204 No Content response.
+    pub(super) async fn post_empty_no_content(&self, path: &str) -> Result<()> {
+        let (url, req) = self.request(Method::POST, path, true)?;
+        self.send_no_content(req, &url).await
     }
 
     /// PATCH with no request body, expects JSON response (used for resolve/unresolve).

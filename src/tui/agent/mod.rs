@@ -1114,6 +1114,47 @@ fn session_picker_items(
 /// 状態パネルに表示する直近アクション履歴の保持件数（パンくず表示用）。
 const RECENT_ACTIONS_CAP: usize = 5;
 
+/// 状態パネルに保持するサブエージェント（Claude Code の `Task`/`Agent` ツール起動）履歴の
+/// 保持件数上限。ターン跨ぎでも保持するため `RECENT_ACTIONS_CAP` より大きめに取る。
+const SUBAGENTS_CAP: usize = 20;
+
+/// サブエージェント 1 件の状態。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubagentState {
+    /// 起動済みで、対応する tool_result 未受信（実行中）。
+    Running,
+    /// tool_result を正常受信（完了）。
+    Completed,
+    /// tool_result がエラーだった（失敗）。
+    Failed,
+}
+
+impl SubagentState {
+    fn icon(self) -> &'static str {
+        match self {
+            SubagentState::Running => "●",
+            SubagentState::Completed => "✔",
+            SubagentState::Failed => "✖",
+        }
+    }
+}
+
+/// 状態パネルに表示する 1 件のサブエージェント起動情報。
+#[derive(Debug, Clone)]
+struct SubagentEntry {
+    /// 起動元 tool_use の `id`。対応する tool_result とのマッチングに使う。
+    tool_use_id: Option<String>,
+    /// 表示ラベル（description 優先）。
+    label: String,
+    /// `subagent_type`（Explore, general-purpose 等）。未取得なら None。
+    #[allow(dead_code)] // 現状は表示に使わないが、将来のフィルタ/集計向けに保持する。
+    agent_type: Option<String>,
+    state: SubagentState,
+    started_at: Instant,
+    /// 完了/失敗した時刻（経過時間表示の固定に使う）。実行中は None。
+    finished_at: Option<Instant>,
+}
+
 /// アクション種別（状態パネルのパンくずで先頭に付けるアイコンを決める）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecentActionKind {
@@ -1205,6 +1246,9 @@ pub struct CodexPane {
     recent_actions: VecDeque<RecentAction>,
     /// `recent_actions` に積んだ直近アクションの総数（ターン内通し番号の採番に使う）。
     recent_action_seq: u32,
+    /// Claude Code が `Task`/`Agent` ツールで起動したサブエージェントの履歴。
+    /// ターンが変わっても実行中エントリはクリアせず保持する（`clear_recent_actions` の対象外）。
+    subagents: VecDeque<SubagentEntry>,
     /// 実行中ターンの開始時刻。経過時間表示と完了時の所要時間算出に使う。
     turn_started_at: Option<Instant>,
     /// 直近に再描画へ反映した経過秒。秒表示が変わったフレームだけ再描画するために保持する。
@@ -1542,6 +1586,7 @@ impl CodexPane {
             current_command_started_at: None,
             recent_actions: VecDeque::new(),
             recent_action_seq: 0,
+            subagents: VecDeque::new(),
             turn_started_at: None,
             last_elapsed_tick_secs: None,
             child_process_label: None,
@@ -1809,6 +1854,12 @@ impl CodexPane {
         self.turn_running = running;
     }
 
+    /// テスト用: 実行中サブエージェントを直接積む（ui 側のヘッダ/状態パネル表示テストから使う）。
+    #[cfg(test)]
+    pub(crate) fn test_add_running_subagent(&mut self, label: &str) {
+        self.record_subagent_launch(None, label.to_string(), None);
+    }
+
     /// このペインのエージェントバックエンド種別。
     pub fn kind(&self) -> AgentKind {
         self.kind
@@ -1915,6 +1966,96 @@ impl CodexPane {
     #[cfg(test)]
     fn recent_actions_len(&self) -> usize {
         self.recent_actions.len()
+    }
+
+    /// サブエージェント起動（`Task`/`Agent` ツール）を「実行中」として記録する。
+    /// ターンをまたいでも保持するため `clear_recent_actions` の対象にはしない。
+    fn record_subagent_launch(
+        &mut self,
+        tool_use_id: Option<String>,
+        label: String,
+        agent_type: Option<String>,
+    ) {
+        self.subagents.push_back(SubagentEntry {
+            tool_use_id,
+            label,
+            agent_type,
+            state: SubagentState::Running,
+            started_at: Instant::now(),
+            finished_at: None,
+        });
+        while self.subagents.len() > SUBAGENTS_CAP {
+            self.subagents.pop_front();
+        }
+    }
+
+    /// tool_result を受けて、対応するサブエージェントの状態を完了/失敗へ遷移させる。
+    /// `tool_use_id` が一致する実行中エントリのみ更新する（Claude Code の tool_result は
+    /// 常に `tool_use_id` を持つため、id 不一致=サブエージェント以外の tool_result として無視する）。
+    fn resolve_subagent_result(&mut self, tool_use_id: Option<&str>, is_error: bool) {
+        let idx = tool_use_id.and_then(|id| {
+            self.subagents
+                .iter()
+                .position(|entry| entry.tool_use_id.as_deref() == Some(id))
+        });
+        let Some(idx) = idx else {
+            return;
+        };
+        if let Some(entry) = self.subagents.get_mut(idx) {
+            if entry.state != SubagentState::Running {
+                return;
+            }
+            entry.state = if is_error {
+                SubagentState::Failed
+            } else {
+                SubagentState::Completed
+            };
+            entry.finished_at = Some(Instant::now());
+        }
+    }
+
+    /// 実行中のサブエージェント数。ヘッダ行・状態パネルの集計表示に使う。
+    pub fn subagent_running_count(&self) -> usize {
+        self.subagents
+            .iter()
+            .filter(|entry| entry.state == SubagentState::Running)
+            .count()
+    }
+
+    /// 状態パネルに表示するサブエージェント一覧を、実行中を優先しつつ新しい順に整形して返す。
+    /// `limit` は呼び出し側（パネル高さに応じた表示件数トリム）で決める。
+    pub fn subagent_status_lines(&self, limit: usize) -> Vec<String> {
+        if limit == 0 || self.subagents.is_empty() {
+            return Vec::new();
+        }
+        let mut running: Vec<&SubagentEntry> = Vec::new();
+        let mut finished: Vec<&SubagentEntry> = Vec::new();
+        for entry in &self.subagents {
+            if entry.state == SubagentState::Running {
+                running.push(entry);
+            } else {
+                finished.push(entry);
+            }
+        }
+        // 完了/失敗は新しい順（直近ほど関心が高い）、実行中はそのまま起動順で先頭にまとめる。
+        finished.reverse();
+        running
+            .into_iter()
+            .chain(finished)
+            .take(limit)
+            .map(|entry| {
+                let elapsed = match entry.finished_at {
+                    Some(finished_at) => finished_at.duration_since(entry.started_at).as_secs(),
+                    None => entry.started_at.elapsed().as_secs(),
+                };
+                format!("{} {} ({}秒)", entry.state.icon(), entry.label, elapsed)
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn subagents_len(&self) -> usize {
+        self.subagents.len()
     }
 
     /// 実行中ターンの経過秒（開始からの秒）。ターン非実行時は None。
@@ -4418,6 +4559,8 @@ impl CodexPane {
                     name,
                     summary,
                     edit_patch,
+                    id,
+                    subagent,
                 } => {
                     if let Some(summary) = &summary {
                         self.record_current_command(
@@ -4426,6 +4569,9 @@ impl CodexPane {
                         );
                     }
                     self.action = Some(format!("ツール実行: {name}"));
+                    if let Some(subagent) = subagent {
+                        self.record_subagent_launch(id, subagent.label, subagent.agent_type);
+                    }
                     // Edit/Write は変更内容を色付き差分プレビュー行（見出し + diff）として残す。
                     // ラベル行と重複しないよう、パッチがあればそれをツール実行行にする。
                     if let Some(patch) = edit_patch {
@@ -4471,6 +4617,7 @@ impl CodexPane {
         for result in claude::tool_results(value) {
             self.current_command = None;
             self.current_command_started_at = None;
+            self.resolve_subagent_result(result.tool_use_id.as_deref(), result.is_error);
             if result.is_error {
                 let text = if result.text.is_empty() {
                     "(エラー詳細なし)".to_string()
@@ -13021,6 +13168,192 @@ mod tests {
                 .iter()
                 .any(|line| line.kind == CodexLogKind::Error && line.text.contains("boom"))
         );
+    }
+
+    #[test]
+    fn claude_task_tool_use_is_detected_as_running_subagent() {
+        let mut pane = claude_pane();
+        assert_eq!(pane.subagents_len(), 0);
+        assert_eq!(pane.subagent_running_count(), 0);
+
+        pane.handle_json_event(serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_sub1",
+                    "name": "Task",
+                    "input": {
+                        "description": "stream-json調査",
+                        "subagent_type": "Explore"
+                    }
+                }
+            ]}
+        }));
+
+        assert_eq!(pane.subagents_len(), 1);
+        assert_eq!(pane.subagent_running_count(), 1);
+        let lines = pane.subagent_status_lines(5);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("● stream-json調査"));
+    }
+
+    #[test]
+    fn claude_agent_tool_use_without_task_name_is_not_detected() {
+        // Bash / Write 等の通常ツールはサブエージェント扱いにならない。
+        let mut pane = claude_pane();
+        pane.handle_json_event(serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [
+                {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}}
+            ]}
+        }));
+        assert_eq!(pane.subagents_len(), 0);
+    }
+
+    #[test]
+    fn claude_subagent_transitions_to_completed_on_matching_tool_result() {
+        let mut pane = claude_pane();
+        pane.handle_json_event(serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_sub1",
+                    "name": "Task",
+                    "input": {"description": "調査タスク", "subagent_type": "Explore"}
+                }
+            ]}
+        }));
+        assert_eq!(pane.subagent_running_count(), 1);
+
+        pane.handle_json_event(serde_json::json!({
+            "type": "user",
+            "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu_sub1", "content": "完了しました", "is_error": false}
+            ]}
+        }));
+
+        assert_eq!(pane.subagent_running_count(), 0);
+        let lines = pane.subagent_status_lines(5);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("✔ 調査タスク"));
+    }
+
+    #[test]
+    fn claude_subagent_transitions_to_failed_on_error_tool_result() {
+        let mut pane = claude_pane();
+        pane.handle_json_event(serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_sub2",
+                    "name": "Agent",
+                    "input": {"description": "失敗するタスク"}
+                }
+            ]}
+        }));
+        pane.handle_json_event(serde_json::json!({
+            "type": "user",
+            "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu_sub2", "content": "boom", "is_error": true}
+            ]}
+        }));
+
+        assert_eq!(pane.subagent_running_count(), 0);
+        let lines = pane.subagent_status_lines(5);
+        assert!(lines[0].starts_with("✖ 失敗するタスク"));
+    }
+
+    #[test]
+    fn claude_subagent_tool_result_with_unrelated_id_does_not_resolve_running_entry() {
+        let mut pane = claude_pane();
+        pane.handle_json_event(serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_sub3",
+                    "name": "Task",
+                    "input": {"description": "実行中タスク"}
+                }
+            ]}
+        }));
+        pane.handle_json_event(serde_json::json!({
+            "type": "user",
+            "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu_other", "content": "ok", "is_error": false}
+            ]}
+        }));
+
+        // 無関係な tool_use_id では実行中のまま。
+        assert_eq!(pane.subagent_running_count(), 1);
+    }
+
+    #[test]
+    fn claude_subagent_history_survives_new_turn_start() {
+        // ターンをまたいでも実行中エントリは clear_recent_actions の対象外として保持される。
+        let mut pane = claude_pane();
+        pane.handle_json_event(serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [
+                {"type": "tool_use", "id": "toolu_sub4", "name": "Task", "input": {"description": "長期タスク"}}
+            ]}
+        }));
+        assert_eq!(pane.subagent_running_count(), 1);
+
+        pane.handle_json_event(serde_json::json!({
+            "type": "system", "subtype": "init", "session_id": "sid-2", "model": "opus"
+        }));
+
+        assert_eq!(pane.subagent_running_count(), 1);
+        assert_eq!(pane.subagents_len(), 1);
+    }
+
+    #[test]
+    fn claude_subagent_entries_are_capped_at_subagents_cap() {
+        let mut pane = claude_pane();
+        for i in 0..(SUBAGENTS_CAP + 3) {
+            pane.record_subagent_launch(
+                Some(format!("id-{i}")),
+                format!("task-{i}"),
+                Some("Explore".to_string()),
+            );
+        }
+        assert_eq!(pane.subagents_len(), SUBAGENTS_CAP);
+    }
+
+    #[test]
+    fn subagent_status_lines_prioritizes_running_and_limits_by_visible_count() {
+        let mut pane = claude_pane();
+        pane.record_subagent_launch(
+            Some("id-1".to_string()),
+            "完了済みタスクA".to_string(),
+            None,
+        );
+        pane.resolve_subagent_result(Some("id-1"), false);
+        pane.record_subagent_launch(Some("id-2".to_string()), "実行中タスクB".to_string(), None);
+        pane.record_subagent_launch(
+            Some("id-3".to_string()),
+            "完了済みタスクC".to_string(),
+            None,
+        );
+        pane.resolve_subagent_result(Some("id-3"), false);
+
+        // limit=0 は空。
+        assert!(pane.subagent_status_lines(0).is_empty());
+
+        // limit=1 では実行中を優先。
+        let lines = pane.subagent_status_lines(1);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("実行中タスクB"));
+
+        // limit=2 では実行中 + 直近の完了（新しい方=タスクC）。
+        let lines = pane.subagent_status_lines(2);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("実行中タスクB"));
+        assert!(lines[1].contains("完了済みタスクC"));
     }
 
     #[test]

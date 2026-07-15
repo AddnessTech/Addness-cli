@@ -11,8 +11,9 @@ use clap::{CommandFactory, Parser, Subcommand};
 use crate::config::{Credentials, DEFAULT_API_URL, Settings};
 use api::ApiClient;
 use cli::commands::{
-    activity, assignment, chat, comment, configure, deliverable, detect, goal, invitation, issue,
-    kpi, link, login, member, notification, org, skills, streak, summary, today, update, user,
+    activity, assignment, chat, comment, configure, deliverable, detect, diagnosis, goal,
+    invitation, invoice, issue, kpi, link, login, media, member, notification, org, referral,
+    search, sharetree, skills, streak, summary, today, update, user,
 };
 
 #[derive(Parser)]
@@ -139,6 +140,48 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Unified search across objectives/comments/members (distinct from `goal search`)
+    Search {
+        /// Search query (supports `#goal:`/`#member:`/`#comment:` filters)
+        query: String,
+        /// Organization ID (uses default if not specified)
+        #[arg(long)]
+        org: Option<String>,
+        /// Max number of results to return
+        #[arg(long)]
+        limit: Option<u16>,
+        /// Pagination offset
+        #[arg(long)]
+        offset: Option<u16>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Manage your diagnosis results (goal style, values, core values, master plan)
+    Diagnosis {
+        #[command(subcommand)]
+        command: diagnosis::DiagnosisCommands,
+    },
+    /// Create referral links and view your referral performance
+    Referral {
+        #[command(subcommand)]
+        command: referral::ReferralCommands,
+    },
+    /// View organization invoices
+    Invoice {
+        #[command(subcommand)]
+        command: invoice::InvoiceCommands,
+    },
+    /// Manage portable, cloneable goal-tree exports (distinct from `goal share`)
+    ShareTree {
+        #[command(subcommand)]
+        command: sharetree::ShareTreeCommands,
+    },
+    /// Manage inline media (editor paste/drop images and videos)
+    Media {
+        #[command(subcommand)]
+        command: media::MediaCommands,
+    },
     /// Detect goal ID from current git branch name
     DetectGoal {
         /// Output as JSON
@@ -174,7 +217,13 @@ fn command_outputs_json(command: &Commands) -> bool {
     match command {
         Commands::Status { json }
         | Commands::Summary { json, .. }
+        | Commands::Search { json, .. }
         | Commands::DetectGoal { json } => *json,
+        Commands::Diagnosis { command } => diagnosis_outputs_json(command),
+        Commands::Referral { command } => referral_outputs_json(command),
+        Commands::Invoice { command } => invoice_outputs_json(command),
+        Commands::ShareTree { command } => sharetree_outputs_json(command),
+        Commands::Media { command } => media_outputs_json(command),
         Commands::Org { command } => org_outputs_json(command),
         Commands::Goal { command } => goal_outputs_json(command),
         Commands::Comment { command } => comment_outputs_json(command),
@@ -260,7 +309,8 @@ fn goal_outputs_json(command: &goal::GoalCommands) -> bool {
         | goal::GoalCommands::Duplicate { json, .. }
         | goal::GoalCommands::Move { json, .. } => *json,
         goal::GoalCommands::Share { command } => match command {
-            goal::ShareCommands::Create { json, .. } => *json,
+            goal::ShareCommands::Create { json, .. }
+            | goal::ShareCommands::GetPublic { json, .. } => *json,
             goal::ShareCommands::Revoke { .. } => false,
         },
         goal::GoalCommands::Alias { command } => match command {
@@ -272,6 +322,58 @@ fn goal_outputs_json(command: &goal::GoalCommands) -> bool {
             | goal::RecurringCommands::Set { json, .. }
             | goal::RecurringCommands::Remove { json, .. } => *json,
         },
+        goal::GoalCommands::ReportSchedule { command } => match command {
+            goal::ReportScheduleCommands::Get { json, .. }
+            | goal::ReportScheduleCommands::Set { json, .. } => *json,
+            goal::ReportScheduleCommands::Rm { .. } => false,
+        },
+    }
+}
+
+fn diagnosis_outputs_json(command: &diagnosis::DiagnosisCommands) -> bool {
+    match command {
+        diagnosis::DiagnosisCommands::Save { json, .. }
+        | diagnosis::DiagnosisCommands::List { json }
+        | diagnosis::DiagnosisCommands::Get { json, .. }
+        | diagnosis::DiagnosisCommands::Stats { json, .. }
+        | diagnosis::DiagnosisCommands::Profiles { json, .. }
+        | diagnosis::DiagnosisCommands::Profile { json, .. } => *json,
+        diagnosis::DiagnosisCommands::Visibility { command } => match command {
+            diagnosis::VisibilityCommands::Get { json, .. }
+            | diagnosis::VisibilityCommands::Set { json, .. } => *json,
+        },
+    }
+}
+
+fn referral_outputs_json(command: &referral::ReferralCommands) -> bool {
+    match command {
+        referral::ReferralCommands::LinkCreate { json, .. }
+        | referral::ReferralCommands::List { json, .. }
+        | referral::ReferralCommands::Convert { json, .. } => *json,
+    }
+}
+
+fn invoice_outputs_json(command: &invoice::InvoiceCommands) -> bool {
+    match command {
+        invoice::InvoiceCommands::List { json, .. } => *json,
+    }
+}
+
+fn sharetree_outputs_json(command: &sharetree::ShareTreeCommands) -> bool {
+    match command {
+        sharetree::ShareTreeCommands::Create { json, .. }
+        | sharetree::ShareTreeCommands::List { json, .. }
+        | sharetree::ShareTreeCommands::Clone { json, .. }
+        | sharetree::ShareTreeCommands::GetPublic { json, .. } => *json,
+        sharetree::ShareTreeCommands::Revoke { .. } => false,
+    }
+}
+
+fn media_outputs_json(command: &media::MediaCommands) -> bool {
+    match command {
+        media::MediaCommands::View { json, .. } | media::MediaCommands::Upload { json, .. } => {
+            *json
+        }
     }
 }
 
@@ -653,6 +755,36 @@ async fn main() -> Result<()> {
         Some(Commands::Summary { org, depth, json }) => {
             let client = build_client()?;
             summary::handle_summary(org.as_deref(), *depth, *json, &client).await
+        }
+        Some(Commands::Search {
+            query,
+            org,
+            limit,
+            offset,
+            json,
+        }) => {
+            let client = build_client()?;
+            search::handle_search(query, org.as_deref(), *limit, *offset, *json, &client).await
+        }
+        Some(Commands::Diagnosis { command }) => {
+            let client = build_client()?;
+            diagnosis::handle_diagnosis(command, &client).await
+        }
+        Some(Commands::Referral { command }) => {
+            let client = build_client()?;
+            referral::handle_referral(command, &client).await
+        }
+        Some(Commands::Invoice { command }) => {
+            let client = build_client()?;
+            invoice::handle_invoice(command, &client).await
+        }
+        Some(Commands::ShareTree { command }) => {
+            let client = build_client()?;
+            sharetree::handle_sharetree(command, &client).await
+        }
+        Some(Commands::Media { command }) => {
+            let client = build_client()?;
+            media::handle_media(command, &client).await
         }
         Some(Commands::DetectGoal { json }) => detect::handle_detect_goal(*json),
         Some(Commands::Update { check }) => update::handle_update(*check).await,

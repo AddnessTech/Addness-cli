@@ -79,3 +79,33 @@ pub struct AcceptInvitationRequest {
     pub invited_member_id: String,
     pub token: String,
 }
+
+// POST /api/v1/team/organization_invitations/accept
+#[derive(Debug, Serialize)]
+pub struct LegacyAcceptInvitationRequest {
+    pub token: String,
+}
+
+// POST /api/v1/team/organization_invitations/check_plan_upgrade
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckPlanUpgradeRequest {
+    pub organization_id: String,
+    pub additional_members_count: i64,
+}
+
+// POST /api/v2/invitations/:token/accept
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcceptInvitationByTokenRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_organization_id: Option<String>,
+}
+
+// POST /api/v2/invitations/decline
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeclineInvitationRequest {
+    pub invited_member_id: String,
+    pub token: String,
+}

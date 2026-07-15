@@ -4,7 +4,8 @@ use clap::Subcommand;
 
 use crate::api::{
     ApiClient, ApiResponse, Comment, CreateGoalRequest, Deliverable, DeliverableType, Goal,
-    GoalStatus, GoalTreeData, GoalTreeItem, UpdateGoalRequest,
+    GoalStatus, GoalTreeData, GoalTreeItem, RecurringGoal, RecurringGoalRequest, RelatedFetchError,
+    UpdateGoalRequest,
 };
 use crate::cli::commands::org::resolve_org_id;
 use crate::cli::output::{
@@ -37,8 +38,198 @@ fn normalize_due_date(input: &str) -> Result<String> {
     Ok(format!("{}T00:00:00Z", date.format("%Y-%m-%d")))
 }
 
+/// `--days-of-week` のCSVをバリデーションしつつ大文字化された曜日リストに変換する。
+fn parse_days_of_week(csv: &str) -> Result<Vec<String>> {
+    csv.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            let day = s.to_uppercase();
+            match day.as_str() {
+                "MONDAY" | "TUESDAY" | "WEDNESDAY" | "THURSDAY" | "FRIDAY" | "SATURDAY"
+                | "SUNDAY" => Ok(day),
+                _ => bail!(
+                    "--days-of-week contains an invalid day: '{s}'. Use MONDAY, TUESDAY, WEDNESDAY, THURSDAY, FRIDAY, SATURDAY, or SUNDAY."
+                ),
+            }
+        })
+        .collect()
+}
+
+/// `--days-of-month` のCSVをバリデーションしつつ整数リストに変換する（1〜31）。
+fn parse_days_of_month(csv: &str) -> Result<Vec<i32>> {
+    csv.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            let day: i32 = s.parse().map_err(|_| {
+                anyhow::anyhow!("--days-of-month must contain integers between 1 and 31, got '{s}'")
+            })?;
+            if !(1..=31).contains(&day) {
+                bail!("--days-of-month must contain integers between 1 and 31, got '{day}'");
+            }
+            Ok(day)
+        })
+        .collect()
+}
+
+/// `goal recurring set` の各種フラグをバリデーションし、リクエストボディを組み立てる。
+/// 基本パターン(`--pattern`)とカスタムパターン(`--recurrence-type`以下)は排他。
+#[allow(clippy::too_many_arguments)]
+fn build_recurring_goal_request(
+    pattern: Option<&str>,
+    recurrence_type: Option<&str>,
+    interval: Option<i32>,
+    days_of_week: Option<&str>,
+    days_of_month: Option<&str>,
+    end_date: Option<&str>,
+    last_day: bool,
+    nth_week: Option<i32>,
+    repeat_from_completion: bool,
+) -> Result<RecurringGoalRequest> {
+    let has_basic = pattern.is_some();
+    let has_custom = recurrence_type.is_some()
+        || interval.is_some()
+        || days_of_week.is_some()
+        || days_of_month.is_some()
+        || end_date.is_some()
+        || last_day
+        || nth_week.is_some()
+        || repeat_from_completion;
+
+    if has_basic && has_custom {
+        bail!(
+            "--pattern cannot be combined with custom recurrence options (--recurrence-type, --interval, --days-of-week, --days-of-month, --end-date, --last-day, --nth-week, --repeat-from-completion)."
+        );
+    }
+    if !has_basic && !has_custom {
+        bail!(
+            "Specify either --pattern <DAILY|WEEKLY|MONTHLY|WEEKDAYS> or custom recurrence options starting with --recurrence-type <DAILY|WEEKLY|MONTHLY|YEARLY>."
+        );
+    }
+
+    if has_basic {
+        let pattern = pattern
+            .expect("has_basic implies pattern is Some")
+            .to_uppercase();
+        if !matches!(
+            pattern.as_str(),
+            "DAILY" | "WEEKLY" | "MONTHLY" | "WEEKDAYS"
+        ) {
+            bail!("--pattern must be one of: DAILY, WEEKLY, MONTHLY, WEEKDAYS");
+        }
+        return Ok(RecurringGoalRequest {
+            pattern: Some(pattern),
+            ..Default::default()
+        });
+    }
+
+    let recurrence_type = recurrence_type
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "--recurrence-type is required for a custom recurrence (DAILY, WEEKLY, MONTHLY, YEARLY)."
+            )
+        })?
+        .to_uppercase();
+    if !matches!(
+        recurrence_type.as_str(),
+        "DAILY" | "WEEKLY" | "MONTHLY" | "YEARLY"
+    ) {
+        bail!("--recurrence-type must be one of: DAILY, WEEKLY, MONTHLY, YEARLY");
+    }
+    let interval = interval.ok_or_else(|| {
+        anyhow::anyhow!("--interval is required for a custom recurrence (must be 1 or greater).")
+    })?;
+    if interval < 1 {
+        bail!("--interval must be 1 or greater");
+    }
+
+    let days_of_week_list = days_of_week
+        .map(parse_days_of_week)
+        .transpose()?
+        .unwrap_or_default();
+    if recurrence_type == "WEEKLY" && days_of_week_list.is_empty() {
+        bail!("--days-of-week is required when --recurrence-type is WEEKLY");
+    }
+
+    let days_of_month_list = days_of_month
+        .map(parse_days_of_month)
+        .transpose()?
+        .unwrap_or_default();
+    if recurrence_type == "MONTHLY"
+        && days_of_month_list.is_empty()
+        && !last_day
+        && nth_week.is_none()
+    {
+        bail!(
+            "For --recurrence-type MONTHLY, specify --days-of-month, --last-day, or --nth-week (with --days-of-week)."
+        );
+    }
+
+    if recurrence_type == "YEARLY"
+        && (!days_of_month_list.is_empty() || !days_of_week_list.is_empty() || last_day)
+    {
+        bail!(
+            "--days-of-month, --days-of-week, and --last-day cannot be used with --recurrence-type YEARLY."
+        );
+    }
+
+    let end_date = end_date.map(normalize_due_date).transpose()?;
+    if let Some(nth) = nth_week
+        && !(1..=5).contains(&nth)
+    {
+        bail!("--nth-week must be between 1 and 5");
+    }
+
+    Ok(RecurringGoalRequest {
+        recurrence_type: Some(recurrence_type),
+        interval: Some(interval),
+        days_of_week: days_of_week_list,
+        days_of_month: days_of_month_list,
+        end_date,
+        is_last_day: last_day.then_some(true),
+        nth_week,
+        repeat_from_completion: repeat_from_completion.then_some(true),
+        ..Default::default()
+    })
+}
+
+/// GET /recurring が404の場合、バックエンドは
+/// `{"error": "繰り返し設定が見つかりません"}` を返す（=まだ設定が無い状態）。
+/// これはエラーではなくCLI上は正常系として扱う。
+fn is_recurring_goal_not_found(err: &anyhow::Error) -> bool {
+    err.to_string().contains("繰り返し設定が見つかりません")
+}
+
 fn should_fetch_child_related(json: bool, include_related: bool) -> bool {
     json || include_related
+}
+
+fn related_fetch_error_message(errors: &[RelatedFetchError]) -> String {
+    let details = errors
+        .iter()
+        .map(|error| format!("{} for {}: {}", error.kind, error.goal_id, error.message))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("Failed to fetch related goal data:\n{details}")
+}
+
+fn handle_related_fetch_errors(strict: bool, errors: Vec<RelatedFetchError>) -> Result<()> {
+    if errors.is_empty() {
+        return Ok(());
+    }
+
+    if strict {
+        bail!("{}", related_fetch_error_message(&errors));
+    }
+
+    for error in errors {
+        eprintln!(
+            "Warning: failed to fetch {} for {}: {}",
+            error.kind, error.goal_id, error.message
+        );
+    }
+    Ok(())
 }
 
 #[derive(Subcommand)]
@@ -74,6 +265,9 @@ pub enum GoalCommands {
         /// With comments information
         #[arg(long)]
         with_comment: bool,
+        /// Fail when child deliverables/comments cannot be fetched
+        #[arg(long)]
+        strict_related_fetch: bool,
     },
     /// List children of a goal
     Children {
@@ -107,6 +301,9 @@ pub enum GoalCommands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+        /// Fail when sibling deliverables cannot be fetched
+        #[arg(long)]
+        strict_related_fetch: bool,
     },
     /// Search goals by keyword
     Search {
@@ -236,6 +433,16 @@ pub enum GoalCommands {
         #[command(subcommand)]
         command: AliasCommands,
     },
+    /// Manage a goal's recurring (repeating) schedule
+    Recurring {
+        #[command(subcommand)]
+        command: RecurringCommands,
+    },
+    /// Manage a goal's activity report schedule (periodic digest emails)
+    ReportSchedule {
+        #[command(subcommand)]
+        command: ReportScheduleCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -252,6 +459,75 @@ pub enum ShareCommands {
     Revoke {
         /// Goal ID
         id: String,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
+    },
+    /// Fetch a publicly shared goal by its public ID (no auth required)
+    GetPublic {
+        /// Public ID (from the share URL, e.g. the last path segment)
+        public_id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Report frequency (`internal/goalreport/usecase/types.go`).
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum ReportFrequency {
+    Daily,
+    EveryTwoDays,
+    Weekly,
+}
+
+impl ReportFrequency {
+    fn as_str(self) -> &'static str {
+        match self {
+            ReportFrequency::Daily => "daily",
+            ReportFrequency::EveryTwoDays => "every_two_days",
+            ReportFrequency::Weekly => "weekly",
+        }
+    }
+}
+
+#[derive(Subcommand)]
+pub enum ReportScheduleCommands {
+    /// Show the current activity report schedule for a goal
+    Get {
+        /// Goal ID
+        id: String,
+        /// Organization ID (uses default if not specified)
+        #[arg(long)]
+        org: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create or update the activity report schedule for a goal
+    Set {
+        /// Goal ID
+        id: String,
+        /// Organization ID (uses default if not specified)
+        #[arg(long)]
+        org: Option<String>,
+        /// Report frequency
+        #[arg(long, value_enum)]
+        frequency: ReportFrequency,
+        /// Enable or disable the schedule (default: enabled)
+        #[arg(long)]
+        enabled: Option<bool>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete the activity report schedule for a goal
+    Rm {
+        /// Goal ID
+        id: String,
+        /// Organization ID (uses default if not specified)
+        #[arg(long)]
+        org: Option<String>,
         /// Skip confirmation prompt
         #[arg(long)]
         force: bool,
@@ -291,6 +567,64 @@ pub enum AliasCommands {
         /// Comma-separated alias IDs in the desired order
         #[arg(long)]
         order: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RecurringCommands {
+    /// Get the recurring schedule configured for a goal
+    Get {
+        /// Goal ID
+        id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create or update the recurring schedule for a goal
+    Set {
+        /// Goal ID
+        id: String,
+        /// Basic pattern: DAILY, WEEKLY, MONTHLY, WEEKDAYS (mutually exclusive with custom options below)
+        #[arg(long)]
+        pattern: Option<String>,
+        /// Custom recurrence type: DAILY, WEEKLY, MONTHLY, YEARLY
+        #[arg(long)]
+        recurrence_type: Option<String>,
+        /// Repeat every N days/weeks/months/years (required for custom recurrence)
+        #[arg(long)]
+        interval: Option<i32>,
+        /// Comma-separated days of week (MONDAY,TUESDAY,...). Required when --recurrence-type is WEEKLY.
+        #[arg(long)]
+        days_of_week: Option<String>,
+        /// Comma-separated days of month (1-31). One option for MONTHLY.
+        #[arg(long)]
+        days_of_month: Option<String>,
+        /// End date (YYYY-MM-DD or RFC3339) after which the schedule stops
+        #[arg(long)]
+        end_date: Option<String>,
+        /// Use the last day of the month (MONTHLY only)
+        #[arg(long)]
+        last_day: bool,
+        /// Nth week of the month (1-5), used together with --days-of-week for MONTHLY
+        #[arg(long)]
+        nth_week: Option<i32>,
+        /// Count the interval from the completion date instead of the schedule date
+        #[arg(long)]
+        repeat_from_completion: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove the recurring schedule from a goal
+    Remove {
+        /// Goal ID
+        id: String,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -388,46 +722,6 @@ impl GoalNode {
             deliverables,
             children,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{normalize_due_date, should_fetch_child_related};
-
-    #[test]
-    fn normalize_due_date_accepts_yyyy_mm_dd() {
-        assert_eq!(
-            normalize_due_date("2026-07-01").unwrap(),
-            "2026-07-01T00:00:00Z"
-        );
-    }
-
-    #[test]
-    fn normalize_due_date_keeps_rfc3339() {
-        assert_eq!(
-            normalize_due_date("2026-07-01T12:30:00Z").unwrap(),
-            "2026-07-01T12:30:00Z"
-        );
-    }
-
-    #[test]
-    fn normalize_due_date_rejects_invalid_input() {
-        // 'T' を含むだけの不正な値は素通しせず、エラーにする。
-        assert!(normalize_due_date("Tomorrow").is_err());
-        assert!(normalize_due_date("2026-13-99T99:99:99Z").is_err());
-        assert!(normalize_due_date("2026-07-01T12:30:00").is_err());
-    }
-
-    #[test]
-    fn child_related_fetch_preserves_json_compatibility() {
-        assert!(should_fetch_child_related(true, false));
-    }
-
-    #[test]
-    fn child_related_fetch_for_human_output_requires_flag() {
-        assert!(should_fetch_child_related(false, true));
-        assert!(!should_fetch_child_related(false, false));
     }
 }
 
@@ -586,6 +880,7 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
             json,
             with_deliverable,
             with_comment,
+            strict_related_fetch,
         } => {
             // id で指定されたゴール自身の情報を取得
             let resp: ApiResponse<Goal> = client.get_goal(id).await?;
@@ -613,16 +908,30 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
                 .iter()
                 .map(|g| g.id.as_str())
                 .collect::<Vec<_>>();
+            let mut related_errors = Vec::new();
             let children_deliverables = if should_fetch_child_related(*json, *with_deliverable) {
-                client.get_deliverables_map(&subtree_ids).await
+                if *strict_related_fetch {
+                    let (map, errors) = client.get_deliverables_map_with_errors(&subtree_ids).await;
+                    related_errors.extend(errors);
+                    map
+                } else {
+                    client.get_deliverables_map(&subtree_ids).await
+                }
             } else {
                 HashMap::new()
             };
             let children_comments = if should_fetch_child_related(*json, *with_comment) {
-                client.get_comments_map(&subtree_ids).await
+                if *strict_related_fetch {
+                    let (map, errors) = client.get_comments_map_with_errors(&subtree_ids).await;
+                    related_errors.extend(errors);
+                    map
+                } else {
+                    client.get_comments_map(&subtree_ids).await
+                }
             } else {
                 HashMap::new()
             };
+            handle_related_fetch_errors(*strict_related_fetch, related_errors)?;
 
             // 階層構造を構成
             let goal_tree = GoalNode::build_tree(
@@ -669,7 +978,12 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
             }
             Ok(())
         }
-        GoalCommands::Siblings { id, limit, json } => {
+        GoalCommands::Siblings {
+            id,
+            limit,
+            json,
+            strict_related_fetch,
+        } => {
             // 1. 対象ゴールの詳細を取得して親IDを得る
             let goal_resp: ApiResponse<Goal> = client.get_goal(id).await?;
             let parent_id = match &goal_resp.data.parent_id {
@@ -702,9 +1016,15 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
                 return Ok(());
             }
 
-            let deliverables_map = client
-                .get_deliverables_map(&siblings.iter().map(|g| g.id.as_str()).collect::<Vec<_>>())
-                .await;
+            let sibling_ids = siblings.iter().map(|g| g.id.as_str()).collect::<Vec<_>>();
+            let deliverables_map = if *strict_related_fetch {
+                let (deliverables_map, deliverable_errors) =
+                    client.get_deliverables_map_with_errors(&sibling_ids).await;
+                handle_related_fetch_errors(true, deliverable_errors)?;
+                deliverables_map
+            } else {
+                client.get_deliverables_map(&sibling_ids).await
+            };
 
             if *json {
                 print_goals_with_deliverables_json(&siblings, &deliverables_map)?;
@@ -887,6 +1207,8 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
         }
         GoalCommands::Share { command } => handle_share(command, client).await,
         GoalCommands::Alias { command } => handle_alias(command, client).await,
+        GoalCommands::Recurring { command } => handle_recurring(command, client).await,
+        GoalCommands::ReportSchedule { command } => handle_report_schedule(command, client).await,
     }
 }
 
@@ -929,6 +1251,17 @@ async fn handle_share(cmd: &ShareCommands, client: &ApiClient) -> Result<()> {
             }
             client.revoke_share_link(id).await?;
             println!("Share link revoked for goal {id}");
+            Ok(())
+        }
+        ShareCommands::GetPublic { public_id, json } => {
+            let goal = client.get_public_shared_objective(public_id).await?;
+            // Response shape has many fields and no dedicated table view;
+            // always render JSON, compact unless --json (pretty) is set.
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&goal)?);
+            } else {
+                println!("{goal}");
+            }
             Ok(())
         }
     }
@@ -981,6 +1314,189 @@ async fn handle_alias(cmd: &AliasCommands, client: &ApiClient) -> Result<()> {
             }
             client.reorder_aliases(parent_id, ids).await?;
             println!("Aliases reordered under parent {parent_id}");
+            Ok(())
+        }
+    }
+}
+
+fn print_recurring_goal(goal: &RecurringGoal) {
+    println!("{}", goal.description);
+    println!("   {}: {}", "ID".dimmed(), goal.id);
+    println!("   {}: {}", "Goal".dimmed(), goal.objective_id);
+    if let Some(pattern) = &goal.pattern {
+        println!("   {}: {pattern}", "Pattern".dimmed());
+    }
+    if let Some(recurrence_type) = &goal.recurrence_type {
+        println!("   {}: {recurrence_type}", "Recurrence type".dimmed());
+    }
+    if let Some(interval) = goal.interval {
+        println!("   {}: {interval}", "Interval".dimmed());
+    }
+    if !goal.days_of_week.is_empty() {
+        println!(
+            "   {}: {}",
+            "Days of week".dimmed(),
+            goal.days_of_week.join(", ")
+        );
+    }
+    if !goal.days_of_month.is_empty() {
+        let days = goal
+            .days_of_month
+            .iter()
+            .map(i32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("   {}: {days}", "Days of month".dimmed());
+    }
+    if let Some(nth_week) = goal.nth_week {
+        println!("   {}: {nth_week}", "Nth week".dimmed());
+    }
+    if goal.is_last_day == Some(true) {
+        println!("   {}: yes", "Last day of month".dimmed());
+    }
+    if goal.repeat_from_completion == Some(true) {
+        println!("   {}: yes", "Repeat from completion".dimmed());
+    }
+    if let Some(end_date) = &goal.end_date {
+        println!("   {}: {end_date}", "End date".dimmed());
+    }
+}
+
+async fn handle_recurring(cmd: &RecurringCommands, client: &ApiClient) -> Result<()> {
+    match cmd {
+        RecurringCommands::Get { id, json } => match client.get_recurring_goal(id).await {
+            Ok(resp) => {
+                if *json {
+                    println!("{}", serde_json::to_string_pretty(&resp.data)?);
+                } else {
+                    print_recurring_goal(&resp.data);
+                }
+                Ok(())
+            }
+            Err(err) if is_recurring_goal_not_found(&err) => {
+                if *json {
+                    println!("null");
+                } else {
+                    println!("No recurring schedule set for goal {id}.");
+                }
+                Ok(())
+            }
+            Err(err) => Err(err),
+        },
+        RecurringCommands::Set {
+            id,
+            pattern,
+            recurrence_type,
+            interval,
+            days_of_week,
+            days_of_month,
+            end_date,
+            last_day,
+            nth_week,
+            repeat_from_completion,
+            json,
+        } => {
+            let req = build_recurring_goal_request(
+                pattern.as_deref(),
+                recurrence_type.as_deref(),
+                *interval,
+                days_of_week.as_deref(),
+                days_of_month.as_deref(),
+                end_date.as_deref(),
+                *last_day,
+                *nth_week,
+                *repeat_from_completion,
+            )?;
+            let resp = client.set_recurring_goal(id, &req).await?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&resp.data)?);
+            } else {
+                println!(
+                    "Recurring schedule set for goal {id}: {}",
+                    resp.data.description
+                );
+            }
+            Ok(())
+        }
+        RecurringCommands::Remove { id, force, json } => {
+            if !*force
+                && !crate::cli::commands::confirm(&format!(
+                    "Remove recurring schedule for goal {id}?"
+                ))?
+            {
+                println!("Cancelled.");
+                return Ok(());
+            }
+            client.remove_recurring_goal(id).await?;
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "removed": true,
+                        "id": id
+                    }))?
+                );
+            } else {
+                println!("Recurring schedule removed for goal {id}");
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn handle_report_schedule(cmd: &ReportScheduleCommands, client: &ApiClient) -> Result<()> {
+    match cmd {
+        ReportScheduleCommands::Get { id, org, json } => {
+            let org_id = resolve_org_id(org.as_deref())?;
+            let schedule = client.get_goal_report_schedule(&org_id, id).await?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&schedule)?);
+            } else {
+                match &schedule {
+                    Some(s) => println!(
+                        "frequency={} enabled={} next_run={}",
+                        s.frequency,
+                        s.enabled,
+                        s.next_run_at.as_deref().unwrap_or("-")
+                    ),
+                    None => println!("No report schedule set for goal {id}."),
+                }
+            }
+            Ok(())
+        }
+        ReportScheduleCommands::Set {
+            id,
+            org,
+            frequency,
+            enabled,
+            json,
+        } => {
+            let org_id = resolve_org_id(org.as_deref())?;
+            let schedule = client
+                .upsert_goal_report_schedule(&org_id, id, frequency.as_str(), *enabled)
+                .await?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&schedule)?);
+            } else {
+                println!(
+                    "Report schedule set for goal {id}: frequency={} enabled={}",
+                    schedule.frequency, schedule.enabled
+                );
+            }
+            Ok(())
+        }
+        ReportScheduleCommands::Rm { id, org, force } => {
+            let org_id = resolve_org_id(org.as_deref())?;
+            if !*force
+                && !crate::cli::commands::confirm(&format!(
+                    "Delete report schedule for goal {id}?"
+                ))?
+            {
+                println!("Cancelled.");
+                return Ok(());
+            }
+            client.delete_goal_report_schedule(&org_id, id).await?;
+            println!("Report schedule deleted for goal {id}");
             Ok(())
         }
     }
@@ -1212,5 +1728,280 @@ impl GoalNode {
                 c.print_goal_detail_subtree(1, with_deliverable, with_comment);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        handle_related_fetch_errors, normalize_due_date, related_fetch_error_message,
+        should_fetch_child_related,
+    };
+    use crate::api::RelatedFetchError;
+
+    #[test]
+    fn normalize_due_date_accepts_yyyy_mm_dd() {
+        assert_eq!(
+            normalize_due_date("2026-07-01").unwrap(),
+            "2026-07-01T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn normalize_due_date_keeps_rfc3339() {
+        assert_eq!(
+            normalize_due_date("2026-07-01T12:30:00Z").unwrap(),
+            "2026-07-01T12:30:00Z"
+        );
+    }
+
+    #[test]
+    fn normalize_due_date_rejects_invalid_input() {
+        // 'T' を含むだけの不正な値は素通しせず、エラーにする。
+        assert!(normalize_due_date("Tomorrow").is_err());
+        assert!(normalize_due_date("2026-13-99T99:99:99Z").is_err());
+        assert!(normalize_due_date("2026-07-01T12:30:00").is_err());
+    }
+
+    #[test]
+    fn child_related_fetch_preserves_json_compatibility() {
+        assert!(should_fetch_child_related(true, false));
+    }
+
+    #[test]
+    fn child_related_fetch_for_human_output_requires_flag() {
+        assert!(should_fetch_child_related(false, true));
+        assert!(!should_fetch_child_related(false, false));
+    }
+
+    #[test]
+    fn related_fetch_error_message_lists_each_failure() {
+        let errors = vec![RelatedFetchError {
+            kind: "deliverables",
+            goal_id: "goal-1".to_string(),
+            message: "network error".to_string(),
+        }];
+
+        assert_eq!(
+            related_fetch_error_message(&errors),
+            "Failed to fetch related goal data:\ndeliverables for goal-1: network error"
+        );
+    }
+
+    #[test]
+    fn related_fetch_errors_only_fail_in_strict_mode() {
+        let errors = vec![RelatedFetchError {
+            kind: "comments",
+            goal_id: "goal-2".to_string(),
+            message: "forbidden".to_string(),
+        }];
+
+        assert!(handle_related_fetch_errors(false, errors.clone()).is_ok());
+        assert!(handle_related_fetch_errors(true, errors).is_err());
+    }
+}
+
+#[cfg(test)]
+mod recurring_tests {
+    use super::{
+        build_recurring_goal_request, is_recurring_goal_not_found, parse_days_of_month,
+        parse_days_of_week,
+    };
+
+    #[test]
+    fn parse_days_of_week_uppercases_and_trims() {
+        assert_eq!(
+            parse_days_of_week(" monday, thursday ").unwrap(),
+            vec!["MONDAY", "THURSDAY"]
+        );
+    }
+
+    #[test]
+    fn parse_days_of_week_rejects_invalid_day() {
+        let err = parse_days_of_week("monday,someday").unwrap_err();
+        assert!(err.to_string().contains("someday"));
+    }
+
+    #[test]
+    fn parse_days_of_month_accepts_valid_range() {
+        assert_eq!(parse_days_of_month("1, 15,31").unwrap(), vec![1, 15, 31]);
+    }
+
+    #[test]
+    fn parse_days_of_month_rejects_out_of_range() {
+        assert!(parse_days_of_month("0").is_err());
+        assert!(parse_days_of_month("32").is_err());
+    }
+
+    #[test]
+    fn build_recurring_goal_request_accepts_basic_pattern() {
+        let req = build_recurring_goal_request(
+            Some("weekly"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(req.pattern.as_deref(), Some("WEEKLY"));
+        assert!(req.recurrence_type.is_none());
+    }
+
+    #[test]
+    fn build_recurring_goal_request_rejects_invalid_basic_pattern() {
+        let err = build_recurring_goal_request(
+            Some("YEARLY"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--pattern"));
+    }
+
+    #[test]
+    fn build_recurring_goal_request_rejects_pattern_and_custom_together() {
+        let err = build_recurring_goal_request(
+            Some("DAILY"),
+            None,
+            Some(2),
+            None,
+            None,
+            None,
+            false,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("cannot be combined"));
+    }
+
+    #[test]
+    fn build_recurring_goal_request_rejects_nothing_specified() {
+        let err =
+            build_recurring_goal_request(None, None, None, None, None, None, false, None, false)
+                .unwrap_err();
+        assert!(err.to_string().contains("Specify either"));
+    }
+
+    #[test]
+    fn build_recurring_goal_request_weekly_requires_days_of_week() {
+        let err = build_recurring_goal_request(
+            None,
+            Some("WEEKLY"),
+            Some(1),
+            None,
+            None,
+            None,
+            false,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--days-of-week"));
+    }
+
+    #[test]
+    fn build_recurring_goal_request_monthly_requires_day_selector() {
+        let err = build_recurring_goal_request(
+            None,
+            Some("MONTHLY"),
+            Some(1),
+            None,
+            None,
+            None,
+            false,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("MONTHLY"));
+    }
+
+    #[test]
+    fn build_recurring_goal_request_monthly_last_day_is_sufficient() {
+        let req = build_recurring_goal_request(
+            None,
+            Some("monthly"),
+            Some(1),
+            None,
+            None,
+            None,
+            true,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(req.is_last_day, Some(true));
+        assert!(req.days_of_month.is_empty());
+    }
+
+    #[test]
+    fn build_recurring_goal_request_yearly_rejects_day_fields() {
+        let err = build_recurring_goal_request(
+            None,
+            Some("YEARLY"),
+            Some(1),
+            None,
+            Some("1"),
+            None,
+            false,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("YEARLY"));
+    }
+
+    #[test]
+    fn build_recurring_goal_request_normalizes_end_date() {
+        let req = build_recurring_goal_request(
+            None,
+            Some("DAILY"),
+            Some(1),
+            None,
+            None,
+            Some("2026-12-31"),
+            false,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(req.end_date.as_deref(), Some("2026-12-31T00:00:00Z"));
+    }
+
+    #[test]
+    fn build_recurring_goal_request_rejects_invalid_interval() {
+        let err = build_recurring_goal_request(
+            None,
+            Some("DAILY"),
+            Some(0),
+            None,
+            None,
+            None,
+            false,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--interval"));
+    }
+
+    #[test]
+    fn is_recurring_goal_not_found_matches_backend_message() {
+        let err = anyhow::anyhow!("API error (404 Not Found): 繰り返し設定が見つかりません");
+        assert!(is_recurring_goal_not_found(&err));
+
+        let other = anyhow::anyhow!("API error (500 Internal Server Error): oops");
+        assert!(!is_recurring_goal_not_found(&other));
     }
 }

@@ -17,12 +17,20 @@ use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
 use crate::api::{
-    ApiClient, CreateGoalRequest, DeliverableType, GoalStatus, Member, MemberId, Organization,
-    UpdateGoalRequest,
+    ApiClient, Comment, CreateGoalRequest, Deliverable, DeliverableType, GoalChildItem, GoalStatus,
+    Member, MemberId, Organization, UpdateGoalRequest,
 };
 use crate::dbg_log;
 
-use super::codex_pane::{self, CodexPane, TerminalNotice};
+use super::agent::{
+    self, AgentKind, CheckpointRequest, ChildGoalUpdate, CodexPane, CodexWorkSummary,
+    TerminalNotice, UndoRequest,
+};
+use super::codex_memory::{codex_body_update_request, codex_trace_link_label, codex_work_memo};
+pub(super) use super::file_picker::PICKER_VISIBLE_ROWS;
+use super::file_picker::{
+    FileEntry, FilePickerReturn, complete_path, initial_picker_dir, read_dir_entries,
+};
 use super::goal_tree::{GoalTree, TreeRow};
 use super::ui;
 
@@ -89,6 +97,7 @@ pub enum DeliverableFormField {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionMenuItem {
     WorkWithCodex,
+    WorkWithClaude,
     AddDeliverable,
     AddComment,
     CompleteGoal,
@@ -111,6 +120,7 @@ impl ActionMenuItem {
     pub fn label(&self) -> &'static str {
         match self {
             ActionMenuItem::WorkWithCodex => "codexで作業",
+            ActionMenuItem::WorkWithClaude => "claude codeで作業",
             ActionMenuItem::AddDeliverable => "add deliverable",
             ActionMenuItem::AddComment => "add comment",
             ActionMenuItem::CompleteGoal => "complete goal",
@@ -207,167 +217,16 @@ impl GoalDisplayStatus {
     }
 }
 
-/// ファイラーで選んだパスを書き戻す先のモーダル状態。
-/// キャンセル時は元の値で、ファイル選択時は選んだパスで復元する。
-#[derive(Debug, Clone)]
-pub enum FilePickerReturn {
-    AddDeliverable {
-        goal_id: String,
-        goal_title: String,
-        kind: DeliverableKind,
-        name: String,
-        value: String,
-    },
-    UpdateDeliverable {
-        goal_id: String,
-        deliverable_id: String,
-        deliverable_name: String,
-        content_file: String,
-    },
-}
-
-/// ファイラーの1エントリ。
-#[derive(Debug, Clone)]
-pub struct FileEntry {
-    pub name: String,
-    pub is_dir: bool,
-}
-
-/// ファイラーで一度に表示する行数（スクロール計算と描画で共有）。
-pub(super) const PICKER_VISIBLE_ROWS: usize = 12;
-
-/// 先頭の `~` をホームディレクトリに展開する。
-fn expand_tilde(input: &str) -> String {
-    if let Some(rest) = input.strip_prefix('~')
-        && (rest.is_empty() || rest.starts_with('/'))
-        && let Some(home) = dirs::home_dir()
-    {
-        return format!("{}{}", home.display(), rest);
+fn child_goal_update_from_item(child: GoalChildItem) -> ChildGoalUpdate {
+    let status = GoalDisplayStatus::from_goal_state(child.status.as_ref(), child.is_completed);
+    ChildGoalUpdate {
+        id: child.id,
+        title: child.title,
+        description: child.description,
+        icon: status.icon(),
+        status_label: status.to_emoji_string(),
+        is_completed: status == GoalDisplayStatus::Completed,
     }
-    input.to_string()
-}
-
-/// パス入力をファイルシステムから補完する（共通接頭辞まで）。
-/// 補完候補が無ければ None。候補が1つでディレクトリなら末尾に `/` を付ける。
-fn complete_path(input: &str) -> Option<String> {
-    let expanded = expand_tilde(input);
-    let path = std::path::Path::new(&expanded);
-
-    let (dir, prefix) = if expanded.ends_with('/') {
-        (PathBuf::from(expanded.trim_end_matches('/')), String::new())
-    } else {
-        let parent = path.parent().map(|p| p.to_path_buf());
-        let dir = match parent {
-            Some(p) if p.as_os_str().is_empty() => PathBuf::from("."),
-            Some(p) => p,
-            None => PathBuf::from("."),
-        };
-        let prefix = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
-        (dir, prefix)
-    };
-
-    let mut names: Vec<(String, bool)> = std::fs::read_dir(&dir)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let name = e.file_name().into_string().ok()?;
-            if name.starts_with(&prefix) {
-                Some((name, e.path().is_dir()))
-            } else {
-                None
-            }
-        })
-        .collect();
-    if names.is_empty() {
-        return None;
-    }
-    names.sort();
-
-    let lcp = longest_common_prefix(names.iter().map(|(n, _)| n.as_str()));
-    let single_dir = names.len() == 1 && names[0].1;
-
-    // 入力にディレクトリ区切りが無い場合は元の見た目（カレント相対）を保つ。
-    let mut result = if expanded.contains('/') {
-        let mut p = dir.join(&lcp).to_string_lossy().into_owned();
-        if expanded.ends_with('/') && lcp.is_empty() {
-            p = dir.to_string_lossy().into_owned();
-        }
-        p
-    } else {
-        lcp
-    };
-    if single_dir {
-        result.push('/');
-    }
-    Some(result)
-}
-
-/// 文字列群の最長共通接頭辞。
-fn longest_common_prefix<'a>(mut iter: impl Iterator<Item = &'a str>) -> String {
-    let Some(first) = iter.next() else {
-        return String::new();
-    };
-    let mut prefix: Vec<char> = first.chars().collect();
-    for s in iter {
-        let common = prefix
-            .iter()
-            .zip(s.chars())
-            .take_while(|(a, b)| **a == *b)
-            .count();
-        prefix.truncate(common);
-        if prefix.is_empty() {
-            break;
-        }
-    }
-    prefix.into_iter().collect()
-}
-
-/// ファイラーの初期ディレクトリを現在の入力値から決める。
-fn initial_picker_dir(current: &str) -> PathBuf {
-    let trimmed = current.trim();
-    if !trimmed.is_empty() {
-        let expanded = expand_tilde(trimmed);
-        let p = PathBuf::from(&expanded);
-        if p.is_dir() {
-            return p;
-        }
-        if let Some(parent) = p.parent()
-            && parent.is_dir()
-            && !parent.as_os_str().is_empty()
-        {
-            return parent.to_path_buf();
-        }
-    }
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
-}
-
-/// ディレクトリの中身を読み、ディレクトリ→ファイルの順、各々名前順で返す。
-/// 隠しファイル（.始まり）は除外する。
-fn read_dir_entries(dir: &std::path::Path) -> Vec<FileEntry> {
-    let mut entries: Vec<FileEntry> = match std::fs::read_dir(dir) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok())
-            .filter_map(|e| {
-                let name = e.file_name().into_string().ok()?;
-                if name.starts_with('.') {
-                    return None;
-                }
-                let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                Some(FileEntry { name, is_dir })
-            })
-            .collect(),
-        Err(_) => Vec::new(),
-    };
-    entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
-        (true, false) => std::cmp::Ordering::Less,
-        (false, true) => std::cmp::Ordering::Greater,
-        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-    });
-    entries
 }
 
 /// コメント本文を一覧表示・タイトル用に短く切り詰める（改行は空白化）。
@@ -482,31 +341,53 @@ pub enum ModalState {
     },
 }
 
+const CONFIRM_CANCEL: usize = 0;
+const CONFIRM_APPLY: usize = 1;
+const CONFIRM_ALWAYS: usize = 2;
+const CONFIRM_CHOICE_COUNT: usize = 3;
+
 /// 起動時にバックグラウンドで取得する初期データ。
 /// `&mut self` を奪わずに別タスクで取得できるよう、所有データだけを持つ。
 struct InitialData {
     orgs: Vec<Organization>,
     goal_tree: GoalTree,
-    members_list: Vec<Member>,
     /// 取得中に起きた最初のエラー（ステータスバーに表示する）。
     error: Option<String>,
 }
 
-/// ルートゴール（depth==0）のコメント・成果物を並列取得し `tree` に詰める。
-/// 失敗した件数を返す（呼び出し側でステータスバーに集約する）。
-/// 専用 helper(get_*_map) は失敗を stderr に出力して握り潰すため、TUI では使わない。
-/// 起動時のバックグラウンド取得と、組織切り替え時の `load_root_goal_details` で共有する。
-async fn fetch_root_goal_details_into(client: &ApiClient, tree: &mut GoalTree) -> usize {
-    let root_ids: Vec<String> = tree
-        .flatten()
+struct RootGoalDetail {
+    goal_id: String,
+    comments: Vec<Comment>,
+    deliverables: Vec<Deliverable>,
+}
+
+#[derive(Default)]
+struct RootGoalDetails {
+    items: Vec<RootGoalDetail>,
+    failed: usize,
+}
+
+struct DeferredInitialData {
+    members_list: Vec<Member>,
+    root_details: RootGoalDetails,
+    error: Option<String>,
+}
+
+fn root_goal_ids(tree: &GoalTree) -> Vec<String> {
+    tree.flatten()
         .iter()
         .filter_map(|row| match row {
             TreeRow::Goal { goal_id, depth, .. } if *depth == 0 => Some(goal_id.to_string()),
             _ => None,
         })
-        .collect();
+        .collect()
+}
+
+/// ルートゴール（depth==0）のコメント・成果物を並列取得する。
+/// 専用 helper(get_*_map) は失敗を stderr に出力して握り潰すため、TUI では使わない。
+async fn fetch_root_goal_details(client: &ApiClient, root_ids: Vec<String>) -> RootGoalDetails {
     if root_ids.is_empty() {
-        return 0;
+        return RootGoalDetails::default();
     }
 
     // 逐次 N 往復 → 概ね 1 往復に畳む。
@@ -517,19 +398,32 @@ async fn fetch_root_goal_details_into(client: &ApiClient, tree: &mut GoalTree) -
     .await;
 
     let mut failed = 0usize;
+    let mut items = Vec::new();
     for (id, r) in fetched {
         match r {
             Ok((comments, deliverables)) => {
-                tree.set_comments_for_goal_id(&id, comments.comments);
-                tree.set_deliverables_for_goal_id(&id, deliverables.data.deliverables);
+                items.push(RootGoalDetail {
+                    goal_id: id,
+                    comments: comments.comments,
+                    deliverables: deliverables.data.deliverables,
+                });
             }
             Err(_) => failed += 1,
         }
     }
+    RootGoalDetails { items, failed }
+}
+
+fn apply_root_goal_details(tree: &mut GoalTree, details: RootGoalDetails) -> usize {
+    let failed = details.failed;
+    for detail in details.items {
+        tree.set_comments_for_goal_id(&detail.goal_id, detail.comments);
+        tree.set_deliverables_for_goal_id(&detail.goal_id, detail.deliverables);
+    }
     failed
 }
 
-/// 組織・ゴールツリー（ルートゴールの詳細込み）・メンバーを取得する。
+/// 組織・ゴールツリーを取得する。
 /// `ApiClient` のクローンを所有し、`App` を借用しないため `spawn` できる。
 async fn fetch_initial_data(mut client: ApiClient) -> InitialData {
     let orgs = match client.list_organizations().await {
@@ -538,7 +432,6 @@ async fn fetch_initial_data(mut client: ApiClient) -> InitialData {
             return InitialData {
                 orgs: Vec::new(),
                 goal_tree: GoalTree::empty(),
-                members_list: Vec::new(),
                 error: Some(format!("Failed to load organizations: {e}")),
             };
         }
@@ -548,48 +441,43 @@ async fn fetch_initial_data(mut client: ApiClient) -> InitialData {
         return InitialData {
             orgs,
             goal_tree: GoalTree::empty(),
-            members_list: Vec::new(),
             error: None,
         };
     };
     client.set_org_id(Some(org_id.clone()));
 
-    // ゴールツリーとメンバーを並列取得する。
-    let (tree_res, members_res) = tokio::join!(
-        client.get_goal_tree(&org_id, 2),
-        client.get_members(&org_id)
-    );
-
-    let mut error: Option<String> = None;
-
-    let goal_tree = match tree_res {
-        Ok(resp) => {
-            let mut tree = GoalTree::from_tree_items(resp.data.items);
-            // 自動展開されるルートゴールのコメント・成果物を取得して埋める。
-            let failed = fetch_root_goal_details_into(&client, &mut tree).await;
-            if failed > 0 {
-                error.get_or_insert_with(|| format!("Failed to load details for {failed} goal(s)"));
-            }
-            tree
-        }
-        Err(e) => {
-            error = Some(format!("Failed to load goals: {e}"));
-            GoalTree::empty()
-        }
-    };
-
-    let members_list = match members_res {
-        Ok(resp) => resp.data.members,
-        Err(e) => {
-            error.get_or_insert_with(|| format!("Failed to load members: {e}"));
-            Vec::new()
-        }
+    let (goal_tree, error) = match client.get_goal_tree(&org_id, 2).await {
+        Ok(resp) => (GoalTree::from_tree_items(resp.data.items), None),
+        Err(e) => (
+            GoalTree::empty(),
+            Some(format!("Failed to load goals: {e}")),
+        ),
     };
 
     InitialData {
         orgs,
         goal_tree,
+        error,
+    }
+}
+
+async fn fetch_deferred_initial_data(
+    mut client: ApiClient,
+    org_id: String,
+    root_ids: Vec<String>,
+) -> DeferredInitialData {
+    client.set_org_id(Some(org_id.clone()));
+    let (members_res, root_details) = tokio::join!(
+        client.get_members(&org_id),
+        fetch_root_goal_details(&client, root_ids)
+    );
+    let (members_list, error) = match members_res {
+        Ok(resp) => (resp.data.members, None),
+        Err(e) => (Vec::new(), Some(format!("Failed to load members: {e}"))),
+    };
+    DeferredInitialData {
         members_list,
+        root_details,
         error,
     }
 }
@@ -628,12 +516,6 @@ fn extract_json_object(s: &str) -> Option<String> {
 /// DoD 自動判定がハングした場合に強制終了するまでの上限時間。
 const DOD_ASSESSMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-const CODEX_AUTO_RECORD_START: &str = "<!-- addness:codex:auto-record:start -->";
-const CODEX_AUTO_RECORD_END: &str = "<!-- addness:codex:auto-record:end -->";
-const CODEX_DECISION_LOG_START: &str = "<!-- addness:codex:decision-log:start -->";
-const CODEX_DECISION_LOG_END: &str = "<!-- addness:codex:decision-log:end -->";
-const CODEX_TRACEABILITY_START: &str = "<!-- addness:codex:traceability:start -->";
-const CODEX_TRACEABILITY_END: &str = "<!-- addness:codex:traceability:end -->";
 const CODEX_WHEEL_LINES: isize = 6;
 const CODEX_MOUSE_DRAIN_LIMIT: usize = 64;
 const XTERM_MOUSE_CAPTURE_ON: &[u8] = b"\x1b[?1000h\x1b[?1006h\x1b[?1007h";
@@ -642,187 +524,30 @@ const XTERM_MOUSE_CAPTURE_OFF: &[u8] =
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CodexTerminalScrollRoute {
-    ChildMouse,
     Scrollback,
     None,
 }
 
-fn git_status_short(cwd: &str) -> String {
-    let output = std::process::Command::new("git")
-        .args(["status", "--short"])
-        .current_dir(cwd)
-        .output();
-    match output {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-        _ => String::new(),
-    }
-}
-
-fn git_branch_name(cwd: &str) -> String {
-    let output = std::process::Command::new("git")
-        .args(["branch", "--show-current"])
-        .current_dir(cwd)
-        .output();
-    match output {
-        Ok(o) if o.status.success() => {
-            let branch = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if branch.is_empty() {
-                "(detached)".to_string()
-            } else {
-                branch
-            }
-        }
-        _ => "(unknown)".to_string(),
-    }
-}
-
-fn codex_work_memo(cwd: &str, session_state: &str, last_prompt: Option<&str>) -> String {
-    let cwd_path = PathBuf::from(cwd);
-    let diff = codex_pane::git_diff_stat(&cwd_path);
-    let status = git_status_short(cwd);
-    let branch = git_branch_name(cwd);
-    let diff_text = if diff.trim().is_empty() {
-        "差分なし".to_string()
-    } else {
-        diff
-    };
-    let status_text = if status.trim().is_empty() {
-        "差分なし".to_string()
-    } else {
-        status
-    };
-    let prompt_text = last_prompt
-        .map(|p| p.split_whitespace().collect::<Vec<_>>().join(" "))
-        .filter(|p| !p.is_empty())
-        .unwrap_or_else(|| "未記録".to_string());
-
-    format!(
-        "## Codex自動メモ(機械)\n\
-         - 更新: {}\n\
-         - セッション: {session_state}\n\
-         - 最後の依頼: {prompt_text}\n\
-         - 作業フォルダ: {cwd}\n\
-         - ブランチ: {branch}\n\
-         - 現在地: プロジェクト固有の判断・決定・次の手は `## Codex作業メモ` / `## Codex決定ログ` / `## PR/Release Traceability` へ集約する（この機械メモは自動更新なので編集不要）\n\
-         - git status:\n\
-         ```text\n\
-         {status_text}\n\
-         ```\n\
-         - git diff --stat HEAD:\n\
-         ```text\n\
-         {diff_text}\n\
-         ```",
-        Local::now().format("%Y-%m-%d %H:%M")
-    )
-}
-
-fn ensure_codex_block(existing: String, start: &str, end: &str, block_body: &str) -> String {
-    // codex が body を書き直して不可視マーカーを落としても、見出し（`## ...`）が
-    // 残っていれば既存とみなし、空ブロックを重複追加しない。
-    let heading = block_body.lines().next().unwrap_or("").trim();
-    let has_markers = existing.contains(start) && existing.contains(end);
-    let has_heading = !heading.is_empty() && existing.contains(heading);
-    if has_markers || has_heading {
-        existing
-    } else if existing.trim().is_empty() {
-        format!("{start}\n{block_body}\n{end}")
-    } else {
-        format!("{}\n\n{start}\n{block_body}\n{end}", existing.trim_end())
-    }
-}
-
-fn ensure_codex_memory_sections(body: String) -> String {
-    let decision_log = "## Codex決定ログ\n\
-        - （決定が出たら `YYYY-MM-DD HH:MM - 決定: ... / 理由: ... / 影響: ...` の形で追記）"
-        .replace("\n        ", "\n");
-    let traceability = "## PR/Release Traceability\n\
-        - PR: 未登録\n\
-        - tag/release: 未登録\n\
-        - CI: 未記録"
-        .replace("\n        ", "\n");
-    let body = ensure_codex_block(
-        body,
-        CODEX_DECISION_LOG_START,
-        CODEX_DECISION_LOG_END,
-        &decision_log,
-    );
-    ensure_codex_block(
-        body,
-        CODEX_TRACEABILITY_START,
-        CODEX_TRACEABILITY_END,
-        &traceability,
-    )
-}
-
-/// codex 作業メモを既存 body へ統合した body 更新リクエストを作る。
-/// 同期・非同期どちらの記録経路もこれを使い、body 合成ロジックを一本化する。
-fn codex_body_update_request(existing_body: Option<&str>, record: &str) -> UpdateGoalRequest {
-    let body = ensure_codex_memory_sections(upsert_codex_auto_record(existing_body, record));
-    UpdateGoalRequest {
-        status: None,
-        completed_at: None,
-        title: None,
-        description: None,
-        body: Some(body),
-        due_date: None,
-    }
-}
-
-fn upsert_codex_auto_record(existing: Option<&str>, record: &str) -> String {
-    let existing = existing.unwrap_or("").trim();
-    let block = format!("{CODEX_AUTO_RECORD_START}\n{record}\n{CODEX_AUTO_RECORD_END}");
-
-    if let (Some(start), Some(end)) = (
-        existing.find(CODEX_AUTO_RECORD_START),
-        existing.find(CODEX_AUTO_RECORD_END),
-    ) {
-        let end = end + CODEX_AUTO_RECORD_END.len();
-        let mut next = String::new();
-        next.push_str(existing[..start].trim_end());
-        if !next.is_empty() {
-            next.push_str("\n\n");
-        }
-        next.push_str(&block);
-        let tail = existing[end..].trim_start();
-        if !tail.is_empty() {
-            next.push_str("\n\n");
-            next.push_str(tail);
-        }
-        next
-    } else if existing.is_empty() {
-        block
-    } else {
-        format!("{existing}\n\n{block}")
-    }
-}
-
-fn codex_trace_link_label(name: &str, url: Option<&str>) -> Option<String> {
-    // URL のパス構造で判定する。`release`/`tag` のベア部分一致は
-    // `staging`（s-tag-ing）や `press release` を誤検知するため使わない。
-    let haystack = format!("{name} {}", url.unwrap_or("")).to_lowercase();
-    let kind = if haystack.contains("/pull/") {
-        "PR"
-    } else if haystack.contains("/releases")
-        || haystack.contains("/tag/")
-        || haystack.contains("/tags/")
-    {
-        "Release"
-    } else {
-        return None;
-    };
-    Some(format!("{kind}: {name}"))
+fn is_permission_denied_error_text(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("403")
+        || lower.contains("forbidden")
+        || lower.contains("permission")
+        || lower.contains("objective.update")
+        || text.contains("権限")
 }
 
 /// codex ペインのライブ更新で取得する Addness 側のスナップショット。
 struct CodexSnapshot {
     title: String,
     description: String,
+    body: Option<String>,
     status_label: String,
     comment_count: Option<usize>,
     deliverable_count: Option<usize>,
     trace_links: Vec<String>,
-    /// 子ゴール一覧（id, タイトル, 状態アイコン）。None=取得失敗。
-    children: Option<Vec<(String, String, &'static str)>>,
+    /// 子ゴール一覧。None=取得失敗。
+    children: Option<Vec<ChildGoalUpdate>>,
 }
 
 /// 実行中の DoD 自動判定（codex exec）ジョブ。
@@ -841,6 +566,13 @@ struct CodexBodyRecordOutcome {
     message: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexBodyRecordResult {
+    Written,
+    SkippedPermission,
+    Failed,
+}
+
 impl DodJob {
     /// 子プロセスを強制終了し（ゾンビ化を防ぐため wait し）、一時ファイルを掃除する。
     fn cleanup(&mut self) {
@@ -851,7 +583,64 @@ impl DodJob {
     }
 }
 
+/// 短いターン（開始から未満なら通知しない）の抑制閾値。
+const NOTIFY_MIN_TURN_SECS: u64 = 10;
+
+/// `ADDNESS_NOTIFY` で選べる通知レベル。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotifyMode {
+    /// すべて無効。
+    Off,
+    /// ターミナルベルのみ。
+    Bell,
+    /// ベル + OS 通知（既定）。
+    Full,
+}
+
+/// `ADDNESS_NOTIFY` の値を通知レベルへ解釈する。未設定・不明値は既定の `Full`。
+fn parse_notify_mode(raw: Option<&str>) -> NotifyMode {
+    match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("off") | Some("none") | Some("0") => NotifyMode::Off,
+        Some("bell") => NotifyMode::Bell,
+        _ => NotifyMode::Full,
+    }
+}
+
+/// ターン所要秒から通知を出すべきか判定する。
+/// `Some(n)` かつ閾値未満なら短いターンとして抑制、それ以外（承認・不明）は通知する。
+fn should_emit_notice(turn_elapsed_secs: Option<u64>, threshold_secs: u64) -> bool {
+    match turn_elapsed_secs {
+        Some(secs) => secs >= threshold_secs,
+        None => true,
+    }
+}
+
+/// AppleScript の文字列リテラルへ安全に埋め込めるようエスケープする。
+/// `\` と `"` をエスケープし、改行類は空白へ潰す（osascript には引数で渡すためシェル注入は起きない）。
+/// `agent` モジュール（クリップボード PNG 書き出し）でも共有する。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // osascript呼び出しはmacOSのみ
+pub(super) fn applescript_string_escape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' | '\r' | '\t' => out.push(' '),
+            ch if ch.is_control() => {}
+            ch => out.push(ch),
+        }
+    }
+    out
+}
+
 fn emit_terminal_notification(notice: &TerminalNotice) {
+    let mode = parse_notify_mode(std::env::var("ADDNESS_NOTIFY").ok().as_deref());
+    if mode == NotifyMode::Off {
+        return;
+    }
+    if !should_emit_notice(notice.turn_elapsed_secs, NOTIFY_MIN_TURN_SECS) {
+        return;
+    }
     let title = terminal_notification_text(&notice.title, 80);
     let message = terminal_notification_text(&notice.message, 240);
     if message.is_empty() {
@@ -859,11 +648,68 @@ fn emit_terminal_notification(notice: &TerminalNotice) {
     }
 
     let mut stdout = std::io::stdout();
-    let _ = write!(
-        stdout,
-        "\x07\x1b]9;{message}\x07\x1b]777;notify;{title};{message}\x07"
-    );
+    match mode {
+        NotifyMode::Bell => {
+            let _ = write!(stdout, "\x07");
+        }
+        NotifyMode::Full => {
+            let _ = write!(
+                stdout,
+                "\x07\x1b]9;{message}\x07\x1b]777;notify;{title};{message}\x07"
+            );
+        }
+        NotifyMode::Off => unreachable!(),
+    }
     let _ = stdout.flush();
+
+    // macOS では加えて osascript のデスクトップ通知を投げる（Full のみ）。
+    #[cfg(target_os = "macos")]
+    if mode == NotifyMode::Full {
+        let body = match &notice.context {
+            Some(ctx) if !ctx.trim().is_empty() => {
+                format!("{}｜{}", terminal_notification_text(ctx, 80), title)
+            }
+            _ => title.clone(),
+        };
+        spawn_macos_notification(&body);
+    }
+}
+
+/// macOS の `display notification` を別スレッドで投げる。UI をブロックしないよう wait せず、
+/// 5 秒でタイムアウトさせて回収する。失敗は無視する。
+#[cfg(target_os = "macos")]
+fn spawn_macos_notification(body: &str) {
+    let script = format!(
+        "display notification \"{}\" with title \"Addness\"",
+        applescript_string_escape(body)
+    );
+    std::thread::spawn(move || {
+        let Ok(mut child) = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        else {
+            return;
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(_) => break,
+            }
+        }
+    });
 }
 
 fn terminal_notification_text(input: &str, max_chars: usize) -> String {
@@ -889,6 +735,174 @@ fn terminal_notification_text(input: &str, max_chars: usize) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// ターン単位チェックポイント / undo の git 実行（すべてブロッキングプールで実行する）
+// ---------------------------------------------------------------------------
+
+/// チェックポイント作成ジョブの結果。
+enum CheckpointJobResult {
+    /// ref を作成した（変更あり=スナップショット / 変更なし=HEAD）。
+    Recorded,
+    /// git リポジトリではない → 記録しない。
+    NotRepo,
+    /// 失敗（薄くログするだけでターンは続行する）。
+    Failed(String),
+}
+
+struct CheckpointJobOutcome {
+    ref_name: String,
+    turn: usize,
+    result: CheckpointJobResult,
+}
+
+struct UndoJobOutcome {
+    turn: usize,
+    error: Option<String>,
+}
+
+fn git_is_repo(cwd: &std::path::Path) -> bool {
+    std::process::Command::new("git")
+        .current_dir(cwd)
+        .args(["rev-parse", "--git-dir"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// git を実行し、成功時に stdout（trim 済み）を返す。失敗は None。
+fn git_capture(
+    cwd: &std::path::Path,
+    args: &[&str],
+    index: Option<&std::path::Path>,
+) -> Option<String> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.current_dir(cwd).args(args);
+    if let Some(index) = index {
+        cmd.env("GIT_INDEX_FILE", index);
+    }
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// git を実行し、成功なら Ok、失敗なら stderr を Err で返す。
+fn git_run(
+    cwd: &std::path::Path,
+    args: &[&str],
+    index: Option<&std::path::Path>,
+) -> Result<(), String> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.current_dir(cwd).args(args);
+    if let Some(index) = index {
+        cmd.env("GIT_INDEX_FILE", index);
+    }
+    let out = cmd.output().map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// 一時 index を使い、作業ツリー全体（untracked 含む）のスナップショットコミットを作る。
+/// 実 index・作業ツリー・スタッシュを一切変更しない。生成コミット SHA を返す。
+fn git_snapshot_commit(cwd: &std::path::Path, head: &str, message: &str) -> Result<String, String> {
+    let tmp_index = std::env::temp_dir().join(format!(
+        "addness-checkpoint-index-{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    let _ = std::fs::remove_file(&tmp_index);
+    let result = (|| {
+        // HEAD の内容で一時 index を初期化してから作業ツリー全体を stage する。
+        git_run(cwd, &["read-tree", "HEAD"], Some(&tmp_index))?;
+        git_run(cwd, &["add", "-A"], Some(&tmp_index))?;
+        let tree = git_capture(cwd, &["write-tree"], Some(&tmp_index))
+            .ok_or_else(|| "write-tree に失敗".to_string())?;
+        git_capture(
+            cwd,
+            &["commit-tree", &tree, "-p", head, "-m", message],
+            None,
+        )
+        .ok_or_else(|| "commit-tree に失敗".to_string())
+    })();
+    let _ = std::fs::remove_file(&tmp_index);
+    result
+}
+
+/// チェックポイント ref を作成する（変更があればスナップショット、無ければ HEAD を指す）。
+fn git_create_checkpoint(cwd: &str, ref_name: &str, message: &str) -> CheckpointJobResult {
+    let cwd = std::path::Path::new(cwd);
+    if !git_is_repo(cwd) {
+        return CheckpointJobResult::NotRepo;
+    }
+    let Some(head) = git_capture(cwd, &["rev-parse", "HEAD"], None) else {
+        return CheckpointJobResult::Failed("HEAD を取得できません（初期コミット前）".to_string());
+    };
+    let porcelain = git_capture(cwd, &["status", "--porcelain"], None).unwrap_or_default();
+    let commit = if agent::git_status_has_changes(&porcelain) {
+        match git_snapshot_commit(cwd, &head, message) {
+            Ok(sha) => sha,
+            Err(e) => return CheckpointJobResult::Failed(e),
+        }
+    } else {
+        head
+    };
+    match git_run(cwd, &["update-ref", ref_name, &commit], None) {
+        Ok(()) => CheckpointJobResult::Recorded,
+        Err(e) => CheckpointJobResult::Failed(e),
+    }
+}
+
+/// チェックポイント ref の状態へ作業ツリーとインデックスを戻す。
+/// ref に存在しない（チェックポイント後に新規作成された）ファイルは削除しない。
+/// 復元範囲はこのペインの作業ディレクトリ配下（`.`）に限定し、cwd 外は巻き戻さない。
+fn git_restore_checkpoint(cwd: &str, ref_name: &str) -> Result<(), String> {
+    let cwd = std::path::Path::new(cwd);
+    git_run(
+        cwd,
+        &[
+            "restore",
+            "--source",
+            ref_name,
+            "--staged",
+            "--worktree",
+            "--",
+            ".",
+        ],
+        None,
+    )
+}
+
+/// チェックポイント ref を削除する（掃除用、失敗は無視）。
+fn git_delete_ref(cwd: &str, ref_name: &str) {
+    let _ = git_run(
+        std::path::Path::new(cwd),
+        &["update-ref", "-d", ref_name],
+        None,
+    );
+}
+
+/// エージェントペインの UI 構造シグネチャ。入力欄高さの変化（承認バナー・複数行入力）や
+/// ピッカー/ヘルプ/diff の開閉・パレット表示など、構造が変わる遷移を前フレームと比較して
+/// 検知するための軽量な値。ペインが無いときは `None` として扱う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CodexUiSignature {
+    /// 入力欄パネルの高さ（`ui::codex_input_panel_height` 相当。バナー・複数行入力を包括）。
+    input_h: u16,
+    turn_picker_open: bool,
+    list_picker_open: bool,
+    show_help: bool,
+    diff_view_open: bool,
+    finished: bool,
+    slash_palette_active: bool,
+    mention_palette_active: bool,
+}
+
 pub struct App {
     pub(super) client: ApiClient,
     rt: Handle,
@@ -905,6 +919,9 @@ pub struct App {
 
     /// キーバインド一覧のヘルプオーバーレイ表示中か（`?` で開く）
     pub show_help: bool,
+    /// ヘルプオーバーレイのスクロール位置（行数）。描画側が実際の行数に
+    /// クランプし直す。開くたびに 0 へ戻す。
+    pub help_scroll: usize,
 
     // Goal trees
     pub goal_tree: GoalTree,
@@ -926,6 +943,10 @@ pub struct App {
 
     /// Modal state for create/edit goal dialogs
     pub modal_state: Option<ModalState>,
+    /// このTUIセッション中、同種の削除確認を省略する。
+    allow_delete_goal_without_confirm: bool,
+    allow_delete_deliverable_without_confirm: bool,
+    allow_delete_comment_without_confirm: bool,
 
     /// Success message to display in status bar (cleared on next key press)
     pub success_message: Option<String>,
@@ -935,6 +956,7 @@ pub struct App {
     /// 直近に描画した codex 端末ペインの外枠領域。マウス座標のローカル変換に使う。
     pub(super) codex_terminal_area: Option<Rect>,
     /// 直近に描画した Codex 左ペインのスクロール対象領域。
+    pub(super) codex_status_area: Option<Rect>,
     pub(super) codex_contract_area: Option<Rect>,
     pub(super) codex_activity_area: Option<Rect>,
     pub(super) codex_contract_scroll: usize,
@@ -953,11 +975,27 @@ pub struct App {
     /// 次の描画前に画面を全クリアする（codex ⇄ 通常UI の構造遷移やリサイズで
     /// 前画面の残像が残らないようにするため）。
     needs_full_clear: bool,
+    /// 前フレームのエージェントペイン UI 構造シグネチャ。承認バナー・ピッカー・
+    /// diff/ヘルプ開閉など、入力欄高さやオーバーレイが変わる構造遷移を検知し、
+    /// bg を塗らない history 描画に前画面の色が残らないよう全クリアを誘発する。
+    codex_ui_signature: Option<CodexUiSignature>,
 
     /// DoD 自動判定（codex exec）の実行中ジョブ。
     codex_dod_job: Option<DodJob>,
     /// 最初の実依頼など、節目の Codex 作業メモを body に非同期記録するジョブ。
     codex_body_record_job: Option<JoinHandle<CodexBodyRecordOutcome>>,
+    /// ターン開始時チェックポイント作成の非同期ジョブ。
+    codex_checkpoint_job: Option<JoinHandle<CheckpointJobOutcome>>,
+    /// /undo（チェックポイント復元）の非同期ジョブ。
+    codex_undo_job: Option<JoinHandle<UndoJobOutcome>>,
+    /// 初回表示後にメンバー・ルートゴール詳細を埋める遅延ロードジョブ。
+    deferred_initial_load: Option<JoinHandle<DeferredInitialData>>,
+
+    /// ステータスメッセージ（error/success）の自動クリア期限。
+    /// キー入力では消さず、表示から一定時間で期限切れとしてクリアする。
+    /// メッセージ設定は `set_error_message` / `set_success_message` 経由で行い、
+    /// 設定と同時に期限を張り直す（同一内容の再設定でも期限が延びる）。
+    status_deadline: Option<Instant>,
 }
 
 impl App {
@@ -974,6 +1012,7 @@ impl App {
             show_org_popup: false,
             org_popup_index: 0,
             show_help: false,
+            help_scroll: 0,
             goal_tree: GoalTree::empty(),
             todays_goals_tree: GoalTree::empty(),
             todays_loaded: false,
@@ -984,9 +1023,13 @@ impl App {
             content_height: 0,
             error_message: None,
             modal_state: None,
+            allow_delete_goal_without_confirm: false,
+            allow_delete_deliverable_without_confirm: false,
+            allow_delete_comment_without_confirm: false,
             success_message: None,
             codex: None,
             codex_terminal_area: None,
+            codex_status_area: None,
             codex_contract_area: None,
             codex_activity_area: None,
             codex_contract_scroll: 0,
@@ -998,8 +1041,43 @@ impl App {
             codex_sync_tick: 0,
             pending_codex_tree_reload: false,
             needs_full_clear: false,
+            codex_ui_signature: None,
             codex_dod_job: None,
             codex_body_record_job: None,
+            codex_checkpoint_job: None,
+            codex_undo_job: None,
+            deferred_initial_load: None,
+            status_deadline: None,
+        }
+    }
+
+    /// ステータスメッセージ（error/success）の自動クリアTTL。
+    const STATUS_MESSAGE_TTL: Duration = Duration::from_secs(5);
+
+    /// エラーメッセージを設定し、同時に自動クリア期限を張り直す。
+    /// 同一内容を再設定した場合でも期限が延びる。
+    pub(super) fn set_error_message(&mut self, msg: String) {
+        self.error_message = Some(msg);
+        self.status_deadline = Some(Instant::now() + Self::STATUS_MESSAGE_TTL);
+    }
+
+    /// 成功メッセージを設定し、同時に自動クリア期限を張り直す。
+    /// 同一内容を再設定した場合でも期限が延びる。
+    pub(super) fn set_success_message(&mut self, msg: String) {
+        self.success_message = Some(msg);
+        self.status_deadline = Some(Instant::now() + Self::STATUS_MESSAGE_TTL);
+    }
+
+    /// 自動クリア期限が過ぎていればメッセージを消す。消したら true を返す（要再描画）。
+    fn expire_status_messages(&mut self) -> bool {
+        match self.status_deadline {
+            Some(deadline) if Instant::now() >= deadline => {
+                self.error_message = None;
+                self.success_message = None;
+                self.status_deadline = None;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -1049,10 +1127,10 @@ impl App {
             .unwrap_or_else(|_| InitialData {
                 orgs: Vec::new(),
                 goal_tree: GoalTree::empty(),
-                members_list: Vec::new(),
                 error: Some("Failed to load initial data".to_string()),
             });
         self.apply_initial_data(data);
+        self.start_deferred_initial_load();
 
         // ロード画面（ロゴ）から本UIへ切り替わる初回フレームの残像を消す。
         self.needs_full_clear = true;
@@ -1060,6 +1138,18 @@ impl App {
         while self.running {
             // 表示しようとしているタブのデータを必要になった時点で取得する。
             self.ensure_active_tab_loaded();
+            if self.poll_deferred_initial_load() {
+                needs_redraw = true;
+            }
+            // エージェントペインの構造遷移（承認バナー出現/解決・ピッカー/ヘルプ/diff の
+            // 開閉・パレット表示による入力欄高さ変化）を検知する。bg を塗らない history
+            // 描画の上に前画面のバナー/入力欄背景色が残るため、変化したら全クリアする。
+            let signature = self.compute_codex_ui_signature();
+            if signature != self.codex_ui_signature {
+                self.codex_ui_signature = signature;
+                self.needs_full_clear = true;
+                needs_redraw = true;
+            }
             if needs_redraw {
                 // 構造遷移・リサイズ時は差分描画前に画面を全消去し、残像を断つ。
                 if self.needs_full_clear {
@@ -1083,9 +1173,9 @@ impl App {
 
             if self.codex.is_some() {
                 // codex は非同期に描画更新するので、キー入力が無くても一定間隔で
-                // PTY 出力を取り込む（ブロッキング read は使わない）。変化があった
+                // JSONL 出力を取り込む（ブロッキング read は使わない）。変化があった
                 // フレームだけ再描画し、アイドル時の無駄な再描画を避ける。
-                if event::poll(std::time::Duration::from_millis(20))? {
+                if event::poll(Duration::from_millis(20))? {
                     self.handle_events()?;
                     needs_redraw = true;
                 }
@@ -1093,11 +1183,48 @@ impl App {
                     needs_redraw = true;
                 }
             } else {
-                self.handle_events()?;
+                // ステータスメッセージは時間ベースで自動クリアするため、ブロッキング
+                // read ではなく poll でタイムアウトさせ、時間経過を進める。メッセージ
+                // 表示中のみ短い間隔でポーリングし、非表示（アイドル）時は長めにして
+                // CPU 負荷を抑える。
+                let timeout = if self.status_deadline.is_some() {
+                    Duration::from_millis(100)
+                } else {
+                    Duration::from_millis(500)
+                };
+                if event::poll(timeout)? {
+                    self.handle_events()?;
+                    needs_redraw = true;
+                }
+            }
+
+            // 期限切れのステータスメッセージを消す（設定時に期限を張る方式）。
+            if self.expire_status_messages() {
                 needs_redraw = true;
             }
         }
         Ok(())
+    }
+
+    /// 現在のエージェントペイン UI 構造シグネチャを計算する。ペインが無ければ `None`。
+    fn compute_codex_ui_signature(&self) -> Option<CodexUiSignature> {
+        let pane = self.codex.as_ref()?;
+        // 入力欄高さは draw と同じ内寸（term_area からボーダー分を引いた値）で計算する。
+        // codex_terminal_area は前フレームの draw で確定した領域。未描画時は 0 扱い。
+        let (inner_w, inner_h) = self
+            .codex_terminal_area
+            .map(|a| (a.width.saturating_sub(2), a.height.saturating_sub(2)))
+            .unwrap_or((0, 0));
+        Some(CodexUiSignature {
+            input_h: ui::codex_input_panel_height(pane, inner_w, inner_h),
+            turn_picker_open: pane.turn_picker_open(),
+            list_picker_open: pane.list_picker_open(),
+            show_help: self.show_help,
+            diff_view_open: pane.diff_view().is_some(),
+            finished: pane.finished,
+            slash_palette_active: pane.slash_palette_active(),
+            mention_palette_active: pane.mention_palette_active(),
+        })
     }
 
     /// バックグラウンドで取得した初期データを App の状態へ反映する。
@@ -1111,10 +1238,47 @@ impl App {
             self.client.set_org_id(Some(org_id));
         }
         self.goal_tree = data.goal_tree;
-        self.set_members(data.members_list);
         if let Some(err) = data.error {
-            self.error_message = Some(err);
+            self.set_error_message(err);
         }
+    }
+
+    fn start_deferred_initial_load(&mut self) {
+        if let Some(handle) = self.deferred_initial_load.take() {
+            handle.abort();
+        }
+        let Some(org_id) = self.current_org_id().map(str::to_string) else {
+            return;
+        };
+        let root_ids = root_goal_ids(&self.goal_tree);
+        let client = self.client.clone();
+        self.deferred_initial_load = Some(
+            self.rt
+                .spawn(fetch_deferred_initial_data(client, org_id, root_ids)),
+        );
+    }
+
+    fn poll_deferred_initial_load(&mut self) -> bool {
+        let Some(handle) = self.deferred_initial_load.as_ref() else {
+            return false;
+        };
+        if !handle.is_finished() {
+            return false;
+        }
+        let handle = self.deferred_initial_load.take().unwrap();
+        let Ok(data) = self.rt.block_on(handle) else {
+            self.set_error_message("Failed to load goal details".to_string());
+            return true;
+        };
+        self.set_members(data.members_list);
+        let failed = apply_root_goal_details(&mut self.goal_tree, data.root_details);
+        self.goal_tree.clamp_cursor();
+        if failed > 0 {
+            self.set_error_message(format!("Failed to load details for {failed} goal(s)"));
+        } else if let Some(err) = data.error {
+            self.set_error_message(err);
+        }
+        true
     }
 
     /// メンバー一覧をルックアップ用マップと表示用リストに反映し、カーソルを先頭へ戻す。
@@ -1147,9 +1311,7 @@ impl App {
         self.rt.block_on(future)
     }
 
-    /// 現在の組織配下のゴールツリーとメンバーを並列取得する。
-    /// 直列に取ると往復が積み上がるため `tokio::join!` で概ね1往復に畳む。
-    /// 起動時と組織切り替え時の両方から使う。
+    /// 現在の組織配下のゴールツリーを取得し、重い詳細は遅延ロードへ逃がす。
     fn load_org_scoped_data(&mut self) {
         let Some(org_id) = self.current_org_id().map(|s| s.to_string()) else {
             self.goal_tree = GoalTree::empty();
@@ -1160,32 +1322,18 @@ impl App {
 
         self.client.set_org_id(Some(org_id.clone()));
 
-        let client = &self.client;
-        let (tree_res, members_res) = self.rt.block_on(async {
-            tokio::join!(
-                client.get_goal_tree(&org_id, 2),
-                client.get_members(&org_id)
-            )
-        });
-
-        match tree_res {
+        match self.api_call(self.client.get_goal_tree(&org_id, 2)) {
             Ok(resp) => {
                 self.goal_tree = GoalTree::from_tree_items(resp.data.items);
-                // 自動展開されるルートゴールのコメント・成果物を取得する。
-                self.load_root_goal_details();
+                self.members = HashMap::new();
+                self.members_list = vec![];
+                self.start_deferred_initial_load();
             }
             Err(e) => {
                 self.goal_tree = GoalTree::empty();
-                self.error_message = Some(format!("Failed to load goals: {e}"));
-            }
-        }
-
-        match members_res {
-            Ok(resp) => self.set_members(resp.data.members),
-            Err(e) => {
                 self.members = HashMap::new();
                 self.members_list = vec![];
-                self.error_message = Some(format!("Failed to load members: {e}"));
+                self.set_error_message(format!("Failed to load goals: {e}"));
             }
         }
     }
@@ -1201,27 +1349,12 @@ impl App {
         match self.api_call(self.client.get_goal_tree(&org_id, 2)) {
             Ok(resp) => {
                 self.goal_tree = GoalTree::from_tree_items(resp.data.items);
-
-                // Load comments and deliverables for auto-expanded root goals
-                self.load_root_goal_details();
+                self.start_deferred_initial_load();
             }
             Err(e) => {
                 self.goal_tree = GoalTree::empty();
-                self.error_message = Some(format!("Failed to load goals: {e}"));
+                self.set_error_message(format!("Failed to load goals: {e}"));
             }
-        }
-    }
-
-    fn load_root_goal_details(&mut self) {
-        // ツリーを一時的に取り出してヘルパーに &mut で渡し、取得後に戻す。
-        // 起動時のバックグラウンド取得と同じ `fetch_root_goal_details_into` を共有する。
-        let mut tree = std::mem::replace(&mut self.goal_tree, GoalTree::empty());
-        let failed = self
-            .rt
-            .block_on(fetch_root_goal_details_into(&self.client, &mut tree));
-        self.goal_tree = tree;
-        if failed > 0 {
-            self.error_message = Some(format!("Failed to load details for {failed} goal(s)"));
         }
     }
 
@@ -1264,7 +1397,7 @@ impl App {
             }
             Err(e) => {
                 self.todays_goals_tree = GoalTree::empty();
-                self.error_message = Some(format!("Failed to load today's goals: {e}"));
+                self.set_error_message(format!("Failed to load today's goals: {e}"));
             }
         }
     }
@@ -1431,6 +1564,7 @@ impl App {
                 title: goal_title,
                 items: vec![
                     ActionMenuItem::WorkWithCodex,
+                    ActionMenuItem::WorkWithClaude,
                     complete_item,
                     ActionMenuItem::AddComment,
                     ActionMenuItem::AddDeliverable,
@@ -1442,37 +1576,63 @@ impl App {
             return;
         }
 
-        self.error_message =
-            Some("Select a goal, deliverable or comment to open actions".to_string());
+        self.set_error_message("Select a goal, deliverable or comment to open actions".to_string());
     }
 
     /// 選択中ゴールの文脈を注入して、埋め込み codex セッションを起動する。
     fn start_codex(&mut self) {
+        self.start_agent(AgentKind::Codex);
+    }
+
+    fn start_agent(&mut self, kind: AgentKind) {
+        let name = kind.display_name();
+        let label = kind.label();
         let Some((goal_id, title)) = self.selected_goal_context() else {
-            self.error_message = Some("ゴールを選択してから codex を起動してください".to_string());
+            self.set_error_message(format!("ゴールを選択してから {label} を起動してください"));
             return;
         };
 
-        // codex 未インストールでもクラッシュさせず、案内を出す。
-        let Some(codex_bin) = codex_pane::codex_path() else {
-            self.error_message = Some(
-                "codex が見つかりません。`brew install codex` 等でインストールしてください"
-                    .to_string(),
-            );
+        // 未インストールでもクラッシュさせず、案内を出す。
+        let bin = match kind {
+            AgentKind::Codex => agent::codex_path(),
+            AgentKind::ClaudeCode => agent::claude_path(),
+        };
+        let Some(agent_bin) = bin else {
+            self.set_error_message(match kind {
+                AgentKind::Codex => {
+                    "codex が見つかりません。`brew install codex` 等でインストールしてください"
+                        .to_string()
+                }
+                AgentKind::ClaudeCode => {
+                    "claude が見つかりません。`npm install -g @anthropic-ai/claude-code` 等でインストールしてください"
+                        .to_string()
+                }
+            });
             return;
         };
 
         // DoD・ステータスを取得して左ペインの初期表示に使う。失敗しても空で続行する。
-        let (dod, status_label) = match self.api_call(self.client.get_goal(&goal_id)) {
+        let (dod, status_label, initial_body) = match self.api_call(self.client.get_goal(&goal_id))
+        {
             Ok(resp) => {
                 let goal = resp.data;
                 let status =
                     GoalDisplayStatus::from_goal_state(goal.status.as_ref(), goal.is_completed)
                         .to_emoji_string();
-                (goal.description.unwrap_or_default(), status)
+                (goal.description.unwrap_or_default(), status, goal.body)
             }
-            Err(_) => (String::new(), String::new()),
+            Err(_) => (String::new(), String::new(), None),
         };
+        let initial_children = self
+            .api_call(self.client.get_goal_children(&goal_id, 50, 0))
+            .ok()
+            .map(|resp| {
+                resp.data
+                    .children
+                    .into_iter()
+                    .map(child_goal_update_from_item)
+                    .collect::<Vec<_>>()
+            });
 
         // codex のサブプロセスから確実に呼べるよう、addness 自身の絶対パスを渡す。
         let addness_bin = std::env::current_exe()
@@ -1484,16 +1644,54 @@ impl App {
         // 対象ゴールの軽量コンテキストは環境変数で伝える。起動直後は初期プロンプトを
         // 送らず、ユーザーがすぐ最初の指示を入力できる状態にする。
         match CodexPane::spawn(
-            &codex_bin,
+            &agent_bin,
             &cwd,
             &addness_bin,
             goal_id,
             title,
             dod,
             status_label,
+            kind,
         ) {
             Ok(mut pane) => {
-                pane.push_activity(format!("{} codex を起動", Local::now().format("%H:%M")));
+                let body_loaded = pane.set_addness_body_context(initial_body);
+                pane.push_activity(format!("{} {label} を起動", Local::now().format("%H:%M")));
+                if body_loaded {
+                    pane.last_addness_read_at = Some(Instant::now());
+                    pane.last_addness_read_label = Some("body".to_string());
+                    pane.push_activity(format!(
+                        "{} 現状(body)を読込",
+                        Local::now().format("%H:%M")
+                    ));
+                }
+                if let Some(children) = initial_children {
+                    let count = children.len();
+                    pane.child_count = Some(count);
+                    pane.update_children(children);
+                    pane.last_addness_read_at = Some(Instant::now());
+                    pane.last_addness_read_label = Some(if body_loaded {
+                        "body/子ゴール".to_string()
+                    } else {
+                        "子ゴール".to_string()
+                    });
+                    pane.push_activity(format!(
+                        "{} 子ゴール{count}件を読込（完了済み含む）",
+                        Local::now().format("%H:%M")
+                    ));
+                }
+                if pane.loaded_history_count() > 0 {
+                    pane.push_activity(format!(
+                        "{} 前回履歴を{}件復元",
+                        Local::now().format("%H:%M"),
+                        pane.loaded_history_count()
+                    ));
+                }
+                if let Some(path) = pane.history_path_label() {
+                    pane.push_activity(format!(
+                        "{} 履歴保存: {path}",
+                        Local::now().format("%H:%M")
+                    ));
+                }
                 pane.push_activity(format!(
                     "{} 軽量コンテキストで入力待ち",
                     Local::now().format("%H:%M")
@@ -1505,6 +1703,7 @@ impl App {
                 self.codex = Some(pane);
                 self.active_pane = ActivePane::Codex;
                 self.codex_terminal_area = None;
+                self.codex_status_area = None;
                 self.codex_contract_area = None;
                 self.codex_activity_area = None;
                 self.codex_contract_scroll = 0;
@@ -1516,7 +1715,7 @@ impl App {
                 Self::set_mouse_capture(true);
             }
             Err(e) => {
-                self.error_message = Some(format!("codex の起動に失敗しました: {e}"));
+                self.set_error_message(format!("{name} の起動に失敗しました: {e}"));
             }
         }
     }
@@ -1540,29 +1739,47 @@ impl App {
         cwd: &str,
         session_state: &str,
         last_prompt: Option<&str>,
-    ) -> bool {
-        let record = codex_work_memo(cwd, session_state, last_prompt);
+        summary: Option<&CodexWorkSummary>,
+    ) -> CodexBodyRecordResult {
+        let record = codex_work_memo(cwd, session_state, last_prompt, summary);
 
         let goal = match self.api_call(self.client.get_goal(goal_id)) {
             Ok(resp) => resp.data,
             Err(e) => {
-                self.error_message = Some(format!("Codex自動記録の取得に失敗しました: {e}"));
-                return false;
+                let message = format!("{e}");
+                if is_permission_denied_error_text(&message) {
+                    self.set_success_message(
+                        "権限がないためCodex作業メモの自動記録をスキップしました".to_string(),
+                    );
+                    return CodexBodyRecordResult::SkippedPermission;
+                }
+                self.set_error_message(format!("Codex自動記録の取得に失敗しました: {message}"));
+                return CodexBodyRecordResult::Failed;
             }
         };
         let req = codex_body_update_request(goal.body.as_deref(), &record);
 
         match self.api_call(self.client.update_goal(goal_id, &req)) {
             Ok(_) => {
-                self.success_message =
-                    Some("Codex作業メモをAddnessの現状(body)に書き込みました".to_string());
-                true
+                self.set_success_message(
+                    "Codex作業メモをAddnessの現状(body)に書き込みました".to_string(),
+                );
+                CodexBodyRecordResult::Written
             }
             Err(e) => {
-                self.error_message = Some(format!(
-                    "Codex作業メモの現状(body)書き込みに失敗しました: {e}"
-                ));
-                false
+                let message = format!("{e}");
+                if is_permission_denied_error_text(&message) {
+                    self.set_success_message(
+                        "書き込み権限がないためCodex作業メモの自動記録をスキップしました"
+                            .to_string(),
+                    );
+                    CodexBodyRecordResult::SkippedPermission
+                } else {
+                    self.set_error_message(format!(
+                        "Codex作業メモの現状(body)書き込みに失敗しました: {message}"
+                    ));
+                    CodexBodyRecordResult::Failed
+                }
             }
         }
     }
@@ -1587,7 +1804,7 @@ impl App {
             // git status/diff のサブプロセスは UI スレッドを固めないよう
             // ブロッキングプールで作る。
             let record = tokio::task::spawn_blocking(move || {
-                codex_work_memo(&cwd, "依頼受付", Some(&prompt))
+                codex_work_memo(&cwd, "依頼受付", Some(&prompt), None)
             })
             .await
             .unwrap_or_default();
@@ -1604,10 +1821,15 @@ impl App {
                     ok: true,
                     message: "現状(body)に作業メモを書込".to_string(),
                 },
-                Err(e) => CodexBodyRecordOutcome {
-                    ok: false,
-                    message: format!("現状(body)の作業メモに失敗: {e}"),
-                },
+                Err(e) => {
+                    let message = format!("{e}");
+                    let message = if is_permission_denied_error_text(&message) {
+                        "書き込み権限なしのため現状(body)の作業メモをスキップ".to_string()
+                    } else {
+                        format!("現状(body)の作業メモに失敗: {message}")
+                    };
+                    CodexBodyRecordOutcome { ok: false, message }
+                }
             }
         }));
         if let Some(pane) = self.codex.as_mut() {
@@ -1642,20 +1864,206 @@ impl App {
         true
     }
 
+    /// ターン開始時に予約されたチェックポイント作成ジョブを起動する。
+    fn maybe_start_checkpoint_job(&mut self) -> bool {
+        if self.codex_checkpoint_job.is_some() {
+            return false;
+        }
+        let Some(req) = self
+            .codex
+            .as_mut()
+            .and_then(|pane| pane.take_checkpoint_request())
+        else {
+            return false;
+        };
+        self.codex_checkpoint_job = Some(self.rt.spawn(async move {
+            let CheckpointRequest {
+                cwd,
+                ref_name,
+                turn,
+                message,
+            } = req;
+            let job_ref = ref_name.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                git_create_checkpoint(&cwd, &job_ref, &message)
+            })
+            .await
+            .unwrap_or_else(|e| CheckpointJobResult::Failed(format!("ジョブ失敗: {e}")));
+            CheckpointJobOutcome {
+                ref_name,
+                turn,
+                result,
+            }
+        }));
+        true
+    }
+
+    fn poll_checkpoint_job(&mut self) -> bool {
+        let Some(handle) = self.codex_checkpoint_job.as_ref() else {
+            return false;
+        };
+        if !handle.is_finished() {
+            return false;
+        }
+        let handle = self.codex_checkpoint_job.take().unwrap();
+        let Ok(outcome) = self.rt.block_on(handle) else {
+            return true;
+        };
+        let mut evicted = Vec::new();
+        let mut cwd = None;
+        if let Some(pane) = self.codex.as_mut() {
+            let now = Local::now().format("%H:%M");
+            match outcome.result {
+                CheckpointJobResult::Recorded => {
+                    cwd = Some(pane.cwd.clone());
+                    evicted = pane.record_checkpoint(outcome.ref_name, outcome.turn);
+                    pane.push_activity(format!(
+                        "{now} turn {}のチェックポイントを保存",
+                        outcome.turn
+                    ));
+                }
+                CheckpointJobResult::NotRepo => {
+                    // git リポジトリでなければチェックポイントは取らない（無音）。
+                }
+                CheckpointJobResult::Failed(e) => {
+                    pane.push_activity(format!("{now} チェックポイント保存に失敗: {e}"));
+                }
+            }
+        }
+        // 上限超過で押し出された古い ref を掃除する（投げっぱなし）。
+        if let Some(cwd) = cwd {
+            for ref_name in evicted {
+                let cwd = cwd.clone();
+                self.rt.spawn(async move {
+                    let _ =
+                        tokio::task::spawn_blocking(move || git_delete_ref(&cwd, &ref_name)).await;
+                });
+            }
+        }
+        true
+    }
+
+    /// /undo の復元ジョブを起動する。
+    fn maybe_start_undo_job(&mut self) -> bool {
+        if self.codex_undo_job.is_some() {
+            return false;
+        }
+        let Some(req) = self
+            .codex
+            .as_mut()
+            .and_then(|pane| pane.take_undo_request())
+        else {
+            return false;
+        };
+        self.codex_undo_job = Some(self.rt.spawn(async move {
+            let UndoRequest {
+                cwd,
+                ref_name,
+                turn,
+            } = req;
+            let restore_cwd = cwd.clone();
+            let restore_ref = ref_name.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                git_restore_checkpoint(&restore_cwd, &restore_ref)
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("ジョブ失敗: {e}")));
+            // 復元に成功したら消費したチェックポイント ref を掃除する。
+            if result.is_ok() {
+                let _ = tokio::task::spawn_blocking(move || git_delete_ref(&cwd, &ref_name)).await;
+            }
+            UndoJobOutcome {
+                turn,
+                error: result.err(),
+            }
+        }));
+        true
+    }
+
+    fn poll_undo_job(&mut self) -> bool {
+        let Some(handle) = self.codex_undo_job.as_ref() else {
+            return false;
+        };
+        if !handle.is_finished() {
+            return false;
+        }
+        let handle = self.codex_undo_job.take().unwrap();
+        let Ok(outcome) = self.rt.block_on(handle) else {
+            return true;
+        };
+        if let Some(pane) = self.codex.as_mut() {
+            pane.note_undo_result(outcome.turn, outcome.error);
+        }
+        true
+    }
+
+    fn maybe_start_codex_turn_body_record(&mut self) -> bool {
+        if self.codex_body_record_job.is_some() {
+            return false;
+        }
+        let Some((goal_id, cwd, prompt, summary, turn)) = self.codex.as_mut().and_then(|pane| {
+            let record = pane.take_completed_turn_body_record()?;
+            Some((
+                pane.goal_id.clone(),
+                pane.cwd.clone(),
+                record.prompt,
+                record.summary,
+                record.turn,
+            ))
+        }) else {
+            return false;
+        };
+
+        let client = self.client.clone();
+        self.codex_body_record_job = Some(self.rt.spawn(async move {
+            let session_state = format!("turn {turn}完了");
+            let record = tokio::task::spawn_blocking(move || {
+                codex_work_memo(&cwd, &session_state, prompt.as_deref(), Some(&summary))
+            })
+            .await
+            .unwrap_or_default();
+            let result = async {
+                let goal = client.get_goal(&goal_id).await?.data;
+                let req = codex_body_update_request(goal.body.as_deref(), &record);
+                client.update_goal(&goal_id, &req).await?;
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+
+            match result {
+                Ok(()) => CodexBodyRecordOutcome {
+                    ok: true,
+                    message: format!("現状(body)にturn {turn}完了メモを書込"),
+                },
+                Err(e) => {
+                    let message = format!("{e}");
+                    let message = if is_permission_denied_error_text(&message) {
+                        format!("書き込み権限なしのためturn {turn}完了メモをスキップ")
+                    } else {
+                        format!("turn {turn}完了メモに失敗: {message}")
+                    };
+                    CodexBodyRecordOutcome { ok: false, message }
+                }
+            }
+        }));
+        if let Some(pane) = self.codex.as_mut() {
+            let now = Local::now().format("%H:%M");
+            pane.push_activity(format!("{now} turn {turn}完了メモを予約"));
+        }
+        true
+    }
+
     fn maybe_record_finished_codex_session(&mut self) -> bool {
         // 非同期の作業メモ記録が進行中の間は、同じ body を二重に read-modify-write して
         // 互いの記録を上書きし合わないよう、ジョブ完了（poll で take）を待ってから終了記録する。
         if self.codex_body_record_job.is_some() {
             return false;
         }
-        let Some((goal_id, cwd, last_prompt)) = self.codex.as_mut().and_then(|pane| {
+        let Some((goal_id, cwd, last_prompt, summary)) = self.codex.as_mut().and_then(|pane| {
             if pane.finished && !pane.auto_record_attempted {
                 pane.auto_record_attempted = true;
-                Some((
-                    pane.goal_id.clone(),
-                    pane.cwd.clone(),
-                    pane.last_prompt().map(str::to_string),
-                ))
+                let (last_prompt, summary) = pane.final_body_record_context();
+                Some((pane.goal_id.clone(), pane.cwd.clone(), last_prompt, summary))
             } else {
                 None
             }
@@ -1663,19 +2071,26 @@ impl App {
             return false;
         };
 
-        let ok = self.record_codex_session_to_goal_body(
+        let result = self.record_codex_session_to_goal_body(
             &goal_id,
             &cwd,
             "codex終了",
             last_prompt.as_deref(),
+            Some(&summary),
         );
         if let Some(pane) = self.codex.as_mut() {
             let now = Local::now().format("%H:%M");
-            if ok {
-                pane.last_addness_write_at = Some(Instant::now());
-                pane.push_activity(format!("{now} 現状(body)に終了メモを書込"));
-            } else {
-                pane.push_activity(format!("{now} 現状(body)の終了メモに失敗"));
+            match result {
+                CodexBodyRecordResult::Written => {
+                    pane.last_addness_write_at = Some(Instant::now());
+                    pane.push_activity(format!("{now} 現状(body)に終了メモを書込"));
+                }
+                CodexBodyRecordResult::SkippedPermission => {
+                    pane.push_activity(format!("{now} 書き込み権限なしのため終了メモをスキップ"));
+                }
+                CodexBodyRecordResult::Failed => {
+                    pane.push_activity(format!("{now} 現状(body)の終了メモに失敗"));
+                }
             }
         }
         true
@@ -1687,6 +2102,7 @@ impl App {
         // 通常画面に戻るのでマウスキャプチャを解除（テキスト選択を戻す）。
         Self::set_mouse_capture(false);
         self.codex_terminal_area = None;
+        self.codex_status_area = None;
         self.codex_contract_area = None;
         self.codex_activity_area = None;
         self.codex_contract_scroll = 0;
@@ -1696,9 +2112,17 @@ impl App {
         if let Some(job) = self.codex_body_record_job.take() {
             job.abort();
         }
+        // チェックポイント / undo ジョブも中断して次に開くペインを汚さない。
+        if let Some(job) = self.codex_checkpoint_job.take() {
+            job.abort();
+        }
+        if let Some(job) = self.codex_undo_job.take() {
+            job.abort();
+        }
         if let Some(mut pane) = self.codex.take() {
             if !pane.auto_record_attempted {
                 pane.auto_record_attempted = true;
+                let (last_prompt, summary) = pane.final_body_record_context();
                 let state = if pane.finished {
                     "codex終了"
                 } else {
@@ -1708,7 +2132,8 @@ impl App {
                     &pane.goal_id,
                     &pane.cwd,
                     state,
-                    pane.last_prompt(),
+                    last_prompt.as_deref(),
+                    Some(&summary),
                 );
             }
             pane.kill();
@@ -1726,7 +2151,7 @@ impl App {
         self.pending_codex_tree_reload = true;
     }
 
-    /// PTY 出力の取り込みとプロセス終了検知。codex 起動中に毎フレーム呼ぶ。
+    /// JSONL 出力の取り込みとプロセス終了検知。codex 起動中に毎フレーム呼ぶ。
     /// あわせて契約ペイン（DoD/タイトル）のライブ更新と DoD 判定を駆動する。
     /// 画面に影響する変化があれば `true` を返す（再描画判定に使う）。
     fn update_codex(&mut self) -> bool {
@@ -1742,8 +2167,13 @@ impl App {
             emit_terminal_notification(&notice);
             changed = true;
         }
+        changed |= self.maybe_start_checkpoint_job();
+        changed |= self.poll_checkpoint_job();
+        changed |= self.maybe_start_undo_job();
+        changed |= self.poll_undo_job();
         changed |= self.maybe_start_codex_prompt_body_record();
         changed |= self.poll_codex_body_record_job();
+        changed |= self.maybe_start_codex_turn_body_record();
         changed |= self.maybe_record_finished_codex_session();
         if close_after_exit_command {
             self.close_codex();
@@ -1765,11 +2195,11 @@ impl App {
             return;
         };
         if pane.dod_items.is_empty() {
-            self.error_message = Some("DoD が未設定のため判定できません".to_string());
+            self.set_error_message("DoD が未設定のため判定できません".to_string());
             return;
         }
-        let Some(codex_bin) = codex_pane::codex_path() else {
-            self.error_message = Some("codex が見つかりません".to_string());
+        let Some(codex_bin) = agent::codex_path() else {
+            self.set_error_message("codex が見つかりません".to_string());
             return;
         };
 
@@ -1782,13 +2212,13 @@ impl App {
         let schema_path = tmp.join(format!("addness-dod-schema-{goal_id}-{pid}.json"));
         let out_path = tmp.join(format!("addness-dod-out-{goal_id}-{pid}.json"));
 
-        if std::fs::write(&schema_path, codex_pane::dod_assessment_schema()).is_err() {
-            self.error_message = Some("一時ファイルの書き込みに失敗しました".to_string());
+        if std::fs::write(&schema_path, agent::dod_assessment_schema()).is_err() {
+            self.set_error_message("一時ファイルの書き込みに失敗しました".to_string());
             return;
         }
         let _ = std::fs::remove_file(&out_path);
 
-        let prompt = codex_pane::build_dod_assessment_prompt(&items);
+        let prompt = agent::build_dod_assessment_prompt(&items);
         let child = std::process::Command::new(&codex_bin)
             .arg("exec")
             .args(["-s", "read-only", "--color", "never"])
@@ -1816,12 +2246,12 @@ impl App {
                 if let Some(pane) = self.codex.as_mut() {
                     pane.assessing = true;
                 }
-                self.success_message = Some("DoD 判定を実行中…".to_string());
+                self.set_success_message("DoD 判定を実行中…".to_string());
             }
             Err(e) => {
                 // 起動失敗時は書き込んだスキーマファイルを残さない。
                 let _ = std::fs::remove_file(&schema_path);
-                self.error_message = Some(format!("DoD 判定の起動に失敗しました: {e}"));
+                self.set_error_message(format!("DoD 判定の起動に失敗しました: {e}"));
             }
         }
     }
@@ -1841,7 +2271,7 @@ impl App {
                     let mut job = self.codex_dod_job.take().unwrap();
                     job.cleanup();
                     self.set_codex_assessing(false);
-                    self.error_message = Some("DoD 判定がタイムアウトしました".to_string());
+                    self.set_error_message("DoD 判定がタイムアウトしました".to_string());
                     return true;
                 }
                 return false;
@@ -1875,18 +2305,18 @@ impl App {
                     // （codex が一部省略・重複しても表示が破綻しないように）。
                     let met = pane.dod_checks.iter().filter(|c| **c == Some(true)).count();
                     let total = pane.dod_items.len();
-                    self.success_message = Some(format!("DoD 判定完了: {met}/{total} 達成"));
+                    self.set_success_message(format!("DoD 判定完了: {met}/{total} 達成"));
                 }
             }
             Some(_) => {
                 // 空の results。judge が判定できなかったとみなす。
-                self.error_message = Some("DoD 判定結果が空でした".to_string());
+                self.set_error_message("DoD 判定結果が空でした".to_string());
             }
             None if status.success() => {
-                self.error_message = Some("DoD 判定結果の解析に失敗しました".to_string());
+                self.set_error_message("DoD 判定結果の解析に失敗しました".to_string());
             }
             None => {
-                self.error_message = Some("DoD 判定に失敗しました".to_string());
+                self.set_error_message("DoD 判定に失敗しました".to_string());
             }
         }
         true
@@ -1934,12 +2364,7 @@ impl App {
                 r.data
                     .children
                     .into_iter()
-                    .map(|c| {
-                        let icon =
-                            GoalDisplayStatus::from_goal_state(c.status.as_ref(), c.is_completed)
-                                .icon();
-                        (c.id, c.title, icon)
-                    })
+                    .map(child_goal_update_from_item)
                     .collect::<Vec<_>>()
             });
             let comment_count = comments_res.ok().map(|r| r.total_count.max(0) as usize);
@@ -1954,6 +2379,7 @@ impl App {
             Some(CodexSnapshot {
                 title: goal.title,
                 description: goal.description.unwrap_or_default(),
+                body: goal.body,
                 status_label,
                 comment_count,
                 deliverable_count,
@@ -1995,6 +2421,12 @@ impl App {
                 if !pane.assessing && pane.set_dod(snap.description) {
                     pane.dod_changed_at = Some(Instant::now());
                     pane.push_activity(format!("{now} 方針(DoD)を書込反映"));
+                }
+
+                if pane.set_addness_body_context(snap.body) {
+                    pane.last_addness_read_at = Some(Instant::now());
+                    pane.last_addness_read_label = Some("body".to_string());
+                    pane.push_activity(format!("{now} 現状(body)を同期"));
                 }
 
                 // 子ゴール一覧の差し替え＋増加検知（codex が Addness に書き込んだサイン）。
@@ -2056,11 +2488,14 @@ impl App {
     }
 
     /// codex ログのスクロールキーを処理する。
-    ///
-    /// codex 実行中はキー操作でログを遡らず、trackpad/wheel だけを使う。
-    /// 終了後は codex がキーを処理しないので、
-    /// 通常の矢印・PgUp/PgDn・Home/End もログ操作に使える。
-    fn handle_codex_log_scroll(pane: &mut CodexPane, key: KeyEvent, allow_plain: bool) -> bool {
+    /// `codex exec --json` の右ペインは Addness 側のリストなので、実行中でも
+    /// 通常の矢印・PgUp/PgDn・Home/End で履歴を遡れる。
+    fn handle_codex_log_scroll(
+        pane: &mut CodexPane,
+        key: KeyEvent,
+        allow_plain: bool,
+        allow_vim_keys: bool,
+    ) -> bool {
         let plain = key.modifiers.is_empty();
         if !allow_plain || !plain {
             return false;
@@ -2092,27 +2527,27 @@ impl App {
                 pane.scroll_to_live();
                 return true;
             }
-            KeyCode::Char('k') => {
+            KeyCode::Char('k') if allow_vim_keys => {
                 pane.scroll_lines(1);
                 return true;
             }
-            KeyCode::Char('j') => {
+            KeyCode::Char('j') if allow_vim_keys => {
                 pane.scroll_lines(-1);
                 return true;
             }
-            KeyCode::Char('u') => {
+            KeyCode::Char('u') if allow_vim_keys => {
                 pane.scroll_lines(page);
                 return true;
             }
-            KeyCode::Char('d') => {
+            KeyCode::Char('d') if allow_vim_keys => {
                 pane.scroll_lines(-page);
                 return true;
             }
-            KeyCode::Char('g') => {
+            KeyCode::Char('g') if allow_vim_keys => {
                 pane.scroll_to_top();
                 return true;
             }
-            KeyCode::Char('G') => {
+            KeyCode::Char('G') if allow_vim_keys => {
                 pane.scroll_to_live();
                 return true;
             }
@@ -2139,6 +2574,227 @@ impl App {
     /// 実行中は F12 で終了、trackpad/wheel でログをスクロールし、それ以外のキーは codex へ転送する。
     /// 終了後は還流バー（c/s/d）で成果を Addness に書き戻し、Esc/q で閉じる。
     fn handle_codex_key(&mut self, key: KeyEvent) {
+        // codex フォーカス中でも、入力欄が空で各種パレット・検索・ピッカー非表示なら
+        // `?` でヘルプオーバーレイを開けるようにする。入力途中の `?` は文字入力のまま。
+        if self.codex_help_key_eligible(key) {
+            self.show_help = true;
+            self.help_scroll = 0;
+            return;
+        }
+        if let Some(pane) = self.codex.as_mut() {
+            if pane.handle_search_key(key) {
+                return;
+            }
+            if pane.handle_decision_key(key) {
+                return;
+            }
+            if pane.turn_picker_open() {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        pane.close_turn_picker();
+                        return;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        pane.move_turn_picker_selection(-1);
+                        return;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        pane.move_turn_picker_selection(1);
+                        return;
+                    }
+                    KeyCode::Enter | KeyCode::Char('o') => {
+                        pane.open_selected_turn_from_picker();
+                        return;
+                    }
+                    KeyCode::Char('c') => {
+                        pane.close_selected_turn_from_picker();
+                        return;
+                    }
+                    KeyCode::Char(' ') => {
+                        pane.toggle_selected_turn_from_picker();
+                        return;
+                    }
+                    KeyCode::Char('a') => {
+                        pane.open_all_turns();
+                        return;
+                    }
+                    _ => return,
+                }
+            }
+            // 汎用リストピッカー（モデル・セッション等）表示中は turn ピッカーと同じ方針で
+            // 全キーをピッカーが消費する（入力欄へ流さない）。f はセッション選択の fork 確定。
+            if pane.list_picker_open() {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        pane.close_list_picker();
+                        return;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        pane.move_list_picker_selection(-1);
+                        return;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        pane.move_list_picker_selection(1);
+                        return;
+                    }
+                    KeyCode::Enter => {
+                        pane.accept_list_picker(false);
+                        return;
+                    }
+                    KeyCode::Char('f') => {
+                        pane.accept_list_picker(true);
+                        return;
+                    }
+                    _ => return,
+                }
+            }
+            // スラッシュコマンドパレット表示中は ↑↓ で候補選択・Tab で補完する。
+            // Esc / 文字入力はそのまま入力欄へ流し、既存挙動（入力クリア等）に委ねる。
+            if pane.slash_palette_active() && key.modifiers.is_empty() {
+                match key.code {
+                    KeyCode::Up => {
+                        pane.move_slash_palette_selection(-1);
+                        return;
+                    }
+                    KeyCode::Down => {
+                        pane.move_slash_palette_selection(1);
+                        return;
+                    }
+                    KeyCode::Tab => {
+                        pane.accept_slash_palette_selection();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            // @メンションのファイル候補パレット表示中は ↑↓ で選択、Tab/Enter で確定、Esc で閉じる。
+            // ディレクトリ確定時は潜って絞り込みを続け、ファイル確定でパスを挿入する。
+            if pane.mention_palette_active() && key.modifiers.is_empty() {
+                match key.code {
+                    KeyCode::Up => {
+                        pane.move_mention_palette_selection(-1);
+                        return;
+                    }
+                    KeyCode::Down => {
+                        pane.move_mention_palette_selection(1);
+                        return;
+                    }
+                    KeyCode::Tab | KeyCode::Enter => {
+                        pane.accept_mention_palette_selection();
+                        return;
+                    }
+                    KeyCode::Esc => {
+                        pane.dismiss_mention_palette();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            if key.modifiers.is_empty() {
+                match key.code {
+                    KeyCode::F(2) => {
+                        pane.cycle_model();
+                        return;
+                    }
+                    KeyCode::F(3) => {
+                        pane.cycle_reasoning();
+                        return;
+                    }
+                    KeyCode::F(4) => {
+                        pane.cycle_approval();
+                        return;
+                    }
+                    KeyCode::F(5) => {
+                        pane.cycle_sandbox();
+                        return;
+                    }
+                    KeyCode::F(6) => {
+                        pane.toggle_diff_view();
+                        return;
+                    }
+                    KeyCode::F(7) => {
+                        pane.open_turn_picker();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            if key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('e' | 'E')) {
+                pane.toggle_visible_turn_collapsed();
+                return;
+            }
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                match key.code {
+                    // ↑ は履歴呼び戻しに使うため、ログの 1 行スクロールは Ctrl+↑/↓ に割り当てる。
+                    KeyCode::Up => {
+                        pane.scroll_lines(1);
+                        return;
+                    }
+                    KeyCode::Down => {
+                        pane.scroll_lines(-1);
+                        return;
+                    }
+                    KeyCode::Char('t' | 'T') => {
+                        pane.cycle_log_filter();
+                        return;
+                    }
+                    KeyCode::Char('f' | 'F') => {
+                        pane.begin_search();
+                        return;
+                    }
+                    KeyCode::Char('l' | 'L') => {
+                        pane.clear_search();
+                        return;
+                    }
+                    KeyCode::Char('o' | 'O') | KeyCode::Enter | KeyCode::Char(' ') => {
+                        pane.toggle_visible_turn_collapsed();
+                        return;
+                    }
+                    KeyCode::Char('e' | 'E') => {
+                        pane.toggle_old_turns_collapsed();
+                        return;
+                    }
+                    // Ctrl+V: クリップボード画像を添付する（bracketed paste とは別の生キー）。
+                    // macOS 端末では Cmd+V が貼り付け（bracketed paste）なので Ctrl+V は生キーで届く。
+                    KeyCode::Char('v' | 'V') => {
+                        pane.attach_clipboard_image();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            if pane.decision_banner().is_none()
+                && pane.scrollback == 0
+                && !pane.finished
+                && pane.input_line().is_empty()
+                && key.modifiers.is_empty()
+                && matches!(key.code, KeyCode::Enter | KeyCode::Char(' '))
+            {
+                pane.toggle_visible_turn_collapsed();
+                return;
+            }
+            if pane.decision_banner().is_none()
+                && (pane.scrollback > 0 || pane.finished)
+                && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+            {
+                match key.code {
+                    KeyCode::Enter | KeyCode::Char(' ') if key.modifiers.is_empty() => {
+                        pane.toggle_visible_turn_collapsed();
+                        return;
+                    }
+                    KeyCode::Char('e') => {
+                        pane.toggle_visible_turn_collapsed();
+                        return;
+                    }
+                    KeyCode::Char('E') => {
+                        pane.toggle_old_turns_collapsed();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         let finished = self.codex.as_ref().map(|c| c.finished).unwrap_or(true);
         if finished {
             // 還流アクションのキー操作時は、古いステータスメッセージを消して鮮度を保つ
@@ -2146,6 +2802,7 @@ impl App {
             if let KeyCode::Char('c' | 's' | 'd' | 'v') = key.code {
                 self.error_message = None;
                 self.success_message = None;
+                self.status_deadline = None;
             }
             if key.modifiers.is_empty() {
                 match key.code {
@@ -2165,7 +2822,7 @@ impl App {
                         self.start_dod_assessment();
                         return;
                     }
-                    KeyCode::Esc | KeyCode::Char('q') => {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::F(12) => {
                         self.close_codex();
                         return;
                     }
@@ -2174,7 +2831,7 @@ impl App {
             }
             // 終了後は codex がキーを処理しないので、ログを遡れるようにする。
             if let Some(pane) = self.codex.as_mut()
-                && Self::handle_codex_log_scroll(pane, key, true)
+                && Self::handle_codex_log_scroll(pane, key, true, true)
             {
                 return;
             }
@@ -2196,6 +2853,32 @@ impl App {
                 pane.scroll_to_live();
                 return;
             }
+            // ターン実行中は Esc 2回でターンを中断する（誤爆防止に 1回目は警告表示）。
+            // 入力欄が空・スクロール中でない・各種パレット非表示のときだけ拾い、
+            // それ以外（入力途中の Esc など）は既存の入力クリア挙動へ委ねる。
+            if pane.is_turn_running()
+                && pane.decision_banner().is_none()
+                && !pane.slash_palette_active()
+                && !pane.mention_palette_active()
+                && pane.scrollback == 0
+                && pane.input_line().is_empty()
+                && key.code == KeyCode::Esc
+                && key.modifiers.is_empty()
+            {
+                if pane.take_esc_interrupt_armed() {
+                    pane.interrupt_turn_by_esc();
+                } else {
+                    pane.arm_esc_interrupt();
+                }
+                return;
+            }
+            if pane.scrollback == 0 && pane.captures_input_key(key) {
+                pane.input(key);
+                return;
+            }
+            if Self::handle_codex_log_scroll(pane, key, true, false) {
+                return;
+            }
             // 過去ログを見たまま通常入力すると入力位置が見えないので、入力前にライブへ戻す。
             if pane.scrollback > 0 {
                 pane.scroll_to_live();
@@ -2204,15 +2887,51 @@ impl App {
         }
     }
 
+    /// codex フォーカス中に `?` でヘルプを開いてよいか。パレット・検索・ターンピッカー・
+    /// 判定バナー表示中やスクロール中、入力欄に文字がある場合は対象外（従来どおり文字入力）。
+    fn codex_help_key_eligible(&self, key: KeyEvent) -> bool {
+        if key.code != KeyCode::Char('?') || !key.modifiers.is_empty() {
+            return false;
+        }
+        let Some(pane) = self.codex.as_ref() else {
+            return false;
+        };
+        !pane.is_search_editing()
+            && !pane.slash_palette_active()
+            && !pane.mention_palette_active()
+            && !pane.turn_picker_open()
+            && !pane.list_picker_open()
+            && pane.decision_banner().is_none()
+            && pane.scrollback == 0
+            && pane.input_line().is_empty()
+    }
+
+    fn handle_codex_paste(&mut self, text: &str) {
+        if let Some(pane) = self.codex.as_mut() {
+            if pane.scrollback > 0 {
+                pane.scroll_to_live();
+            }
+            pane.paste_input(text);
+        }
+    }
+
+    fn handle_modal_paste(&mut self, text: &str) {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        for ch in normalized.chars() {
+            let ch = if matches!(ch, '\n' | '\t') { ' ' } else { ch };
+            self.handle_modal_input(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+    }
+
     fn send_codex_resume_prompt(&mut self) {
         if let Some(pane) = self.codex.as_mut() {
             if pane.scrollback > 0 {
                 pane.scroll_to_live();
             }
-            pane.submit_system_line(codex_pane::resume_prompt());
+            pane.submit_system_line(agent::resume_prompt());
             let now = Local::now().format("%H:%M");
             pane.push_activity(format!("{now} F9 再開プロンプトを送信"));
-            self.success_message = Some("Addnessから再開するプロンプトを送信しました".to_string());
+            self.set_success_message("Addnessから再開するプロンプトを送信しました".to_string());
         }
     }
 
@@ -2291,34 +3010,17 @@ impl App {
             };
             if let Some(pane) = self.codex.as_mut() {
                 let batch = Self::mouse_scroll_batch_label(event_count);
-                let terminal_point =
-                    Self::point_in_inner_area_clamped(area, mouse.column, mouse.row);
+                let terminal_point = Self::point_in_area(Some(area), mouse.column, mouse.row);
                 let before = pane.scrollback;
                 pane.scroll_lines(delta);
                 let after = pane.scrollback;
-                match Self::codex_terminal_scroll_route(
-                    before,
-                    after,
-                    pane.finished,
-                    pane.mouse_reporting_enabled(),
-                    terminal_point,
-                ) {
+                match Self::codex_terminal_scroll_route(before, after, terminal_point) {
                     CodexTerminalScrollRoute::Scrollback => {
                         self.codex_last_scroll_input = Some(format!(
                             "mouse {:?}{batch} -> codex {before}->{after}",
                             mouse.kind
                         ));
                         return;
-                    }
-                    CodexTerminalScrollRoute::ChildMouse => {
-                        if let Some((column, row)) = terminal_point {
-                            pane.input_mouse_wheel(mouse.kind, column, row, mouse.modifiers);
-                            self.codex_last_scroll_input = Some(format!(
-                                "mouse {:?}{batch} -> codex {before}->{after} pty-mouse",
-                                mouse.kind
-                            ));
-                            return;
-                        }
                     }
                     CodexTerminalScrollRoute::None => {
                         self.codex_last_scroll_input = Some(format!(
@@ -2332,11 +3034,13 @@ impl App {
             return;
         }
 
-        if Self::point_in_area(self.codex_contract_area, mouse.column, mouse.row) {
-            Self::scroll_index(&mut self.codex_contract_scroll, delta);
+        if Self::point_in_area(self.codex_status_area, mouse.column, mouse.row)
+            || Self::point_in_area(self.codex_contract_area, mouse.column, mouse.row)
+        {
+            Self::scroll_document_offset(&mut self.codex_contract_scroll, delta);
             let batch = Self::mouse_scroll_batch_label(event_count);
             self.codex_last_scroll_input =
-                Some(format!("mouse {:?}{batch} -> Addness", mouse.kind));
+                Some(format!("mouse {:?}{batch} -> Addnessゴール", mouse.kind));
             return;
         }
 
@@ -2378,18 +3082,13 @@ impl App {
     fn codex_terminal_scroll_route(
         before: usize,
         after: usize,
-        finished: bool,
-        mouse_reporting_enabled: bool,
-        terminal_point: Option<(u16, u16)>,
+        terminal_point_inside: bool,
     ) -> CodexTerminalScrollRoute {
         if after != before {
             return CodexTerminalScrollRoute::Scrollback;
         }
-        if terminal_point.is_none() {
+        if !terminal_point_inside {
             return CodexTerminalScrollRoute::None;
-        }
-        if !finished && mouse_reporting_enabled {
-            return CodexTerminalScrollRoute::ChildMouse;
         }
         CodexTerminalScrollRoute::None
     }
@@ -2400,6 +3099,10 @@ impl App {
         } else {
             *offset = offset.saturating_sub((-delta) as usize);
         }
+    }
+
+    fn scroll_document_offset(offset: &mut usize, delta: isize) {
+        Self::scroll_index(offset, -delta);
     }
 
     fn point_in_area(area: Option<Rect>, column: u16, row: u16) -> bool {
@@ -2430,27 +3133,6 @@ impl App {
         Some((column - inner.x, row - inner.y))
     }
 
-    fn point_in_inner_area_clamped(area: Rect, column: u16, row: u16) -> Option<(u16, u16)> {
-        let inner = Rect {
-            x: area.x.saturating_add(1),
-            y: area.y.saturating_add(1),
-            width: area.width.saturating_sub(2),
-            height: area.height.saturating_sub(2),
-        };
-        if inner.width == 0 || inner.height == 0 {
-            return None;
-        }
-        if !Self::point_in_area(Some(area), column, row) {
-            return None;
-        }
-
-        let right = inner.x.saturating_add(inner.width).saturating_sub(1);
-        let bottom = inner.y.saturating_add(inner.height).saturating_sub(1);
-        let column = column.clamp(inner.x, right);
-        let row = row.clamp(inner.y, bottom);
-        Some((column - inner.x, row - inner.y))
-    }
-
     /// codex の作業差分（git diff --stat）をプリフィルして、対象ゴールへの
     /// 進捗コメントモーダルを開く（還流: コメント）。
     fn start_codex_reflow_comment(&mut self) {
@@ -2459,12 +3141,13 @@ impl App {
         };
         let goal_id = pane.goal_id.clone();
         let goal_title = pane.goal_title.clone();
+        let name = pane.kind().label();
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let diff = codex_pane::git_diff_stat(&cwd);
+        let diff = agent::git_diff_stat(&cwd);
         let body = if diff.trim().is_empty() {
             String::new()
         } else {
-            format!("codexでの作業差分:\n{diff}\n\n")
+            format!("{name}での作業差分:\n{diff}\n\n")
         };
         self.modal_state = Some(ModalState::AddComment {
             goal_id,
@@ -2497,7 +3180,7 @@ impl App {
                 });
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to load goal: {e}"));
+                self.set_error_message(format!("Failed to load goal: {e}"));
             }
         }
     }
@@ -2531,7 +3214,7 @@ impl App {
                     .set_deliverables_for_goal_id(goal_id, deliverables);
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to reload deliverables: {e}"));
+                self.set_error_message(format!("Failed to reload deliverables: {e}"));
             }
         }
     }
@@ -2549,7 +3232,7 @@ impl App {
                 self.todays_goals_tree.clamp_cursor();
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to reload comments: {e}"));
+                self.set_error_message(format!("Failed to reload comments: {e}"));
             }
         }
     }
@@ -2560,7 +3243,7 @@ impl App {
 
     fn start_add_comment_modal(&mut self) {
         let Some((goal_id, goal_title)) = self.selected_goal_context() else {
-            self.error_message = Some("Please select a goal to add a comment".to_string());
+            self.set_error_message("Please select a goal to add a comment".to_string());
             return;
         };
         self.modal_state = Some(ModalState::AddComment {
@@ -2572,7 +3255,7 @@ impl App {
 
     fn start_reply_comment_modal(&mut self) {
         let Some((goal_id, comment_id, content, _)) = self.selected_comment_context() else {
-            self.error_message = Some("Please select a comment to reply to".to_string());
+            self.set_error_message("Please select a comment to reply to".to_string());
             return;
         };
         self.modal_state = Some(ModalState::ReplyComment {
@@ -2585,7 +3268,7 @@ impl App {
 
     fn start_edit_comment_modal(&mut self) {
         let Some((goal_id, comment_id, content, _)) = self.selected_comment_context() else {
-            self.error_message = Some("Please select a comment to edit".to_string());
+            self.set_error_message("Please select a comment to edit".to_string());
             return;
         };
         self.modal_state = Some(ModalState::EditComment {
@@ -2597,20 +3280,24 @@ impl App {
 
     fn start_delete_comment_modal(&mut self) {
         let Some((goal_id, comment_id, content, _)) = self.selected_comment_context() else {
-            self.error_message = Some("Please select a comment to delete".to_string());
+            self.set_error_message("Please select a comment to delete".to_string());
             return;
         };
+        if self.allow_delete_comment_without_confirm {
+            self.modal_submit_delete_comment(goal_id, comment_id);
+            return;
+        }
         self.modal_state = Some(ModalState::DeleteComment {
             goal_id,
             comment_id,
             excerpt: truncate_comment(&content),
-            confirm_index: 0,
+            confirm_index: CONFIRM_CANCEL,
         });
     }
 
     fn start_react_comment_modal(&mut self) {
         let Some((goal_id, comment_id, _, _)) = self.selected_comment_context() else {
-            self.error_message = Some("Please select a comment to react to".to_string());
+            self.set_error_message("Please select a comment to react to".to_string());
             return;
         };
         self.modal_state = Some(ModalState::ReactComment {
@@ -2623,7 +3310,7 @@ impl App {
 
     fn do_set_comment_resolved(&mut self, resolved: bool) {
         let Some((goal_id, comment_id, _, _)) = self.selected_comment_context() else {
-            self.error_message = Some("Please select a comment".to_string());
+            self.set_error_message("Please select a comment".to_string());
             return;
         };
         let result = if resolved {
@@ -2635,7 +3322,7 @@ impl App {
         };
         match result {
             Ok(()) => {
-                self.success_message = Some(
+                self.set_success_message(
                     if resolved {
                         "Comment resolved"
                     } else {
@@ -2646,7 +3333,7 @@ impl App {
                 self.reload_comments_for_goal(&goal_id);
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to update comment: {e}"));
+                self.set_error_message(format!("Failed to update comment: {e}"));
             }
         }
     }
@@ -2659,7 +3346,7 @@ impl App {
     ) {
         let body = body.trim();
         if body.is_empty() {
-            self.error_message = Some("Comment body is required".to_string());
+            self.set_error_message("Comment body is required".to_string());
             return;
         }
         // AIではなく人間の操作だが、CLI経由と区別できるよう本文はそのまま送る。
@@ -2671,11 +3358,11 @@ impl App {
         ));
         match result {
             Ok(_) => {
-                self.success_message = Some("Comment posted".to_string());
+                self.set_success_message("Comment posted".to_string());
                 self.reload_comments_for_goal(&goal_id);
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to post comment: {e}"));
+                self.set_error_message(format!("Failed to post comment: {e}"));
             }
         }
     }
@@ -2683,16 +3370,16 @@ impl App {
     fn modal_submit_edit_comment(&mut self, goal_id: String, comment_id: String, body: String) {
         let body = body.trim();
         if body.is_empty() {
-            self.error_message = Some("Comment body is required".to_string());
+            self.set_error_message("Comment body is required".to_string());
             return;
         }
         match self.api_call(self.client.update_comment(&comment_id, body, Vec::new())) {
             Ok(_) => {
-                self.success_message = Some("Comment updated".to_string());
+                self.set_success_message("Comment updated".to_string());
                 self.reload_comments_for_goal(&goal_id);
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to update comment: {e}"));
+                self.set_error_message(format!("Failed to update comment: {e}"));
             }
         }
     }
@@ -2700,11 +3387,11 @@ impl App {
     fn modal_submit_delete_comment(&mut self, goal_id: String, comment_id: String) {
         match self.api_call(self.client.delete_comment(&comment_id)) {
             Ok(()) => {
-                self.success_message = Some("Comment deleted".to_string());
+                self.set_success_message("Comment deleted".to_string());
                 self.reload_comments_for_goal(&goal_id);
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to delete comment: {e}"));
+                self.set_error_message(format!("Failed to delete comment: {e}"));
             }
         }
     }
@@ -2712,11 +3399,11 @@ impl App {
     fn modal_submit_react_comment(&mut self, goal_id: String, comment_id: String, emoji: &str) {
         match self.api_call(self.client.add_reaction(&comment_id, emoji)) {
             Ok(()) => {
-                self.success_message = Some(format!("Reacted {emoji}"));
+                self.set_success_message(format!("Reacted {emoji}"));
                 self.reload_comments_for_goal(&goal_id);
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to react: {e}"));
+                self.set_error_message(format!("Failed to react: {e}"));
             }
         }
     }
@@ -2738,13 +3425,69 @@ impl App {
         }
 
         if let Event::Mouse(me) = event {
-            // codex 使用中のみ有効なマウスキャプチャを、右側の PTY 端末領域に限定して扱う。
+            // codex 使用中のみ有効なマウスキャプチャを、右側の会話領域に限定して扱う。
             self.handle_codex_mouse_batch(me)?;
+            return Ok(());
+        }
+
+        if let Event::Paste(text) = event {
+            if self.active_pane == ActivePane::Codex
+                && self.modal_state.is_none()
+                && !self.show_help
+            {
+                self.handle_codex_paste(&text);
+            } else if self.modal_state.is_some() && !self.show_help {
+                self.handle_modal_paste(&text);
+            }
             return Ok(());
         }
 
         if let Event::Key(key) = event {
             if key.kind != KeyEventKind::Press {
+                return Ok(());
+            }
+
+            if self.active_pane == ActivePane::Codex
+                && self.modal_state.is_none()
+                && Self::is_ctrl_help_key(key)
+            {
+                self.show_help = !self.show_help;
+                self.help_scroll = 0;
+                return Ok(());
+            }
+            if Self::is_ctrl_help_key(key) {
+                return Ok(());
+            }
+
+            if self.show_help {
+                // ヘルプ表示中は閉じる操作とスクロールのみ受け付ける。
+                // 実際の最大スクロール量は描画側（行数・枠高さ）が知っているため、
+                // ここでは意図だけを反映し、描画側で毎フレームクランプし直す。
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => {
+                        self.show_help = false;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.help_scroll = self.help_scroll.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.help_scroll = self.help_scroll.saturating_add(1);
+                    }
+                    KeyCode::PageUp => {
+                        self.help_scroll = self.help_scroll.saturating_sub(10);
+                    }
+                    KeyCode::PageDown => {
+                        self.help_scroll = self.help_scroll.saturating_add(10);
+                    }
+                    KeyCode::Home => {
+                        self.help_scroll = 0;
+                    }
+                    KeyCode::End => {
+                        // 描画側で実際の最大値へクランプされる。
+                        self.help_scroll = usize::MAX / 2;
+                    }
+                    _ => {}
+                }
                 return Ok(());
             }
 
@@ -2755,19 +3498,11 @@ impl App {
                 return Ok(());
             }
 
-            // Clear error and success messages on any key press
-            self.error_message = None;
-            self.success_message = None;
+            // ステータスメッセージはキー入力では消さず、時間経過で自動クリアする
+            // （run ループの expire_status_messages が担当）。新しいメッセージが
+            // 来れば下の各ハンドラが上書きし、期限も張り直される。
 
-            if self.show_help {
-                // ヘルプ表示中は閉じる操作のみ受け付ける。
-                if matches!(
-                    key.code,
-                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')
-                ) {
-                    self.show_help = false;
-                }
-            } else if self.modal_state.is_some() {
+            if self.modal_state.is_some() {
                 self.handle_modal_input(key);
             } else if self.show_org_popup {
                 self.handle_org_popup(key.code);
@@ -2776,6 +3511,11 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    fn is_ctrl_help_key(key: KeyEvent) -> bool {
+        key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
     }
 
     fn handle_org_popup(&mut self, code: KeyCode) {
@@ -2808,7 +3548,10 @@ impl App {
 
     fn handle_normal(&mut self, code: KeyCode) {
         match code {
-            KeyCode::Char('?') => self.show_help = true,
+            KeyCode::Char('?') => {
+                self.show_help = true;
+                self.help_scroll = 0;
+            }
             KeyCode::Char('q') | KeyCode::Esc => self.running = false,
             KeyCode::Tab => {
                 self.active_pane = match self.active_pane {
@@ -2894,7 +3637,7 @@ impl App {
             {
                 self.active_goal_tree_mut().cycle_comment_view();
                 let mode = self.active_goal_tree().comment_view.label();
-                self.success_message = Some(format!("Comments: {mode}"));
+                self.set_success_message(format!("Comments: {mode}"));
             }
             KeyCode::Char('e')
                 if self.active_pane == ActivePane::Content
@@ -3053,7 +3796,7 @@ impl App {
                     }
                 }
                 Err(e) => {
-                    self.error_message = Some(format!("Failed to load data: {e}"));
+                    self.set_error_message(format!("Failed to load data: {e}"));
                     return;
                 }
             }
@@ -3121,11 +3864,11 @@ impl App {
                     });
                 }
                 Err(e) => {
-                    self.error_message = Some(format!("Failed to load goal: {e}"));
+                    self.set_error_message(format!("Failed to load goal: {e}"));
                 }
             }
         } else {
-            self.error_message = Some("Please select a goal to edit".to_string());
+            self.set_error_message("Please select a goal to edit".to_string());
         }
     }
 
@@ -3141,19 +3884,23 @@ impl App {
         };
 
         if let Some((goal_id, goal_title)) = goal_info {
+            if self.allow_delete_goal_without_confirm {
+                self.modal_submit_delete(goal_id);
+                return;
+            }
             self.modal_state = Some(ModalState::DeleteGoal {
                 goal_id,
                 goal_title,
-                confirm_index: 0, // Default to Cancel
+                confirm_index: CONFIRM_CANCEL,
             });
         } else {
-            self.error_message = Some("Please select a goal to delete".to_string());
+            self.set_error_message("Please select a goal to delete".to_string());
         }
     }
 
     fn start_add_deliverable_modal(&mut self) {
         let Some((goal_id, goal_title)) = self.selected_goal_context() else {
-            self.error_message = Some("Please select a goal to add a deliverable".to_string());
+            self.set_error_message("Please select a goal to add a deliverable".to_string());
             return;
         };
 
@@ -3171,11 +3918,11 @@ impl App {
         let Some((goal_id, deliverable_id, deliverable_name, _, node_type)) =
             self.selected_deliverable_context()
         else {
-            self.error_message = Some("Please select a document deliverable to update".to_string());
+            self.set_error_message("Please select a document deliverable to update".to_string());
             return;
         };
         if node_type != DeliverableType::Document {
-            self.error_message = Some("Only document deliverables can be updated".to_string());
+            self.set_error_message("Only document deliverables can be updated".to_string());
             return;
         }
 
@@ -3191,7 +3938,7 @@ impl App {
         let Some((goal_id, deliverable_id, deliverable_name, _, _)) =
             self.selected_deliverable_context()
         else {
-            self.error_message = Some("Please select a deliverable to rename".to_string());
+            self.set_error_message("Please select a deliverable to rename".to_string());
             return;
         };
 
@@ -3207,7 +3954,7 @@ impl App {
         let Some((goal_id, deliverable_id, deliverable_name, _, _)) =
             self.selected_deliverable_context()
         else {
-            self.error_message = Some("Please select a deliverable to move".to_string());
+            self.set_error_message("Please select a deliverable to move".to_string());
             return;
         };
         let targets = self.deliverable_folder_targets_for_goal(&goal_id, &deliverable_id);
@@ -3225,15 +3972,19 @@ impl App {
         let Some((goal_id, deliverable_id, deliverable_name, _, _)) =
             self.selected_deliverable_context()
         else {
-            self.error_message = Some("Please select a deliverable to delete".to_string());
+            self.set_error_message("Please select a deliverable to delete".to_string());
             return;
         };
 
+        if self.allow_delete_deliverable_without_confirm {
+            self.modal_submit_delete_deliverable(goal_id, deliverable_id);
+            return;
+        }
         self.modal_state = Some(ModalState::DeleteDeliverable {
             goal_id,
             deliverable_id,
             deliverable_name,
-            confirm_index: 0,
+            confirm_index: CONFIRM_CANCEL,
         });
     }
 
@@ -3514,34 +4265,16 @@ impl App {
                 }
             }
             KeyCode::Left => {
-                // For delete confirmation modal
-                if let Some(ModalState::DeleteGoal { confirm_index, .. }) = &mut self.modal_state {
-                    *confirm_index = 0; // Cancel
-                } else if let Some(ModalState::DeleteDeliverable { confirm_index, .. }) =
-                    &mut self.modal_state
+                if !self.modal_confirm_prev()
+                    && matches!(self.modal_state, Some(ModalState::ReactComment { .. }))
                 {
-                    *confirm_index = 0;
-                } else if let Some(ModalState::DeleteComment { confirm_index, .. }) =
-                    &mut self.modal_state
-                {
-                    *confirm_index = 0;
-                } else if matches!(self.modal_state, Some(ModalState::ReactComment { .. })) {
                     self.modal_react_prev();
                 }
             }
             KeyCode::Right => {
-                // For delete confirmation modal
-                if let Some(ModalState::DeleteGoal { confirm_index, .. }) = &mut self.modal_state {
-                    *confirm_index = 1; // Delete
-                } else if let Some(ModalState::DeleteDeliverable { confirm_index, .. }) =
-                    &mut self.modal_state
+                if !self.modal_confirm_next()
+                    && matches!(self.modal_state, Some(ModalState::ReactComment { .. }))
                 {
-                    *confirm_index = 1;
-                } else if let Some(ModalState::DeleteComment { confirm_index, .. }) =
-                    &mut self.modal_state
-                {
-                    *confirm_index = 1;
-                } else if matches!(self.modal_state, Some(ModalState::ReactComment { .. })) {
                     self.modal_react_next();
                 }
             }
@@ -3558,30 +4291,7 @@ impl App {
                         'k' => self.modal_move_target_prev(),
                         _ => {}
                     }
-                } else if let Some(ModalState::DeleteGoal { confirm_index, .. }) =
-                    &mut self.modal_state
-                {
-                    match c {
-                        'h' => *confirm_index = 0, // Cancel
-                        'l' => *confirm_index = 1, // Delete
-                        _ => {}
-                    }
-                } else if let Some(ModalState::DeleteDeliverable { confirm_index, .. }) =
-                    &mut self.modal_state
-                {
-                    match c {
-                        'h' => *confirm_index = 0,
-                        'l' => *confirm_index = 1,
-                        _ => {}
-                    }
-                } else if let Some(ModalState::DeleteComment { confirm_index, .. }) =
-                    &mut self.modal_state
-                {
-                    match c {
-                        'h' => *confirm_index = 0,
-                        'l' => *confirm_index = 1,
-                        _ => {}
-                    }
+                } else if self.modal_confirm_key(c) {
                 } else if matches!(self.modal_state, Some(ModalState::ReactComment { .. })) {
                     match c {
                         'j' | 'l' => self.modal_react_next(),
@@ -3597,6 +4307,48 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn modal_confirm_index_mut(&mut self) -> Option<&mut usize> {
+        match &mut self.modal_state {
+            Some(ModalState::DeleteGoal { confirm_index, .. })
+            | Some(ModalState::DeleteDeliverable { confirm_index, .. })
+            | Some(ModalState::DeleteComment { confirm_index, .. }) => Some(confirm_index),
+            _ => None,
+        }
+    }
+
+    fn modal_confirm_prev(&mut self) -> bool {
+        let Some(index) = self.modal_confirm_index_mut() else {
+            return false;
+        };
+        *index = if *index == CONFIRM_CANCEL {
+            CONFIRM_ALWAYS
+        } else {
+            (*index).saturating_sub(1)
+        };
+        true
+    }
+
+    fn modal_confirm_next(&mut self) -> bool {
+        let Some(index) = self.modal_confirm_index_mut() else {
+            return false;
+        };
+        *index = (*index + 1) % CONFIRM_CHOICE_COUNT;
+        true
+    }
+
+    fn modal_confirm_key(&mut self, c: char) -> bool {
+        let Some(index) = self.modal_confirm_index_mut() else {
+            return false;
+        };
+        match c.to_ascii_lowercase() {
+            'h' | 'n' => *index = CONFIRM_CANCEL,
+            'l' | 'y' => *index = CONFIRM_APPLY,
+            'a' => *index = CONFIRM_ALWAYS,
+            _ => return false,
+        }
+        true
     }
 
     fn modal_next_field(&mut self) {
@@ -3842,14 +4594,16 @@ impl App {
             }
             Some(ModalState::DeleteGoal {
                 goal_id,
-                confirm_index: 1,
+                confirm_index,
                 ..
-            }) => {
-                // User confirmed deletion
+            }) if confirm_index == CONFIRM_APPLY || confirm_index == CONFIRM_ALWAYS => {
+                if confirm_index == CONFIRM_ALWAYS {
+                    self.allow_delete_goal_without_confirm = true;
+                }
                 self.modal_submit_delete(goal_id);
             }
             Some(ModalState::DeleteGoal { .. }) => {
-                // confirm_index == 0 means cancel, do nothing
+                // cancel
             }
             Some(ModalState::AddDeliverable {
                 goal_id,
@@ -3891,9 +4645,12 @@ impl App {
             Some(ModalState::DeleteDeliverable {
                 goal_id,
                 deliverable_id,
-                confirm_index: 1,
+                confirm_index,
                 ..
-            }) => {
+            }) if confirm_index == CONFIRM_APPLY || confirm_index == CONFIRM_ALWAYS => {
+                if confirm_index == CONFIRM_ALWAYS {
+                    self.allow_delete_deliverable_without_confirm = true;
+                }
                 self.modal_submit_delete_deliverable(goal_id, deliverable_id);
             }
             Some(ModalState::DeleteDeliverable { .. }) => {}
@@ -3919,9 +4676,12 @@ impl App {
             Some(ModalState::DeleteComment {
                 goal_id,
                 comment_id,
-                confirm_index: 1,
+                confirm_index,
                 ..
-            }) => {
+            }) if confirm_index == CONFIRM_APPLY || confirm_index == CONFIRM_ALWAYS => {
+                if confirm_index == CONFIRM_ALWAYS {
+                    self.allow_delete_comment_without_confirm = true;
+                }
                 self.modal_submit_delete_comment(goal_id, comment_id);
             }
             Some(ModalState::DeleteComment { .. }) => {}
@@ -3949,12 +4709,12 @@ impl App {
     ) {
         // Validate
         if title.trim().is_empty() {
-            self.error_message = Some("Title is required".to_string());
+            self.set_error_message("Title is required".to_string());
             return;
         }
 
         let Some(org_id) = self.current_org_id().map(|s| s.to_string()) else {
-            self.error_message = Some("No organization selected".to_string());
+            self.set_error_message("No organization selected".to_string());
             return;
         };
 
@@ -3971,12 +4731,12 @@ impl App {
 
         match self.api_call(self.client.create_goal(&req)) {
             Ok(_) => {
-                self.success_message = Some("Goal created successfully".to_string());
+                self.set_success_message("Goal created successfully".to_string());
                 self.load_goal_tree();
                 self.load_todays_goals();
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to create goal: {e}"));
+                self.set_error_message(format!("Failed to create goal: {e}"));
             }
         }
     }
@@ -3990,12 +4750,12 @@ impl App {
     ) {
         // Validate
         if title.trim().is_empty() {
-            self.error_message = Some("Title is required".to_string());
+            self.set_error_message("Title is required".to_string());
             return;
         }
 
         let Some(_org_id) = self.current_org_id().map(|s| s.to_string()) else {
-            self.error_message = Some("No organization selected".to_string());
+            self.set_error_message("No organization selected".to_string());
             return;
         };
 
@@ -4022,12 +4782,12 @@ impl App {
 
         match self.api_call(self.client.update_goal(&goal_id, &req)) {
             Ok(_) => {
-                self.success_message = Some("Goal updated successfully".to_string());
+                self.set_success_message("Goal updated successfully".to_string());
                 self.load_goal_tree();
                 self.load_todays_goals();
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to update goal: {e}"));
+                self.set_error_message(format!("Failed to update goal: {e}"));
             }
         }
     }
@@ -4035,12 +4795,12 @@ impl App {
     fn modal_submit_delete(&mut self, goal_id: String) {
         match self.api_call(self.client.delete_goal(&goal_id)) {
             Ok(_) => {
-                self.success_message = Some("Goal deleted successfully".to_string());
+                self.set_success_message("Goal deleted successfully".to_string());
                 self.load_goal_tree();
                 self.load_todays_goals();
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to delete goal: {e}"));
+                self.set_error_message(format!("Failed to delete goal: {e}"));
             }
         }
     }
@@ -4050,7 +4810,7 @@ impl App {
     /// （title/description は送らず最小更新）。
     fn do_set_goal_completed(&mut self, completed: bool) {
         let Some((goal_id, _title, _)) = self.selected_goal_row_context() else {
-            self.error_message = Some("Please select a goal to complete".to_string());
+            self.set_error_message("Please select a goal to complete".to_string());
             return;
         };
 
@@ -4076,7 +4836,7 @@ impl App {
 
         match self.api_call(self.client.update_goal(&goal_id, &req)) {
             Ok(_) => {
-                self.success_message = Some(
+                self.set_success_message(
                     if completed {
                         "Goal completed"
                     } else {
@@ -4091,7 +4851,7 @@ impl App {
                 }
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to update goal: {e}"));
+                self.set_error_message(format!("Failed to update goal: {e}"));
             }
         }
     }
@@ -4099,6 +4859,7 @@ impl App {
     fn run_action_menu_item(&mut self, item: ActionMenuItem) {
         match item {
             ActionMenuItem::WorkWithCodex => self.start_codex(),
+            ActionMenuItem::WorkWithClaude => self.start_agent(AgentKind::ClaudeCode),
             ActionMenuItem::AddDeliverable => self.start_add_deliverable_modal(),
             ActionMenuItem::AddComment => self.start_add_comment_modal(),
             ActionMenuItem::CompleteGoal => self.do_set_goal_completed(true),
@@ -4131,7 +4892,7 @@ impl App {
         let result = match kind {
             DeliverableKind::File => {
                 if value.is_empty() {
-                    self.error_message = Some("File path is required".to_string());
+                    self.set_error_message("File path is required".to_string());
                     return;
                 }
                 let path = PathBuf::from(value);
@@ -4148,14 +4909,14 @@ impl App {
             }
             DeliverableKind::Document => {
                 if value.is_empty() {
-                    self.error_message = Some("Content file path is required".to_string());
+                    self.set_error_message("Content file path is required".to_string());
                     return;
                 }
                 let path = PathBuf::from(value);
                 let content = match std::fs::read_to_string(&path) {
                     Ok(content) => content,
                     Err(e) => {
-                        self.error_message = Some(format!(
+                        self.set_error_message(format!(
                             "Failed to read content file {}: {e}",
                             path.display()
                         ));
@@ -4166,7 +4927,7 @@ impl App {
                     match path.file_name().and_then(|s| s.to_str()) {
                         Some(file_name) => file_name.to_string(),
                         None => {
-                            self.error_message = Some("Name is required".to_string());
+                            self.set_error_message("Name is required".to_string());
                             return;
                         }
                     }
@@ -4181,7 +4942,7 @@ impl App {
             }
             DeliverableKind::Link => {
                 if display_name.is_empty() || value.is_empty() {
-                    self.error_message = Some("Name and URL are required".to_string());
+                    self.set_error_message("Name and URL are required".to_string());
                     return;
                 }
                 self.api_call(
@@ -4192,7 +4953,7 @@ impl App {
             }
             DeliverableKind::Folder => {
                 if display_name.is_empty() {
-                    self.error_message = Some("Name is required".to_string());
+                    self.set_error_message("Name is required".to_string());
                     return;
                 }
                 self.api_call(
@@ -4205,11 +4966,11 @@ impl App {
 
         match result {
             Ok(id) => {
-                self.success_message = Some(format!("Deliverable added: {id}"));
+                self.set_success_message(format!("Deliverable added: {id}"));
                 self.reload_deliverables_for_goal(&goal_id);
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to add deliverable: {e}"));
+                self.set_error_message(format!("Failed to add deliverable: {e}"));
             }
         }
     }
@@ -4222,13 +4983,13 @@ impl App {
     ) {
         let path = PathBuf::from(content_file.trim());
         if path.as_os_str().is_empty() {
-            self.error_message = Some("Content file path is required".to_string());
+            self.set_error_message("Content file path is required".to_string());
             return;
         }
         let content = match std::fs::read_to_string(&path) {
             Ok(content) => content,
             Err(e) => {
-                self.error_message = Some(format!(
+                self.set_error_message(format!(
                     "Failed to read content file {}: {e}",
                     path.display()
                 ));
@@ -4243,11 +5004,11 @@ impl App {
             vec![],
         )) {
             Ok(_) => {
-                self.success_message = Some("Deliverable updated".to_string());
+                self.set_success_message("Deliverable updated".to_string());
                 self.reload_deliverables_for_goal(&goal_id);
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to update deliverable: {e}"));
+                self.set_error_message(format!("Failed to update deliverable: {e}"));
             }
         }
     }
@@ -4260,7 +5021,7 @@ impl App {
     ) {
         let name = name.trim();
         if name.is_empty() {
-            self.error_message = Some("Name is required".to_string());
+            self.set_error_message("Name is required".to_string());
             return;
         }
 
@@ -4269,11 +5030,11 @@ impl App {
                 .rename_deliverable(&goal_id, &deliverable_id, name),
         ) {
             Ok(_) => {
-                self.success_message = Some("Deliverable renamed".to_string());
+                self.set_success_message("Deliverable renamed".to_string());
                 self.reload_deliverables_for_goal(&goal_id);
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to rename deliverable: {e}"));
+                self.set_error_message(format!("Failed to rename deliverable: {e}"));
             }
         }
     }
@@ -4289,11 +5050,11 @@ impl App {
                 .move_deliverable(&goal_id, &deliverable_id, parent, 0.0),
         ) {
             Ok(_) => {
-                self.success_message = Some("Deliverable moved".to_string());
+                self.set_success_message("Deliverable moved".to_string());
                 self.reload_deliverables_for_goal(&goal_id);
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to move deliverable: {e}"));
+                self.set_error_message(format!("Failed to move deliverable: {e}"));
             }
         }
     }
@@ -4301,11 +5062,11 @@ impl App {
     fn modal_submit_delete_deliverable(&mut self, goal_id: String, deliverable_id: String) {
         match self.api_call(self.client.delete_deliverable(&goal_id, &deliverable_id)) {
             Ok(_) => {
-                self.success_message = Some("Deliverable deleted".to_string());
+                self.set_success_message("Deliverable deleted".to_string());
                 self.reload_deliverables_for_goal(&goal_id);
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to delete deliverable: {e}"));
+                self.set_error_message(format!("Failed to delete deliverable: {e}"));
             }
         }
     }
@@ -4437,7 +5198,9 @@ impl App {
 
 #[cfg(test)]
 mod path_tests {
-    use super::{complete_path, expand_tilde, longest_common_prefix, read_dir_entries};
+    use super::super::file_picker::{
+        complete_path, expand_tilde, longest_common_prefix, read_dir_entries,
+    };
     use std::fs;
     use std::path::PathBuf;
 
@@ -4721,6 +5484,364 @@ mod picker_interaction_tests {
 }
 
 #[cfg(test)]
+mod action_menu_tests {
+    use super::*;
+
+    #[test]
+    fn work_with_claude_item_has_label() {
+        assert_eq!(ActionMenuItem::WorkWithClaude.label(), "claude codeで作業");
+        assert_eq!(ActionMenuItem::WorkWithCodex.label(), "codexで作業");
+    }
+}
+
+#[cfg(test)]
+mod codex_help_key_tests {
+    use super::*;
+
+    #[test]
+    fn ctrl_help_key_accepts_ctrl_q() {
+        assert!(App::is_ctrl_help_key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL,
+        )));
+        // Ctrl+Shift+Q（大文字で届くケース）も許容する。
+        assert!(App::is_ctrl_help_key(KeyEvent::new(
+            KeyCode::Char('Q'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        )));
+    }
+
+    #[test]
+    fn ctrl_help_key_does_not_steal_plain_q_or_other_ctrl_keys() {
+        // 素の q はアプリ終了などに使うため横取りしない。
+        assert!(!App::is_ctrl_help_key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+        )));
+        // 旧割り当て（Ctrl+? / Ctrl+/）はもうヘルプを開かない。
+        assert!(!App::is_ctrl_help_key(KeyEvent::new(
+            KeyCode::Char('/'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(!App::is_ctrl_help_key(KeyEvent::new(
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL,
+        )));
+    }
+
+    fn app_for_help_scroll() -> (tokio::runtime::Runtime, App) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = ApiClient::new("t", "http://localhost").unwrap();
+        let mut app = App::new(client, rt.handle().clone());
+        app.show_help = true;
+        app.help_scroll = 5;
+        (rt, app)
+    }
+
+    #[test]
+    fn help_scroll_moves_with_arrow_and_page_keys_while_open() {
+        let (_rt, mut app) = app_for_help_scroll();
+
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)))
+            .unwrap();
+        assert_eq!(app.help_scroll, 6);
+        assert!(app.show_help);
+
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)))
+            .unwrap();
+        assert_eq!(app.help_scroll, 5);
+
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::PageDown,
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+        assert_eq!(app.help_scroll, 15);
+
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)))
+            .unwrap();
+        assert_eq!(app.help_scroll, 0);
+    }
+
+    #[test]
+    fn help_scroll_does_not_underflow_at_top() {
+        let (_rt, mut app) = app_for_help_scroll();
+        app.help_scroll = 0;
+
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)))
+            .unwrap();
+        assert_eq!(app.help_scroll, 0);
+    }
+
+    #[test]
+    fn help_close_keys_still_close_overlay_and_scroll_resets_next_open() {
+        let (_rt, mut app) = app_for_help_scroll();
+
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+            .unwrap();
+        assert!(!app.show_help);
+
+        // 素の '?' で再度開くとスクロールは先頭へ戻る。
+        app.handle_normal(KeyCode::Char('?'));
+        assert!(app.show_help);
+        assert_eq!(app.help_scroll, 0);
+    }
+}
+
+#[cfg(test)]
+mod codex_turn_key_tests {
+    use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn modified_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    fn app_with_codex_turns(scrollback: usize) -> (tokio::runtime::Runtime, App) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = ApiClient::new("t", "http://localhost").unwrap();
+        let mut app = App::new(client, rt.handle().clone());
+        let mut pane = CodexPane::test_with_output(6, 80, 0, "");
+        pane.finished = false;
+        pane.test_add_completed_turn("first response");
+        pane.test_add_completed_turn("second response");
+        pane.scrollback = scrollback;
+        app.active_pane = ActivePane::Codex;
+        app.codex = Some(pane);
+        (rt, app)
+    }
+
+    fn app_with_codex_history() -> (tokio::runtime::Runtime, App) {
+        app_with_codex_turns(1)
+    }
+
+    fn app_with_codex_live_input() -> (tokio::runtime::Runtime, App) {
+        app_with_codex_turns(0)
+    }
+
+    #[test]
+    fn history_enter_toggles_visible_turn_without_submitting_input() {
+        let (_rt, mut app) = app_with_codex_history();
+
+        app.handle_codex_key(key(KeyCode::Enter));
+
+        let pane = app.codex.as_ref().unwrap();
+        assert_eq!(pane.input_line(), "");
+        assert_eq!(pane.collapsed_turn_count(), 1);
+    }
+
+    #[test]
+    fn history_plain_digit_returns_to_live_and_types_without_turn_shortcut() {
+        let (_rt, mut app) = app_with_codex_history();
+
+        app.handle_codex_key(key(KeyCode::Char('1')));
+
+        let pane = app.codex.as_ref().unwrap();
+        assert_eq!(pane.input_line(), "1");
+        assert_eq!(pane.collapsed_turn_count(), 0);
+    }
+
+    #[test]
+    fn live_empty_enter_toggles_latest_turn_without_submitting_input() {
+        let (_rt, mut app) = app_with_codex_live_input();
+
+        app.handle_codex_key(key(KeyCode::Enter));
+
+        let pane = app.codex.as_ref().unwrap();
+        assert_eq!(pane.input_line(), "");
+        assert_eq!(pane.collapsed_turn_count(), 1);
+    }
+
+    #[test]
+    fn live_empty_space_toggles_latest_turn_without_typing_space() {
+        let (_rt, mut app) = app_with_codex_live_input();
+
+        app.handle_codex_key(key(KeyCode::Char(' ')));
+
+        let pane = app.codex.as_ref().unwrap();
+        assert_eq!(pane.input_line(), "");
+        assert_eq!(pane.collapsed_turn_count(), 1);
+    }
+
+    #[test]
+    fn live_ctrl_o_toggles_latest_turn_without_typing() {
+        let (_rt, mut app) = app_with_codex_live_input();
+
+        app.handle_codex_key(modified_key(KeyCode::Char('o'), KeyModifiers::CONTROL));
+
+        let pane = app.codex.as_ref().unwrap();
+        assert_eq!(pane.input_line(), "");
+        assert_eq!(pane.collapsed_turn_count(), 1);
+    }
+
+    #[test]
+    fn ctrl_up_down_scrolls_log_one_line() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = ApiClient::new("t", "http://localhost").unwrap();
+        let mut app = App::new(client, rt.handle().clone());
+        let mut pane = CodexPane::test_with_output(6, 80, 0, "");
+        pane.finished = false;
+        // スクロール余地を作るため会話ログを十分に積む。
+        pane.seed_assistant_log_for_test(40);
+        app.active_pane = ActivePane::Codex;
+        app.codex = Some(pane);
+
+        // ↑ 単体は履歴呼び戻し。ログの 1 行スクロールは Ctrl+↑/↓ で行う。
+        assert_eq!(app.codex.as_ref().unwrap().scrollback, 0);
+        app.handle_codex_key(modified_key(KeyCode::Up, KeyModifiers::CONTROL));
+        assert_eq!(app.codex.as_ref().unwrap().scrollback, 1);
+        app.handle_codex_key(modified_key(KeyCode::Up, KeyModifiers::CONTROL));
+        assert_eq!(app.codex.as_ref().unwrap().scrollback, 2);
+        app.handle_codex_key(modified_key(KeyCode::Down, KeyModifiers::CONTROL));
+        assert_eq!(app.codex.as_ref().unwrap().scrollback, 1);
+    }
+
+    #[test]
+    fn f7_turn_picker_opens_and_enter_expands_selected_turn() {
+        let (_rt, mut app) = app_with_codex_live_input();
+        {
+            let pane = app.codex.as_mut().unwrap();
+            pane.toggle_old_turns_collapsed();
+        }
+
+        app.handle_codex_key(key(KeyCode::F(7)));
+        {
+            let pane = app.codex.as_ref().unwrap();
+            assert!(pane.turn_picker_open());
+            assert_eq!(pane.turn_picker_selected_turn(), Some(1));
+            assert_eq!(pane.collapsed_turn_count(), 2);
+        }
+
+        app.handle_codex_key(key(KeyCode::Enter));
+
+        let pane = app.codex.as_ref().unwrap();
+        assert!(pane.turn_picker_open());
+        assert_eq!(pane.collapsed_turn_count(), 1);
+        assert!(!pane.turn_picker_items()[0].collapsed);
+    }
+
+    #[test]
+    fn live_plain_digit_still_types_into_codex_prompt() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = ApiClient::new("t", "http://localhost").unwrap();
+        let mut app = App::new(client, rt.handle().clone());
+        let mut pane = CodexPane::test_with_output(6, 80, 0, "");
+        pane.finished = false;
+        app.active_pane = ActivePane::Codex;
+        app.codex = Some(pane);
+
+        app.handle_codex_key(key(KeyCode::Char('1')));
+
+        let pane = app.codex.as_ref().unwrap();
+        assert_eq!(pane.input_line(), "1");
+        assert_eq!(pane.collapsed_turn_count(), 0);
+    }
+
+    #[test]
+    fn question_mark_opens_help_when_input_empty() {
+        let (_rt, mut app) = app_with_codex_live_input();
+
+        app.handle_codex_key(key(KeyCode::Char('?')));
+
+        assert!(app.show_help);
+        assert_eq!(app.help_scroll, 0);
+        assert_eq!(app.codex.as_ref().unwrap().input_line(), "");
+    }
+
+    #[test]
+    fn question_mark_types_into_prompt_when_input_nonempty() {
+        let (_rt, mut app) = app_with_codex_live_input();
+
+        app.handle_codex_key(key(KeyCode::Char('a')));
+        app.handle_codex_key(key(KeyCode::Char('?')));
+
+        assert!(!app.show_help);
+        assert_eq!(app.codex.as_ref().unwrap().input_line(), "a?");
+    }
+
+    #[test]
+    fn question_mark_ignored_during_scrollback() {
+        let (_rt, mut app) = app_with_codex_history();
+
+        app.handle_codex_key(key(KeyCode::Char('?')));
+
+        // スクロール中は `?` でヘルプを開かず、従来どおりの経路に委ねる。
+        assert!(!app.show_help);
+    }
+}
+
+#[cfg(test)]
+mod status_message_tests {
+    use super::*;
+
+    fn app() -> (tokio::runtime::Runtime, App) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = ApiClient::new("t", "http://localhost").unwrap();
+        let app = App::new(client, rt.handle().clone());
+        (rt, app)
+    }
+
+    #[test]
+    fn new_message_arms_deadline() {
+        let (_rt, mut app) = app();
+        assert!(app.status_deadline.is_none());
+
+        app.set_success_message("done".to_string());
+
+        assert!(app.status_deadline.is_some());
+        // 期限内なので消えない。
+        assert!(!app.expire_status_messages());
+        assert_eq!(app.success_message.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn expired_message_is_cleared() {
+        let (_rt, mut app) = app();
+        app.set_error_message("boom".to_string());
+
+        // 期限を過去にして期限切れを再現する。
+        app.status_deadline = Some(Instant::now() - Duration::from_millis(1));
+
+        assert!(app.expire_status_messages());
+        assert!(app.error_message.is_none());
+        assert!(app.status_deadline.is_none());
+    }
+
+    #[test]
+    fn newer_message_rearms_deadline() {
+        let (_rt, mut app) = app();
+        app.set_success_message("first".to_string());
+        // 期限切れ寸前に設定。
+        app.status_deadline = Some(Instant::now() - Duration::from_millis(1));
+
+        // 新しいメッセージが上書きされたら期限を張り直す。
+        app.set_success_message("second".to_string());
+
+        assert!(app.status_deadline.is_some());
+        assert!(!app.expire_status_messages());
+        assert_eq!(app.success_message.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn same_message_reset_extends_deadline() {
+        let (_rt, mut app) = app();
+        app.set_error_message("same".to_string());
+        // 期限を過去にする（内容は同じ）。
+        app.status_deadline = Some(Instant::now() - Duration::from_millis(1));
+
+        // 同一内容を再設定しても期限が延びる。
+        app.set_error_message("same".to_string());
+
+        assert!(app.status_deadline.is_some());
+        assert!(!app.expire_status_messages());
+        assert_eq!(app.error_message.as_deref(), Some("same"));
+    }
+}
+
+#[cfg(test)]
 mod codex_mouse_tests {
     use super::*;
 
@@ -4778,24 +5899,6 @@ mod codex_mouse_tests {
         assert!(!App::point_in_area(Some(area), 30, 12));
         assert!(!App::point_in_area(Some(area), 29, 13));
         assert!(!App::point_in_area(None, 10, 5));
-    }
-
-    #[test]
-    fn point_in_inner_area_clamped_maps_frame_to_nearest_terminal_cell() {
-        let area = Rect {
-            x: 10,
-            y: 5,
-            width: 20,
-            height: 8,
-        };
-
-        assert_eq!(App::point_in_inner_area_clamped(area, 10, 5), Some((0, 0)));
-        assert_eq!(
-            App::point_in_inner_area_clamped(area, 29, 12),
-            Some((17, 5))
-        );
-        assert_eq!(App::point_in_inner_area_clamped(area, 15, 8), Some((4, 2)));
-        assert_eq!(App::point_in_inner_area_clamped(area, 30, 12), None);
     }
 
     #[test]
@@ -4857,27 +5960,51 @@ mod codex_mouse_tests {
     }
 
     #[test]
-    fn codex_terminal_scroll_route_prefers_scrollback_then_child_mouse() {
+    fn codex_terminal_scroll_route_prefers_scrollback() {
         assert_eq!(
-            App::codex_terminal_scroll_route(0, 3, false, true, Some((1, 1))),
+            App::codex_terminal_scroll_route(0, 3, true),
             CodexTerminalScrollRoute::Scrollback
         );
         assert_eq!(
-            App::codex_terminal_scroll_route(0, 0, false, true, Some((1, 1))),
-            CodexTerminalScrollRoute::ChildMouse
-        );
-        assert_eq!(
-            App::codex_terminal_scroll_route(0, 0, false, false, Some((1, 1))),
+            App::codex_terminal_scroll_route(0, 0, true),
             CodexTerminalScrollRoute::None
         );
         assert_eq!(
-            App::codex_terminal_scroll_route(0, 0, true, true, Some((1, 1))),
+            App::codex_terminal_scroll_route(0, 0, false),
             CodexTerminalScrollRoute::None
         );
-        assert_eq!(
-            App::codex_terminal_scroll_route(0, 0, false, true, None),
-            CodexTerminalScrollRoute::None
-        );
+    }
+
+    #[test]
+    fn codex_ui_signature_tracks_pane_overlay_and_picker_changes() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = ApiClient::new("t", "http://localhost").unwrap();
+        let mut app = App::new(client, rt.handle().clone());
+
+        // ペインが無ければシグネチャは None。
+        assert!(app.compute_codex_ui_signature().is_none());
+
+        app.codex = Some(CodexPane::test_with_output(20, 40, 0, ""));
+        app.codex_terminal_area = Some(Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 20,
+        });
+        let base = app.compute_codex_ui_signature();
+        assert!(base.is_some());
+
+        // ヘルプオーバーレイの開閉で構造が変わる。
+        app.show_help = true;
+        assert_ne!(app.compute_codex_ui_signature(), base);
+        app.show_help = false;
+        assert_eq!(app.compute_codex_ui_signature(), base);
+
+        // turn ピッカーの開閉で構造が変わる。
+        app.codex.as_mut().unwrap().test_add_completed_turn("done");
+        assert!(app.codex.as_mut().unwrap().open_turn_picker());
+        assert_ne!(app.compute_codex_ui_signature(), base);
+        app.codex.as_mut().unwrap().close_turn_picker();
     }
 
     #[test]
@@ -4887,7 +6014,7 @@ mod codex_mouse_tests {
         let mut app = App::new(client, rt.handle().clone());
         let mut output = String::new();
         for row in 1..=100 {
-            output.push_str(&format!("\x1b[{row};1Hrow {row:03}"));
+            output.push_str(&format!("row {row:03}\n"));
         }
         app.codex = Some(CodexPane::test_with_output(100, 20, 0, &output));
         app.codex.as_mut().unwrap().resize(4, 20);
@@ -4925,7 +6052,7 @@ mod codex_mouse_tests {
         let mut app = App::new(client, rt.handle().clone());
         let mut output = String::new();
         for row in 1..=100 {
-            output.push_str(&format!("\x1b[{row};1Hrow {row:03}"));
+            output.push_str(&format!("row {row:03}\n"));
         }
         app.codex = Some(CodexPane::test_with_output(100, 20, 0, &output));
         app.codex.as_mut().unwrap().resize(4, 20);
@@ -4957,6 +6084,93 @@ mod codex_mouse_tests {
     }
 
     #[test]
+    fn handle_codex_mouse_scroll_routes_left_panes_by_pointer_area() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = ApiClient::new("t", "http://localhost").unwrap();
+        let mut app = App::new(client, rt.handle().clone());
+        app.codex = Some(CodexPane::test_with_output(20, 20, 0, ""));
+        app.active_pane = ActivePane::Codex;
+        app.codex_status_area = Some(Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 5,
+        });
+        app.codex_contract_area = Some(Rect {
+            x: 0,
+            y: 5,
+            width: 20,
+            height: 10,
+        });
+        app.codex_activity_area = Some(Rect {
+            x: 0,
+            y: 15,
+            width: 20,
+            height: 5,
+        });
+
+        app.handle_codex_mouse_scroll(
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 2,
+                row: 6,
+                modifiers: KeyModifiers::NONE,
+            },
+            CODEX_WHEEL_LINES,
+            1,
+        );
+        assert_eq!(app.codex_contract_scroll, 0);
+        assert_eq!(
+            app.codex_last_scroll_input.as_deref(),
+            Some("mouse ScrollUp -> Addnessゴール")
+        );
+
+        app.handle_codex_mouse_scroll(
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 2,
+                row: 6,
+                modifiers: KeyModifiers::NONE,
+            },
+            -CODEX_WHEEL_LINES,
+            1,
+        );
+        assert_eq!(app.codex_contract_scroll, CODEX_WHEEL_LINES as usize);
+        assert_eq!(
+            app.codex_last_scroll_input.as_deref(),
+            Some("mouse ScrollDown -> Addnessゴール")
+        );
+
+        app.handle_codex_mouse_scroll(
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 2,
+                row: 16,
+                modifiers: KeyModifiers::NONE,
+            },
+            CODEX_WHEEL_LINES,
+            1,
+        );
+        assert_eq!(app.codex_activity_scroll, CODEX_WHEEL_LINES as usize);
+        assert_eq!(
+            app.codex_last_scroll_input.as_deref(),
+            Some("mouse ScrollUp -> Addness更新")
+        );
+
+        app.handle_codex_mouse_scroll(
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 2,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            },
+            CODEX_WHEEL_LINES,
+            1,
+        );
+        assert_eq!(app.codex_contract_scroll, 0);
+    }
+
+    #[test]
     fn shifted_codex_navigation_keys_are_swallowed() {
         assert!(App::is_codex_shift_navigation_key(KeyEvent::new(
             KeyCode::Up,
@@ -4979,11 +6193,12 @@ mod codex_mouse_tests {
 
 #[cfg(test)]
 mod dod_tests {
-    use super::{
+    use super::super::codex_memory::{
         CODEX_DECISION_LOG_END, CODEX_DECISION_LOG_START, CODEX_TRACEABILITY_END,
-        CODEX_TRACEABILITY_START, codex_trace_link_label, ensure_codex_memory_sections,
-        extract_json_object, parse_dod_results, upsert_codex_auto_record,
+        CODEX_TRACEABILITY_START, CODEX_WORK_MEMO_END, CODEX_WORK_MEMO_START,
+        codex_trace_link_label, ensure_codex_memory_sections, upsert_codex_auto_record,
     };
+    use super::{extract_json_object, is_permission_denied_error_text, parse_dod_results};
 
     #[test]
     fn extract_json_object_strips_surrounding_text() {
@@ -5051,13 +6266,15 @@ mod dod_tests {
     }
 
     #[test]
-    fn ensure_codex_memory_sections_adds_decision_and_trace_blocks_once() {
+    fn ensure_codex_memory_sections_adds_memory_decision_and_trace_blocks_once() {
         let first = ensure_codex_memory_sections("手書きメモ".to_string());
         let second = ensure_codex_memory_sections(first.clone());
 
         assert!(second.contains("手書きメモ"));
+        assert_eq!(second.matches("## Codex作業メモ").count(), 1);
         assert_eq!(second.matches("## Codex決定ログ").count(), 1);
         assert_eq!(second.matches("## PR/Release Traceability").count(), 1);
+        assert!(second.contains("Codexの通常memoryへ混ぜない"));
     }
 
     #[test]
@@ -5091,17 +6308,256 @@ mod dod_tests {
     }
 
     #[test]
+    fn permission_denied_error_text_detects_goal_write_errors() {
+        assert!(is_permission_denied_error_text(
+            "API error (403 Forbidden): objective.update denied"
+        ));
+        assert!(is_permission_denied_error_text(
+            "この操作を行う権限がありません"
+        ));
+        assert!(!is_permission_denied_error_text("API error (500): server"));
+    }
+
+    #[test]
     fn ensure_codex_memory_sections_skips_when_only_heading_remains() {
         let seeded = ensure_codex_memory_sections(String::new());
         // codex が body を編集して不可視マーカーだけ落とした状況を模す。
         let without_markers = seeded
+            .replace(CODEX_WORK_MEMO_START, "")
+            .replace(CODEX_WORK_MEMO_END, "")
             .replace(CODEX_DECISION_LOG_START, "")
             .replace(CODEX_DECISION_LOG_END, "")
             .replace(CODEX_TRACEABILITY_START, "")
             .replace(CODEX_TRACEABILITY_END, "");
         let again = ensure_codex_memory_sections(without_markers);
 
+        assert_eq!(again.matches("## Codex作業メモ").count(), 1);
         assert_eq!(again.matches("## Codex決定ログ").count(), 1);
         assert_eq!(again.matches("## PR/Release Traceability").count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod notify_tests {
+    use super::{
+        NOTIFY_MIN_TURN_SECS, NotifyMode, applescript_string_escape, parse_notify_mode,
+        should_emit_notice,
+    };
+
+    #[test]
+    fn parse_notify_mode_defaults_to_full() {
+        assert_eq!(parse_notify_mode(None), NotifyMode::Full);
+        assert_eq!(parse_notify_mode(Some("on")), NotifyMode::Full);
+        assert_eq!(parse_notify_mode(Some("なにか")), NotifyMode::Full);
+        assert_eq!(parse_notify_mode(Some(" Bell ")), NotifyMode::Bell);
+        assert_eq!(parse_notify_mode(Some("OFF")), NotifyMode::Off);
+        assert_eq!(parse_notify_mode(Some("none")), NotifyMode::Off);
+    }
+
+    #[test]
+    fn should_emit_notice_suppresses_short_turns_only() {
+        // ターン完了（Some）: 閾値未満は抑制、以上は通知。
+        assert!(!should_emit_notice(Some(0), NOTIFY_MIN_TURN_SECS));
+        assert!(!should_emit_notice(Some(9), NOTIFY_MIN_TURN_SECS));
+        assert!(should_emit_notice(Some(10), NOTIFY_MIN_TURN_SECS));
+        assert!(should_emit_notice(Some(120), NOTIFY_MIN_TURN_SECS));
+        // 承認・その他（None）は常に通知。
+        assert!(should_emit_notice(None, NOTIFY_MIN_TURN_SECS));
+    }
+
+    #[test]
+    fn applescript_string_escape_escapes_quotes_and_backslash() {
+        assert_eq!(applescript_string_escape("plain"), "plain");
+        assert_eq!(applescript_string_escape("a\"b"), "a\\\"b");
+        assert_eq!(applescript_string_escape("a\\b"), "a\\\\b");
+        assert_eq!(applescript_string_escape("line1\nline2"), "line1 line2");
+        // 制御文字は除去する。
+        assert_eq!(applescript_string_escape("a\u{7}b"), "ab");
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::{
+        CheckpointJobResult, git_create_checkpoint, git_delete_ref, git_restore_checkpoint,
+    };
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("git 実行");
+        assert!(
+            out.status.success(),
+            "git {:?} 失敗: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn setup_repo(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "addness_checkpoint_{tag}_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        git(&dir, &["config", "user.email", "test@example.com"]);
+        git(&dir, &["config", "user.name", "Test"]);
+        git(&dir, &["config", "commit.gpgsign", "false"]);
+        fs::write(dir.join("tracked.txt"), "v1\n").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-q", "-m", "init"]);
+        dir
+    }
+
+    #[test]
+    fn checkpoint_leaves_worktree_and_index_untouched_but_creates_ref() {
+        let dir = setup_repo("clean");
+        let cwd = dir.display().to_string();
+
+        // 作業ツリーを変更（tracked 変更 + untracked 追加）。
+        fs::write(dir.join("tracked.txt"), "v2-checkpoint\n").unwrap();
+        fs::write(dir.join("untracked_a.txt"), "a\n").unwrap();
+
+        let before_status = git(&dir, &["status", "--porcelain"]);
+        let before_head = git(&dir, &["rev-parse", "HEAD"]);
+
+        let refn = "refs/addness/checkpoint-test-0";
+        let result = git_create_checkpoint(&cwd, refn, "addness-checkpoint-turn-1");
+        assert!(matches!(result, CheckpointJobResult::Recorded));
+
+        // ref が作られている。
+        let cp = git(&dir, &["rev-parse", refn]);
+        assert_ne!(
+            cp, before_head,
+            "変更ありなのでスナップショットコミットになる"
+        );
+
+        // 作業ツリー・インデックス・HEAD は無変更。
+        assert_eq!(git(&dir, &["status", "--porcelain"]), before_status);
+        assert_eq!(git(&dir, &["rev-parse", "HEAD"]), before_head);
+        assert_eq!(
+            fs::read_to_string(dir.join("tracked.txt")).unwrap(),
+            "v2-checkpoint\n"
+        );
+        // スタッシュスタックは空のまま。
+        assert_eq!(git(&dir, &["stash", "list"]), "");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checkpoint_with_no_changes_points_at_head() {
+        let dir = setup_repo("nochange");
+        let cwd = dir.display().to_string();
+        let head = git(&dir, &["rev-parse", "HEAD"]);
+        let refn = "refs/addness/checkpoint-test-0";
+        let result = git_create_checkpoint(&cwd, refn, "cp");
+        assert!(matches!(result, CheckpointJobResult::Recorded));
+        assert_eq!(git(&dir, &["rev-parse", refn]), head);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undo_restores_content_and_keeps_new_files() {
+        let dir = setup_repo("undo");
+        let cwd = dir.display().to_string();
+
+        // チェックポイント時点: tracked=v2 + untracked_a。
+        fs::write(dir.join("tracked.txt"), "v2-checkpoint\n").unwrap();
+        fs::write(dir.join("untracked_a.txt"), "a\n").unwrap();
+        let refn = "refs/addness/checkpoint-test-0";
+        assert!(matches!(
+            git_create_checkpoint(&cwd, refn, "cp"),
+            CheckpointJobResult::Recorded
+        ));
+
+        // チェックポイント後: tracked を更に変更 + 新規ファイル B 作成 + a を削除。
+        fs::write(dir.join("tracked.txt"), "v3-after\n").unwrap();
+        fs::write(dir.join("new_b.txt"), "b\n").unwrap();
+        fs::remove_file(dir.join("untracked_a.txt")).unwrap();
+
+        // undo（復元）。
+        git_restore_checkpoint(&cwd, refn).expect("復元成功");
+
+        // tracked はチェックポイント時点へ戻る。
+        assert_eq!(
+            fs::read_to_string(dir.join("tracked.txt")).unwrap(),
+            "v2-checkpoint\n"
+        );
+        // チェックポイント時に存在した untracked_a は復元される。
+        assert_eq!(
+            fs::read_to_string(dir.join("untracked_a.txt")).unwrap(),
+            "a\n"
+        );
+        // チェックポイント後に新規作成した B は残る（消さない）。
+        assert!(dir.join("new_b.txt").exists());
+
+        git_delete_ref(&cwd, refn);
+        assert!(super::git_capture(&dir, &["rev-parse", "--verify", refn], None).is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undo_only_restores_within_cwd() {
+        let dir = setup_repo("cwd-scope");
+        // サブディレクトリと、その中/外のトラッキングファイルを用意する。
+        let sub = dir.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(dir.join("root.txt"), "root-v1\n").unwrap();
+        fs::write(sub.join("inner.txt"), "inner-v1\n").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-q", "-m", "add files"]);
+
+        // 現状（v1）で全ツリーのチェックポイントを作成する。
+        let refn = "refs/addness/checkpoint-test-0";
+        assert!(matches!(
+            git_create_checkpoint(&dir.display().to_string(), refn, "cp"),
+            CheckpointJobResult::Recorded
+        ));
+
+        // チェックポイント後: cwd 内も外も変更する。
+        fs::write(dir.join("root.txt"), "root-v2\n").unwrap();
+        fs::write(sub.join("inner.txt"), "inner-v2\n").unwrap();
+
+        // 復元は cwd（sub）配下に限定する。
+        git_restore_checkpoint(&sub.display().to_string(), refn).expect("復元成功");
+
+        // cwd 配下はチェックポイント状態へ戻る。
+        assert_eq!(
+            fs::read_to_string(sub.join("inner.txt")).unwrap(),
+            "inner-v1\n"
+        );
+        // cwd 外は巻き戻らない。
+        assert_eq!(
+            fs::read_to_string(dir.join("root.txt")).unwrap(),
+            "root-v2\n"
+        );
+
+        git_delete_ref(&dir.display().to_string(), refn);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checkpoint_on_non_repo_reports_not_repo() {
+        let dir = std::env::temp_dir().join(format!(
+            "addness_checkpoint_norepo_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let result = git_create_checkpoint(&dir.display().to_string(), "refs/addness/x", "cp");
+        assert!(matches!(result, CheckpointJobResult::NotRepo));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

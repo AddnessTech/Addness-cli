@@ -3,8 +3,8 @@ use std::{collections::HashMap, path::Path};
 use crate::api::{
     ApiClient, ApiResponse, AttachmentUploadRequest, BatchDeleteDeliverableRequest,
     BatchMoveDeliverableRequest, CreateDeliverableRequest, Deliverable, DeliverableCreateData,
-    DeliverableListData, DeliverableType, MoveDeliverableRequest, RenameDeliverableRequest,
-    UpdateDeliverableRequest,
+    DeliverableListData, DeliverableType, MoveDeliverableRequest, RelatedFetchError,
+    RenameDeliverableRequest, UpdateDeliverableRequest,
 };
 use anyhow::{Context, Result};
 
@@ -264,6 +264,22 @@ impl ApiClient {
         &self,
         goal_ids: &[&str],
     ) -> HashMap<String, Vec<Deliverable>> {
+        let (map, errors) = self.get_deliverables_map_with_errors(goal_ids).await;
+        for error in errors {
+            eprintln!(
+                "Warning: failed to fetch {} for {}: {}",
+                error.kind, error.goal_id, error.message
+            );
+        }
+
+        map
+    }
+
+    /// 各ゴールの成果物を並行取得し、部分失敗を呼び出し側で扱える形で返す。
+    pub async fn get_deliverables_map_with_errors(
+        &self,
+        goal_ids: &[&str],
+    ) -> (HashMap<String, Vec<Deliverable>>, Vec<RelatedFetchError>) {
         let futures: Vec<_> = goal_ids
             .iter()
             .map(|g| self.get_goal_deliverables(g))
@@ -271,21 +287,23 @@ impl ApiClient {
         let results = futures::future::join_all(futures).await;
 
         let mut map = HashMap::new();
+        let mut errors = Vec::new();
         for (i, result) in results.into_iter().enumerate() {
             match result {
                 Ok(resp) => {
                     map.insert(goal_ids[i].to_string(), resp.data.deliverables);
                 }
                 Err(e) => {
-                    eprintln!(
-                        "Warning: failed to fetch deliverables for {}: {e}",
-                        goal_ids[i]
-                    );
+                    errors.push(RelatedFetchError {
+                        kind: "deliverables",
+                        goal_id: goal_ids[i].to_string(),
+                        message: e.to_string(),
+                    });
                 }
             }
         }
 
-        map
+        (map, errors)
     }
 }
 

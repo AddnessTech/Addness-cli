@@ -71,3 +71,23 @@ pub struct UpdateCommentRequest {
 pub struct ReactionRequest {
     pub emoji: String,
 }
+
+// GET /v1/team/comments/:id/context
+// Surrounding comments for a notification highlight (radius before/after).
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommentContextResponse {
+    #[serde(default)]
+    pub comments: Vec<Comment>,
+    /// Index of the highlighted target comment within `comments`.
+    pub target_index: i64,
+    #[serde(default)]
+    pub has_above: bool,
+    #[serde(default)]
+    pub has_below: bool,
+    #[serde(default)]
+    pub total_count: i64,
+    /// Present when the target is a thread reply.
+    #[serde(default)]
+    pub parent_comment: Option<Comment>,
+}

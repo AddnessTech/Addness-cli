@@ -47,7 +47,7 @@ pub struct DeliverableCreateData {
 }
 
 /// S3 presigned POST のフォーム情報。
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttachmentUploadResponse {
     pub url: String,
     pub values: std::collections::HashMap<String, String>,

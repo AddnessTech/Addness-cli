@@ -1,25 +1,64 @@
+mod activity;
+mod api_key;
 mod assignment;
+mod chat;
+mod codex_job;
 mod comment;
 mod deliverable;
+mod desktop_auth;
+mod diagnosis;
 mod goal;
 mod goal_execution;
+mod goalreport;
+mod inlinemedia;
 mod invitation;
+mod invoice;
+mod issue;
 mod kpi;
+mod meeting;
 mod member;
+mod notification;
 mod org;
+mod personal;
+mod referral;
+mod search;
+mod sharetree;
+mod skill;
+mod streak;
+mod tool;
+mod user;
 
-pub use comment::ListCommentsParams;
-pub use org::CreateOrganizationParams;
+pub use activity::{
+    ActivityLogByGoalParams, ActivityLogByMemberParams, ActivityLogSummaryParams,
+    GoalActivitySummaryParams,
+};
+pub use chat::{ChatMessageListParams, ChatRoomListParams, ChatSearchParams};
+pub use comment::{ListAllCommentsParams, ListCommentsParams};
+pub use invoice::InvoiceListParams;
+pub use issue::{GoalSectionListParams, IssueListParams};
+pub use meeting::{HuddleInviteableMembersParams, MinuteListParams};
+pub use member::BrowseMembersParams;
+pub use notification::ListNotificationsParams;
+pub use org::{CreateOrganizationParams, ListAllOrganizationsParams};
+pub use search::SearchQueryParams;
+pub use user::ListUsersParams;
 
 use anyhow::{Context, Result};
 use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
-use reqwest::{Method, RequestBuilder, Response, StatusCode};
+use reqwest::{Method, RequestBuilder, Response, StatusCode, Url};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
+const API_RESOLVE_ENV: &str = "ADDNESS_API_RESOLVE";
 const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 120;
+const REQUEST_SEND_ATTEMPTS: usize = 3;
+/// Long-lived SSE connections (e.g. Codex job event streams) outlive the
+/// default per-request timeout, so `get_stream` overrides it with this much
+/// larger budget instead of leaving the whole request unbounded.
+const EVENT_STREAM_TIMEOUT_SECS: u64 = 1800;
 
 fn http_timeout_from_env_value(value: Option<&str>) -> Duration {
     value
@@ -40,6 +79,66 @@ pub struct ApiClient {
     org_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelatedFetchError {
+    pub kind: &'static str,
+    pub goal_id: String,
+    pub message: String,
+}
+
+fn dns_override_for_base_url(base_url: &str) -> Result<Option<(String, Vec<SocketAddr>)>> {
+    let override_value = match std::env::var(API_RESOLVE_ENV) {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => return Ok(None),
+    };
+    let url = Url::parse(base_url).context("Invalid API URL")?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("Invalid API URL: missing host"))?;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| anyhow::anyhow!("Invalid API URL: missing port"))?;
+    let addrs = parse_dns_override_addrs(&override_value, host, port)?;
+    if addrs.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((host.to_string(), addrs)))
+}
+
+fn parse_dns_override_addrs(raw: &str, host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+    let mut addrs = Vec::new();
+    for entry in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let addr_text = match entry.split_once('=') {
+            Some((entry_host, value)) if entry_host.trim() == host => value.trim(),
+            Some(_) => continue,
+            None => entry,
+        };
+        addrs.push(parse_dns_override_addr(addr_text, port)?);
+    }
+    Ok(addrs)
+}
+
+fn parse_dns_override_addr(raw: &str, port: u16) -> Result<SocketAddr> {
+    if let Ok(addr) = raw.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    let ip = raw
+        .parse::<IpAddr>()
+        .with_context(|| format!("Invalid {API_RESOLVE_ENV} address: {raw}"))?;
+    Ok(SocketAddr::new(ip, port))
+}
+
+fn send_failure_context(url: &str, attempts: usize) -> String {
+    format!(
+        "Failed to send request to {url} after {attempts} attempt(s). \
+         If this is a DNS error in a restricted environment, set \
+         {API_RESOLVE_ENV}=<host>=<ip> to temporarily bypass local name resolution."
+    )
+}
 impl ApiClient {
     pub fn new(token: &str, base_url: &str) -> Result<Self> {
         let mut headers = HeaderMap::new();
@@ -49,10 +148,16 @@ impl ApiClient {
             HeaderValue::from_str(&auth_value).context("Invalid token format")?,
         );
 
-        let client = Client::builder()
+        let mut client_builder = Client::builder()
             .default_headers(headers)
             .user_agent(format!("addness-cli/{}", env!("CARGO_PKG_VERSION")))
-            .timeout(configured_http_timeout())
+            .timeout(configured_http_timeout());
+
+        if let Some((host, addrs)) = dns_override_for_base_url(base_url)? {
+            client_builder = client_builder.resolve_to_addrs(&host, &addrs);
+        }
+
+        let client = client_builder
             .build()
             .context("Failed to create HTTP client")?;
 
@@ -217,10 +322,7 @@ impl ApiClient {
     }
 
     async fn send(&self, req: RequestBuilder, url: &str) -> Result<Response> {
-        let response = req
-            .send()
-            .await
-            .with_context(|| format!("Failed to send request to {url}"))?;
+        let response = Self::send_request(req, url).await?;
 
         let status = response.status();
         if !status.is_success() {
@@ -229,6 +331,49 @@ impl ApiClient {
         }
 
         Ok(response)
+    }
+
+    async fn send_request(req: RequestBuilder, url: &str) -> Result<Response> {
+        let retryable_req = req.try_clone();
+        let mut first_req = Some(req);
+
+        for attempt in 1..=REQUEST_SEND_ATTEMPTS {
+            let current_req = if attempt == 1 {
+                first_req
+                    .take()
+                    .expect("request builder should be available for first send")
+            } else if let Some(retryable_req) = &retryable_req {
+                retryable_req
+                    .try_clone()
+                    .expect("request builder clone should remain cloneable")
+            } else {
+                break;
+            };
+
+            match current_req.send().await {
+                Ok(response) => return Ok(response),
+                Err(err)
+                    if Self::should_retry_send_error(&err, attempt, retryable_req.is_some()) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(150 * attempt as u64)).await;
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| send_failure_context(url, attempt));
+                }
+            }
+        }
+
+        anyhow::bail!("{}", send_failure_context(url, REQUEST_SEND_ATTEMPTS))
+    }
+
+    fn should_retry_send_error(
+        err: &reqwest::Error,
+        attempt: usize,
+        request_cloneable: bool,
+    ) -> bool {
+        request_cloneable
+            && attempt < REQUEST_SEND_ATTEMPTS
+            && (err.is_connect() || err.is_timeout())
     }
 
     async fn send_json<T: DeserializeOwned>(&self, req: RequestBuilder, url: &str) -> Result<T> {
@@ -308,6 +453,12 @@ impl ApiClient {
         self.send_json(req, &url).await
     }
 
+    /// POST with no request body, expects 204 No Content response.
+    pub(super) async fn post_empty_no_content(&self, path: &str) -> Result<()> {
+        let (url, req) = self.request(Method::POST, path, true)?;
+        self.send_no_content(req, &url).await
+    }
+
     /// PATCH with no request body, expects JSON response (used for resolve/unresolve).
     pub(super) async fn patch_empty<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
         let (url, req) = self.request(Method::PATCH, path, true)?;
@@ -347,12 +498,64 @@ impl ApiClient {
         let (url, req) = self.request(Method::DELETE, path, true)?;
         self.send_no_content(req, &url).await
     }
+
+    /// DELETE with no request body, expects a JSON response body (unlike
+    /// `delete_no_body`; used by endpoints that return a status payload on
+    /// deletion, e.g. the goal activity report schedule).
+    pub(super) async fn delete_json<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+        let (url, req) = self.request(Method::DELETE, path, true)?;
+        self.send_json(req, &url).await
+    }
+
+    /// PUT with a raw binary body (e.g. organization logo upload), expects JSON response.
+    /// The backend reads the request body directly as the uploaded file, so this
+    /// sends the bytes as-is with an explicit `Content-Type`.
+    pub(super) async fn put_bytes<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        bytes: Vec<u8>,
+        content_type: &str,
+    ) -> Result<T> {
+        let (url, req) = self.request(Method::PUT, path, true)?;
+        let req = req
+            .header(reqwest::header::CONTENT_TYPE, content_type.to_string())
+            .body(bytes);
+        self.send_json(req, &url).await
+    }
+
+    /// POST a `multipart/form-data` body directly to our own API (unlike
+    /// `upload_attachment`, which posts to a third-party presigned URL).
+    /// Used by endpoints that accept a raw file upload alongside auth headers,
+    /// e.g. meeting-note audio transcription.
+    pub(super) async fn post_multipart<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        form: reqwest::multipart::Form,
+    ) -> Result<T> {
+        let (url, req) = self.request(Method::POST, path, true)?;
+        self.send_json(req.multipart(form), &url).await
+    }
+
+    /// GET a server-sent-events endpoint, returning the raw `Response` for
+    /// the caller to consume as a byte stream (e.g. via `bytes_stream()` +
+    /// `eventsource_stream::Eventsource`). Overrides the client's default
+    /// timeout — SSE connections are kept alive far longer than a normal
+    /// request/response round trip.
+    pub(super) async fn get_stream(&self, path: &str) -> Result<Response> {
+        let (url, req) = self.request(Method::GET, path, true)?;
+        let req = req.timeout(Duration::from_secs(EVENT_STREAM_TIMEOUT_SECS));
+        self.send(req, &url).await
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiClient, DEFAULT_HTTP_TIMEOUT_SECS, http_timeout_from_env_value};
+    use super::{
+        API_RESOLVE_ENV, ApiClient, DEFAULT_HTTP_TIMEOUT_SECS, http_timeout_from_env_value,
+        parse_dns_override_addrs, send_failure_context,
+    };
     use reqwest::StatusCode;
+    use std::net::SocketAddr;
     use std::time::Duration;
 
     #[test]
@@ -390,5 +593,47 @@ mod tests {
 
         assert!(message.contains("API error (401 Unauthorized): AUTH_INVALID_API_KEY"));
         assert!(message.contains("Run: addness login"));
+    }
+
+    #[test]
+    fn dns_override_accepts_plain_ip_for_base_host() {
+        let addrs = parse_dns_override_addrs("54.248.80.181", "vt.api.addness.com", 443).unwrap();
+
+        assert_eq!(
+            addrs,
+            vec!["54.248.80.181:443".parse::<SocketAddr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn dns_override_filters_host_mapping() {
+        let addrs = parse_dns_override_addrs(
+            "other.example=10.0.0.1,vt.api.addness.com=54.248.80.181:8443",
+            "vt.api.addness.com",
+            443,
+        )
+        .unwrap();
+
+        assert_eq!(
+            addrs,
+            vec!["54.248.80.181:8443".parse::<SocketAddr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn dns_override_rejects_invalid_address() {
+        let err = parse_dns_override_addrs("not-an-ip", "vt.api.addness.com", 443)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("Invalid ADDNESS_API_RESOLVE address"));
+    }
+
+    #[test]
+    fn send_failure_context_mentions_dns_override_env() {
+        let context = send_failure_context("https://vt.api.addness.com/api/v2/objectives", 3);
+
+        assert!(context.contains(API_RESOLVE_ENV));
+        assert!(context.contains("after 3 attempt"));
     }
 }

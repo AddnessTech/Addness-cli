@@ -5,6 +5,7 @@ mod deliverable;
 mod goal;
 mod goal_execution;
 mod invitation;
+mod issue;
 mod kpi;
 mod member;
 mod notification;
@@ -16,7 +17,8 @@ pub use activity::{
     ActivityLogByGoalParams, ActivityLogByMemberParams, ActivityLogSummaryParams,
     GoalActivitySummaryParams,
 };
-pub use comment::ListCommentsParams;
+pub use comment::{ListAllCommentsParams, ListCommentsParams};
+pub use issue::{GoalSectionListParams, IssueListParams};
 pub use member::BrowseMembersParams;
 pub use notification::ListNotificationsParams;
 pub use org::{CreateOrganizationParams, ListAllOrganizationsParams};

@@ -13,4 +13,5 @@ pub use client::{
     ActivityLogByGoalParams, ActivityLogByMemberParams, ActivityLogSummaryParams,
     GoalActivitySummaryParams,
 };
+pub use client::{GoalSectionListParams, IssueListParams, ListAllCommentsParams};
 pub use models::*;

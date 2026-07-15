@@ -15,6 +15,7 @@ mod kpi;
 mod member;
 mod notification;
 mod org;
+mod personal;
 mod referral;
 mod search;
 mod sharetree;

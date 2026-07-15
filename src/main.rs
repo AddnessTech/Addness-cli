@@ -11,8 +11,8 @@ use clap::{CommandFactory, Parser, Subcommand};
 use crate::config::{Credentials, DEFAULT_API_URL, Settings};
 use api::ApiClient;
 use cli::commands::{
-    assignment, comment, configure, deliverable, detect, goal, invitation, kpi, link, login,
-    member, notification, org, skills, summary, today, update,
+    activity, assignment, comment, configure, deliverable, detect, goal, invitation, kpi, link,
+    login, member, notification, org, skills, streak, summary, today, update, user,
 };
 
 #[derive(Parser)]
@@ -87,6 +87,11 @@ enum Commands {
         #[command(subcommand)]
         command: member::MemberCommands,
     },
+    /// Manage your Addness user profile, settings, and account
+    User {
+        #[command(subcommand)]
+        command: user::UserCommands,
+    },
     /// Send notifications, manage read status, and manage subscription channels
     Notification {
         #[command(subcommand)]
@@ -96,6 +101,16 @@ enum Commands {
     Invitation {
         #[command(subcommand)]
         command: invitation::InvitationCommands,
+    },
+    /// Read activity logs (per-member, per-goal, and organization/goal summaries)
+    Activity {
+        #[command(subcommand)]
+        command: activity::ActivityCommands,
+    },
+    /// View and manage streaks (daily completion streaks, freeze, revive, sharing)
+    Streak {
+        #[command(subcommand)]
+        command: streak::StreakCommands,
     },
     /// Read and write today's todos (today's goals)
     Today {
@@ -158,8 +173,11 @@ fn command_outputs_json(command: &Commands) -> bool {
         Commands::Assignment { command } => assignment_outputs_json(command),
         Commands::Kpi { command } => kpi_outputs_json(command),
         Commands::Member { command } => member_outputs_json(command),
+        Commands::User { command } => user_outputs_json(command),
         Commands::Notification { command } => notification_outputs_json(command),
         Commands::Invitation { command } => invitation_outputs_json(command),
+        Commands::Activity { command } => activity_outputs_json(command),
+        Commands::Streak { command } => streak_outputs_json(command),
         Commands::Today { command } => command.as_ref().is_some_and(today_outputs_json),
         Commands::Login { .. }
         | Commands::Configure
@@ -266,6 +284,22 @@ fn member_outputs_json(command: &member::MemberCommands) -> bool {
     matches!(command, member::MemberCommands::List { json: true, .. })
 }
 
+fn user_outputs_json(command: &user::UserCommands) -> bool {
+    match command {
+        user::UserCommands::Me { json }
+        | user::UserCommands::Get { json, .. }
+        | user::UserCommands::Update { json, .. }
+        | user::UserCommands::List { json, .. }
+        | user::UserCommands::Create { json, .. }
+        | user::UserCommands::Memberships { json } => *json,
+        user::UserCommands::Rm { .. } => false,
+        user::UserCommands::Settings { command } => match command {
+            user::UserSettingsCommands::Get { json }
+            | user::UserSettingsCommands::Update { json, .. } => *json,
+        },
+    }
+}
+
 fn notification_outputs_json(command: &notification::NotificationCommands) -> bool {
     match command {
         notification::NotificationCommands::Send { json, .. }
@@ -294,6 +328,30 @@ fn invitation_outputs_json(command: &invitation::InvitationCommands) -> bool {
             invitation::InviteLinkCommands::Deactivate { .. } => false,
         },
         invitation::InvitationCommands::Revoke { .. } => false,
+    }
+}
+
+fn activity_outputs_json(command: &activity::ActivityCommands) -> bool {
+    match command {
+        activity::ActivityCommands::List { json, .. }
+        | activity::ActivityCommands::Goal { json, .. }
+        | activity::ActivityCommands::Summary { json, .. }
+        | activity::ActivityCommands::GoalSummary { json, .. } => *json,
+    }
+}
+
+fn streak_outputs_json(command: &streak::StreakCommands) -> bool {
+    match command {
+        streak::StreakCommands::Get { json, .. }
+        | streak::StreakCommands::Freeze { json, .. }
+        | streak::StreakCommands::Revive { json, .. }
+        | streak::StreakCommands::Public { json, .. } => *json,
+        streak::StreakCommands::Unfreeze { .. } => false,
+        streak::StreakCommands::Share { command } => match command {
+            streak::StreakShareCommands::Status { json, .. }
+            | streak::StreakShareCommands::Create { json, .. } => *json,
+            streak::StreakShareCommands::Revoke { .. } => false,
+        },
     }
 }
 
@@ -410,6 +468,10 @@ async fn main() -> Result<()> {
             let client = build_client()?;
             member::handle_member(command, &client).await
         }
+        Some(Commands::User { command }) => {
+            let client = build_client()?;
+            user::handle_user(command, &client).await
+        }
         Some(Commands::Notification { command }) => {
             let client = build_client()?;
             notification::handle_notification(command, &client).await
@@ -417,6 +479,14 @@ async fn main() -> Result<()> {
         Some(Commands::Invitation { command }) => {
             let client = build_client()?;
             invitation::handle_invitation(command, &client).await
+        }
+        Some(Commands::Activity { command }) => {
+            let client = build_client()?;
+            activity::handle_activity(command, &client).await
+        }
+        Some(Commands::Streak { command }) => {
+            let client = build_client()?;
+            streak::handle_streak(command, &client).await
         }
         Some(Commands::Today { command }) => {
             let client = build_client()?;

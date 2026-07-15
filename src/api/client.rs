@@ -1,3 +1,4 @@
+mod activity;
 mod assignment;
 mod comment;
 mod deliverable;
@@ -8,10 +9,17 @@ mod kpi;
 mod member;
 mod notification;
 mod org;
+mod streak;
+mod user;
 
+pub use activity::{
+    ActivityLogByGoalParams, ActivityLogByMemberParams, ActivityLogSummaryParams,
+    GoalActivitySummaryParams,
+};
 pub use comment::ListCommentsParams;
 pub use notification::ListNotificationsParams;
 pub use org::CreateOrganizationParams;
+pub use user::ListUsersParams;
 
 use anyhow::{Context, Result};
 use reqwest::Client;

@@ -4529,8 +4529,8 @@ fn compact_tool_command_name(command: &str) -> String {
     {
         return path;
     }
-    if looks_like_addness_command(command) {
-        return "addness".to_string();
+    if let Some(preview) = addness_tool_command_preview(command) {
+        return preview;
     }
     let concise = concise_command_name(command);
     if !concise.is_empty() {
@@ -4539,6 +4539,52 @@ fn compact_tool_command_name(command: &str) -> String {
     let (_, command) = split_tool_state_prefix(command.trim());
     let first_line = command.lines().next().unwrap_or("").trim();
     ellipsize_width(first_line, CODEX_TOOL_COMMAND_PREVIEW_WIDTH)
+}
+
+fn addness_tool_command_preview(command: &str) -> Option<String> {
+    let (_, command) = split_tool_state_prefix(command.trim());
+    let first_line = command.lines().next().unwrap_or("").trim();
+    let rest = addness_command_rest_from_line(first_line)?;
+    if rest.is_empty() {
+        Some("addness".to_string())
+    } else {
+        Some(format!("addness {rest}"))
+    }
+}
+
+fn addness_command_rest_from_line(line: &str) -> Option<&str> {
+    let mut command = line.trim();
+    if let Some(rest) = command.strip_prefix('$') {
+        command = rest.trim_start();
+    }
+
+    let lower = command.to_ascii_lowercase();
+    if lower == "addness" {
+        return Some("");
+    }
+    if lower.starts_with("addness ") {
+        return Some(command["addness ".len()..].trim());
+    }
+
+    for marker in [
+        "\"$addness_bin\" ",
+        "'$addness_bin' ",
+        "$addness_bin ",
+        "${addness_bin} ",
+    ] {
+        if lower.starts_with(marker) {
+            return Some(command[marker.len()..].trim());
+        }
+    }
+
+    if let Some(idx) = lower.find("/addness ") {
+        return Some(command[idx + "/addness ".len()..].trim());
+    }
+    if let Some(idx) = lower.find(" addness ") {
+        return Some(command[idx + " addness ".len()..].trim());
+    }
+
+    None
 }
 
 fn tool_output_tree_preview(output: &str) -> String {
@@ -4778,6 +4824,9 @@ fn codex_management_output_summary(head: &str, output: &str) -> String {
 }
 
 fn looks_like_addness_command(head: &str) -> bool {
+    if addness_tool_command_preview(head).is_some() {
+        return true;
+    }
     let lower = head.to_ascii_lowercase();
     lower.contains("addness")
         || lower.contains("$addness_bin")
@@ -4786,6 +4835,9 @@ fn looks_like_addness_command(head: &str) -> bool {
         || lower.contains(" goal children ")
         || lower.contains(" comment list ")
         || lower.contains(" deliverable ")
+        || lower.contains(" link ")
+        || lower.contains(" status ")
+        || lower.contains(" summary ")
 }
 
 fn json_output_summary(output: &str) -> Option<String> {
@@ -4984,7 +5036,10 @@ fn codex_command_subject(command: &str) -> String {
         return ellipsize_width(&path, 36);
     }
     if looks_like_addness_command(command) {
-        return "Addness".to_string();
+        if let Some(preview) = addness_tool_command_preview(command) {
+            return ellipsize_width(&preview, 36);
+        }
+        return "addness".to_string();
     }
     concise_command_name(command)
 }
@@ -5623,7 +5678,36 @@ mod tests {
 {"id":"goal-1","title":"AddnessTUI改善"}"#,
         );
 
-        assert_eq!(text, "• 実行: addness\n  └ addness: ゴール");
+        assert_eq!(
+            text,
+            "• 実行: addness goal get goal-1 --json\n  └ addness: ゴール"
+        );
+    }
+
+    #[test]
+    fn summarize_tool_display_text_keeps_addness_bin_subcommand() {
+        let text = summarize_tool_display_text(
+            r#""$ADDNESS_BIN" goal get goal-1 --json
+{"id":"goal-1","title":"AddnessTUI改善"}"#,
+        );
+
+        assert_eq!(
+            text,
+            "• 実行: addness goal get goal-1 --json\n  └ addness: ゴール"
+        );
+    }
+
+    #[test]
+    fn summarize_tool_display_text_keeps_prompted_addness_subcommand() {
+        let text = summarize_tool_display_text(
+            r#"$ addness link progress --goal goal-1 --message ok --json
+{"name":"progress"}"#,
+        );
+
+        assert_eq!(
+            text,
+            "• 実行: addness link progress --goal goal-1 --message ok --json\n  └ addness: 1項目"
+        );
     }
 
     #[test]

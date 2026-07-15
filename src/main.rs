@@ -11,8 +11,8 @@ use clap::{CommandFactory, Parser, Subcommand};
 use crate::config::{Credentials, DEFAULT_API_URL, Settings};
 use api::ApiClient;
 use cli::commands::{
-    assignment, comment, configure, deliverable, detect, goal, invitation, kpi, link, login,
-    member, notification, org, skills, summary, today, update,
+    activity, assignment, comment, configure, deliverable, detect, goal, invitation, kpi, link,
+    login, member, notification, org, skills, streak, summary, today, update,
 };
 
 #[derive(Parser)]
@@ -97,6 +97,16 @@ enum Commands {
         #[command(subcommand)]
         command: invitation::InvitationCommands,
     },
+    /// Read activity logs (per-member, per-goal, and organization/goal summaries)
+    Activity {
+        #[command(subcommand)]
+        command: activity::ActivityCommands,
+    },
+    /// View and manage streaks (daily completion streaks, freeze, revive, sharing)
+    Streak {
+        #[command(subcommand)]
+        command: streak::StreakCommands,
+    },
     /// Read and write today's todos (today's goals)
     Today {
         #[command(subcommand)]
@@ -160,6 +170,8 @@ fn command_outputs_json(command: &Commands) -> bool {
         Commands::Member { command } => member_outputs_json(command),
         Commands::Notification { command } => notification_outputs_json(command),
         Commands::Invitation { command } => invitation_outputs_json(command),
+        Commands::Activity { command } => activity_outputs_json(command),
+        Commands::Streak { command } => streak_outputs_json(command),
         Commands::Today { command } => command.as_ref().is_some_and(today_outputs_json),
         Commands::Login { .. }
         | Commands::Configure
@@ -297,6 +309,30 @@ fn invitation_outputs_json(command: &invitation::InvitationCommands) -> bool {
     }
 }
 
+fn activity_outputs_json(command: &activity::ActivityCommands) -> bool {
+    match command {
+        activity::ActivityCommands::List { json, .. }
+        | activity::ActivityCommands::Goal { json, .. }
+        | activity::ActivityCommands::Summary { json, .. }
+        | activity::ActivityCommands::GoalSummary { json, .. } => *json,
+    }
+}
+
+fn streak_outputs_json(command: &streak::StreakCommands) -> bool {
+    match command {
+        streak::StreakCommands::Get { json, .. }
+        | streak::StreakCommands::Freeze { json, .. }
+        | streak::StreakCommands::Revive { json, .. }
+        | streak::StreakCommands::Public { json, .. } => *json,
+        streak::StreakCommands::Unfreeze { .. } => false,
+        streak::StreakCommands::Share { command } => match command {
+            streak::StreakShareCommands::Status { json, .. }
+            | streak::StreakShareCommands::Create { json, .. } => *json,
+            streak::StreakShareCommands::Revoke { .. } => false,
+        },
+    }
+}
+
 fn today_outputs_json(command: &today::TodayCommands) -> bool {
     match command {
         today::TodayCommands::List { json, .. }
@@ -417,6 +453,14 @@ async fn main() -> Result<()> {
         Some(Commands::Invitation { command }) => {
             let client = build_client()?;
             invitation::handle_invitation(command, &client).await
+        }
+        Some(Commands::Activity { command }) => {
+            let client = build_client()?;
+            activity::handle_activity(command, &client).await
+        }
+        Some(Commands::Streak { command }) => {
+            let client = build_client()?;
+            streak::handle_streak(command, &client).await
         }
         Some(Commands::Today { command }) => {
             let client = build_client()?;

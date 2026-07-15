@@ -5,6 +5,7 @@ mod chat;
 mod codex_job;
 mod comment;
 mod deliverable;
+mod desktop_auth;
 mod diagnosis;
 mod goal;
 mod goal_execution;

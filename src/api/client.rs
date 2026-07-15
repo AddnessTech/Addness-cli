@@ -1,15 +1,30 @@
+mod activity;
 mod assignment;
+mod chat;
 mod comment;
 mod deliverable;
 mod goal;
 mod goal_execution;
 mod invitation;
+mod issue;
 mod kpi;
 mod member;
+mod notification;
 mod org;
+mod streak;
+mod user;
 
-pub use comment::ListCommentsParams;
-pub use org::CreateOrganizationParams;
+pub use activity::{
+    ActivityLogByGoalParams, ActivityLogByMemberParams, ActivityLogSummaryParams,
+    GoalActivitySummaryParams,
+};
+pub use chat::{ChatMessageListParams, ChatRoomListParams, ChatSearchParams};
+pub use comment::{ListAllCommentsParams, ListCommentsParams};
+pub use issue::{GoalSectionListParams, IssueListParams};
+pub use member::BrowseMembersParams;
+pub use notification::ListNotificationsParams;
+pub use org::{CreateOrganizationParams, ListAllOrganizationsParams};
+pub use user::ListUsersParams;
 
 use anyhow::{Context, Result};
 use reqwest::Client;
@@ -417,6 +432,12 @@ impl ApiClient {
         self.send_json(req, &url).await
     }
 
+    /// POST with no request body, expects 204 No Content response.
+    pub(super) async fn post_empty_no_content(&self, path: &str) -> Result<()> {
+        let (url, req) = self.request(Method::POST, path, true)?;
+        self.send_no_content(req, &url).await
+    }
+
     /// PATCH with no request body, expects JSON response (used for resolve/unresolve).
     pub(super) async fn patch_empty<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
         let (url, req) = self.request(Method::PATCH, path, true)?;
@@ -455,6 +476,22 @@ impl ApiClient {
     pub(super) async fn delete_no_body(&self, path: &str) -> Result<()> {
         let (url, req) = self.request(Method::DELETE, path, true)?;
         self.send_no_content(req, &url).await
+    }
+
+    /// PUT with a raw binary body (e.g. organization logo upload), expects JSON response.
+    /// The backend reads the request body directly as the uploaded file, so this
+    /// sends the bytes as-is with an explicit `Content-Type`.
+    pub(super) async fn put_bytes<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        bytes: Vec<u8>,
+        content_type: &str,
+    ) -> Result<T> {
+        let (url, req) = self.request(Method::PUT, path, true)?;
+        let req = req
+            .header(reqwest::header::CONTENT_TYPE, content_type.to_string())
+            .body(bytes);
+        self.send_json(req, &url).await
     }
 }
 

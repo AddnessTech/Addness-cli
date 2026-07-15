@@ -2628,8 +2628,9 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
 
         let mut lines: Vec<Line> = Vec::new();
 
-        // 「いま参照/書込中」インジケータ（codex の操作をリアルタイム表示）
-        if let Some(action) = &pane.action {
+        // 「いま参照/書込中」インジケータ（codex の操作をリアルタイム表示）。
+        // ターン内の作業インジケータを優先し、なければ設定変更等の恒常メッセージを見せる。
+        if let Some(action) = pane.work_action().or_else(|| pane.status_note()) {
             lines.push(Line::from(Span::styled(
                 format!("» {action}"),
                 Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD),
@@ -3124,11 +3125,15 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
         if input_chunk.height <= 1 {
             prompt_lines
         } else {
+            let status_style = if pane.decision_banner().is_some() {
+                Style::default()
+                    .fg(COLOR_DANGER)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(COLOR_MUTED)
+            };
             let mut lines = Vec::with_capacity(prompt_lines.len() + 1);
-            lines.push(Line::from(Span::styled(
-                status,
-                Style::default().fg(COLOR_MUTED),
-            )));
+            lines.push(Line::from(Span::styled(status, status_style)));
             lines.extend(prompt_lines);
             lines
         }
@@ -3725,7 +3730,13 @@ fn decision_always_choice_text(decision: &super::agent::CodexDecisionBanner) -> 
 fn codex_header_lines(pane: &CodexPane, max_width: usize, max_rows: usize) -> Vec<Line<'static>> {
     let run_state = pane.run_state();
     let focus = codex_current_activity_label(pane, max_width.saturating_sub(6));
-    let focus_style = if pane.decision_banner().is_some() || pane.is_turn_running() {
+    // 承認待ちは「作業を止めて人間の応答を待っている」状態なので、単なる実行中（WARN）より
+    // 目立つ危険色（DANGER）にして見逃しを防ぐ。
+    let focus_style = if pane.decision_banner().is_some() {
+        Style::default()
+            .fg(COLOR_DANGER)
+            .add_modifier(Modifier::BOLD)
+    } else if pane.is_turn_running() {
         Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(COLOR_TEXT_STRONG)
@@ -3733,13 +3744,16 @@ fn codex_header_lines(pane: &CodexPane, max_width: usize, max_rows: usize) -> Ve
     let mut parts = vec![
         format!("状態: {}", run_state.label()),
         format!("Turn {}", pane.turn_count()),
-        format!("表示:{}", pane.log_filter_label()),
+        format!("表示:{}", pane.log_filter_display_label()),
     ];
     if let Some(usage) = pane.usage_header_label() {
         parts.push(usage);
     }
     if pane.collapsed_turn_count() > 0 {
         parts.push(format!("格納{}", pane.collapsed_turn_count()));
+    }
+    if pane.subagent_running_count() > 0 {
+        parts.push(format!("Sub:{}", pane.subagent_running_count()));
     }
     if pane.diff_view().is_some() {
         parts.push("差分表示中".to_string());
@@ -3764,7 +3778,11 @@ fn codex_header_lines(pane: &CodexPane, max_width: usize, max_rows: usize) -> Ve
     }
 
     let summary = format!(" {}", parts.join(" | "));
-    let summary_style = if pane.decision_banner().is_some() || pane.is_turn_running() {
+    let summary_style = if pane.decision_banner().is_some() {
+        Style::default()
+            .fg(COLOR_DANGER)
+            .add_modifier(Modifier::BOLD)
+    } else if pane.is_turn_running() {
         Style::default().fg(COLOR_WARN)
     } else {
         Style::default().fg(COLOR_MUTED)
@@ -4784,7 +4802,7 @@ fn json_output_summary(output: &str) -> Option<String> {
 
 fn codex_runtime_status(pane: &CodexPane, max_width: usize) -> String {
     let state = pane.run_state_elapsed_label();
-    let view = format!("表示:{} Ctrl-Tで切替", pane.log_filter_label());
+    let view = format!("表示:{} Ctrl-Tで切替", pane.log_filter_display_label());
     let fixed_width = UnicodeWidthStr::width(state.as_str())
         .saturating_add(UnicodeWidthStr::width(view.as_str()))
         .saturating_add(8);
@@ -4792,8 +4810,20 @@ fn codex_runtime_status(pane: &CodexPane, max_width: usize) -> String {
     ellipsize_width(&format!("  {state}  {detail}  |  {view}"), max_width)
 }
 
+/// 実行中スピナーのコマ送り文字。Addness ゴール同期の鼓動表示（`draw_codex` 内 SPIN 配列）と
+/// 揃えた点字スピナーを使う。
+const RUN_SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// tick を実行中スピナーの1文字へ変換する純関数。tick は単調増加のカウンタであればよく、
+/// 実際に何ミリ秒間隔で進めるかは呼び出し側（`CodexPane::advance_activity_spin`）が決める。
+/// 副作用を持たないため、コマ送りの見た目はここだけをテストすれば検証できる。
+fn run_spinner_glyph(tick: u64) -> &'static str {
+    RUN_SPINNER_FRAMES[(tick as usize) % RUN_SPINNER_FRAMES.len()]
+}
+
 fn codex_current_activity_label(pane: &CodexPane, max_width: usize) -> String {
     let detail = if pane.is_turn_running() {
+        let spin = run_spinner_glyph(pane.activity_spin_tick());
         let queued = pane.queued_prompt_count();
         let input_hint = if queued > 0 {
             format!(" / 予約{queued}件")
@@ -4801,7 +4831,8 @@ fn codex_current_activity_label(pane: &CodexPane, max_width: usize) -> String {
             " / Enterで次ターン予約".to_string()
         };
         if let Some(decision) = pane.decision_banner() {
-            format!("確認待ち: {}", decision.message)
+            // 承認待ちは他の実行中状態より目に留まりやすいラベルにする（色は呼び出し側で強調）。
+            format!("⏸ 承認待ち: {}", decision.message)
         } else if let Some(command) = pane.current_command() {
             let elapsed = pane
                 .current_command_elapsed_secs()
@@ -4814,19 +4845,22 @@ fn codex_current_activity_label(pane: &CodexPane, max_width: usize) -> String {
                 .map(|line| format!(" › {line}"))
                 .unwrap_or_default();
             format!(
-                "{}{elapsed}{live}{input_hint}",
+                "{spin} {}{elapsed}{live}{input_hint}",
                 codex_command_activity_summary(command)
             )
-        } else if let Some(action) = pane.action.as_deref() {
-            format!("作業中: {action}{input_hint}")
+        } else if let Some(action) = pane.work_action() {
+            format!("{spin} 作業中: {action}{input_hint}")
         } else {
-            format!("{}が考えています{input_hint}", pane.kind().display_name())
+            format!(
+                "{spin} {}が考えています{input_hint}",
+                pane.kind().display_name()
+            )
         }
     } else {
         codex_work_label(
             pane.finished,
             pane.assessing,
-            pane.action.as_deref(),
+            pane.status_note(),
             pane.last_prompt(),
             max_width,
         )
@@ -4998,9 +5032,10 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
         super::agent::CodexRunState::Completed => {
             Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD)
         }
-        super::agent::CodexRunState::Confirming => {
-            Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD)
-        }
+        // 承認待ちは人間の応答をブロックしている状態なので、単なる実行中より目立つ危険色にする。
+        super::agent::CodexRunState::Confirming => Style::default()
+            .fg(COLOR_DANGER)
+            .add_modifier(Modifier::BOLD),
         super::agent::CodexRunState::CommandRunning | super::agent::CodexRunState::Thinking => {
             Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD)
         }
@@ -5009,10 +5044,11 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
         }
     };
     let focus = codex_current_activity_label(pane, prompt_width);
-    let focus_style = if pane.current_command().is_some()
-        || pane.is_turn_running()
-        || pane.decision_banner().is_some()
-    {
+    let focus_style = if pane.decision_banner().is_some() {
+        Style::default()
+            .fg(COLOR_DANGER)
+            .add_modifier(Modifier::BOLD)
+    } else if pane.current_command().is_some() || pane.is_turn_running() {
         Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(COLOR_TEXT_STRONG)
@@ -5039,7 +5075,7 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
     let view = ellipsize_width(
         &format!(
             "{} / {} / 格納{}",
-            pane.log_filter_label(),
+            pane.log_filter_display_label(),
             pane.history_label(),
             pane.collapsed_turn_count()
         ),
@@ -5144,6 +5180,48 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
             Span::styled(assistant, assistant_style),
         ]));
     }
+    // 直近アクション履歴（パンくず）。「今」は最新 1 件しか見せないため、コマンドが高速連続
+    // 実行されると途中のアクションが一瞬で上書きされ見逃される。パネル高さに応じて件数を絞って
+    // 直近 N 件を古い順に添える。
+    let recent_actions = pane.recent_action_breadcrumbs();
+    let recent_actions_visible = codex_recent_action_visible_count(area.height);
+    if recent_actions_visible > 0 && !recent_actions.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "直近",
+            Style::default().fg(COLOR_MUTED),
+        )));
+        let start = recent_actions.len().saturating_sub(recent_actions_visible);
+        for label in &recent_actions[start..] {
+            lines.push(Line::from(Span::styled(
+                ellipsize_width(&format!("  {label}"), prompt_width),
+                Style::default().fg(COLOR_MUTED),
+            )));
+        }
+    }
+    // サブエージェント稼働状況（Claude Code の Task/Agent ツール起動）。
+    // 実行中件数の集計行 + 実行中を優先した各エージェントの行を、パネル高さに応じて表示する。
+    let subagent_running = pane.subagent_running_count();
+    let subagent_visible = codex_subagent_visible_count(area.height);
+    let subagent_lines = pane.subagent_status_lines(subagent_visible);
+    if !subagent_lines.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("サブエージェント ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(
+                format!("{subagent_running}体稼働中"),
+                if subagent_running > 0 {
+                    Style::default().fg(COLOR_WARN)
+                } else {
+                    Style::default().fg(COLOR_MUTED)
+                },
+            ),
+        ]));
+        for label in &subagent_lines {
+            lines.push(Line::from(Span::styled(
+                ellipsize_width(&format!("  {label}"), prompt_width),
+                Style::default().fg(COLOR_MUTED),
+            )));
+        }
+    }
     // 実行中コマンドのライブ出力（末尾最大3行）を薄色ブロックで添える。
     // コマンド完了で消え、確定した Tool 行だけがログに残る。
     let live_output = pane.codex_appserver_live_output();
@@ -5194,6 +5272,34 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
         )
         .wrap(ratatui::widgets::Wrap { trim: true });
     frame.render_widget(panel, area);
+}
+
+/// パネル高さに応じて、状態パネルに表示する直近アクションパンくずの件数を決める。
+/// 実際の呼び出し元（draw 関数）ではパネル高さは 8/10/12 の 3 段階（`chunks[0].height` に応じて
+/// 選ばれる）が中心のため、その範囲では 0〜3 件に絞り、他の固定セクション（状態/表示/記憶/同期/
+/// 設定やショートカット等）を圧迫しないようにする。将来パネルがより高くなった場合は最大 5 件
+/// （リングバッファの保持上限 `RECENT_ACTIONS_CAP`）まで増やす。
+fn codex_recent_action_visible_count(height: u16) -> usize {
+    match height {
+        0..=8 => 0,
+        9..=10 => 2,
+        11..=13 => 3,
+        14..=17 => 4,
+        _ => 5,
+    }
+}
+
+/// パネル高さに応じて、状態パネルに表示するサブエージェント一覧の件数を決める。
+/// `codex_recent_action_visible_count` と同じ段階を踏むが、直近アクションの後に追加される
+/// セクションのため、低い高さではより控えめ（1 件から）に出す。
+fn codex_subagent_visible_count(height: u16) -> usize {
+    match height {
+        0..=8 => 0,
+        9..=10 => 1,
+        11..=13 => 2,
+        14..=17 => 3,
+        _ => 5,
+    }
 }
 
 fn codex_dashboard_shortcut_lines(max_width: usize) -> Vec<Line<'static>> {
@@ -5259,7 +5365,7 @@ fn elapsed_compact(t: Instant) -> String {
 fn codex_work_label(
     finished: bool,
     assessing: bool,
-    action: Option<&str>,
+    status_note: Option<&str>,
     last_prompt: Option<&str>,
     max_width: usize,
 ) -> String {
@@ -5269,8 +5375,8 @@ fn codex_work_label(
     if assessing {
         return ellipsize_width("DoD自動判定", max_width);
     }
-    if let Some(action) = action {
-        return ellipsize_width(action, max_width);
+    if let Some(note) = status_note {
+        return ellipsize_width(note, max_width);
     }
     if let Some(prompt) = last_prompt {
         return prompt_preview(&format!("依頼対応: {prompt}"), max_width);
@@ -5313,13 +5419,15 @@ fn ellipsize_width(text: &str, max_width: usize) -> String {
 mod tests {
     use super::{
         ActivePane, App, CODEX_EDIT_DIFF_PREVIEW_LINES, COLOR_DANGER, COLOR_EVENT, COLOR_SUCCESS,
-        COLOR_WARN, cached_assistant_markdown_count, cached_assistant_markdown_lines,
-        code_edit_diff_preview, codex_activity_lines, codex_child_goal_lines,
-        codex_dashboard_shortcut_lines, codex_decision_choice_line, codex_decision_input_lines,
-        codex_decision_title_hint, codex_diff_lines, codex_header_line, codex_header_lines,
-        codex_input_prompt_render, codex_log_entry_lines, codex_log_lines, codex_markdown_styles,
-        codex_runtime_status, codex_visible_log_lines, codex_work_label, draw_status_bar,
-        ellipsize_width, markdown, prompt_preview, summarize_tool_display_text,
+        COLOR_WARN, RUN_SPINNER_FRAMES, cached_assistant_markdown_count,
+        cached_assistant_markdown_lines, code_edit_diff_preview, codex_activity_lines,
+        codex_child_goal_lines, codex_current_activity_label, codex_dashboard_shortcut_lines,
+        codex_decision_choice_line, codex_decision_input_lines, codex_decision_title_hint,
+        codex_diff_lines, codex_header_line, codex_header_lines, codex_input_prompt_render,
+        codex_log_entry_lines, codex_log_lines, codex_markdown_styles,
+        codex_recent_action_visible_count, codex_runtime_status, codex_subagent_visible_count,
+        codex_visible_log_lines, codex_work_label, draw_status_bar, ellipsize_width, markdown,
+        prompt_preview, run_spinner_glyph, summarize_tool_display_text,
     };
     use crate::api::ApiClient;
     use crate::tui::agent::{
@@ -5555,7 +5663,7 @@ mod tests {
     fn codex_header_lines_make_current_activity_primary() {
         let mut pane = CodexPane::test_with_output(8, 80, 0, "");
         pane.finished = false;
-        pane.action = Some("ファイルを確認中".to_string());
+        pane.set_status_note("ファイルを確認中");
 
         let lines = codex_header_lines(&pane, 120, 2)
             .iter()
@@ -5981,13 +6089,103 @@ mod tests {
     fn codex_runtime_status_shows_current_action() {
         let mut pane = CodexPane::test_with_output(8, 20, 0, "");
         pane.finished = false;
-        pane.action = Some("ゴール文脈を読込中".to_string());
+        pane.set_status_note("ゴール文脈を読込中");
 
         let status = codex_runtime_status(&pane, 80);
 
         assert!(status.contains("入力待ち"));
         assert!(status.contains("表示:会話"));
         assert!(status.contains("ゴール文脈を読込中"));
+    }
+
+    #[test]
+    fn codex_recent_action_visible_count_scales_with_panel_height() {
+        // パネルが低いときは直近アクションのパンくずを表示せず、他の固定セクションを圧迫しない。
+        assert_eq!(codex_recent_action_visible_count(0), 0);
+        assert_eq!(codex_recent_action_visible_count(8), 0);
+        // 実際の呼び出し元で使われる高さ（8/10/12）では 0〜3 件に収まる。
+        assert_eq!(codex_recent_action_visible_count(9), 2);
+        assert_eq!(codex_recent_action_visible_count(10), 2);
+        assert_eq!(codex_recent_action_visible_count(11), 3);
+        assert_eq!(codex_recent_action_visible_count(12), 3);
+        assert_eq!(codex_recent_action_visible_count(13), 3);
+        // 高さが増えるにつれ、リングバッファの保持上限 5 件まで段階的に表示件数を増やす。
+        assert_eq!(codex_recent_action_visible_count(14), 4);
+        assert_eq!(codex_recent_action_visible_count(17), 4);
+        assert_eq!(codex_recent_action_visible_count(18), 5);
+        assert_eq!(codex_recent_action_visible_count(u16::MAX), 5);
+    }
+
+    #[test]
+    fn codex_header_lines_show_running_subagent_count() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.test_add_running_subagent("調査タスク");
+        pane.test_add_running_subagent("実装タスク");
+
+        let text = line_text(&codex_header_line(&pane, 200));
+        assert!(text.contains("Sub:2"));
+    }
+
+    #[test]
+    fn codex_header_lines_omit_sub_count_when_no_subagent_running() {
+        let pane = CodexPane::test_with_output(8, 80, 0, "");
+        let text = line_text(&codex_header_line(&pane, 200));
+        assert!(!text.contains("Sub:"));
+    }
+
+    #[test]
+    fn codex_subagent_visible_count_scales_with_panel_height() {
+        assert_eq!(codex_subagent_visible_count(0), 0);
+        assert_eq!(codex_subagent_visible_count(8), 0);
+        assert_eq!(codex_subagent_visible_count(9), 1);
+        assert_eq!(codex_subagent_visible_count(10), 1);
+        assert_eq!(codex_subagent_visible_count(11), 2);
+        assert_eq!(codex_subagent_visible_count(13), 2);
+        assert_eq!(codex_subagent_visible_count(14), 3);
+        assert_eq!(codex_subagent_visible_count(17), 3);
+        assert_eq!(codex_subagent_visible_count(18), 5);
+        assert_eq!(codex_subagent_visible_count(u16::MAX), 5);
+    }
+
+    #[test]
+    fn run_spinner_glyph_cycles_through_all_frames_and_wraps() {
+        // 純関数: 同じtickは同じ文字を返し、周期(フレーム数)で元へ戻る。
+        let frames: Vec<&str> = (0..RUN_SPINNER_FRAMES.len() as u64)
+            .map(run_spinner_glyph)
+            .collect();
+        assert_eq!(frames, RUN_SPINNER_FRAMES.to_vec());
+        assert_eq!(
+            run_spinner_glyph(RUN_SPINNER_FRAMES.len() as u64),
+            run_spinner_glyph(0)
+        );
+        assert_eq!(run_spinner_glyph(7), run_spinner_glyph(7));
+    }
+
+    #[test]
+    fn codex_current_activity_label_shows_spinner_while_turn_running() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.finished = false;
+        pane.test_set_turn_running(true);
+        pane.set_work_action("作業中");
+
+        let label = codex_current_activity_label(&pane, 80);
+        assert!(label.starts_with(run_spinner_glyph(0)));
+
+        pane.test_set_turn_running(false);
+        let idle_label = codex_current_activity_label(&pane, 80);
+        assert!(!idle_label.starts_with(run_spinner_glyph(0)));
+    }
+
+    #[test]
+    fn codex_current_activity_label_marks_confirming_state_distinctly() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.finished = false;
+        pane.test_set_turn_running(true);
+        pane.test_set_pending_decision(CodexDecisionKind::Approval, "Run cargo test?");
+
+        let label = codex_current_activity_label(&pane, 80);
+        assert!(label.contains("⏸ 承認待ち"));
+        assert!(label.contains("Run cargo test?"));
     }
 
     #[test]
@@ -6007,18 +6205,58 @@ mod tests {
     }
 
     #[test]
-    fn codex_work_label_prefers_action_over_last_prompt() {
+    fn codex_work_label_prefers_status_note_over_last_prompt() {
         assert_eq!(
-            codex_work_label(false, false, Some("ゴールを更新中"), Some("実装して"), 80),
-            "ゴールを更新中"
+            codex_work_label(false, false, Some("model: gpt-5"), Some("実装して"), 80),
+            "model: gpt-5"
         );
     }
 
     #[test]
-    fn codex_work_label_uses_last_prompt_when_no_action() {
+    fn codex_work_label_uses_last_prompt_when_no_status_note() {
         let label = codex_work_label(false, false, None, Some("この不具合を直して"), 80);
 
         assert_eq!(label, "依頼対応: この不具合を直して");
+    }
+
+    #[test]
+    fn codex_current_activity_label_falls_back_command_then_work_action_then_generic() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.finished = false;
+        pane.test_set_turn_running(true);
+
+        // work_action も current_command も無い → 汎用文言。
+        let generic = codex_current_activity_label(&pane, 120);
+        assert!(generic.contains("考えています"), "label={generic}");
+
+        // work_action があればそれを使う。
+        pane.set_work_action("ツール実行: Bash");
+        let with_action = codex_current_activity_label(&pane, 120);
+        assert!(
+            with_action.contains("作業中: ツール実行: Bash"),
+            "label={with_action}"
+        );
+
+        // current_command があれば work_action より優先する。
+        pane.test_set_current_command("cargo test");
+        let with_command = codex_current_activity_label(&pane, 120);
+        assert!(
+            with_command.contains("テストを実行中"),
+            "label={with_command}"
+        );
+        assert!(!with_command.contains("作業中:"), "label={with_command}");
+    }
+
+    #[test]
+    fn codex_current_activity_label_uses_status_note_when_idle() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.finished = false;
+        pane.set_status_note("model: gpt-5");
+        // 実行中に残った作業インジケータがあっても、非実行中の表示には使わない。
+        pane.set_work_action("ツール実行: Bash");
+
+        let label = codex_current_activity_label(&pane, 120);
+        assert_eq!(label, "model: gpt-5");
     }
 
     #[test]

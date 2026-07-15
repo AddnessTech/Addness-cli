@@ -48,6 +48,8 @@ Addness TUI から起動された場合、**対象ゴールがあなたの作業
 - `addness skills` — 全コマンドの使い方を出力（迷ったらまずこれ）
 - データ取得系は `--json` を付けると構造化出力になる（例: `addness goal get <ID> --json`）
 - `addness detect-goal` — 現在の git ブランチ名から対象ゴール ID を推定
+- メインAIが子ゴールを作成しサブエージェントへ実装を委譲する運用手順は
+  [docs/subagent-goal-protocol.md](docs/subagent-goal-protocol.md) を参照
 
 ### 作業の進め方（想起 → 作業 → 引き継ぎ点の更新）
 1. **想起** — 作業を始める前に対象ゴールを読んで現状・方針・直近の進捗を把握する。

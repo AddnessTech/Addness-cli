@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::config::{AgentLanguage, Settings};
+
 mod claude;
 mod claude_resident;
 mod codex;
@@ -80,6 +82,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/permissions", "承認 / sandbox 権限を設定"),
     ("/personality", "通信スタイルを切替"),
     ("/settings", "モデル・推論・承認・sandbox 設定を表示"),
+    ("/lang", "エージェントの応答言語を設定"),
     ("/cd", "次セッションの作業ルートを変更"),
     ("/add-dir", "書込許可ディレクトリを追加"),
     ("/image", "画像を添付する"),
@@ -462,6 +465,17 @@ fn matches_log_filter(kind: CodexLogKind, filter: CodexLogFilter) -> bool {
         CodexLogFilter::Errors => matches!(kind, CodexLogKind::Error),
         CodexLogFilter::All => true,
     }
+}
+
+/// 実行中ターン中、会話フィルタでも直近のTool/Eventログを混ぜて見せるための判定。
+/// `live_tool_start` は現在実行中ターンの開始インデックス（`None` なら混在させない）。
+fn is_live_turn_tool_line(
+    kind: CodexLogKind,
+    index: usize,
+    live_tool_start: Option<usize>,
+) -> bool {
+    matches!(kind, CodexLogKind::Tool | CodexLogKind::Event)
+        && live_tool_start.is_some_and(|start| index >= start)
 }
 
 fn on_off(enabled: bool) -> &'static str {
@@ -859,7 +873,8 @@ impl CodexRunState {
             Self::InputWaiting => "入力待ち",
             Self::Thinking => "考え中",
             Self::CommandRunning => "コマンド実行中",
-            Self::Confirming => "確認待ち",
+            // 見た目の目立ちやすさのため、他の状態と区別できるアイコンを付ける。
+            Self::Confirming => "⏸ 承認待ち",
             Self::Completed => "完了",
         }
     }
@@ -1051,6 +1066,8 @@ pub enum CodexListPickerAction {
     SetApproval,
     /// Codex のみ。
     SetSandbox,
+    /// エージェントの応答言語（両バックエンド共通）。
+    SetLanguage,
     /// Enter=resume / f=fork。
     ResumeSession,
 }
@@ -1092,6 +1109,83 @@ fn session_picker_items(
             current: thread_id == Some(session.id.as_str()),
         })
         .collect()
+}
+
+/// 状態パネルに表示する直近アクション履歴の保持件数（パンくず表示用）。
+const RECENT_ACTIONS_CAP: usize = 5;
+
+/// 状態パネルに保持するサブエージェント（Claude Code の `Task`/`Agent` ツール起動）履歴の
+/// 保持件数上限。ターン跨ぎでも保持するため `RECENT_ACTIONS_CAP` より大きめに取る。
+const SUBAGENTS_CAP: usize = 20;
+
+/// サブエージェント 1 件の状態。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubagentState {
+    /// 起動済みで、対応する tool_result 未受信（実行中）。
+    Running,
+    /// tool_result を正常受信（完了）。
+    Completed,
+    /// tool_result がエラーだった（失敗）。
+    Failed,
+}
+
+impl SubagentState {
+    fn icon(self) -> &'static str {
+        match self {
+            SubagentState::Running => "●",
+            SubagentState::Completed => "✔",
+            SubagentState::Failed => "✖",
+        }
+    }
+}
+
+/// 状態パネルに表示する 1 件のサブエージェント起動情報。
+#[derive(Debug, Clone)]
+struct SubagentEntry {
+    /// 起動元 tool_use の `id`。対応する tool_result とのマッチングに使う。
+    tool_use_id: Option<String>,
+    /// 表示ラベル（description 優先）。
+    label: String,
+    /// `subagent_type`（Explore, general-purpose 等）。未取得なら None。
+    #[allow(dead_code)] // 現状は表示に使わないが、将来のフィルタ/集計向けに保持する。
+    agent_type: Option<String>,
+    state: SubagentState,
+    started_at: Instant,
+    /// 完了/失敗した時刻（経過時間表示の固定に使う）。実行中は None。
+    finished_at: Option<Instant>,
+}
+
+/// アクション種別（状態パネルのパンくずで先頭に付けるアイコンを決める）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecentActionKind {
+    /// シェルコマンド実行（CommandExecution / codex サブコマンド等）。
+    Command,
+    /// MCP ツール呼び出し。
+    Mcp,
+    /// ファイル変更。
+    FileChange,
+    /// 上記に当てはまらないツール利用（Claude の ToolUse 汎用イベント等）。
+    Tool,
+}
+
+impl RecentActionKind {
+    fn icon(self) -> &'static str {
+        match self {
+            RecentActionKind::Command => "▶",
+            RecentActionKind::Mcp => "◆",
+            RecentActionKind::FileChange => "✎",
+            RecentActionKind::Tool => "•",
+        }
+    }
+}
+
+/// 状態パネルのパンくずに表示する 1 件の直近アクション。
+#[derive(Debug, Clone)]
+struct RecentAction {
+    kind: RecentActionKind,
+    label: String,
+    /// 現在のターン内での通し番号（1 始まり）。
+    turn_seq: u32,
 }
 
 /// 埋め込み codex セッションの状態。
@@ -1140,11 +1234,25 @@ pub struct CodexPane {
     pub children: Vec<ChildGoal>,
     /// `/work` で選択した現在の実装ワークパッケージ。
     pub active_work_package: Option<ActiveWorkPackage>,
-    /// codex が直近に実行した addness 操作の表示ラベル（参照/書込中インジケータ）。
-    pub action: Option<String>,
+    /// 設定変更・モード切替など、恒常的に表示し続けたい状態メモ（例: "model: gpt-5"）。
+    /// ユーザー操作で明示的に変更されるまで保持し、ターンの開始/終了では変化しない。
+    status_note: Option<String>,
+    /// ターン内の作業インジケータ（例: "依頼を確認中", "ツール実行: X", "応答完了"）。
+    /// ターン開始時（`begin_turn_work`）と終了時（`end_turn_work`）に明示的にリセットする。
+    work_action: Option<String>,
     /// codex が現在実行中として報告したコマンド。
     current_command: Option<String>,
     current_command_started_at: Option<Instant>,
+    /// 直近アクション履歴（固定長リングバッファ）。「今」表示は最新 1 件しか見せないため、
+    /// コマンドが高速連続実行されると途中のアクションが一瞬で上書きされ見逃される。
+    /// ここに直近 N 件を種別アイコン付きラベルとターン内通し番号として積み、状態パネルの
+    /// パンくずに表示する。ターン開始でクリアする。
+    recent_actions: VecDeque<RecentAction>,
+    /// `recent_actions` に積んだ直近アクションの総数（ターン内通し番号の採番に使う）。
+    recent_action_seq: u32,
+    /// Claude Code が `Task`/`Agent` ツールで起動したサブエージェントの履歴。
+    /// ターンが変わっても実行中エントリはクリアせず保持する（`clear_recent_actions` の対象外）。
+    subagents: VecDeque<SubagentEntry>,
     /// 実行中ターンの開始時刻。経過時間表示と完了時の所要時間算出に使う。
     turn_started_at: Option<Instant>,
     /// 直近に再描画へ反映した経過秒。秒表示が変わったフレームだけ再描画するために保持する。
@@ -1233,6 +1341,9 @@ pub struct CodexPane {
     search_query: String,
     /// 検索入力中か。
     search_editing: bool,
+    /// エージェントへ注入する応答言語設定（両バックエンド共通）。
+    /// `~/.addness/config.json` に永続化し、起動時に読み込む。
+    agent_language: AgentLanguage,
     /// 次回 `codex exec` 起動時に使う設定。
     exec_settings: CodexExecSettings,
     /// 現在turnを承認後に再実行する場合だけ使う一時的な approval override。
@@ -1335,6 +1446,15 @@ pub struct CodexPane {
     pending_undo_request: Option<UndoRequest>,
     /// 確認バナー（YesNo）に紐づく Accept 時アクション。/undo 確認で使う。
     pending_decision_action: Option<PaneDecisionAction>,
+    /// 実行中スピナーのtick。ターン実行中のみ一定間隔で進める（純関数でtick→文字を選ぶため、
+    /// ここでは単調増加するカウンタとして保持するだけ）。
+    activity_spin_tick: u64,
+    /// 直近にスピナーtickを進めた時刻。次に進めるべきタイミングの判定に使う。
+    last_spin_advance_at: Option<Instant>,
+    /// 承認待ち（`pending_decision`）が始まった時刻。長時間放置の検知に使う。
+    pending_decision_started_at: Option<Instant>,
+    /// 承認待ちの再通知（リマインド）を最後に送った時刻。
+    last_confirming_reminder_at: Option<Instant>,
 }
 
 impl CodexPane {
@@ -1433,6 +1553,11 @@ impl CodexPane {
             input_state.history = load_input_history(path);
         }
 
+        // グローバル設定から応答言語を読み込む（未設定・読込失敗時は auto）。
+        let agent_language = Settings::load()
+            .map(|settings| settings.agent_language())
+            .unwrap_or_default();
+
         let mut pane = Self {
             kind,
             codex_bin: codex_bin.to_path_buf(),
@@ -1460,9 +1585,13 @@ impl CodexPane {
             trace_links: Vec::new(),
             children: Vec::new(),
             active_work_package: None,
-            action: None,
+            status_note: None,
+            work_action: None,
             current_command: None,
             current_command_started_at: None,
+            recent_actions: VecDeque::new(),
+            recent_action_seq: 0,
+            subagents: VecDeque::new(),
             turn_started_at: None,
             last_elapsed_tick_secs: None,
             child_process_label: None,
@@ -1510,6 +1639,7 @@ impl CodexPane {
             log_filter: CodexLogFilter::Conversation,
             search_query: String::new(),
             search_editing: false,
+            agent_language,
             exec_settings: CodexExecSettings::default(),
             one_shot_approval: None,
             diff_view: None,
@@ -1560,6 +1690,10 @@ impl CodexPane {
             pending_checkpoint_requests: VecDeque::new(),
             pending_undo_request: None,
             pending_decision_action: None,
+            activity_spin_tick: 0,
+            last_spin_advance_at: None,
+            pending_decision_started_at: None,
+            last_confirming_reminder_at: None,
         };
         let name = kind.display_name();
         if pane.loaded_history_count > 0 {
@@ -1638,6 +1772,7 @@ impl CodexPane {
         pane.log_filter = CodexLogFilter::Conversation;
         pane.search_query.clear();
         pane.search_editing = false;
+        pane.agent_language = AgentLanguage::Auto;
         pane.exec_settings = CodexExecSettings::default();
         pane.one_shot_approval = None;
         pane.claude_settings = claude::ClaudeExecSettings::default();
@@ -1692,6 +1827,10 @@ impl CodexPane {
         pane.current_turn_prompt = None;
         pane.current_turn_retry_prompt = None;
         pane.goal_mode = CodexGoalMode::default();
+        pane.activity_spin_tick = 0;
+        pane.last_spin_advance_at = None;
+        pane.pending_decision_started_at = None;
+        pane.last_confirming_reminder_at = None;
         for line in output.lines() {
             pane.push_log(CodexLogKind::Assistant, line.to_string());
         }
@@ -1706,6 +1845,30 @@ impl CodexPane {
         self.push_log(CodexLogKind::Turn, format!("Turn {}", self.turn_count));
         self.push_log(CodexLogKind::Assistant, assistant_text.to_string());
         self.queue_completed_turn_body_record();
+    }
+
+    /// テスト用: 承認待ちバナーを直接立てる（ui 側のレンダリングテストから使う）。
+    #[cfg(test)]
+    pub(crate) fn test_set_pending_decision(&mut self, kind: CodexDecisionKind, message: &str) {
+        self.set_pending_decision(CodexDecisionBanner::new(kind, message.to_string()));
+    }
+
+    /// テスト用: ターン実行中フラグを直接切り替える（ui 側のレンダリングテストから使う）。
+    #[cfg(test)]
+    pub(crate) fn test_set_turn_running(&mut self, running: bool) {
+        self.turn_running = running;
+    }
+
+    /// テスト用: 実行中コマンドを直接設定する（ui 側の「今」表示テストから使う）。
+    #[cfg(test)]
+    pub(crate) fn test_set_current_command(&mut self, command: &str) {
+        self.record_current_command(RecentActionKind::Command, command.to_string());
+    }
+
+    /// テスト用: 実行中サブエージェントを直接積む（ui 側のヘッダ/状態パネル表示テストから使う）。
+    #[cfg(test)]
+    pub(crate) fn test_add_running_subagent(&mut self, label: &str) {
+        self.record_subagent_launch(None, label.to_string(), None);
     }
 
     /// このペインのエージェントバックエンド種別。
@@ -1766,9 +1929,176 @@ impl CodexPane {
         self.current_command.as_deref()
     }
 
+    /// 設定変更等の恒常メッセージ（非実行中の「今」表示に使う）。
+    pub fn status_note(&self) -> Option<&str> {
+        self.status_note.as_deref()
+    }
+
+    pub(crate) fn set_status_note(&mut self, note: impl Into<String>) {
+        self.status_note = Some(note.into());
+    }
+
+    /// ターン内の作業インジケータ（実行中の「今」表示のフォールバックに使う）。
+    pub fn work_action(&self) -> Option<&str> {
+        self.work_action.as_deref()
+    }
+
+    pub(crate) fn set_work_action(&mut self, action: impl Into<String>) {
+        self.work_action = Some(action.into());
+    }
+
+    /// ターン開始時に呼ぶ。前ターンの作業インジケータが残っていても必ずクリアしてから
+    /// 開始ラベル（通常は「依頼を確認中」）を設定する。
+    fn begin_turn_work(&mut self, label: impl Into<String>) {
+        self.work_action = None;
+        self.set_work_action(label);
+    }
+
+    /// ターン終了時（応答完了/中断完了）に呼ぶ。ターン中に積み上がった作業インジケータを
+    /// 明示的にクリアしてから終端ラベルを設定する。
+    fn end_turn_work(&mut self, label: impl Into<String>) {
+        self.work_action = None;
+        self.set_work_action(label);
+    }
+
     pub fn current_command_elapsed_secs(&self) -> Option<u64> {
         self.current_command_started_at
             .map(|t| t.elapsed().as_secs())
+    }
+
+    /// 「今」欄（current_command）を更新すると同時に、状態パネルのパンくず表示用リングバッファへ
+    /// 直近アクションとして積む一元ヘルパー。CommandExecution / McpToolCall / FileChange の開始や
+    /// Claude の ToolUse 等、"いま何をしているか" を更新する箇所はすべてここを経由する。
+    fn record_current_command(&mut self, kind: RecentActionKind, label: impl Into<String>) {
+        let label = label.into();
+        self.current_command = Some(label.clone());
+        self.current_command_started_at = Some(Instant::now());
+        self.recent_action_seq = self.recent_action_seq.saturating_add(1);
+        self.recent_actions.push_back(RecentAction {
+            kind,
+            label,
+            turn_seq: self.recent_action_seq,
+        });
+        while self.recent_actions.len() > RECENT_ACTIONS_CAP {
+            self.recent_actions.pop_front();
+        }
+    }
+
+    /// ターン開始時に直近アクション履歴をクリアする（パンくずは実行中ターンの分だけ見せる）。
+    fn clear_recent_actions(&mut self) {
+        self.recent_actions.clear();
+        self.recent_action_seq = 0;
+    }
+
+    /// 状態パネルのパンくず表示用に、直近アクションを古い順に整形して返す。
+    /// 各要素は「アイコン ラベル #ターン内通し番号」の形式で、幅に応じたトリムは呼び出し側で行う。
+    pub fn recent_action_breadcrumbs(&self) -> Vec<String> {
+        self.recent_actions
+            .iter()
+            .map(|action| {
+                format!(
+                    "{} {} #{}",
+                    action.kind.icon(),
+                    action.label,
+                    action.turn_seq
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn recent_actions_len(&self) -> usize {
+        self.recent_actions.len()
+    }
+
+    /// サブエージェント起動（`Task`/`Agent` ツール）を「実行中」として記録する。
+    /// ターンをまたいでも保持するため `clear_recent_actions` の対象にはしない。
+    fn record_subagent_launch(
+        &mut self,
+        tool_use_id: Option<String>,
+        label: String,
+        agent_type: Option<String>,
+    ) {
+        self.subagents.push_back(SubagentEntry {
+            tool_use_id,
+            label,
+            agent_type,
+            state: SubagentState::Running,
+            started_at: Instant::now(),
+            finished_at: None,
+        });
+        while self.subagents.len() > SUBAGENTS_CAP {
+            self.subagents.pop_front();
+        }
+    }
+
+    /// tool_result を受けて、対応するサブエージェントの状態を完了/失敗へ遷移させる。
+    /// `tool_use_id` が一致する実行中エントリのみ更新する（Claude Code の tool_result は
+    /// 常に `tool_use_id` を持つため、id 不一致=サブエージェント以外の tool_result として無視する）。
+    fn resolve_subagent_result(&mut self, tool_use_id: Option<&str>, is_error: bool) {
+        let idx = tool_use_id.and_then(|id| {
+            self.subagents
+                .iter()
+                .position(|entry| entry.tool_use_id.as_deref() == Some(id))
+        });
+        let Some(idx) = idx else {
+            return;
+        };
+        if let Some(entry) = self.subagents.get_mut(idx) {
+            if entry.state != SubagentState::Running {
+                return;
+            }
+            entry.state = if is_error {
+                SubagentState::Failed
+            } else {
+                SubagentState::Completed
+            };
+            entry.finished_at = Some(Instant::now());
+        }
+    }
+
+    /// 実行中のサブエージェント数。ヘッダ行・状態パネルの集計表示に使う。
+    pub fn subagent_running_count(&self) -> usize {
+        self.subagents
+            .iter()
+            .filter(|entry| entry.state == SubagentState::Running)
+            .count()
+    }
+
+    /// 状態パネルに表示するサブエージェント一覧を、実行中を優先しつつ新しい順に整形して返す。
+    /// `limit` は呼び出し側（パネル高さに応じた表示件数トリム）で決める。
+    pub fn subagent_status_lines(&self, limit: usize) -> Vec<String> {
+        if limit == 0 || self.subagents.is_empty() {
+            return Vec::new();
+        }
+        let mut running: Vec<&SubagentEntry> = Vec::new();
+        let mut finished: Vec<&SubagentEntry> = Vec::new();
+        for entry in &self.subagents {
+            if entry.state == SubagentState::Running {
+                running.push(entry);
+            } else {
+                finished.push(entry);
+            }
+        }
+        // 完了/失敗は新しい順（直近ほど関心が高い）、実行中はそのまま起動順で先頭にまとめる。
+        finished.reverse();
+        running
+            .into_iter()
+            .chain(finished)
+            .take(limit)
+            .map(|entry| {
+                let elapsed = match entry.finished_at {
+                    Some(finished_at) => finished_at.duration_since(entry.started_at).as_secs(),
+                    None => entry.started_at.elapsed().as_secs(),
+                };
+                format!("{} {} ({}秒)", entry.state.icon(), entry.label, elapsed)
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn subagents_len(&self) -> usize {
+        self.subagents.len()
     }
 
     /// 実行中ターンの経過秒（開始からの秒）。ターン非実行時は None。
@@ -1818,6 +2148,59 @@ impl CodexPane {
         } else {
             false
         }
+    }
+
+    /// 実行中スピナーのtick（文字選択は ui 側の純関数に任せる）。
+    pub fn activity_spin_tick(&self) -> u64 {
+        self.activity_spin_tick
+    }
+
+    /// ターン実行中のみ、一定間隔でスピナーtickを進める。動いていることが見た目で分かるように、
+    /// 進んだフレームだけ再描画対象として true を返す（アイドル時は無駄な再描画をしない）。
+    fn advance_activity_spin(&mut self) -> bool {
+        const SPIN_INTERVAL: Duration = Duration::from_millis(120);
+        if !self.is_turn_running() {
+            self.last_spin_advance_at = None;
+            return false;
+        }
+        let should_advance = match self.last_spin_advance_at {
+            Some(t) => t.elapsed() >= SPIN_INTERVAL,
+            None => true,
+        };
+        if should_advance {
+            self.activity_spin_tick = self.activity_spin_tick.wrapping_add(1);
+            self.last_spin_advance_at = Some(Instant::now());
+        }
+        should_advance
+    }
+
+    /// 承認待ち（`pending_decision`）が一定時間続いたら、見逃し防止のため通知を再送する。
+    /// 一度きりの通知（`set_pending_decision` 時）だけでは長時間の放置に気づけないため、
+    /// 待機が続く間は間隔を空けて繰り返し知らせる。
+    fn remind_confirming_if_stale(&mut self) {
+        const REMIND_INTERVAL: Duration = Duration::from_secs(5 * 60);
+        if self.pending_decision.is_none() {
+            self.pending_decision_started_at = None;
+            self.last_confirming_reminder_at = None;
+            return;
+        }
+        let started = *self
+            .pending_decision_started_at
+            .get_or_insert_with(Instant::now);
+        let last_reminder = *self.last_confirming_reminder_at.get_or_insert(started);
+        if last_reminder.elapsed() < REMIND_INTERVAL {
+            return;
+        }
+        self.last_confirming_reminder_at = Some(Instant::now());
+        let Some(decision) = self.pending_decision.clone() else {
+            return;
+        };
+        let name = self.kind.display_name();
+        let waited = format_elapsed(started.elapsed().as_secs());
+        self.push_terminal_notice(
+            format!("{name} 承認待ち継続中 ({waited})"),
+            decision.message,
+        );
     }
 
     /// 完了したターンの所要時間を控えめな System 行として残す。
@@ -2168,13 +2551,14 @@ impl CodexPane {
     pub fn filtered_log_lines(&self) -> Vec<&CodexLogLine> {
         let query = self.normalized_search_query();
         let collapse_turns = self.turns_are_collapsible_in_current_view();
+        let live_tool_start = self.live_turn_tool_start_index();
         let mut current_collapsed_turn = None;
         let mut visible = Vec::new();
-        for line in &self.log {
+        for (index, line) in self.log.iter().enumerate() {
             if line.kind == CodexLogKind::Turn {
                 current_collapsed_turn = turn_number_from_label(&line.text)
                     .filter(|n| collapse_turns && self.collapsed_turns.contains(n));
-                if self.log_line_visible(line, &query) {
+                if self.log_line_visible(line, &query, index, live_tool_start) {
                     visible.push(line);
                 }
                 continue;
@@ -2182,11 +2566,23 @@ impl CodexPane {
             if current_collapsed_turn.is_some() {
                 continue;
             }
-            if self.log_line_visible(line, &query) {
+            if self.log_line_visible(line, &query, index, live_tool_start) {
                 visible.push(line);
             }
         }
         visible
+    }
+
+    /// 実行中ターン中は会話フィルタでも直近のTool/Eventログを混ぜて表示するため、
+    /// 現在実行中ターンの開始位置（直近のTurn行のインデックス）を返す。
+    /// 実行中でない、または会話フィルタ以外のときは None（従来通りログを汚さない）。
+    fn live_turn_tool_start_index(&self) -> Option<usize> {
+        if self.log_filter != CodexLogFilter::Conversation || !self.is_turn_running() {
+            return None;
+        }
+        self.log
+            .iter()
+            .rposition(|line| line.kind == CodexLogKind::Turn)
     }
 
     /// ストリーミング中（未完成）の assistant ログ行への参照を返す。
@@ -2366,6 +2762,11 @@ impl CodexPane {
             CodexListPickerAction::SetReasoning => self.handle_reasoning_slash_command(&value),
             CodexListPickerAction::SetApproval => self.handle_approval_slash_command(&value),
             CodexListPickerAction::SetSandbox => self.handle_sandbox_slash_command(&value),
+            CodexListPickerAction::SetLanguage => {
+                if let Some(choice) = AgentLanguage::parse(&value) {
+                    self.set_agent_language(choice);
+                }
+            }
             CodexListPickerAction::ResumeSession => {
                 if self.kind == AgentKind::ClaudeCode {
                     self.start_claude_resume(Some(&value), fork, "");
@@ -2756,6 +3157,16 @@ impl CodexPane {
         self.log_filter.label()
     }
 
+    /// ヘッダー表示用のフィルタラベル。実行中ターン中は会話フィルタでも
+    /// 直近のTool/Eventログを混ぜて表示しているため、その旨を示す接尾辞を付ける。
+    pub fn log_filter_display_label(&self) -> String {
+        if self.live_turn_tool_start_index().is_some() {
+            format!("{}+実行中", self.log_filter_label())
+        } else {
+            self.log_filter_label().to_string()
+        }
+    }
+
     pub fn search_query(&self) -> &str {
         &self.search_query
     }
@@ -2857,7 +3268,7 @@ impl CodexPane {
     pub fn cycle_model(&mut self) {
         if self.kind == AgentKind::ClaudeCode {
             let value = self.claude_settings.cycle_model();
-            self.action = Some(format!("model: {value}"));
+            self.set_status_note(format!("model: {value}"));
             self.push_activity(format!("Claude Code model を {value} に変更"));
             self.push_log(CodexLogKind::System, format!("次回ターンの model: {value}"));
             self.push_claude_resident_model();
@@ -2865,7 +3276,7 @@ impl CodexPane {
         }
         self.exec_settings.model_override = None;
         let value = self.exec_settings.cycle_model();
-        self.action = Some(format!("model: {value}"));
+        self.set_status_note(format!("model: {value}"));
         self.push_activity(format!("Codex model を {value} に変更"));
         self.push_log(CodexLogKind::System, format!("次回ターンの model: {value}"));
         self.push_codex_appserver_model();
@@ -2874,7 +3285,7 @@ impl CodexPane {
     fn set_model(&mut self, value: &str) {
         if self.kind == AgentKind::ClaudeCode {
             let value = self.claude_settings.set_model(value);
-            self.action = Some(format!("model: {value}"));
+            self.set_status_note(format!("model: {value}"));
             self.push_activity(format!("Claude Code model を {value} に変更"));
             self.push_log(CodexLogKind::System, format!("次回ターンの model: {value}"));
             self.push_claude_resident_model();
@@ -2893,22 +3304,108 @@ impl CodexPane {
             .as_deref()
             .unwrap_or_else(|| self.exec_settings.model.label())
             .to_string();
-        self.action = Some(format!("model: {value}"));
+        self.set_status_note(format!("model: {value}"));
         self.push_activity(format!("Codex model を {value} に変更"));
         self.push_log(CodexLogKind::System, format!("次回ターンの model: {value}"));
         self.push_codex_appserver_model();
     }
 
+    /// 現在の応答言語設定と環境変数から合成した最終的な developer instructions。
+    /// 全バックエンドの起動引数はこの文字列を使う（言語指示の注入漏れ防止）。
+    fn composed_developer_instructions(&self) -> String {
+        compose_developer_instructions(self.agent_language, current_lang_env().as_deref())
+    }
+
+    /// `/lang`（`/language`）: 引数なしはピッカー、引数ありは直接設定。
+    fn handle_language_slash_command(&mut self, args: &str) {
+        if args.is_empty() {
+            self.open_language_picker();
+            return;
+        }
+        match AgentLanguage::parse(args) {
+            Some(choice) => self.set_agent_language(choice),
+            None => self.push_log(
+                CodexLogKind::Error,
+                "応答言語は auto / ja / en / off を指定してください",
+            ),
+        }
+    }
+
+    /// `/lang`（引数なし）: auto / 日本語 / English / off の選択ピッカーを開く。
+    fn open_language_picker(&mut self) {
+        let current = self.agent_language;
+        let items = [
+            AgentLanguage::Auto,
+            AgentLanguage::Ja,
+            AgentLanguage::En,
+            AgentLanguage::Off,
+        ]
+        .into_iter()
+        .map(|choice| CodexListPickerItem {
+            label: choice.label().to_string(),
+            detail: String::new(),
+            value: choice.config_value().to_string(),
+            current: choice == current,
+        })
+        .collect::<Vec<_>>();
+        let selected = list_picker_initial_selection(&items);
+        self.open_list_picker(CodexListPicker {
+            title: " 応答言語を選択 ".to_string(),
+            action: CodexListPickerAction::SetLanguage,
+            items,
+            selected,
+        });
+    }
+
+    /// 応答言語を設定し、グローバル設定へ永続化する。
+    /// 常駐プロセス（Claude / Codex app-server）は起動時に developer instructions を
+    /// 渡すため、変更は次の thread/セッションから有効。生存中の常駐には再起動保留を立てる。
+    fn set_agent_language(&mut self, language: AgentLanguage) {
+        self.agent_language = language;
+        if let Err(err) =
+            Settings::load().and_then(|mut settings| settings.set_agent_language(language))
+        {
+            self.push_log(
+                CodexLogKind::Error,
+                format!("応答言語設定の保存に失敗しました: {err}"),
+            );
+        }
+        let label = language.label();
+        self.set_status_note(format!("lang: {}", language.config_value()));
+        self.push_activity(format!("応答言語を {label} に変更"));
+
+        let mut resident_pending = false;
+        if self.claude_resident.is_some() {
+            self.claude_resident_restart_pending = true;
+            resident_pending = true;
+        }
+        if self.codex_appserver.is_some() {
+            self.codex_appserver_restart_pending = true;
+            resident_pending = true;
+        }
+        if resident_pending {
+            self.push_log(
+                CodexLogKind::System,
+                format!("応答言語を {label} に変更しました（常駐プロセス再起動後に反映）"),
+            );
+        } else {
+            self.push_log(
+                CodexLogKind::System,
+                format!("応答言語を {label} に変更しました（次のセッションから反映）"),
+            );
+        }
+    }
+
     pub fn cycle_reasoning(&mut self) {
         if self.kind == AgentKind::ClaudeCode {
             let value = self.claude_settings.cycle_effort();
-            self.action = Some(format!("effort: {value}"));
+            self.set_status_note(format!("effort: {value}"));
             self.push_activity(format!("Claude Code effort を {value} に変更"));
             self.note_claude_effort_change(value);
             return;
         }
         let value = self.exec_settings.cycle_reasoning();
-        self.action = Some(format!("reasoning: {value}"));
+        self.set_status_note(format!("reasoning: {value}"));
         self.push_activity(format!("Codex reasoning を {value} に変更"));
         self.push_log(
             CodexLogKind::System,
@@ -2920,7 +3417,7 @@ impl CodexPane {
     /// ClaudeCode の `/effort` フリーテキスト設定。
     fn set_claude_effort(&mut self, value: claude::ClaudeEffortChoice) {
         let value = self.claude_settings.set_effort(value);
-        self.action = Some(format!("effort: {value}"));
+        self.set_status_note(format!("effort: {value}"));
         self.push_activity(format!("Claude Code effort を {value} に変更"));
         self.note_claude_effort_change(value);
     }
@@ -2945,7 +3442,7 @@ impl CodexPane {
     fn set_reasoning(&mut self, value: CodexReasoningChoice) {
         self.exec_settings.reasoning = value;
         let value = self.exec_settings.reasoning.label();
-        self.action = Some(format!("reasoning: {value}"));
+        self.set_status_note(format!("reasoning: {value}"));
         self.push_activity(format!("Codex reasoning を {value} に変更"));
         self.push_log(
             CodexLogKind::System,
@@ -2958,7 +3455,7 @@ impl CodexPane {
         if self.kind == AgentKind::ClaudeCode {
             let previous = self.claude_settings.permission_mode_choice();
             let value = self.claude_settings.cycle_permission_mode();
-            self.action = Some(format!("permission: {value}"));
+            self.set_status_note(format!("permission: {value}"));
             self.push_activity(format!("Claude Code permission-mode を {value} に変更"));
             self.push_log(
                 CodexLogKind::System,
@@ -2968,7 +3465,7 @@ impl CodexPane {
             return;
         }
         let value = self.exec_settings.cycle_approval();
-        self.action = Some(format!("approval: {value}"));
+        self.set_status_note(format!("approval: {value}"));
         self.push_activity(format!("Codex approval を {value} に変更"));
         self.push_log(
             CodexLogKind::System,
@@ -2981,7 +3478,7 @@ impl CodexPane {
     fn set_claude_permission_mode(&mut self, value: claude::ClaudePermissionMode) {
         let previous = self.claude_settings.permission_mode_choice();
         let value = self.claude_settings.set_permission_mode(value);
-        self.action = Some(format!("permission: {value}"));
+        self.set_status_note(format!("permission: {value}"));
         self.push_activity(format!("Claude Code permission-mode を {value} に変更"));
         self.push_log(
             CodexLogKind::System,
@@ -2993,7 +3490,7 @@ impl CodexPane {
     fn set_approval(&mut self, value: CodexApprovalChoice) {
         self.exec_settings.approval = value;
         let value = self.exec_settings.approval.label();
-        self.action = Some(format!("approval: {value}"));
+        self.set_status_note(format!("approval: {value}"));
         self.push_activity(format!("Codex approval を {value} に変更"));
         self.push_log(
             CodexLogKind::System,
@@ -3011,7 +3508,7 @@ impl CodexPane {
             return;
         }
         let value = self.exec_settings.cycle_sandbox();
-        self.action = Some(format!("sandbox: {value}"));
+        self.set_status_note(format!("sandbox: {value}"));
         self.push_activity(format!("Codex sandbox を {value} に変更"));
         self.push_log(
             CodexLogKind::System,
@@ -3023,7 +3520,7 @@ impl CodexPane {
     fn set_sandbox(&mut self, value: CodexSandboxChoice) {
         self.exec_settings.sandbox = value;
         let value = self.exec_settings.sandbox.label();
-        self.action = Some(format!("sandbox: {value}"));
+        self.set_status_note(format!("sandbox: {value}"));
         self.push_activity(format!("Codex sandbox を {value} に変更"));
         self.push_log(
             CodexLogKind::System,
@@ -3106,7 +3603,7 @@ impl CodexPane {
     pub fn toggle_web_search(&mut self) {
         let enabled = self.exec_settings.toggle_web_search();
         let value = on_off(enabled);
-        self.action = Some(format!("search: {value}"));
+        self.set_status_note(format!("search: {value}"));
         self.push_activity(format!("Codex web search を {value} に変更"));
         self.push_log(
             CodexLogKind::System,
@@ -3117,15 +3614,20 @@ impl CodexPane {
     pub fn toggle_oss(&mut self) {
         let enabled = self.exec_settings.toggle_oss();
         let value = on_off(enabled);
-        self.action = Some(format!("oss: {value}"));
+        self.set_status_note(format!("oss: {value}"));
         self.push_activity(format!("Codex OSS mode を {value} に変更"));
         self.push_log(CodexLogKind::System, format!("次回ターンの oss: {value}"));
     }
 
     fn set_remote_addr(&mut self, addr: Option<String>) {
         self.exec_settings.remote_addr = addr;
-        let value = self.exec_settings.remote_addr.as_deref().unwrap_or("off");
-        self.action = Some(format!("remote: {value}"));
+        let value = self
+            .exec_settings
+            .remote_addr
+            .as_deref()
+            .unwrap_or("off")
+            .to_string();
+        self.set_status_note(format!("remote: {value}"));
         self.push_log(
             CodexLogKind::System,
             format!("次回ターンの remote: {value}"),
@@ -3138,8 +3640,9 @@ impl CodexPane {
             .exec_settings
             .remote_auth_token_env
             .as_deref()
-            .unwrap_or("off");
-        self.action = Some(format!("remote-auth-token-env: {value}"));
+            .unwrap_or("off")
+            .to_string();
+        self.set_status_note(format!("remote-auth-token-env: {value}"));
         self.push_log(
             CodexLogKind::System,
             format!("次回ターンの remote-auth-token-env: {value}"),
@@ -3149,7 +3652,7 @@ impl CodexPane {
     fn toggle_no_alt_screen(&mut self) {
         self.exec_settings.no_alt_screen = !self.exec_settings.no_alt_screen;
         let value = on_off(self.exec_settings.no_alt_screen);
-        self.action = Some(format!("no-alt-screen: {value}"));
+        self.set_status_note(format!("no-alt-screen: {value}"));
         self.push_log(
             CodexLogKind::System,
             format!("次回ターンの no-alt-screen: {value}"),
@@ -3158,7 +3661,7 @@ impl CodexPane {
 
     pub fn cycle_local_provider(&mut self) {
         let value = self.exec_settings.cycle_local_provider();
-        self.action = Some(format!("local provider: {value}"));
+        self.set_status_note(format!("local provider: {value}"));
         self.push_activity(format!("Codex local provider を {value} に変更"));
         self.push_log(
             CodexLogKind::System,
@@ -3168,8 +3671,13 @@ impl CodexPane {
 
     fn set_profile(&mut self, profile: Option<String>) {
         self.exec_settings.profile = profile;
-        let value = self.exec_settings.profile.as_deref().unwrap_or("config");
-        self.action = Some(format!("profile: {value}"));
+        let value = self
+            .exec_settings
+            .profile
+            .as_deref()
+            .unwrap_or("config")
+            .to_string();
+        self.set_status_note(format!("profile: {value}"));
         self.push_log(
             CodexLogKind::System,
             format!("次回ターンの profile: {value}"),
@@ -3179,7 +3687,7 @@ impl CodexPane {
     fn add_image_path(&mut self, path: String) {
         self.exec_settings.image_paths.push(path.clone());
         let count = self.exec_settings.image_paths.len();
-        self.action = Some(format!("image: {count}件"));
+        self.set_status_note(format!("image: {count}件"));
         self.push_log(
             CodexLogKind::System,
             format!("次回ターンに画像を添付: {path}"),
@@ -3192,13 +3700,13 @@ impl CodexPane {
             return;
         }
         let removed = self.exec_settings.image_paths.remove(index);
-        self.action = Some(format!("image: {}件", self.exec_settings.image_paths.len()));
+        self.set_status_note(format!("image: {}件", self.exec_settings.image_paths.len()));
         self.push_log(CodexLogKind::System, format!("画像添付を削除: {removed}"));
     }
 
     fn clear_image_paths(&mut self) {
         self.exec_settings.image_paths.clear();
-        self.action = Some("image: cleared".to_string());
+        self.set_status_note("image: cleared".to_string());
         self.push_log(CodexLogKind::System, "画像添付をクリアしました");
     }
 
@@ -3220,7 +3728,7 @@ impl CodexPane {
     fn add_writable_dir(&mut self, dir: String) {
         self.exec_settings.additional_dirs.push(dir.clone());
         let count = self.exec_settings.additional_dirs.len();
-        self.action = Some(format!("add-dir: {count}件"));
+        self.set_status_note(format!("add-dir: {count}件"));
         self.push_log(
             CodexLogKind::System,
             format!("次回ターンに追加書込ディレクトリを渡します: {dir}"),
@@ -3229,7 +3737,7 @@ impl CodexPane {
 
     fn clear_writable_dirs(&mut self) {
         self.exec_settings.additional_dirs.clear();
-        self.action = Some("add-dir: cleared".to_string());
+        self.set_status_note("add-dir: cleared".to_string());
         self.push_log(CodexLogKind::System, "追加書込ディレクトリをクリアしました");
     }
 
@@ -3242,7 +3750,7 @@ impl CodexPane {
         }
         self.exec_settings.config_overrides.push(value.clone());
         let count = self.exec_settings.config_overrides.len();
-        self.action = Some(format!("config: {count}件"));
+        self.set_status_note(format!("config: {count}件"));
         self.push_log(
             CodexLogKind::System,
             format!("次回ターンに -c {value} を渡します"),
@@ -3259,7 +3767,7 @@ impl CodexPane {
             .retain(|entry| config_override_key(entry) != key);
         let value = format!("{key}={toml_value}");
         self.exec_settings.config_overrides.push(value.clone());
-        self.action = Some(format!("{label}: set"));
+        self.set_status_note(format!("{label}: set"));
         self.push_log(
             CodexLogKind::System,
             format!("次回ターンに -c {value} を渡します"),
@@ -3272,7 +3780,7 @@ impl CodexPane {
             .config_overrides
             .retain(|entry| config_override_key(entry) != key);
         let removed = before.saturating_sub(self.exec_settings.config_overrides.len());
-        self.action = Some(format!("{label}: cleared"));
+        self.set_status_note(format!("{label}: cleared"));
         self.push_log(
             CodexLogKind::System,
             format!("{label} config override をクリアしました ({removed}件)"),
@@ -3287,7 +3795,7 @@ impl CodexPane {
         self.exec_settings
             .config_overrides
             .extend(default_addness_memory_config_overrides());
-        self.action = Some("memories: addness-default".to_string());
+        self.set_status_note("memories: addness-default".to_string());
         self.push_log(
             CodexLogKind::System,
             "記憶先をAddness既定値に戻しました: 通常Codex memory off",
@@ -3309,7 +3817,7 @@ impl CodexPane {
             key != prefix && !key.starts_with(&format!("{prefix}."))
         });
         let removed = before.saturating_sub(self.exec_settings.config_overrides.len());
-        self.action = Some(format!("{label}: cleared"));
+        self.set_status_note(format!("{label}: cleared"));
         self.push_log(
             CodexLogKind::System,
             format!("{label} config override をクリアしました ({removed}件)"),
@@ -3328,7 +3836,7 @@ impl CodexPane {
         self.exec_settings
             .config_overrides
             .extend(default_addness_memory_config_overrides());
-        self.action = Some("config: addness-default".to_string());
+        self.set_status_note("config: addness-default".to_string());
         self.push_log(
             CodexLogKind::System,
             "追加 config override をクリアし、記憶先をAddness既定値に戻しました",
@@ -3337,7 +3845,7 @@ impl CodexPane {
 
     fn add_enabled_feature(&mut self, feature: String) {
         self.exec_settings.enabled_features.push(feature.clone());
-        self.action = Some(format!("enable: {feature}"));
+        self.set_status_note(format!("enable: {feature}"));
         self.push_log(
             CodexLogKind::System,
             format!("次回ターンで feature を有効化: {feature}"),
@@ -3346,7 +3854,7 @@ impl CodexPane {
 
     fn add_disabled_feature(&mut self, feature: String) {
         self.exec_settings.disabled_features.push(feature.clone());
-        self.action = Some(format!("disable: {feature}"));
+        self.set_status_note(format!("disable: {feature}"));
         self.push_log(
             CodexLogKind::System,
             format!("次回ターンで feature を無効化: {feature}"),
@@ -3356,7 +3864,7 @@ impl CodexPane {
     fn toggle_strict_config(&mut self) {
         self.exec_settings.strict_config = !self.exec_settings.strict_config;
         let value = on_off(self.exec_settings.strict_config);
-        self.action = Some(format!("strict-config: {value}"));
+        self.set_status_note(format!("strict-config: {value}"));
         self.push_log(
             CodexLogKind::System,
             format!("次回ターンの strict-config: {value}"),
@@ -3366,7 +3874,7 @@ impl CodexPane {
     fn toggle_ignore_user_config(&mut self) {
         self.exec_settings.ignore_user_config = !self.exec_settings.ignore_user_config;
         let value = on_off(self.exec_settings.ignore_user_config);
-        self.action = Some(format!("ignore-user-config: {value}"));
+        self.set_status_note(format!("ignore-user-config: {value}"));
         self.push_log(
             CodexLogKind::System,
             format!("次回ターンの ignore-user-config: {value}"),
@@ -3376,7 +3884,7 @@ impl CodexPane {
     fn toggle_ignore_rules(&mut self) {
         self.exec_settings.ignore_rules = !self.exec_settings.ignore_rules;
         let value = on_off(self.exec_settings.ignore_rules);
-        self.action = Some(format!("ignore-rules: {value}"));
+        self.set_status_note(format!("ignore-rules: {value}"));
         self.push_log(
             CodexLogKind::System,
             format!("次回ターンの ignore-rules: {value}"),
@@ -3386,7 +3894,7 @@ impl CodexPane {
     fn toggle_skip_git_repo_check(&mut self) {
         self.exec_settings.skip_git_repo_check = !self.exec_settings.skip_git_repo_check;
         let value = on_off(self.exec_settings.skip_git_repo_check);
-        self.action = Some(format!("skip-git-check: {value}"));
+        self.set_status_note(format!("skip-git-check: {value}"));
         self.push_log(
             CodexLogKind::System,
             format!("次回ターンの skip-git-repo-check: {value}"),
@@ -3396,7 +3904,7 @@ impl CodexPane {
     fn toggle_ephemeral(&mut self) {
         self.exec_settings.ephemeral = !self.exec_settings.ephemeral;
         let value = on_off(self.exec_settings.ephemeral);
-        self.action = Some(format!("ephemeral: {value}"));
+        self.set_status_note(format!("ephemeral: {value}"));
         self.push_log(
             CodexLogKind::System,
             format!("次回ターンの ephemeral: {value}"),
@@ -3407,7 +3915,7 @@ impl CodexPane {
         self.exec_settings.bypass_approvals_and_sandbox =
             !self.exec_settings.bypass_approvals_and_sandbox;
         let value = on_off(self.exec_settings.bypass_approvals_and_sandbox);
-        self.action = Some(format!("bypass approvals+sandbox: {value}"));
+        self.set_status_note(format!("bypass approvals+sandbox: {value}"));
         self.push_log(
             CodexLogKind::System,
             format!("次回ターンの dangerously-bypass-approvals-and-sandbox: {value}"),
@@ -3417,7 +3925,7 @@ impl CodexPane {
     fn toggle_bypass_hook_trust(&mut self) {
         self.exec_settings.bypass_hook_trust = !self.exec_settings.bypass_hook_trust;
         let value = on_off(self.exec_settings.bypass_hook_trust);
-        self.action = Some(format!("bypass-hook-trust: {value}"));
+        self.set_status_note(format!("bypass-hook-trust: {value}"));
         self.push_log(
             CodexLogKind::System,
             format!("次回ターンの dangerously-bypass-hook-trust: {value}"),
@@ -3426,8 +3934,13 @@ impl CodexPane {
 
     fn set_output_schema(&mut self, path: Option<String>) {
         self.exec_settings.output_schema = path;
-        let value = self.exec_settings.output_schema.as_deref().unwrap_or("off");
-        self.action = Some(format!("output-schema: {value}"));
+        let value = self
+            .exec_settings
+            .output_schema
+            .as_deref()
+            .unwrap_or("off")
+            .to_string();
+        self.set_status_note(format!("output-schema: {value}"));
         self.push_log(
             CodexLogKind::System,
             format!("次回ターンの output-schema: {value}"),
@@ -3440,8 +3953,9 @@ impl CodexPane {
             .exec_settings
             .output_last_message
             .as_deref()
-            .unwrap_or("off");
-        self.action = Some(format!("output-last-message: {value}"));
+            .unwrap_or("off")
+            .to_string();
+        self.set_status_note(format!("output-last-message: {value}"));
         self.push_log(
             CodexLogKind::System,
             format!("次回ターンの output-last-message: {value}"),
@@ -3465,13 +3979,13 @@ impl CodexPane {
             self.diff_view = None;
             self.invalidate_rendered_history_metrics();
             self.scroll_to_live();
-            self.action = Some("diff view off".to_string());
+            self.set_status_note("diff view off".to_string());
             return;
         }
         self.diff_view = Some(git_diff_preview(Path::new(&self.cwd)));
         self.invalidate_rendered_history_metrics();
         self.scroll_to_live();
-        self.action = Some("diff view on".to_string());
+        self.set_status_note("diff view on".to_string());
     }
 
     pub fn sync_rendered_history_metrics(&mut self, total_lines: usize, viewport_height: usize) {
@@ -3499,8 +4013,16 @@ impl CodexPane {
         self.search_query.trim().to_lowercase()
     }
 
-    fn log_line_visible(&self, line: &CodexLogLine, query: &str) -> bool {
-        if !matches_log_filter(line.kind, self.log_filter) {
+    fn log_line_visible(
+        &self,
+        line: &CodexLogLine,
+        query: &str,
+        index: usize,
+        live_tool_start: Option<usize>,
+    ) -> bool {
+        let matches_filter = matches_log_filter(line.kind, self.log_filter)
+            || is_live_turn_tool_line(line.kind, index, live_tool_start);
+        if !matches_filter {
             return false;
         }
         if query.is_empty()
@@ -3811,6 +4333,10 @@ impl CodexPane {
 
         // 経過時間タイマー: 表示秒が繰り上がったフレームだけ再描画させる。
         changed |= self.manage_turn_timer();
+        // 実行中スピナー: ターン実行中だけ一定間隔で回す。
+        changed |= self.advance_activity_spin();
+        // 承認待ちが長時間続いていたら見逃し防止の再通知を送る。
+        self.remind_confirming_if_stale();
 
         changed
     }
@@ -3926,8 +4452,9 @@ impl CodexPane {
                 self.turn_finished_by_event = false;
                 self.current_command = None;
                 self.current_command_started_at = None;
+                self.clear_recent_actions();
                 self.pending_decision = None;
-                self.action = Some("依頼を確認中".to_string());
+                self.begin_turn_work("依頼を確認中");
                 if self.turn_count > 0 {
                     self.collapsed_turns.insert(self.turn_count);
                 }
@@ -3951,7 +4478,7 @@ impl CodexPane {
                 self.pending_decision = None;
                 self.refresh_current_turn_title();
                 self.queue_completed_turn_body_record();
-                self.action = Some("応答完了".to_string());
+                self.end_turn_work("応答完了");
                 self.push_log(CodexLogKind::System, "Codex の応答が完了しました");
                 self.record_turn_duration();
                 self.push_turn_complete_notice("Codex 完了", "Codex の出力が完了しました");
@@ -4051,7 +4578,8 @@ impl CodexPane {
         self.turn_finished_by_event = false;
         self.current_command = None;
         self.current_command_started_at = None;
-        self.action = Some("依頼を確認中".to_string());
+        self.clear_recent_actions();
+        self.begin_turn_work("依頼を確認中");
         self.turn_count = self.turn_count.saturating_add(1);
         let label = self
             .current_turn_prompt
@@ -4091,12 +4619,19 @@ impl CodexPane {
                     name,
                     summary,
                     edit_patch,
+                    id,
+                    subagent,
                 } => {
                     if let Some(summary) = &summary {
-                        self.current_command = Some(compact_tool_text(summary));
-                        self.current_command_started_at = Some(Instant::now());
+                        self.record_current_command(
+                            RecentActionKind::Tool,
+                            compact_tool_text(summary),
+                        );
                     }
-                    self.action = Some(format!("ツール実行: {name}"));
+                    self.set_work_action(format!("ツール実行: {name}"));
+                    if let Some(subagent) = subagent {
+                        self.record_subagent_launch(id, subagent.label, subagent.agent_type);
+                    }
                     // Edit/Write は変更内容を色付き差分プレビュー行（見出し + diff）として残す。
                     // ラベル行と重複しないよう、パッチがあればそれをツール実行行にする。
                     if let Some(patch) = edit_patch {
@@ -4142,6 +4677,7 @@ impl CodexPane {
         for result in claude::tool_results(value) {
             self.current_command = None;
             self.current_command_started_at = None;
+            self.resolve_subagent_result(result.tool_use_id.as_deref(), result.is_error);
             if result.is_error {
                 let text = if result.text.is_empty() {
                     "(エラー詳細なし)".to_string()
@@ -4180,7 +4716,7 @@ impl CodexPane {
             self.claude_pending_tool = None;
             self.current_turn_prompt = None;
             self.current_turn_retry_prompt = None;
-            self.action = Some("中断完了".to_string());
+            self.end_turn_work("中断完了");
             self.push_log(CodexLogKind::System, "ターンを中断しました");
             let queued = self.queued_prompts.len();
             if queued > 0 {
@@ -4212,7 +4748,7 @@ impl CodexPane {
             // ここでの drop は「session_id を伴わないエラー」時のみ発火する。
             self.drop_restored_thread_on_failure();
         } else {
-            self.action = Some("応答完了".to_string());
+            self.end_turn_work("応答完了");
             self.push_log(CodexLogKind::System, "Claude Code の応答が完了しました");
             self.push_turn_complete_notice("Claude Code 完了", "Claude Code の出力が完了しました");
         }
@@ -4282,7 +4818,7 @@ impl CodexPane {
             self.resolve_claude_resident_tool(response, response_label);
             return;
         }
-        self.action = Some(format!("確認応答: {response_label}"));
+        self.set_work_action(format!("確認応答: {response_label}"));
         self.push_activity(format!("確認待ちに {response_label} で応答"));
         let rules = std::mem::take(&mut self.claude_pending_allowed_tools);
         let denials = std::mem::take(&mut self.claude_pending_denials);
@@ -4321,7 +4857,7 @@ impl CodexPane {
             return;
         }
         let prompt = "先ほど拒否されたツール実行を許可しました。同じ作業を続行してください。";
-        self.action = Some(format!("{reason}: 続行ターン"));
+        self.set_work_action(format!("{reason}: 続行ターン"));
         self.push_log(
             CodexLogKind::System,
             format!("{reason}の設定で作業を続行します"),
@@ -4355,11 +4891,12 @@ impl CodexPane {
     /// 常駐 claude プロセスを spawn する（stdout/stderr は既存の line reader で読む）。
     fn spawn_claude_resident(&mut self) -> Result<claude_resident::ResidentClient> {
         let mut cmd = Command::new(&self.codex_bin);
+        let developer_instructions = self.composed_developer_instructions();
         for arg in claude::resident_args(
             self.thread_id.as_deref(),
             &self.claude_settings,
             self.claude_fork_next,
-            addness_tui_developer_instructions(),
+            &developer_instructions,
         ) {
             cmd.arg(arg);
         }
@@ -4738,7 +5275,7 @@ impl CodexPane {
         let Some(pending) = self.claude_pending_tool.take() else {
             return;
         };
-        self.action = Some(format!("確認応答: {response_label}"));
+        self.set_work_action(format!("確認応答: {response_label}"));
         self.push_activity(format!("ツール承認に {response_label} で応答"));
         self.claude_resident_last_activity = Some(Instant::now());
         let Some(resident) = self.claude_resident.as_ref() else {
@@ -4895,7 +5432,7 @@ impl CodexPane {
             model: settings.model_cli_arg().map(str::to_string),
             approval_policy: approval,
             sandbox: Some(sandbox),
-            developer_instructions: Some(addness_tui_developer_instructions().to_string()),
+            developer_instructions: Some(self.composed_developer_instructions()),
         }
     }
 
@@ -5255,7 +5792,8 @@ impl CodexPane {
         }
         self.current_command = None;
         self.current_command_started_at = None;
-        self.action = Some("依頼を確認中".to_string());
+        self.clear_recent_actions();
+        self.begin_turn_work("依頼を確認中");
         self.turn_count = self.turn_count.saturating_add(1);
         let label = self
             .current_turn_prompt
@@ -5289,7 +5827,7 @@ impl CodexPane {
             self.codex_appserver_pending_approval = None;
             self.current_turn_prompt = None;
             self.current_turn_retry_prompt = None;
-            self.action = Some("中断完了".to_string());
+            self.end_turn_work("中断完了");
             self.refresh_current_turn_title();
             self.push_log(CodexLogKind::System, "ターンを中断しました");
             let queued = self.queued_prompts.len();
@@ -5311,7 +5849,7 @@ impl CodexPane {
             self.push_log(CodexLogKind::Error, message.clone());
             self.push_turn_complete_notice("Codex 失敗", message);
         } else {
-            self.action = Some("応答完了".to_string());
+            self.end_turn_work("応答完了");
             self.push_log(CodexLogKind::System, "Codex の応答が完了しました");
             self.push_turn_complete_notice("Codex 完了", "Codex の出力が完了しました");
         }
@@ -5341,8 +5879,7 @@ impl CodexPane {
         use codex_appserver::ThreadItemKind as K;
         match item.kind {
             K::CommandExecution { command, .. } => {
-                self.current_command = Some(compact_tool_text(&command));
-                self.current_command_started_at = Some(Instant::now());
+                self.record_current_command(RecentActionKind::Command, compact_tool_text(&command));
                 self.refresh_action_from_text(&command);
                 self.codex_appserver_running_item = Some(item.id.clone());
                 self.codex_appserver_output.insert(item.id, VecDeque::new());
@@ -5353,14 +5890,16 @@ impl CodexPane {
             }
             K::McpToolCall { server, tool, .. } => {
                 let label = format!("{server}.{tool}");
-                self.current_command = Some(label.clone());
-                self.current_command_started_at = Some(Instant::now());
-                self.action = Some(format!("ツール実行: {label}"));
+                self.record_current_command(RecentActionKind::Mcp, label.clone());
+                self.set_work_action(format!("ツール実行: {label}"));
                 self.push_log(CodexLogKind::Tool, format!("MCP {label}"));
             }
             K::FileChange { changes, .. } => {
                 let paths = codex_appserver_change_paths(&changes);
                 let label = codex_appserver_paths_label(&paths);
+                // 「今なにをしているか」表示へ反映する（Claude Code 経路と対称）。
+                self.record_current_command(RecentActionKind::FileChange, label.clone());
+                self.set_work_action(format!("ファイル変更: {label}"));
                 self.push_log(CodexLogKind::Tool, format!("ファイル変更 {label}"));
             }
             // reasoning / agentMessage はデルタ・完了で扱う。
@@ -5415,6 +5954,8 @@ impl CodexPane {
                 }
             }
             K::FileChange { changes, status } => {
+                self.current_command = None;
+                self.current_command_started_at = None;
                 let paths = codex_appserver_change_paths(&changes);
                 let label = codex_appserver_paths_label(&paths);
                 let status = status.unwrap_or_else(|| "完了".to_string());
@@ -5521,7 +6062,7 @@ impl CodexPane {
         let Some(request) = self.codex_appserver_pending_approval.take() else {
             return;
         };
-        self.action = Some(format!("確認応答: {response_label}"));
+        self.set_work_action(format!("確認応答: {response_label}"));
         self.push_activity(format!("ツール承認に {response_label} で応答"));
         self.codex_appserver_last_activity = Some(Instant::now());
         let allows_session = request.allows_session();
@@ -5941,8 +6482,7 @@ impl CodexPane {
                     self.current_command = None;
                     self.current_command_started_at = None;
                 } else {
-                    self.current_command = Some(compact_tool_text(command));
-                    self.current_command_started_at = Some(Instant::now());
+                    self.record_current_command(RecentActionKind::Tool, compact_tool_text(command));
                 }
             }
             if let Some(action_text) = display.action_text.as_deref() {
@@ -5978,8 +6518,7 @@ impl CodexPane {
                 self.current_command = None;
                 self.current_command_started_at = None;
             } else {
-                self.current_command = Some(compact_tool_text(&text));
-                self.current_command_started_at = Some(Instant::now());
+                self.record_current_command(RecentActionKind::Tool, compact_tool_text(&text));
             }
             self.refresh_action_from_text(&text);
             self.push_log(
@@ -6014,7 +6553,7 @@ impl CodexPane {
                     self.last_addness_write_label = Some(label.clone());
                 }
             }
-            self.action = Some(label);
+            self.set_work_action(label);
         }
     }
 
@@ -6023,6 +6562,10 @@ impl CodexPane {
         self.pending_decision_action = None;
         let message = decision.message.clone();
         self.pending_decision = Some(decision);
+        // 承認待ち経過時間の起点をリセットする（リマインド通知の間隔もここから数える）。
+        let now = Instant::now();
+        self.pending_decision_started_at = Some(now);
+        self.last_confirming_reminder_at = Some(now);
         let name = self.kind.display_name();
         self.push_terminal_notice(format!("{name} 確認待ち"), message);
     }
@@ -6041,7 +6584,7 @@ impl CodexPane {
         }
         let response_label = decision.label_for_response(response);
         if auto {
-            self.action = Some(format!("確認自動応答: {response_label}"));
+            self.set_work_action(format!("確認自動応答: {response_label}"));
             self.push_activity(format!("確認待ちに {response_label} で自動応答"));
             let name = self.kind.display_name();
             self.push_terminal_notice(
@@ -6062,7 +6605,7 @@ impl CodexPane {
             return;
         }
 
-        self.action = Some(format!("確認応答: {response_label}"));
+        self.set_work_action(format!("確認応答: {response_label}"));
         self.push_activity(format!("確認待ちに {response_label} で応答"));
         match response {
             CodexDecisionResponse::Accept => {
@@ -6126,7 +6669,7 @@ impl CodexPane {
             .clone()
             .unwrap_or_else(|| retry_prompt.clone());
         self.kill_current_turn();
-        self.action = Some(format!("{reason}: turn再実行中"));
+        self.set_work_action(format!("{reason}: turn再実行中"));
         self.push_log(
             CodexLogKind::System,
             format!("{reason}の設定で現在のturnを再実行します"),
@@ -6204,7 +6747,7 @@ impl CodexPane {
     pub fn note_undo_result(&mut self, turn: usize, error: Option<String>) {
         match error {
             None => {
-                self.action = Some("undo 完了".to_string());
+                self.set_work_action("undo 完了".to_string());
                 self.push_log(
                     CodexLogKind::System,
                     format!(
@@ -6258,7 +6801,7 @@ impl CodexPane {
             PaneDecisionAction::Undo => match response {
                 CodexDecisionResponse::Accept => self.request_undo(),
                 _ => {
-                    self.action = Some("undo 取消".to_string());
+                    self.set_work_action("undo 取消".to_string());
                     self.push_log(CodexLogKind::System, "undo を取り消しました");
                 }
             },
@@ -6390,7 +6933,7 @@ impl CodexPane {
                 placeholder,
                 full: normalized,
             });
-            self.action = Some(format!("貼り付けを折り畳み: {line_count}行"));
+            self.set_work_action(format!("貼り付けを折り畳み: {line_count}行"));
         } else {
             self.input_state.insert_text(text);
         }
@@ -6425,7 +6968,7 @@ impl CodexPane {
                 Ok(Some(path)) => {
                     let path_str = path.display().to_string();
                     self.input_state.insert_text(&path_str);
-                    self.action = Some("クリップボード画像を添付".to_string());
+                    self.set_work_action("クリップボード画像を添付".to_string());
                     self.push_log(
                         CodexLogKind::System,
                         format!("クリップボード画像を保存しパスを挿入しました: {path_str}"),
@@ -6504,7 +7047,7 @@ impl CodexPane {
 
         if self.is_turn_running() {
             let count = self.queue_user_prompt(submitted);
-            self.action = Some(format!("次ターン予約 {count}件"));
+            self.set_work_action(format!("次ターン予約 {count}件"));
             let name = self.kind.display_name();
             self.push_log(
                 CodexLogKind::System,
@@ -6942,6 +7485,10 @@ impl CodexPane {
                 self.handle_reasoning_slash_command(args);
                 true
             }
+            "lang" | "language" => {
+                self.handle_language_slash_command(args);
+                true
+            }
             "approval" | "approvals" => {
                 self.handle_approval_slash_command(args);
                 true
@@ -7179,7 +7726,12 @@ impl CodexPane {
                 return;
             }
         };
-        let args = codex_named_subcommand_args_with_settings(args, &self.exec_settings);
+        let developer_instructions = self.composed_developer_instructions();
+        let args = codex_named_subcommand_args_with_settings(
+            args,
+            &self.exec_settings,
+            &developer_instructions,
+        );
         let label = format!("codex {}", command_preview(&args));
         self.start_codex_subcommand(args, label);
     }
@@ -7219,7 +7771,7 @@ impl CodexPane {
         self.checkpoint_seq = 0;
         self.pending_checkpoint_requests.clear();
         self.queued_prompts.clear();
-        self.action = Some(format!("新しい{name}セッション"));
+        self.set_status_note(format!("新しい{name}セッション"));
         self.push_log(
             CodexLogKind::System,
             format!("新しい {name} セッションを開始します。次の入力は新規セッションへ送信します"),
@@ -7307,7 +7859,7 @@ impl CodexPane {
 
         if self.is_turn_running() {
             let count = self.queue_direct_prompt(prompt, display);
-            self.action = Some(format!("作業分解を予約 {count}件"));
+            self.set_work_action(format!("作業分解を予約 {count}件"));
             self.push_log(
                 CodexLogKind::System,
                 format!("作業分解を次のターンに予約しました（待ち{count}件）"),
@@ -7321,7 +7873,7 @@ impl CodexPane {
     fn handle_child_work_slash_command(&mut self, args: &str) {
         let selector = normalize_submitted_line(args);
         if selector.is_empty() || selector.eq_ignore_ascii_case("list") {
-            self.action = Some("子ゴール一覧を表示".to_string());
+            self.set_work_action("子ゴール一覧を表示".to_string());
             self.push_log(CodexLogKind::System, child_goal_work_list(&self.children));
             return;
         }
@@ -7347,7 +7899,7 @@ impl CodexPane {
 
         if self.is_turn_running() {
             let count = self.queue_direct_work_prompt(prompt, display, active_work);
-            self.action = Some(format!("子ゴール着手を予約 {count}件"));
+            self.set_work_action(format!("子ゴール着手を予約 {count}件"));
             self.push_log(
                 CodexLogKind::System,
                 format!("子ゴール着手を次のターンに予約しました（待ち{count}件）"),
@@ -7355,7 +7907,7 @@ impl CodexPane {
             return;
         }
 
-        self.action = Some(action);
+        self.set_work_action(action);
         self.start_turn_with_display_prompt(&prompt, &display);
     }
 
@@ -7388,7 +7940,7 @@ impl CodexPane {
         );
 
         if self.is_turn_running() {
-            self.action = Some(format!("子ゴール一括着手を予約 {added}件"));
+            self.set_work_action(format!("子ゴール一括着手を予約 {added}件"));
             return;
         }
 
@@ -7460,19 +8012,36 @@ impl CodexPane {
                 return;
             }
         };
-        let args = codex_named_subcommand_args_with_settings(args, &self.exec_settings);
+        let developer_instructions = self.composed_developer_instructions();
+        let args = codex_named_subcommand_args_with_settings(
+            args,
+            &self.exec_settings,
+            &developer_instructions,
+        );
         let label = format!("codex {}", command_preview(&args));
         self.start_codex_subcommand(args, label);
     }
 
     fn handle_root_interactive_slash_command(&mut self, prompt: &str) {
-        let args = codex_root_interactive_args(prompt.trim(), &self.cwd, &self.exec_settings);
+        let developer_instructions = self.composed_developer_instructions();
+        let args = codex_root_interactive_args(
+            prompt.trim(),
+            &self.cwd,
+            &self.exec_settings,
+            &developer_instructions,
+        );
         let label = format!("codex {}", command_preview(&args));
         self.start_codex_subcommand(args, label);
     }
 
     fn handle_review_slash_command(&mut self, args: &str) {
-        let args = match codex_review_args(args, &self.cwd, &self.exec_settings) {
+        let developer_instructions = self.composed_developer_instructions();
+        let args = match codex_review_args(
+            args,
+            &self.cwd,
+            &self.exec_settings,
+            &developer_instructions,
+        ) {
             Ok(args) => args,
             Err(e) => {
                 self.push_log(CodexLogKind::Error, e.to_string());
@@ -7484,7 +8053,13 @@ impl CodexPane {
     }
 
     fn handle_exec_review_slash_command(&mut self, args: &str) {
-        let args = match codex_exec_review_args(args, &self.cwd, &self.exec_settings) {
+        let developer_instructions = self.composed_developer_instructions();
+        let args = match codex_exec_review_args(
+            args,
+            &self.cwd,
+            &self.exec_settings,
+            &developer_instructions,
+        ) {
             Ok(args) => args,
             Err(e) => {
                 self.push_log(CodexLogKind::Error, e.to_string());
@@ -7629,12 +8204,12 @@ impl CodexPane {
                 self.turn_finished_by_event = false;
                 self.pending_decision = None;
                 self.diff_view = None;
-                self.current_command = Some(label.clone());
-                self.current_command_started_at = Some(Instant::now());
+                self.clear_recent_actions();
+                self.record_current_command(RecentActionKind::Command, label.clone());
                 self.child_process_label = Some(label.clone());
                 self.child_process_output.clear();
                 self.child_process_error_output.clear();
-                self.action = Some(format!("{category}: {label}"));
+                self.set_work_action(format!("{category}: {label}"));
                 self.push_log(CodexLogKind::Tool, format!("RUNNING [{category}] {label}"));
                 self.scroll_to_live();
             }
@@ -7742,7 +8317,15 @@ impl CodexPane {
         } else {
             args.trim().to_string()
         };
-        let command = codex_exec_resume_args(None, true, include_all, &prompt, &self.exec_settings);
+        let developer_instructions = self.composed_developer_instructions();
+        let command = codex_exec_resume_args(
+            None,
+            true,
+            include_all,
+            &prompt,
+            &self.exec_settings,
+            &developer_instructions,
+        );
         let label = format!("codex {}", command_preview(&command));
         self.start_codex_subcommand(command, label);
     }
@@ -7767,12 +8350,14 @@ impl CodexPane {
         } else {
             prompt.trim().to_string()
         };
+        let developer_instructions = self.composed_developer_instructions();
         let command = codex_exec_resume_args(
             Some(&session),
             false,
             include_all,
             &prompt,
             &self.exec_settings,
+            &developer_instructions,
         );
         let label = format!("codex {}", command_preview(&command));
         self.start_codex_subcommand(command, label);
@@ -7784,6 +8369,7 @@ impl CodexPane {
         include_all: bool,
         include_non_interactive: bool,
     ) {
+        let developer_instructions = self.composed_developer_instructions();
         let command = codex_root_resume_args(
             None,
             true,
@@ -7792,6 +8378,7 @@ impl CodexPane {
             args.trim(),
             &self.cwd,
             &self.exec_settings,
+            &developer_instructions,
         );
         let label = format!("codex {}", command_preview(&command));
         self.start_codex_subcommand(command, label);
@@ -7808,6 +8395,7 @@ impl CodexPane {
         let Some(session) = self.resolve_session_ref(&session_ref) else {
             return;
         };
+        let developer_instructions = self.composed_developer_instructions();
         let command = codex_root_resume_args(
             Some(&session),
             false,
@@ -7816,17 +8404,20 @@ impl CodexPane {
             prompt.trim(),
             &self.cwd,
             &self.exec_settings,
+            &developer_instructions,
         );
         let label = format!("codex {}", command_preview(&command));
         self.start_codex_subcommand(command, label);
     }
 
     fn handle_root_session_command_slash_command(&mut self, command_name: &str, args: &str) {
+        let developer_instructions = self.composed_developer_instructions();
         let command = match codex_root_session_command_args(
             command_name,
             args,
             &self.cwd,
             &self.exec_settings,
+            &developer_instructions,
         ) {
             Ok(command) => command,
             Err(e) => {
@@ -7846,6 +8437,7 @@ impl CodexPane {
             );
             return;
         };
+        let developer_instructions = self.composed_developer_instructions();
         let command = codex_fork_args(
             Some(thread_id),
             false,
@@ -7853,6 +8445,7 @@ impl CodexPane {
             prompt.trim(),
             &self.cwd,
             &self.exec_settings,
+            &developer_instructions,
         );
         let label = format!("codex {}", command_preview(&command));
         self.start_codex_subcommand(command, label);
@@ -7863,6 +8456,7 @@ impl CodexPane {
             self.start_claude_resume(None, true, args);
             return;
         }
+        let developer_instructions = self.composed_developer_instructions();
         let command = codex_fork_args(
             None,
             true,
@@ -7870,6 +8464,7 @@ impl CodexPane {
             args.trim(),
             &self.cwd,
             &self.exec_settings,
+            &developer_instructions,
         );
         let label = format!("codex {}", command_preview(&command));
         self.start_codex_subcommand(command, label);
@@ -7890,6 +8485,7 @@ impl CodexPane {
         let Some(session) = self.resolve_session_ref(&session_ref) else {
             return;
         };
+        let developer_instructions = self.composed_developer_instructions();
         let command = codex_fork_args(
             Some(&session),
             false,
@@ -7897,6 +8493,7 @@ impl CodexPane {
             prompt.trim(),
             &self.cwd,
             &self.exec_settings,
+            &developer_instructions,
         );
         let label = format!("codex {}", command_preview(&command));
         self.start_codex_subcommand(command, label);
@@ -7977,7 +8574,7 @@ impl CodexPane {
                         session.title = title.to_string();
                     }
                 }
-                self.action = Some(format!("renamed: {title}"));
+                self.set_status_note(format!("renamed: {title}"));
                 self.push_log(
                     CodexLogKind::System,
                     format!("Codex セッション名を更新しました: {title}"),
@@ -8020,12 +8617,12 @@ impl CodexPane {
             "" => self.cycle_local_provider(),
             "config" | "clear" | "default" => {
                 self.exec_settings.local_provider = CodexLocalProviderChoice::Config;
-                self.action = Some("local provider: config".to_string());
+                self.set_status_note("local provider: config".to_string());
                 self.push_log(CodexLogKind::System, "次回ターンの local provider: config");
             }
             "lmstudio" | "lm-studio" => {
                 self.exec_settings.local_provider = CodexLocalProviderChoice::LmStudio;
-                self.action = Some("local provider: lmstudio".to_string());
+                self.set_status_note("local provider: lmstudio".to_string());
                 self.push_log(
                     CodexLogKind::System,
                     "次回ターンの local provider: lmstudio",
@@ -8033,7 +8630,7 @@ impl CodexPane {
             }
             "ollama" => {
                 self.exec_settings.local_provider = CodexLocalProviderChoice::Ollama;
-                self.action = Some("local provider: ollama".to_string());
+                self.set_status_note("local provider: ollama".to_string());
                 self.push_log(CodexLogKind::System, "次回ターンの local provider: ollama");
             }
             _ => self.push_log(
@@ -8056,7 +8653,7 @@ impl CodexPane {
             );
             return;
         };
-        self.action = Some(format!("color: {value}"));
+        self.set_status_note(format!("color: {value}"));
         self.push_log(CodexLogKind::System, format!("次回ターンの color: {value}"));
     }
 
@@ -8453,7 +9050,7 @@ impl CodexPane {
 
         if self.is_turn_running() {
             let count = self.queue_direct_prompt(prompt, display);
-            self.action = Some(format!("Addness記憶を予約 {count}件"));
+            self.set_work_action(format!("Addness記憶を予約 {count}件"));
             self.push_log(
                 CodexLogKind::System,
                 format!("Addness記憶を次のターンに予約しました（待ち{count}件）"),
@@ -8478,7 +9075,7 @@ impl CodexPane {
 
         if self.is_turn_running() {
             let count = self.queue_direct_prompt(prompt, display);
-            self.action = Some(format!("Addness引き継ぎ保存を予約 {count}件"));
+            self.set_work_action(format!("Addness引き継ぎ保存を予約 {count}件"));
             self.push_log(
                 CodexLogKind::System,
                 format!("Addness引き継ぎ保存を次のターンに予約しました（待ち{count}件）"),
@@ -8502,7 +9099,7 @@ impl CodexPane {
             }
         };
         self.cwd = path.display().to_string();
-        self.action = Some(format!("cwd: {}", compact_home_path(&path)));
+        self.set_status_note(format!("cwd: {}", compact_home_path(&path)));
         self.push_log(
             CodexLogKind::System,
             format!("次回ターンの cwd: {}", self.cwd),
@@ -8590,7 +9187,7 @@ impl CodexPane {
                 return;
             }
             self.claude_settings.add_dir(dir.to_string());
-            self.action = Some(format!("add-dir: {dir}"));
+            self.set_status_note(format!("add-dir: {dir}"));
             self.push_log(
                 CodexLogKind::System,
                 format!("次回ターンに --add-dir {dir} を渡します"),
@@ -8662,7 +9259,7 @@ impl CodexPane {
         self.exec_settings.sandbox = CodexSandboxChoice::WorkspaceWrite;
         self.exec_settings.approval = CodexApprovalChoice::OnRequest;
         self.exec_settings.bypass_approvals_and_sandbox = false;
-        self.action = Some("sandbox preset".to_string());
+        self.set_status_note("sandbox preset".to_string());
         self.push_log(
             CodexLogKind::System,
             "Default sandbox preset: sandbox=workspace-write approval=on-request",
@@ -8768,7 +9365,7 @@ impl CodexPane {
                 }
                 self.goal_mode.paused = true;
                 self.persist_goal_mode();
-                self.action = Some("継続ゴール: 一時停止".to_string());
+                self.set_status_note("継続ゴール: 一時停止".to_string());
                 self.push_activity("Goal mode を一時停止しました".to_string());
                 self.push_log(CodexLogKind::System, "Goal mode を一時停止しました");
             }
@@ -8779,14 +9376,14 @@ impl CodexPane {
                 }
                 self.goal_mode.paused = false;
                 self.persist_goal_mode();
-                self.action = Some("継続ゴール: 有効".to_string());
+                self.set_status_note("継続ゴール: 有効".to_string());
                 self.push_activity("Goal mode を再開しました".to_string());
                 self.push_log(CodexLogKind::System, "Goal mode を再開しました");
             }
             "clear" => {
                 self.goal_mode = CodexGoalMode::default();
                 self.persist_goal_mode();
-                self.action = Some("継続ゴール: 解除".to_string());
+                self.set_status_note("継続ゴール: 解除".to_string());
                 self.push_activity("Goal mode を解除しました".to_string());
                 self.push_log(CodexLogKind::System, "Goal mode を解除しました");
             }
@@ -8814,7 +9411,7 @@ impl CodexPane {
             paused: false,
         };
         self.persist_goal_mode();
-        self.action = Some("継続ゴール: 有効".to_string());
+        self.set_status_note("継続ゴール: 有効".to_string());
         self.push_activity("Goal mode を設定しました".to_string());
         self.push_log(CodexLogKind::System, format!("Goal mode: {objective}"));
     }
@@ -9343,24 +9940,24 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
         let remaining = self.queued_prompts.len();
         if let Some(active) = queued.active_work.clone() {
             self.active_work_package = Some(active.clone());
-            self.action = if remaining > 0 {
-                Some(format!(
+            if remaining > 0 {
+                self.set_work_action(format!(
                     "子ゴール着手 #{}: {} 残り{}件",
                     active.ordinal,
                     compact_one_line(&active.title, 80),
                     remaining
-                ))
+                ));
             } else {
-                Some(format!(
+                self.set_work_action(format!(
                     "子ゴール着手 #{}: {}",
                     active.ordinal,
                     compact_one_line(&active.title, 80)
-                ))
-            };
+                ));
+            }
         } else if remaining > 0 {
-            self.action = Some(format!("予約入力を実行中 残り{remaining}件"))
+            self.set_work_action(format!("予約入力を実行中 残り{remaining}件"));
         } else {
-            self.action = Some("予約入力を実行中".to_string())
+            self.set_work_action("予約入力を実行中".to_string());
         }
         self.push_log(CodexLogKind::System, "予約した入力を実行します");
         if queued.apply_goal_mode {
@@ -9375,10 +9972,16 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
 
     fn spawn_exec_process(&self, prompt: &str) -> Result<Child> {
         let mut cmd = Command::new(&self.codex_bin);
+        let developer_instructions = self.composed_developer_instructions();
         match self.kind {
             AgentKind::Codex => {
                 let exec_settings = self.exec_settings_for_spawn();
-                for arg in codex_exec_args(self.thread_id.as_deref(), &self.cwd, &exec_settings) {
+                for arg in codex_exec_args(
+                    self.thread_id.as_deref(),
+                    &self.cwd,
+                    &exec_settings,
+                    &developer_instructions,
+                ) {
                     cmd.arg(arg);
                 }
             }
@@ -9389,7 +9992,7 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
                     &self.claude_settings,
                     &self.claude_one_shot_allowed_tools,
                     self.claude_fork_next,
-                    addness_tui_developer_instructions(),
+                    &developer_instructions,
                 ) {
                     cmd.arg(arg);
                 }
@@ -9604,6 +10207,7 @@ Claude Code sessions:
   /fork-last [prompt], /fork-session <N|id> [prompt] - fork a session directly
 Claude Code options for next turn:
   /settings, /cd <dir>, /model [name|config], /reasoning|/effort [level]
+  /lang|/language [auto|ja|en|off] - エージェントの応答言語（既定 auto は LANG/LC_ALL から判定）
   /permissions|/approval [mode] - permission-mode: config/plan/acceptEdits/dontAsk/bypassPermissions/skip-permissions
   /add-dir <path|list|clear>
 TUI helpers:
@@ -9649,6 +10253,7 @@ Codex sessions:
   /archive <N|id>, /unarchive <N|id>, /delete <N|uuid>
 Codex options for next turn:
   /settings, /cd <dir>, /model [name|config], /reasoning [effort]
+  /lang|/language [auto|ja|en|off] - エージェントの応答言語（既定 auto は LANG/LC_ALL から判定）
   /permissions [approval <policy>|sandbox <mode>|bypass]
   /personality [friendly|pragmatic|clear], /statusline [items|colors on|off|clear]
   /theme [name|clear], /pets [name|hide|anchor <pos>|clear], /vim [on|off|clear], /raw [on|off|clear]
@@ -12300,6 +12905,7 @@ Addness DBの置き場所:
 - 構造化フィールドに置けない短い質問や補足: コメント
 
 CLI最小操作:
+- Addnessの読み書きは必ずAddness CLI（`"$ADDNESS_BIN"`）で行う。`mcp__addness__*` のMCPツールが見えても使わない（認証・接続先がTUIと一致する保証がないため）。
 - 読む: `"$ADDNESS_BIN" goal get "$ADDNESS_GOAL_ID" --json --with-deliverable --with-comment`
 - body更新: `"$ADDNESS_BIN" goal update "$ADDNESS_GOAL_ID" --body-file <file> --json`
 - DoD更新: `"$ADDNESS_BIN" goal update "$ADDNESS_GOAL_ID" --description-file <file> --json`
@@ -12324,6 +12930,70 @@ body の `## Codex作業メモ`、`## Codex決定ログ`、`## PR/Release Tracea
 
 共有:
 Addnessを読んだ/更新した場合は、対象(body/DoD/子ゴール/コメント/成果物)だけ短く共有してください。"#
+}
+
+/// 応答言語設定を解決した実効言語。`None` 相当（注入なし）は
+/// `resolve_agent_language` の戻り値 `Option` で表す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolvedAgentLanguage {
+    Japanese,
+    English,
+}
+
+/// `LANG`（無ければ `LC_ALL`）の現在値。空文字は未設定として扱う。
+/// auto 判定にのみ使う。テスト容易性のため env 読み取りはこの関数に閉じる。
+fn current_lang_env() -> Option<String> {
+    for key in ["LANG", "LC_ALL"] {
+        if let Ok(value) = std::env::var(key)
+            && !value.is_empty()
+        {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// 言語設定と `LANG`/`LC_ALL` 相当の値から、注入すべき実効言語を解決する。
+/// 環境変数を直接読まず引数で受け取るため、他テストと干渉せず検証できる。
+fn resolve_agent_language(
+    setting: AgentLanguage,
+    lang_env: Option<&str>,
+) -> Option<ResolvedAgentLanguage> {
+    match setting {
+        AgentLanguage::Off => None,
+        AgentLanguage::Ja => Some(ResolvedAgentLanguage::Japanese),
+        AgentLanguage::En => Some(ResolvedAgentLanguage::English),
+        AgentLanguage::Auto => match lang_env {
+            Some(value) if value.starts_with("ja") => Some(ResolvedAgentLanguage::Japanese),
+            Some(value) if value.starts_with("en") => Some(ResolvedAgentLanguage::English),
+            // 判定不能なら off と同じく注入しない。
+            _ => None,
+        },
+    }
+}
+
+/// 実効言語に対応する 1 行の応答言語指示。
+fn agent_language_instruction(language: ResolvedAgentLanguage) -> &'static str {
+    match language {
+        ResolvedAgentLanguage::Japanese => {
+            "ユーザーへの応答・説明は必ず日本語で書く。コード・識別子・技術用語は原文のままでよい。"
+        }
+        ResolvedAgentLanguage::English => {
+            "Always write your responses and explanations to the user in English. Code, identifiers, and technical terms may stay in their original form."
+        }
+    }
+}
+
+/// base 開発者指示に応答言語指示を合成する共通関数。
+/// 全バックエンド（Claude の `--append-system-prompt` / Codex の developerInstructions・
+/// ワンショット `-c`）の developer instructions 経路は必ずこの関数を通し、
+/// 言語指示の注入漏れを防ぐ。
+fn compose_developer_instructions(setting: AgentLanguage, lang_env: Option<&str>) -> String {
+    let base = addness_tui_developer_instructions();
+    match resolve_agent_language(setting, lang_env).map(agent_language_instruction) {
+        Some(line) => format!("{base}\n\n応答言語:\n{line}"),
+        None => base.to_string(),
+    }
 }
 
 /// DoD 自動判定で codex に強制する出力 JSON Schema。
@@ -12558,6 +13228,192 @@ mod tests {
                 .iter()
                 .any(|line| line.kind == CodexLogKind::Error && line.text.contains("boom"))
         );
+    }
+
+    #[test]
+    fn claude_task_tool_use_is_detected_as_running_subagent() {
+        let mut pane = claude_pane();
+        assert_eq!(pane.subagents_len(), 0);
+        assert_eq!(pane.subagent_running_count(), 0);
+
+        pane.handle_json_event(serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_sub1",
+                    "name": "Task",
+                    "input": {
+                        "description": "stream-json調査",
+                        "subagent_type": "Explore"
+                    }
+                }
+            ]}
+        }));
+
+        assert_eq!(pane.subagents_len(), 1);
+        assert_eq!(pane.subagent_running_count(), 1);
+        let lines = pane.subagent_status_lines(5);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("● stream-json調査"));
+    }
+
+    #[test]
+    fn claude_agent_tool_use_without_task_name_is_not_detected() {
+        // Bash / Write 等の通常ツールはサブエージェント扱いにならない。
+        let mut pane = claude_pane();
+        pane.handle_json_event(serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [
+                {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}}
+            ]}
+        }));
+        assert_eq!(pane.subagents_len(), 0);
+    }
+
+    #[test]
+    fn claude_subagent_transitions_to_completed_on_matching_tool_result() {
+        let mut pane = claude_pane();
+        pane.handle_json_event(serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_sub1",
+                    "name": "Task",
+                    "input": {"description": "調査タスク", "subagent_type": "Explore"}
+                }
+            ]}
+        }));
+        assert_eq!(pane.subagent_running_count(), 1);
+
+        pane.handle_json_event(serde_json::json!({
+            "type": "user",
+            "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu_sub1", "content": "完了しました", "is_error": false}
+            ]}
+        }));
+
+        assert_eq!(pane.subagent_running_count(), 0);
+        let lines = pane.subagent_status_lines(5);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("✔ 調査タスク"));
+    }
+
+    #[test]
+    fn claude_subagent_transitions_to_failed_on_error_tool_result() {
+        let mut pane = claude_pane();
+        pane.handle_json_event(serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_sub2",
+                    "name": "Agent",
+                    "input": {"description": "失敗するタスク"}
+                }
+            ]}
+        }));
+        pane.handle_json_event(serde_json::json!({
+            "type": "user",
+            "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu_sub2", "content": "boom", "is_error": true}
+            ]}
+        }));
+
+        assert_eq!(pane.subagent_running_count(), 0);
+        let lines = pane.subagent_status_lines(5);
+        assert!(lines[0].starts_with("✖ 失敗するタスク"));
+    }
+
+    #[test]
+    fn claude_subagent_tool_result_with_unrelated_id_does_not_resolve_running_entry() {
+        let mut pane = claude_pane();
+        pane.handle_json_event(serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_sub3",
+                    "name": "Task",
+                    "input": {"description": "実行中タスク"}
+                }
+            ]}
+        }));
+        pane.handle_json_event(serde_json::json!({
+            "type": "user",
+            "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu_other", "content": "ok", "is_error": false}
+            ]}
+        }));
+
+        // 無関係な tool_use_id では実行中のまま。
+        assert_eq!(pane.subagent_running_count(), 1);
+    }
+
+    #[test]
+    fn claude_subagent_history_survives_new_turn_start() {
+        // ターンをまたいでも実行中エントリは clear_recent_actions の対象外として保持される。
+        let mut pane = claude_pane();
+        pane.handle_json_event(serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [
+                {"type": "tool_use", "id": "toolu_sub4", "name": "Task", "input": {"description": "長期タスク"}}
+            ]}
+        }));
+        assert_eq!(pane.subagent_running_count(), 1);
+
+        pane.handle_json_event(serde_json::json!({
+            "type": "system", "subtype": "init", "session_id": "sid-2", "model": "opus"
+        }));
+
+        assert_eq!(pane.subagent_running_count(), 1);
+        assert_eq!(pane.subagents_len(), 1);
+    }
+
+    #[test]
+    fn claude_subagent_entries_are_capped_at_subagents_cap() {
+        let mut pane = claude_pane();
+        for i in 0..(SUBAGENTS_CAP + 3) {
+            pane.record_subagent_launch(
+                Some(format!("id-{i}")),
+                format!("task-{i}"),
+                Some("Explore".to_string()),
+            );
+        }
+        assert_eq!(pane.subagents_len(), SUBAGENTS_CAP);
+    }
+
+    #[test]
+    fn subagent_status_lines_prioritizes_running_and_limits_by_visible_count() {
+        let mut pane = claude_pane();
+        pane.record_subagent_launch(
+            Some("id-1".to_string()),
+            "完了済みタスクA".to_string(),
+            None,
+        );
+        pane.resolve_subagent_result(Some("id-1"), false);
+        pane.record_subagent_launch(Some("id-2".to_string()), "実行中タスクB".to_string(), None);
+        pane.record_subagent_launch(
+            Some("id-3".to_string()),
+            "完了済みタスクC".to_string(),
+            None,
+        );
+        pane.resolve_subagent_result(Some("id-3"), false);
+
+        // limit=0 は空。
+        assert!(pane.subagent_status_lines(0).is_empty());
+
+        // limit=1 では実行中を優先。
+        let lines = pane.subagent_status_lines(1);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("実行中タスクB"));
+
+        // limit=2 では実行中 + 直近の完了（新しい方=タスクC）。
+        let lines = pane.subagent_status_lines(2);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("実行中タスクB"));
+        assert!(lines[1].contains("完了済みタスクC"));
     }
 
     #[test]
@@ -12875,6 +13731,64 @@ mod tests {
                 .iter()
                 .any(|l| l.kind == CodexLogKind::Tool && l.text.contains("OK"))
         );
+    }
+
+    #[test]
+    fn codex_appserver_filechange_item_updates_current_activity() {
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        pane.turn_running = true;
+        // started で「今」表示（current_command / action）へ対象パスが載る。
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0", "method": "item/started",
+            "params": {"item": {"id": "fc_1", "type": "fileChange", "changes": [
+                {"path": "src/tui/ui.rs", "kind": {"type": "update"}}
+            ]}}
+        }));
+        assert_eq!(pane.current_command.as_deref(), Some("src/tui/ui.rs"));
+        assert!(pane.current_command_started_at.is_some());
+        assert_eq!(pane.work_action(), Some("ファイル変更: src/tui/ui.rs"));
+        assert!(
+            pane.log
+                .iter()
+                .any(|l| l.kind == CodexLogKind::Tool
+                    && l.text.contains("ファイル変更 src/tui/ui.rs"))
+        );
+        // completed でクリアし、確定行を残す。
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0", "method": "item/completed",
+            "params": {"item": {"id": "fc_1", "type": "fileChange", "status": "completed", "changes": [
+                {"path": "src/tui/ui.rs", "kind": {"type": "update"}}
+            ]}}
+        }));
+        assert!(pane.current_command.is_none());
+        assert!(pane.current_command_started_at.is_none());
+        assert!(
+            pane.log
+                .iter()
+                .any(|l| l.kind == CodexLogKind::Tool && l.text.contains("completed"))
+        );
+    }
+
+    #[test]
+    fn codex_appserver_filechange_multiple_paths_show_rest_count() {
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        pane.turn_running = true;
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0", "method": "item/started",
+            "params": {"item": {"id": "fc_2", "type": "fileChange", "changes": [
+                {"path": "a.rs", "kind": {"type": "update"}},
+                {"path": "b.rs", "kind": {"type": "add"}},
+                {"path": "c.rs", "kind": {"type": "update"}},
+                {"path": "d.rs", "kind": {"type": "delete"}}
+            ]}}
+        }));
+        let command = pane.current_command.as_deref().unwrap();
+        assert!(command.contains("a.rs"));
+        assert!(command.contains("ほか1件"));
     }
 
     #[test]
@@ -14251,7 +15165,7 @@ mod tests {
         assert!(pane.handle_decision_key(key(KeyCode::Char('l'))));
 
         assert!(pane.decision_banner().is_none());
-        assert_eq!(pane.action.as_deref(), Some("確認応答: これからずっと許可"));
+        assert_eq!(pane.work_action(), Some("確認応答: これからずっと許可"));
         assert_eq!(pane.exec_settings.approval, CodexApprovalChoice::Never);
         assert!(!pane.exec_settings.bypass_approvals_and_sandbox);
         assert!(
@@ -14271,12 +15185,12 @@ mod tests {
         let banner = pane.decision_banner().unwrap();
         assert_eq!(banner.kind, CodexDecisionKind::YesNo);
         assert_eq!(pane.run_state(), CodexRunState::Confirming);
-        assert_eq!(pane.action.as_deref(), Some("依頼を確認中"));
+        assert_eq!(pane.work_action(), Some("依頼を確認中"));
 
         assert!(pane.handle_decision_key(key(KeyCode::Char('y'))));
 
         assert!(pane.decision_banner().is_none());
-        assert_eq!(pane.action.as_deref(), Some("確認応答: Yes"));
+        assert_eq!(pane.work_action(), Some("確認応答: Yes"));
         assert!(
             pane.activity
                 .iter()
@@ -14295,7 +15209,7 @@ mod tests {
 
         let banner = pane.decision_banner().unwrap();
         assert_eq!(banner.kind, CodexDecisionKind::Permission);
-        assert_eq!(pane.action.as_deref(), Some("依頼を確認中"));
+        assert_eq!(pane.work_action(), Some("依頼を確認中"));
     }
 
     #[test]
@@ -14350,6 +15264,82 @@ mod tests {
     }
 
     #[test]
+    fn conversation_filter_mixes_in_live_tool_lines_while_turn_running() {
+        let mut pane = CodexPane::test_with_output(8, 40, 0, "");
+        pane.push_log(CodexLogKind::Turn, "Turn 1");
+        pane.push_log(CodexLogKind::User, "cargo test して");
+        pane.push_log(CodexLogKind::Tool, "old turn tool line");
+
+        // ターンが実行中でなければ、従来通り会話フィルタは Tool/Event を含まない。
+        let idle = pane
+            .filtered_log_lines()
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(!idle.contains(&"old turn tool line"));
+        assert_eq!(pane.log_filter_display_label(), "会話");
+
+        // ターン実行中は直近ターンの Tool/Event 行を会話フィルタでも混ぜて表示する。
+        pane.turn_running = true;
+        pane.push_log(CodexLogKind::Turn, "Turn 2");
+        pane.push_log(CodexLogKind::Assistant, "確認します");
+        pane.push_log(CodexLogKind::Tool, "exec_command_begin: cargo test");
+        pane.push_log(CodexLogKind::Event, "file changed: src/lib.rs");
+
+        let running = pane
+            .filtered_log_lines()
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(running.contains(&"exec_command_begin: cargo test"));
+        assert!(running.contains(&"file changed: src/lib.rs"));
+        // 完了済みの前ターンの Tool 行は引き続き隠れたまま。
+        assert!(!running.contains(&"old turn tool line"));
+        assert_eq!(pane.log_filter_display_label(), "会話+実行中");
+
+        // ターンが終われば従来の会話フィルタ挙動に戻る（ログは汚さない）。
+        pane.turn_running = false;
+        let finished = pane
+            .filtered_log_lines()
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(!finished.contains(&"exec_command_begin: cargo test"));
+        assert!(!finished.contains(&"file changed: src/lib.rs"));
+        assert_eq!(pane.log_filter_display_label(), "会話");
+    }
+
+    #[test]
+    fn live_tool_mixing_only_applies_to_conversation_filter() {
+        let mut pane = CodexPane::test_with_output(8, 40, 0, "");
+        pane.turn_running = true;
+        pane.push_log(CodexLogKind::Turn, "Turn 1");
+        pane.push_log(CodexLogKind::Tool, "exec_command_begin: ls");
+
+        // 実行フィルタでは元々 Tool 行が見えるため、混在ロジックは表示件数へ影響しない。
+        pane.cycle_log_filter();
+        assert_eq!(pane.log_filter, CodexLogFilter::Tools);
+        let tools = pane.filtered_log_lines();
+        assert!(
+            tools
+                .iter()
+                .any(|line| line.text == "exec_command_begin: ls")
+        );
+        assert_eq!(pane.log_filter_display_label(), "実行");
+
+        // 失敗フィルタは対象外（Tool行は依然として現れない）。
+        pane.cycle_log_filter();
+        assert_eq!(pane.log_filter, CodexLogFilter::Errors);
+        let errors = pane.filtered_log_lines();
+        assert!(
+            !errors
+                .iter()
+                .any(|line| line.text == "exec_command_begin: ls")
+        );
+        assert_eq!(pane.log_filter_display_label(), "失敗");
+    }
+
+    #[test]
     fn conversation_filter_hides_routine_system_noise() {
         let mut pane = CodexPane::test_with_output(8, 40, 0, "");
         pane.push_log(CodexLogKind::System, "Codex セッションを開始しました");
@@ -14398,6 +15388,57 @@ mod tests {
         assert_eq!(first.title, "Codex 確認待ち");
         assert!(first.message.contains("yes/no"));
         assert_eq!(second.title, "Codex 完了");
+    }
+
+    #[test]
+    fn confirming_reminder_is_not_sent_before_interval_elapses() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.handle_stdout_line(r#"{"type":"approval_requested","message":"Run command? yes/no"}"#);
+        // 初回の通知（set_pending_decision 時点）を消費しておく。
+        pane.take_terminal_notice();
+
+        // まだリマインド間隔（5分）が経っていないので追加通知は来ない。
+        pane.remind_confirming_if_stale();
+        assert!(pane.take_terminal_notice().is_none());
+    }
+
+    #[test]
+    fn confirming_reminder_repeats_while_still_pending() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.handle_stdout_line(r#"{"type":"approval_requested","message":"Run command? yes/no"}"#);
+        pane.take_terminal_notice();
+
+        // リマインド間隔が経過した状態を作る（実時間を待たずにテストするための時刻巻き戻し）。
+        pane.last_confirming_reminder_at = Some(Instant::now() - Duration::from_secs(5 * 60 + 1));
+        pane.remind_confirming_if_stale();
+
+        let reminder = pane
+            .take_terminal_notice()
+            .expect("承認待ちが続いていればリマインド通知が来るはず");
+        assert!(reminder.title.contains("承認待ち継続中"));
+        assert!(reminder.message.contains("yes/no"));
+
+        // 直後にもう一度呼んでも、間隔内なので再送されない。
+        pane.remind_confirming_if_stale();
+        assert!(pane.take_terminal_notice().is_none());
+    }
+
+    #[test]
+    fn confirming_reminder_stops_once_decision_resolved() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.handle_stdout_line(r#"{"type":"approval_requested","message":"Run command? yes/no"}"#);
+        pane.take_terminal_notice();
+
+        pane.resolve_pending_decision(
+            pane.pending_decision.clone().unwrap(),
+            CodexDecisionResponse::Accept,
+            false,
+        );
+        pane.take_terminal_notice(); // 応答時の通知を消費
+
+        pane.last_confirming_reminder_at = Some(Instant::now() - Duration::from_secs(5 * 60 + 1));
+        pane.remind_confirming_if_stale();
+        assert!(pane.take_terminal_notice().is_none());
     }
 
     #[test]
@@ -14626,7 +15667,7 @@ mod tests {
             r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"\\\"$ADDNESS_BIN\\\" goal get goal-1 --json\",\"workdir\":\"/repo\"}"}}"#,
         );
 
-        assert_eq!(pane.action.as_deref(), Some("ゴール文脈を読込中"));
+        assert_eq!(pane.work_action(), Some("ゴール文脈を読込中"));
         assert!(pane.last_addness_read_at.is_some());
     }
 
@@ -14722,6 +15763,149 @@ mod tests {
         pane.handle_stdout_line(r#"{"type":"turn.completed"}"#);
 
         assert_eq!(pane.current_command(), None);
+    }
+
+    #[test]
+    fn begin_turn_work_resets_previous_work_action() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.set_work_action("ツール実行: Bash");
+
+        pane.begin_turn_work("依頼を確認中");
+
+        assert_eq!(pane.work_action(), Some("依頼を確認中"));
+    }
+
+    #[test]
+    fn end_turn_work_resets_accumulated_work_action() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.begin_turn_work("依頼を確認中");
+        pane.set_work_action("ツール実行: Bash");
+
+        pane.end_turn_work("応答完了");
+
+        assert_eq!(pane.work_action(), Some("応答完了"));
+    }
+
+    #[test]
+    fn status_note_and_work_action_are_independent() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+
+        pane.set_status_note("model: gpt-5");
+        assert_eq!(pane.status_note(), Some("model: gpt-5"));
+        assert_eq!(pane.work_action(), None);
+
+        pane.begin_turn_work("依頼を確認中");
+        pane.set_work_action("ツール実行: Bash");
+        assert_eq!(pane.status_note(), Some("model: gpt-5"));
+
+        pane.end_turn_work("応答完了");
+        assert_eq!(pane.status_note(), Some("model: gpt-5"));
+        assert_eq!(pane.work_action(), Some("応答完了"));
+
+        pane.set_status_note("effort: high");
+        assert_eq!(pane.work_action(), Some("応答完了"));
+        assert_eq!(pane.status_note(), Some("effort: high"));
+    }
+
+    #[test]
+    fn turn_started_event_resets_work_action_via_begin_turn_work() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.set_work_action("前ターンの残骸");
+
+        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
+        assert_eq!(pane.work_action(), Some("依頼を確認中"));
+
+        pane.handle_stdout_line(r#"{"type":"turn.completed"}"#);
+        assert_eq!(pane.work_action(), Some("応答完了"));
+    }
+
+    #[test]
+    fn record_current_command_pushes_recent_action_breadcrumb() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        assert_eq!(pane.recent_actions_len(), 0);
+
+        pane.record_current_command(RecentActionKind::Command, "cargo test".to_string());
+
+        assert_eq!(pane.current_command(), Some("cargo test"));
+        assert_eq!(pane.recent_actions_len(), 1);
+        let breadcrumbs = pane.recent_action_breadcrumbs();
+        assert_eq!(breadcrumbs, vec!["▶ cargo test #1".to_string()]);
+    }
+
+    #[test]
+    fn recent_action_breadcrumbs_keep_oldest_to_newest_order_with_turn_seq() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+
+        pane.record_current_command(RecentActionKind::Command, "cargo test".to_string());
+        pane.record_current_command(RecentActionKind::Mcp, "addness.get_goal".to_string());
+        pane.record_current_command(RecentActionKind::FileChange, "src/main.rs".to_string());
+
+        let breadcrumbs = pane.recent_action_breadcrumbs();
+        assert_eq!(
+            breadcrumbs,
+            vec![
+                "▶ cargo test #1".to_string(),
+                "◆ addness.get_goal #2".to_string(),
+                "✎ src/main.rs #3".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn recent_actions_buffer_is_capped_at_recent_actions_cap() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+
+        for i in 0..(RECENT_ACTIONS_CAP + 2) {
+            pane.record_current_command(RecentActionKind::Tool, format!("action-{i}"));
+        }
+
+        assert_eq!(pane.recent_actions_len(), RECENT_ACTIONS_CAP);
+        let breadcrumbs = pane.recent_action_breadcrumbs();
+        assert_eq!(breadcrumbs.len(), RECENT_ACTIONS_CAP);
+        // 古い順で保持されるので、末尾の要素が直近の action-(N-1) になる。
+        assert!(
+            breadcrumbs
+                .last()
+                .unwrap()
+                .contains(&format!("action-{}", RECENT_ACTIONS_CAP + 1))
+        );
+        // 先頭 2 件は溢れて消えている（action-0, action-1 は含まれない）。
+        assert!(!breadcrumbs.iter().any(|b| b.contains("action-0 ")));
+        assert!(!breadcrumbs.iter().any(|b| b.contains("action-1 ")));
+    }
+
+    #[test]
+    fn clear_recent_actions_resets_buffer_and_sequence() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.record_current_command(RecentActionKind::Command, "cargo test".to_string());
+        pane.record_current_command(RecentActionKind::Command, "cargo build".to_string());
+        assert_eq!(pane.recent_actions_len(), 2);
+
+        pane.clear_recent_actions();
+        assert_eq!(pane.recent_actions_len(), 0);
+        assert!(pane.recent_action_breadcrumbs().is_empty());
+
+        // クリア後に積み直すと通し番号は 1 から振り直される。
+        pane.record_current_command(RecentActionKind::Command, "cargo fmt".to_string());
+        assert_eq!(
+            pane.recent_action_breadcrumbs(),
+            vec!["▶ cargo fmt #1".to_string()]
+        );
+    }
+
+    #[test]
+    fn turn_started_clears_recent_action_history() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.handle_stdout_line(
+            r#"{"type":"exec_command_begin","parsed_cmd":"cargo check","codex_cwd":"/repo"}"#,
+        );
+        assert_eq!(pane.recent_actions_len(), 1);
+
+        // 新しいターンが始まると、前ターンのパンくずは残さずクリアする。
+        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
+
+        assert_eq!(pane.recent_actions_len(), 0);
+        assert!(pane.recent_action_breadcrumbs().is_empty());
     }
 
     #[test]
@@ -14927,6 +16111,101 @@ mod tests {
         assert!(instructions.contains("body=入力情報/ブランチ/次の手"));
         assert!(instructions.contains("goal update <CHILD_GOAL_ID> --body-file"));
         assert!(instructions.contains("子ゴールは毎ターン機械的に作らない"));
+    }
+
+    #[test]
+    fn resolve_agent_language_auto_uses_lang_env_prefix() {
+        assert_eq!(
+            resolve_agent_language(AgentLanguage::Auto, Some("ja_JP.UTF-8")),
+            Some(ResolvedAgentLanguage::Japanese)
+        );
+        assert_eq!(
+            resolve_agent_language(AgentLanguage::Auto, Some("en_US.UTF-8")),
+            Some(ResolvedAgentLanguage::English)
+        );
+        // 判定不能・未設定は off と同じく注入しない。
+        assert_eq!(resolve_agent_language(AgentLanguage::Auto, Some("C")), None);
+        assert_eq!(resolve_agent_language(AgentLanguage::Auto, None), None);
+    }
+
+    #[test]
+    fn resolve_agent_language_explicit_ignores_env() {
+        assert_eq!(
+            resolve_agent_language(AgentLanguage::Ja, Some("en_US.UTF-8")),
+            Some(ResolvedAgentLanguage::Japanese)
+        );
+        assert_eq!(
+            resolve_agent_language(AgentLanguage::En, Some("ja_JP.UTF-8")),
+            Some(ResolvedAgentLanguage::English)
+        );
+        assert_eq!(
+            resolve_agent_language(AgentLanguage::Off, Some("ja_JP.UTF-8")),
+            None
+        );
+    }
+
+    #[test]
+    fn compose_developer_instructions_injects_language_line() {
+        let base = addness_tui_developer_instructions();
+
+        let ja = compose_developer_instructions(AgentLanguage::Ja, None);
+        assert!(ja.starts_with(base));
+        assert!(ja.contains("ユーザーへの応答・説明は必ず日本語で書く"));
+
+        let en = compose_developer_instructions(AgentLanguage::En, None);
+        assert!(en.contains("Always write your responses and explanations to the user in English"));
+
+        // auto + ja 環境は日本語指示、auto + 判定不能 は注入なし（base と一致）。
+        let auto_ja = compose_developer_instructions(AgentLanguage::Auto, Some("ja_JP.UTF-8"));
+        assert!(auto_ja.contains("必ず日本語で書く"));
+        let auto_unknown = compose_developer_instructions(AgentLanguage::Auto, Some("C"));
+        assert_eq!(auto_unknown, base);
+    }
+
+    #[test]
+    fn compose_developer_instructions_off_omits_language_line() {
+        let base = addness_tui_developer_instructions();
+        let off = compose_developer_instructions(AgentLanguage::Off, Some("ja_JP.UTF-8"));
+        assert_eq!(off, base);
+        assert!(!off.contains("応答言語:"));
+    }
+
+    #[test]
+    fn lang_slash_command_without_args_opens_picker_with_current_marker() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        assert!(pane.list_picker().is_none());
+
+        assert!(pane.handle_local_slash_command("/lang"));
+        let picker = pane.list_picker().expect("picker opened");
+        assert_eq!(picker.action, CodexListPickerAction::SetLanguage);
+        let values = picker
+            .items
+            .iter()
+            .map(|item| item.value.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec!["auto", "ja", "en", "off"]);
+        // 既定は auto なので auto のみ current。
+        assert!(picker.items[0].current);
+        assert!(picker.items.iter().skip(1).all(|item| !item.current));
+    }
+
+    #[test]
+    fn lang_alias_language_is_dispatched() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        assert!(pane.handle_local_slash_command("/language"));
+        assert_eq!(
+            pane.list_picker().map(|picker| picker.action),
+            Some(CodexListPickerAction::SetLanguage)
+        );
+    }
+
+    #[test]
+    fn agent_language_parse_maps_slash_argument() {
+        assert_eq!(AgentLanguage::parse("ja"), Some(AgentLanguage::Ja));
+        assert_eq!(AgentLanguage::parse("en"), Some(AgentLanguage::En));
+        assert_eq!(AgentLanguage::parse("auto"), Some(AgentLanguage::Auto));
+        assert_eq!(AgentLanguage::parse("off"), Some(AgentLanguage::Off));
+        assert_eq!(AgentLanguage::parse("bogus"), None);
     }
 
     #[test]
@@ -15340,7 +16619,7 @@ mod tests {
 
         assert_eq!(pane.turn_count(), 0);
         assert_eq!(pane.queued_prompts.len(), 1);
-        assert_eq!(pane.action.as_deref(), Some("作業分解を予約 1件"));
+        assert_eq!(pane.work_action(), Some("作業分解を予約 1件"));
         let queued = pane.queued_prompts.front().unwrap();
         assert!(!queued.apply_goal_mode);
         assert!(
@@ -15384,7 +16663,7 @@ mod tests {
         submit_line(&mut pane, "/work");
 
         assert_eq!(pane.turn_count(), 0);
-        assert_eq!(pane.action.as_deref(), Some("子ゴール一覧を表示"));
+        assert_eq!(pane.work_action(), Some("子ゴール一覧を表示"));
         assert!(pane.log.iter().any(|line| {
             line.kind == CodexLogKind::System
                 && line.text.contains("1. [~] 承認UIを整理")
@@ -15422,7 +16701,7 @@ mod tests {
 
         assert_eq!(pane.turn_count(), 0);
         assert_eq!(pane.queued_prompts.len(), 1);
-        assert_eq!(pane.action.as_deref(), Some("子ゴール着手を予約 1件"));
+        assert_eq!(pane.work_action(), Some("子ゴール着手を予約 1件"));
         assert_eq!(
             pane.active_work_package_label().as_deref(),
             Some("#2 子ゴール着手導線")
@@ -15487,7 +16766,7 @@ mod tests {
 
         assert_eq!(pane.turn_count(), 0);
         assert_eq!(pane.queued_prompts.len(), 2);
-        assert_eq!(pane.action.as_deref(), Some("子ゴール一括着手を予約 2件"));
+        assert_eq!(pane.work_action(), Some("子ゴール一括着手を予約 2件"));
         assert_eq!(
             pane.queued_work_package_label().as_deref(),
             Some("待機2件: #2 承認UI / #3 ログ要約")
@@ -15823,7 +17102,12 @@ mod tests {
             line.kind == CodexLogKind::System && line.text.contains("新しい Codex セッション")
         }));
 
-        let args = codex_exec_args(pane.thread_id.as_deref(), &pane.cwd, &pane.exec_settings);
+        let args = codex_exec_args(
+            pane.thread_id.as_deref(),
+            &pane.cwd,
+            &pane.exec_settings,
+            "DEV",
+        );
         assert!(args.windows(2).any(|pair| pair == ["exec", "--json"]));
         assert!(!args.contains(&"resume".to_string()));
     }
@@ -15927,7 +17211,7 @@ mod tests {
         assert!(label.contains("approval:never"));
         assert!(label.contains("sandbox:read-only"));
 
-        let args = codex_exec_args(None, "/repo", &pane.exec_settings);
+        let args = codex_exec_args(None, "/repo", &pane.exec_settings, "DEV");
         assert!(args.windows(2).any(|pair| pair == ["-m", "gpt-custom"]));
         assert!(args.windows(2).any(|pair| pair == ["-a", "never"]));
         assert!(args.windows(2).any(|pair| pair == ["-s", "read-only"]));
@@ -16027,7 +17311,7 @@ mod tests {
 
         let expected = nested.canonicalize().unwrap();
         assert_eq!(Path::new(&pane.cwd), expected.as_path());
-        let args = codex_exec_args(None, &pane.cwd, &pane.exec_settings);
+        let args = codex_exec_args(None, &pane.cwd, &pane.exec_settings, "DEV");
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["-C", expected.to_string_lossy().as_ref()])

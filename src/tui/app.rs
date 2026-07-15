@@ -959,6 +959,7 @@ pub struct App {
     pub(super) codex_status_area: Option<Rect>,
     pub(super) codex_contract_area: Option<Rect>,
     pub(super) codex_activity_area: Option<Rect>,
+    pub(super) codex_status_scroll: usize,
     pub(super) codex_contract_scroll: usize,
     pub(super) codex_activity_scroll: usize,
     pub(super) codex_last_scroll_input: Option<String>,
@@ -1032,6 +1033,7 @@ impl App {
             codex_status_area: None,
             codex_contract_area: None,
             codex_activity_area: None,
+            codex_status_scroll: 0,
             codex_contract_scroll: 0,
             codex_activity_scroll: 0,
             codex_last_scroll_input: None,
@@ -1706,6 +1708,7 @@ impl App {
                 self.codex_status_area = None;
                 self.codex_contract_area = None;
                 self.codex_activity_area = None;
+                self.codex_status_scroll = 0;
                 self.codex_contract_scroll = 0;
                 self.codex_activity_scroll = 0;
                 self.codex_last_scroll_input = None;
@@ -2105,6 +2108,7 @@ impl App {
         self.codex_status_area = None;
         self.codex_contract_area = None;
         self.codex_activity_area = None;
+        self.codex_status_scroll = 0;
         self.codex_contract_scroll = 0;
         self.codex_activity_scroll = 0;
         self.codex_last_scroll_input = None;
@@ -3034,9 +3038,17 @@ impl App {
             return;
         }
 
-        if Self::point_in_area(self.codex_status_area, mouse.column, mouse.row)
-            || Self::point_in_area(self.codex_contract_area, mouse.column, mouse.row)
-        {
+        if Self::point_in_area(self.codex_status_area, mouse.column, mouse.row) {
+            Self::scroll_document_offset(&mut self.codex_status_scroll, delta);
+            let batch = Self::mouse_scroll_batch_label(event_count);
+            self.codex_last_scroll_input = Some(format!(
+                "mouse {:?}{batch} -> 作業ダッシュボード",
+                mouse.kind
+            ));
+            return;
+        }
+
+        if Self::point_in_area(self.codex_contract_area, mouse.column, mouse.row) {
             Self::scroll_document_offset(&mut self.codex_contract_scroll, delta);
             let batch = Self::mouse_scroll_batch_label(event_count);
             self.codex_last_scroll_input =
@@ -6159,15 +6171,20 @@ mod codex_mouse_tests {
 
         app.handle_codex_mouse_scroll(
             MouseEvent {
-                kind: MouseEventKind::ScrollUp,
+                kind: MouseEventKind::ScrollDown,
                 column: 2,
                 row: 2,
                 modifiers: KeyModifiers::NONE,
             },
-            CODEX_WHEEL_LINES,
+            -CODEX_WHEEL_LINES,
             1,
         );
-        assert_eq!(app.codex_contract_scroll, 0);
+        assert_eq!(app.codex_status_scroll, CODEX_WHEEL_LINES as usize);
+        assert_eq!(app.codex_contract_scroll, CODEX_WHEEL_LINES as usize);
+        assert_eq!(
+            app.codex_last_scroll_input.as_deref(),
+            Some("mouse ScrollDown -> 作業ダッシュボード")
+        );
     }
 
     #[test]

@@ -48,6 +48,7 @@ pub const CODEX_LOG_PREFIX_WIDTH: usize = 7;
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/goal", "Goal モードを開始 / 更新"),
     ("/work", "子ゴールの作業単位へ進む"),
+    ("/dual", "Codex + Claude Code の実装/レビュー分担"),
     ("/organize", "子ゴールに分解する"),
     ("/remember", "メモを Addness の body へ保存"),
     ("/handoff", "会話コンテキストを Addness へ保存"),
@@ -216,6 +217,13 @@ impl AgentKind {
         match self {
             AgentKind::Codex => CODEX_SESSION_HISTORY_DIR,
             AgentKind::ClaudeCode => CLAUDE_SESSION_HISTORY_DIR,
+        }
+    }
+
+    fn counterpart(self) -> AgentKind {
+        match self {
+            AgentKind::Codex => AgentKind::ClaudeCode,
+            AgentKind::ClaudeCode => AgentKind::Codex,
         }
     }
 }
@@ -7575,6 +7583,10 @@ impl CodexPane {
                 self.handle_child_work_slash_command(args);
                 true
             }
+            "dual" | "pair" | "pair-agent" | "pair-agents" => {
+                self.handle_dual_agent_slash_command(args);
+                true
+            }
             "model" => {
                 if args.is_empty() {
                     self.open_model_picker();
@@ -8047,6 +8059,28 @@ impl CodexPane {
         }
 
         self.start_next_queued_turn_if_idle();
+    }
+
+    fn handle_dual_agent_slash_command(&mut self, args: &str) {
+        let args = normalize_submitted_line(args);
+        let (mode, task) = dual_agent_mode_and_task(&args);
+        let prompt = dual_agent_prompt(self, mode, task);
+        let display = dual_agent_display_prompt(self.kind, mode, task);
+        self.input_state.record_submitted(&display);
+        self.push_log(CodexLogKind::User, display.clone());
+
+        if self.is_turn_running() {
+            let count = self.queue_direct_prompt(prompt, display);
+            self.set_work_action(format!("Dual Agentを予約 {count}件"));
+            self.push_log(
+                CodexLogKind::System,
+                format!("Dual Agentターンを予約しました（待ち{count}件）"),
+            );
+            return;
+        }
+
+        self.set_work_action(dual_agent_action_label(self.kind, mode));
+        self.start_turn_with_display_prompt(&prompt, &display);
     }
 
     fn child_goal_work_parts(
@@ -10316,6 +10350,7 @@ TUI helpers:
   /goal <目標>, /goal pause, /goal resume, /goal clear
   /organize|/team [task] - Addness子ゴールへ分解し、最初の実装単位へ進む
   /work [next|all|N|id|title] - 子ゴールを実装ワークパッケージとして着手/キュー化
+  /dual|/pair [review|fix] [task] - Codex/Claude Codeの実装・レビュー分担プロンプトを開始
   /remember|/memo <内容> - Addness bodyの作業メモへ保存
   /handoff [メモ] - 現在の会話をAddness bodyへ再開用に保存
   /diff, /history, /turn [picker|N|all|old|close N|toggle N], /rollout, /debug-config, /ps, /stop [all], /btw
@@ -10372,6 +10407,7 @@ TUI helpers:
   /goal <目標>, /goal pause, /goal resume, /goal clear
   /organize|/team [task] - Addness子ゴールへ分解し、最初の実装単位へ進む
   /work [next|all|N|id|title] - 子ゴールを実装ワークパッケージとして着手/キュー化
+  /dual|/pair [review|fix] [task] - Codex/Claude Codeの実装・レビュー分担プロンプトを開始
   /remember|/memo <内容> - Addness bodyのCodex作業メモへ保存
   /handoff [メモ] - 現在の会話をAddness bodyへ再開用に保存
   /diff, /history, /turn [picker|N|all|old|close N|toggle N], /rollout, /debug-config, /ps, /stop [all], /btw
@@ -12396,6 +12432,113 @@ fn child_goal_index_for_selector(children: &[ChildGoal], selector: &str) -> Resu
             "子ゴール `{selector}` は複数候補に一致します。番号で指定してください"
         )),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DualAgentMode {
+    Implement,
+    Review,
+    Fix,
+}
+
+fn dual_agent_mode_and_task(args: &str) -> (DualAgentMode, &str) {
+    let args = args.trim();
+    let mut parts = args.splitn(2, char::is_whitespace);
+    let first = parts.next().unwrap_or_default();
+    let rest = parts.next().unwrap_or_default().trim();
+    match first.to_ascii_lowercase().as_str() {
+        "implement" | "impl" | "start" | "pair" => (DualAgentMode::Implement, rest),
+        "review" | "rev" => (DualAgentMode::Review, rest),
+        "fix" | "repair" | "apply" => (DualAgentMode::Fix, rest),
+        _ => (DualAgentMode::Implement, args),
+    }
+}
+
+fn dual_agent_role_summary(kind: AgentKind, mode: DualAgentMode) -> String {
+    let current = kind.display_name();
+    let other = kind.counterpart().display_name();
+    match mode {
+        DualAgentMode::Implement => format!("{current}実装 + {other}レビュー"),
+        DualAgentMode::Review => format!("{current}レビュー + {other}実装"),
+        DualAgentMode::Fix => format!("{current}修正 + {other}再レビュー"),
+    }
+}
+
+fn dual_agent_display_prompt(kind: AgentKind, mode: DualAgentMode, task: &str) -> String {
+    let role = dual_agent_role_summary(kind, mode);
+    if task.trim().is_empty() {
+        format!("Dual Agent: {role}")
+    } else {
+        format!("Dual Agent: {role}: {}", compact_one_line(task, 120))
+    }
+}
+
+fn dual_agent_action_label(kind: AgentKind, mode: DualAgentMode) -> String {
+    format!("Dual Agent: {}", dual_agent_role_summary(kind, mode))
+}
+
+fn dual_agent_mode_instructions(mode: DualAgentMode) -> &'static str {
+    match mode {
+        DualAgentMode::Implement => {
+            "あなたは実装担当です。リポジトリを読み、既存パターンに沿って必要な変更を実装し、可能な範囲で検証してください。最後に `レビュー依頼` セクションを作り、相手バックエンドへ渡すべき差分要約、確認してほしい観点、実行済みチェック、未確認リスクを日本語でまとめてください。"
+        }
+        DualAgentMode::Review => {
+            "あなたはレビュー担当です。差分、テスト結果、設計上の前提を確認し、コードレビューの姿勢で findings first にしてください。重大度順にファイル/行参照つきで指摘し、問題がなければその旨と残リスクを短く述べてください。最後に `実装側への修正依頼` セクションを作ってください。"
+        }
+        DualAgentMode::Fix => {
+            "あなたはレビュー指摘の修正担当です。指摘内容を再現できる形で整理し、必要なコード変更と検証を行ってください。最後に `再レビュー依頼` セクションを作り、相手バックエンドへ重点確認ポイントを渡してください。"
+        }
+    }
+}
+
+fn dual_agent_prompt(pane: &CodexPane, mode: DualAgentMode, task: &str) -> String {
+    let current = pane.kind.display_name();
+    let other = pane.kind.counterpart().display_name();
+    let task = task.trim();
+    let task = if task.is_empty() {
+        "現在のユーザー依頼、Addnessゴール、未完了の子ゴール、作業ツリーの状態から次に進めるべき作業"
+    } else {
+        task
+    };
+    let instructions = dual_agent_mode_instructions(mode);
+    let children = addness_child_goal_context(&pane.children);
+    format!(
+        r#"Dual Agentモードで進めてください。
+
+このターンの役割:
+- 現在のバックエンド: {current}
+- 組み合わせる相手: {other}
+- 分担: {role}
+- 対象作業: {task}
+
+対象Addnessゴール:
+- id: {goal_id}
+- title: {goal_title}
+- status: {goal_status}
+- DoD:
+{goal_dod}
+
+子ゴール:
+{children}
+
+進め方:
+1. {instructions}
+2. 相手バックエンドが後続ターンで使えるように、結論だけでなく根拠・変更ファイル・検証結果を明示する。
+3. 同じ作業ツリーで相手も動く前提なので、未コミット差分や危険な操作は必ず明示する。
+4. Addnessへの通常進捗保存はTUIの自動記録に任せ、長期的な決定・PR・リリースだけ構造化して残す。
+5. ユーザーへの報告、レビュー指摘、相手への依頼文は日本語で書く。
+"#,
+        current = current,
+        other = other,
+        role = dual_agent_role_summary(pane.kind, mode),
+        task = task,
+        goal_id = pane.goal_id,
+        goal_title = pane.goal_title,
+        goal_status = pane.status_label,
+        goal_dod = pane.dod,
+        children = children,
+        instructions = instructions,
+    )
 }
 
 fn addness_child_goal_work_prompt(pane: &CodexPane, ordinal: usize, child: &ChildGoal) -> String {
@@ -17030,6 +17173,59 @@ mod tests {
             line.kind == CodexLogKind::System
                 && line.text.contains("未完了子ゴール 2件をワークキューに追加")
         }));
+    }
+
+    #[test]
+    fn dual_slash_queues_codex_implementation_and_claude_review_prompt_when_running() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.finished = false;
+        pane.turn_running = true;
+        pane.update_children(vec![ChildGoalUpdate {
+            id: "child-dual".to_string(),
+            title: "Dual Agent導線".to_string(),
+            description: Some("CodexとClaude Codeの役割が見える".to_string()),
+            icon: "[ ]",
+            status_label: "未着手".to_string(),
+            is_completed: false,
+        }]);
+
+        submit_line(&mut pane, "/dual TUIの回帰修正");
+
+        assert_eq!(pane.turn_count(), 0);
+        assert_eq!(pane.queued_prompts.len(), 1);
+        assert_eq!(pane.work_action(), Some("Dual Agentを予約 1件"));
+        let queued = pane.queued_prompts.front().unwrap();
+        assert!(
+            queued
+                .display_prompt
+                .contains("Dual Agent: Codex実装 + Claude Codeレビュー")
+        );
+        assert!(queued.display_prompt.contains("TUIの回帰修正"));
+        assert!(queued.submitted.contains("現在のバックエンド: Codex"));
+        assert!(queued.submitted.contains("組み合わせる相手: Claude Code"));
+        assert!(queued.submitted.contains("レビュー依頼"));
+        assert!(queued.submitted.contains("Dual Agent導線"));
+    }
+
+    #[test]
+    fn dual_review_slash_uses_current_claude_as_reviewer() {
+        let mut pane = claude_pane();
+        pane.finished = false;
+        pane.turn_running = true;
+
+        submit_line(&mut pane, "/dual review PR #123");
+
+        assert_eq!(pane.queued_prompts.len(), 1);
+        let queued = pane.queued_prompts.front().unwrap();
+        assert!(
+            queued
+                .display_prompt
+                .contains("Dual Agent: Claude Codeレビュー + Codex実装")
+        );
+        assert!(queued.submitted.contains("現在のバックエンド: Claude Code"));
+        assert!(queued.submitted.contains("組み合わせる相手: Codex"));
+        assert!(queued.submitted.contains("あなたはレビュー担当です"));
+        assert!(queued.submitted.contains("findings first"));
     }
 
     #[test]

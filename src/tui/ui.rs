@@ -107,6 +107,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         app.codex_status_area = None;
         app.codex_contract_area = None;
         app.codex_activity_area = None;
+        app.codex_status_scroll = 0;
         let content_layout = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(24), Constraint::Min(0)])
@@ -2624,7 +2625,7 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
         app.codex_contract_area = Some(panes[1]);
         app.codex_activity_area = Some(panes[2]);
 
-        draw_codex_status_panel(frame, panes[0], pane);
+        draw_codex_status_panel(frame, panes[0], pane, &mut app.codex_status_scroll);
 
         let mut lines: Vec<Line> = Vec::new();
 
@@ -2701,6 +2702,32 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
         }
         lines.push(Line::from(""));
 
+        // 子ゴールは作業分解の入口なので、DoD/PRより前に出して初期表示から見えるようにする。
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "── 子ゴール ({}) ・ コメント {} ──",
+                pane.child_count.unwrap_or(0),
+                pane.comment_count.unwrap_or(0)
+            ),
+            Style::default().fg(COLOR_MUTED),
+        )));
+        if pane.children.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "（まだありません）",
+                Style::default().fg(COLOR_MUTED),
+            )));
+        } else {
+            for (idx, child) in pane.children.iter().enumerate() {
+                lines.extend(codex_child_goal_lines(
+                    child,
+                    now,
+                    idx + 1,
+                    pane.child_goal_is_active(child),
+                ));
+            }
+        }
+
         // DoD チェックリスト（更新直後はヘッダをハイライト）
         let dod_header_style = if recently(pane.dod_changed_at) {
             Style::default().fg(Color::Black).bg(COLOR_WARN)
@@ -2743,32 +2770,6 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
                     Span::styled("↗ ", Style::default().fg(COLOR_MUTED)),
                     Span::styled(link.as_str(), Style::default().fg(COLOR_TEXT)),
                 ]));
-            }
-        }
-
-        // 子ゴールのライブリスト（新着は数秒ハイライト）
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            format!(
-                "── 子ゴール ({}) ・ コメント {} ──",
-                pane.child_count.unwrap_or(0),
-                pane.comment_count.unwrap_or(0)
-            ),
-            Style::default().fg(COLOR_MUTED),
-        )));
-        if pane.children.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "（まだありません）",
-                Style::default().fg(COLOR_MUTED),
-            )));
-        } else {
-            for (idx, child) in pane.children.iter().enumerate() {
-                lines.extend(codex_child_goal_lines(
-                    child,
-                    now,
-                    idx + 1,
-                    pane.child_goal_is_active(child),
-                ));
             }
         }
 
@@ -5077,7 +5078,7 @@ fn concise_command_name(command: &str) -> String {
     }
 }
 
-fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
+fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane, scroll: &mut usize) {
     let inner_width = area.width.saturating_sub(2) as usize;
     let value_width = inner_width.saturating_sub(8);
     let prompt_width = inner_width.saturating_sub(2);
@@ -5303,6 +5304,11 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
         lines.push(Line::from(Span::styled(prompt, prompt_style)));
     }
 
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let max_scroll = rendered_lines_height(&lines, inner_w).saturating_sub(inner_h.max(1));
+    *scroll = (*scroll).min(max_scroll);
+
     let panel = Paragraph::new(lines)
         .block(
             Block::default()
@@ -5325,6 +5331,7 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
                     }
                 }),
         )
+        .scroll(((*scroll).min(u16::MAX as usize) as u16, 0))
         .wrap(ratatui::widgets::Wrap { trim: true });
     frame.render_widget(panel, area);
 }
@@ -5370,7 +5377,10 @@ fn codex_dashboard_shortcut_lines(max_width: usize) -> Vec<Line<'static>> {
             Style::default().fg(COLOR_TEXT),
         )),
         Line::from(Span::styled(
-            ellipsize_width("  F6:差分  /organize:分解  /work next/all:着手", max_width),
+            ellipsize_width(
+                "  F6:差分  /organize:分解  /work next/all:着手  /dual",
+                max_width,
+            ),
             Style::default().fg(COLOR_TEXT),
         )),
         Line::from(Span::styled(
@@ -6404,6 +6414,7 @@ mod tests {
         assert!(text.contains("F7:turn一覧"));
         assert!(text.contains("/organize"));
         assert!(text.contains("/work next"));
+        assert!(text.contains("/dual"));
         assert!(text.contains("/remember"));
         assert!(text.contains("/handoff"));
         assert!(text.contains("/settings"));

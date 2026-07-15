@@ -33,7 +33,6 @@ const COLOR_MUTED: Color = Color::Rgb(112, 122, 134);
 const COLOR_EVENT: Color = Color::Rgb(142, 150, 160);
 const COLOR_PANEL: Color = Color::Rgb(76, 84, 96);
 const COLOR_INPUT_BG: Color = Color::Rgb(27, 30, 36);
-const CODEX_TOOL_COMMAND_PREVIEW_WIDTH: usize = 56;
 /// @メンションのファイル候補パレットで一度に表示する最大行数。
 const MENTION_PALETTE_VISIBLE_ROWS: usize = 10;
 const CODEX_EDIT_DIFF_PREVIEW_LINES: usize = 8;
@@ -107,6 +106,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         app.codex_status_area = None;
         app.codex_contract_area = None;
         app.codex_activity_area = None;
+        app.codex_status_scroll = 0;
         let content_layout = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(24), Constraint::Min(0)])
@@ -2624,7 +2624,7 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
         app.codex_contract_area = Some(panes[1]);
         app.codex_activity_area = Some(panes[2]);
 
-        draw_codex_status_panel(frame, panes[0], pane);
+        draw_codex_status_panel(frame, panes[0], pane, &mut app.codex_status_scroll);
 
         let mut lines: Vec<Line> = Vec::new();
 
@@ -2701,6 +2701,32 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
         }
         lines.push(Line::from(""));
 
+        // 子ゴールは作業分解の入口なので、DoD/PRより前に出して初期表示から見えるようにする。
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "── 子ゴール ({}) ・ コメント {} ──",
+                pane.child_count.unwrap_or(0),
+                pane.comment_count.unwrap_or(0)
+            ),
+            Style::default().fg(COLOR_MUTED),
+        )));
+        if pane.children.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "（まだありません）",
+                Style::default().fg(COLOR_MUTED),
+            )));
+        } else {
+            for (idx, child) in pane.children.iter().enumerate() {
+                lines.extend(codex_child_goal_lines(
+                    child,
+                    now,
+                    idx + 1,
+                    pane.child_goal_is_active(child),
+                ));
+            }
+        }
+
         // DoD チェックリスト（更新直後はヘッダをハイライト）
         let dod_header_style = if recently(pane.dod_changed_at) {
             Style::default().fg(Color::Black).bg(COLOR_WARN)
@@ -2743,32 +2769,6 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
                     Span::styled("↗ ", Style::default().fg(COLOR_MUTED)),
                     Span::styled(link.as_str(), Style::default().fg(COLOR_TEXT)),
                 ]));
-            }
-        }
-
-        // 子ゴールのライブリスト（新着は数秒ハイライト）
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            format!(
-                "── 子ゴール ({}) ・ コメント {} ──",
-                pane.child_count.unwrap_or(0),
-                pane.comment_count.unwrap_or(0)
-            ),
-            Style::default().fg(COLOR_MUTED),
-        )));
-        if pane.children.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "（まだありません）",
-                Style::default().fg(COLOR_MUTED),
-            )));
-        } else {
-            for (idx, child) in pane.children.iter().enumerate() {
-                lines.extend(codex_child_goal_lines(
-                    child,
-                    now,
-                    idx + 1,
-                    pane.child_goal_is_active(child),
-                ));
             }
         }
 
@@ -4516,8 +4516,7 @@ fn tool_command_tree_head(state: Option<&str>, command: &str) -> String {
     } else {
         "実行"
     };
-    let compact = compact_tool_command_name(command);
-    let command = ellipsize_width(&compact, CODEX_TOOL_COMMAND_PREVIEW_WIDTH);
+    let command = compact_tool_command_name(command);
     format!("• {verb}: {command}")
 }
 
@@ -4529,16 +4528,13 @@ fn compact_tool_command_name(command: &str) -> String {
     {
         return path;
     }
-    if let Some(preview) = addness_tool_command_preview(command) {
-        return preview;
-    }
     let concise = concise_command_name(command);
     if !concise.is_empty() {
         return concise;
     }
     let (_, command) = split_tool_state_prefix(command.trim());
     let first_line = command.lines().next().unwrap_or("").trim();
-    ellipsize_width(first_line, CODEX_TOOL_COMMAND_PREVIEW_WIDTH)
+    first_line.to_string()
 }
 
 fn addness_tool_command_preview(command: &str) -> Option<String> {
@@ -5035,12 +5031,6 @@ fn codex_command_subject(command: &str) -> String {
     {
         return ellipsize_width(&path, 36);
     }
-    if looks_like_addness_command(command) {
-        if let Some(preview) = addness_tool_command_preview(command) {
-            return ellipsize_width(&preview, 36);
-        }
-        return "addness".to_string();
-    }
     concise_command_name(command)
 }
 
@@ -5057,27 +5047,10 @@ fn concise_command_name(command: &str) -> String {
     if first_line.is_empty() {
         return String::new();
     }
-
-    let parts = first_line.split_whitespace().collect::<Vec<_>>();
-    let keep = match parts.as_slice() {
-        ["cargo", sub, ..] => vec!["cargo", *sub],
-        ["codex", sub, ..] => vec!["codex", *sub],
-        ["git", sub, ..] => vec!["git", *sub],
-        ["go", sub, ..] => vec!["go", *sub],
-        ["npm", "run", sub, ..] => vec!["npm", "run", *sub],
-        ["pnpm", sub, ..] => vec!["pnpm", *sub],
-        ["yarn", sub, ..] => vec!["yarn", *sub],
-        [cmd, ..] => vec![*cmd],
-        [] => Vec::new(),
-    };
-    if keep.is_empty() {
-        String::new()
-    } else {
-        ellipsize_width(&keep.join(" "), 36)
-    }
+    first_line.to_string()
 }
 
-fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
+fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane, scroll: &mut usize) {
     let inner_width = area.width.saturating_sub(2) as usize;
     let value_width = inner_width.saturating_sub(8);
     let prompt_width = inner_width.saturating_sub(2);
@@ -5303,6 +5276,11 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
         lines.push(Line::from(Span::styled(prompt, prompt_style)));
     }
 
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let max_scroll = rendered_lines_height(&lines, inner_w).saturating_sub(inner_h.max(1));
+    *scroll = (*scroll).min(max_scroll);
+
     let panel = Paragraph::new(lines)
         .block(
             Block::default()
@@ -5325,6 +5303,7 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
                     }
                 }),
         )
+        .scroll(((*scroll).min(u16::MAX as usize) as u16, 0))
         .wrap(ratatui::widgets::Wrap { trim: true });
     frame.render_widget(panel, area);
 }
@@ -5370,7 +5349,10 @@ fn codex_dashboard_shortcut_lines(max_width: usize) -> Vec<Line<'static>> {
             Style::default().fg(COLOR_TEXT),
         )),
         Line::from(Span::styled(
-            ellipsize_width("  F6:差分  /organize:分解  /work next/all:着手", max_width),
+            ellipsize_width(
+                "  F6:差分  /organize:分解  /work next/all:着手  /dual",
+                max_width,
+            ),
             Style::default().fg(COLOR_TEXT),
         )),
         Line::from(Span::styled(
@@ -5607,7 +5589,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(rendered.contains("完了 | • 実行: curl"));
+        assert!(rendered.contains("完了 | • 実行: curl https://example.test"));
         assert!(rendered.contains("└ 出力1行"));
         assert!(!rendered.contains("└ 0123456789"));
         assert!(!rendered.contains(&"0123456789 ".repeat(25)));
@@ -5668,7 +5650,7 @@ mod tests {
             "cargo fmt -- --check\nDiff in /repo/src/tui/ui.rs:3163:\n-old\n+new",
         );
 
-        assert_eq!(text, "• 実行: cargo fmt\n  └ 出力3行");
+        assert_eq!(text, "• 実行: cargo fmt -- --check\n  └ 出力3行");
     }
 
     #[test]
@@ -5693,7 +5675,8 @@ mod tests {
 
         assert_eq!(
             text,
-            "• 実行: addness goal get goal-1 --json\n  └ addness: ゴール"
+            r#"• 実行: "$ADDNESS_BIN" goal get goal-1 --json
+  └ addness: ゴール"#
         );
     }
 
@@ -5706,7 +5689,7 @@ mod tests {
 
         assert_eq!(
             text,
-            "• 実行: addness link progress --goal goal-1 --message ok --json\n  └ addness: 1項目"
+            "• 実行: $ addness link progress --goal goal-1 --message ok --json\n  └ addness: 1項目"
         );
     }
 
@@ -5714,7 +5697,7 @@ mod tests {
     fn summarize_tool_display_text_highlights_codex_management_output() {
         let text = summarize_tool_display_text("OK codex mcp list\nserver-a\nserver-b");
 
-        assert_eq!(text, "• 実行: codex mcp\n  └ mcp: 2行");
+        assert_eq!(text, "• 実行: codex mcp list\n  └ mcp: 2行");
     }
 
     #[test]
@@ -5724,7 +5707,7 @@ mod tests {
 [{"id":"task-1"},{"id":"task-2"}]"#,
         );
 
-        assert_eq!(text, "• 実行: codex cloud\n  └ cloud: 一覧2件");
+        assert_eq!(text, "• 実行: codex cloud list\n  └ cloud: 一覧2件");
     }
 
     #[test]
@@ -6278,8 +6261,11 @@ mod tests {
             "cargo test --workspace --all-features -- --nocapture very_long_filter",
         );
 
-        assert_eq!(summary, "テストを実行中 (cargo test)");
-        assert!(!summary.contains("--workspace"));
+        assert_eq!(
+            summary,
+            "テストを実行中 (cargo test --workspace --all-features -- --nocapture very_long_filter)"
+        );
+        assert!(summary.contains("--workspace"));
         assert_eq!(
             super::codex_command_activity_summary(
                 "*** Begin Patch\n*** Update File: src/tui/ui.rs\n@@\n*** End Patch",
@@ -6404,6 +6390,7 @@ mod tests {
         assert!(text.contains("F7:turn一覧"));
         assert!(text.contains("/organize"));
         assert!(text.contains("/work next"));
+        assert!(text.contains("/dual"));
         assert!(text.contains("/remember"));
         assert!(text.contains("/handoff"));
         assert!(text.contains("/settings"));

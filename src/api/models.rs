@@ -6,6 +6,7 @@ mod goal_execution;
 mod invitation;
 mod kpi;
 mod member;
+mod notification;
 mod org;
 
 pub use assignment::*;
@@ -16,6 +17,7 @@ pub use goal_execution::*;
 pub use invitation::*;
 pub use kpi::*;
 pub use member::*;
+pub use notification::*;
 pub use org::*;
 
 use serde::{Deserialize, Serialize};

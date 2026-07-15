@@ -6,9 +6,11 @@ mod goal_execution;
 mod invitation;
 mod kpi;
 mod member;
+mod notification;
 mod org;
 
 pub use comment::ListCommentsParams;
+pub use notification::ListNotificationsParams;
 pub use org::CreateOrganizationParams;
 
 use anyhow::{Context, Result};

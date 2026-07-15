@@ -3,7 +3,8 @@ use clap::{Subcommand, ValueEnum};
 use serde::Serialize;
 use std::io::{self, Read, Write};
 
-use crate::api::{ApiClient, Comment};
+use crate::api::{ApiClient, Comment, ListNotificationsParams, NotificationSettingRequest};
+use crate::cli::commands::org::resolve_org_id;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum NotificationKind {
@@ -59,6 +60,164 @@ pub enum NotificationCommands {
         /// Mention member IDs (UUID), repeatable. Mentioned users get targeted notifications.
         #[arg(long)]
         mention: Vec<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// List your notifications
+    List {
+        /// Organization ID (uses default if not specified)
+        #[arg(long)]
+        org: Option<String>,
+        /// Max notifications to return (1-100, default 20)
+        #[arg(long)]
+        limit: Option<u16>,
+        /// Pagination offset
+        #[arg(long)]
+        offset: Option<u64>,
+        /// Only show unread notifications
+        #[arg(long, conflicts_with = "read_only")]
+        unread_only: bool,
+        /// Only show already-read notifications
+        #[arg(long, conflicts_with = "unread_only")]
+        read_only: bool,
+        /// Filter by goal ID (objective)
+        #[arg(long)]
+        goal: Option<String>,
+        /// Filter by category (mention, comment, reply, reaction, assignment, goal, ai).
+        /// Comma-separated or repeatable.
+        #[arg(long)]
+        category: Vec<String>,
+        /// Sort order: asc (oldest first) or desc (newest first, default)
+        #[arg(long)]
+        sort: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show unread notification counts (overall and by category)
+    Count {
+        /// Organization ID (uses default if not specified)
+        #[arg(long)]
+        org: Option<String>,
+        /// Filter by category. Comma-separated or repeatable.
+        #[arg(long)]
+        category: Vec<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show unread notification counts grouped by goal
+    CountsByGoal {
+        /// Organization ID (uses default if not specified)
+        #[arg(long)]
+        org: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Mark specific notifications as read
+    MarkRead {
+        /// Organization ID (uses default if not specified)
+        #[arg(long)]
+        org: Option<String>,
+        /// Comma-separated notification IDs to mark as read
+        #[arg(long)]
+        ids: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Mark specific notifications as unread
+    MarkUnread {
+        /// Organization ID (uses default if not specified)
+        #[arg(long)]
+        org: Option<String>,
+        /// Comma-separated notification IDs to mark as unread
+        #[arg(long)]
+        ids: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Mark all notifications as read
+    MarkAllRead {
+        /// Organization ID (uses default if not specified)
+        #[arg(long)]
+        org: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Manage notification subscription channels (Slack/Email/LINE/Discord)
+    Subscription {
+        #[command(subcommand)]
+        command: SubscriptionCommands,
+    },
+}
+
+/// Notification delivery channel for `notification subscription` settings.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum NotificationProvider {
+    Slack,
+    Email,
+    Line,
+    Discord,
+}
+
+impl NotificationProvider {
+    fn as_str(self) -> &'static str {
+        match self {
+            NotificationProvider::Slack => "slack",
+            NotificationProvider::Email => "email",
+            NotificationProvider::Line => "line",
+            NotificationProvider::Discord => "discord",
+        }
+    }
+}
+
+#[derive(Subcommand)]
+pub enum SubscriptionCommands {
+    /// List your notification subscription settings
+    List {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add a new subscription channel (active by default)
+    Add {
+        /// Delivery channel
+        #[arg(long, value_enum)]
+        provider: NotificationProvider,
+        /// Email address (required for --provider email while active)
+        #[arg(long)]
+        email: Option<String>,
+        /// Create the setting disabled instead of active
+        #[arg(long)]
+        inactive: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Update an existing subscription setting
+    Update {
+        /// Notification setting ID
+        id: String,
+        /// Delivery channel
+        #[arg(long, value_enum)]
+        provider: NotificationProvider,
+        /// Email address (required for --provider email while active)
+        #[arg(long)]
+        email: Option<String>,
+        /// Disable the setting instead of activating it
+        #[arg(long)]
+        inactive: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// List email addresses registered as notification destinations
+    EmailDestinations {
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -184,6 +343,47 @@ fn resolve_goal_id(goal: Option<&String>) -> Result<String> {
     bail!("Specify --goal <GOAL_ID> or run from an Addness TUI codex session.");
 }
 
+/// Comma-separated IDのリストをトリム済みの `Vec<String>` に分割する
+/// （複数指定可能な `--ids`/`--category` 引数の共通処理）。
+fn split_csv(csv: &str) -> Vec<String> {
+    csv.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// `--category` は繰り返し指定・カンマ区切りの両方を許容する
+/// （バックエンドの `?category=a&category=b` / `?category=a,b` 両対応に合わせる）。
+fn flatten_categories(raw: &[String]) -> Vec<String> {
+    raw.iter().flat_map(|s| split_csv(s)).collect()
+}
+
+fn resolve_read_filter(unread_only: bool, read_only: bool) -> Option<bool> {
+    if unread_only {
+        Some(false)
+    } else if read_only {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+fn build_notification_setting_request(
+    provider: NotificationProvider,
+    email: Option<&String>,
+    inactive: bool,
+) -> Result<NotificationSettingRequest> {
+    let active = !inactive;
+    if matches!(provider, NotificationProvider::Email) && active && email.is_none() {
+        bail!("--email is required when --provider email and the setting is active.");
+    }
+    Ok(NotificationSettingRequest {
+        provider: provider.as_str().to_string(),
+        active,
+        email: email.cloned(),
+    })
+}
+
 pub async fn handle_notification(cmd: &NotificationCommands, client: &ApiClient) -> Result<()> {
     match cmd {
         NotificationCommands::Send {
@@ -223,12 +423,223 @@ pub async fn handle_notification(cmd: &NotificationCommands, client: &ApiClient)
             }
             Ok(())
         }
+        NotificationCommands::List {
+            org,
+            limit,
+            offset,
+            unread_only,
+            read_only,
+            goal,
+            category,
+            sort,
+            json,
+        } => {
+            let org_id = resolve_org_id(org.as_deref())?;
+            let categories = flatten_categories(category);
+            let resp = client
+                .list_notifications(
+                    &org_id,
+                    ListNotificationsParams {
+                        limit: *limit,
+                        offset: *offset,
+                        read: resolve_read_filter(*unread_only, *read_only),
+                        goal_id: goal.as_deref(),
+                        categories: &categories,
+                        sort: sort.as_deref(),
+                    },
+                )
+                .await?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&resp)?);
+            } else if resp.notifications.is_empty() {
+                println!("No notifications.");
+            } else {
+                for n in &resp.notifications {
+                    let status = if n.read_at.is_some() {
+                        "read"
+                    } else {
+                        "unread"
+                    };
+                    let title = n.subject_title.as_deref().unwrap_or("-");
+                    let ids = n.notification_ids.join(",");
+                    println!("[{status}] {} - {title} (ids: {ids})", n.event_type);
+                }
+                if resp.has_more {
+                    println!("More notifications available (use --offset or --limit).");
+                }
+            }
+            Ok(())
+        }
+        NotificationCommands::Count {
+            org,
+            category,
+            json,
+        } => {
+            let org_id = resolve_org_id(org.as_deref())?;
+            let categories = flatten_categories(category);
+            let resp = client.count_notifications(&org_id, &categories).await?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&resp)?);
+            } else {
+                println!("Unread: {}", resp.unread_count);
+                for (cat, count) in &resp.unread_by_category {
+                    println!("  {cat}: {count}");
+                }
+            }
+            Ok(())
+        }
+        NotificationCommands::CountsByGoal { org, json } => {
+            let org_id = resolve_org_id(org.as_deref())?;
+            let resp = client.count_notifications_by_goal(&org_id).await?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&resp)?);
+            } else if resp.counts.is_empty() {
+                println!("No unread notifications.");
+            } else {
+                for (goal_id, counts) in &resp.counts {
+                    println!(
+                        "{goal_id}: total={} comments={} deliverables={} assignments={} childActivity={}",
+                        counts.total,
+                        counts.comments,
+                        counts.deliverables,
+                        counts.assignments,
+                        counts.child_activity
+                    );
+                }
+            }
+            Ok(())
+        }
+        NotificationCommands::MarkRead { org, ids, json } => {
+            let org_id = resolve_org_id(org.as_deref())?;
+            let id_list = split_csv(ids);
+            if id_list.is_empty() {
+                bail!("--ids must contain at least one notification ID");
+            }
+            let resp = client.mark_notifications_read(&org_id, &id_list).await?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&resp)?);
+            } else {
+                println!(
+                    "Marked {} notification(s) as read. Unread remaining: {}",
+                    resp.marked_count, resp.unread_count
+                );
+            }
+            Ok(())
+        }
+        NotificationCommands::MarkUnread { org, ids, json } => {
+            let org_id = resolve_org_id(org.as_deref())?;
+            let id_list = split_csv(ids);
+            if id_list.is_empty() {
+                bail!("--ids must contain at least one notification ID");
+            }
+            let resp = client.mark_notifications_unread(&org_id, &id_list).await?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&resp)?);
+            } else {
+                println!(
+                    "Marked {} notification(s) as unread. Unread remaining: {}",
+                    resp.marked_count, resp.unread_count
+                );
+            }
+            Ok(())
+        }
+        NotificationCommands::MarkAllRead { org, json } => {
+            let org_id = resolve_org_id(org.as_deref())?;
+            let resp = client.mark_all_notifications_read(&org_id).await?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&resp)?);
+            } else {
+                println!(
+                    "Marked {} notification(s) as read. Unread remaining: {}",
+                    resp.marked_count, resp.unread_count
+                );
+            }
+            Ok(())
+        }
+        NotificationCommands::Subscription { command } => {
+            handle_subscription(command, client).await
+        }
+    }
+}
+
+pub async fn handle_subscription(cmd: &SubscriptionCommands, client: &ApiClient) -> Result<()> {
+    match cmd {
+        SubscriptionCommands::List { json } => {
+            let settings = client.list_notification_settings().await?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&settings)?);
+            } else if settings.is_empty() {
+                println!("No notification subscription settings.");
+            } else {
+                for s in &settings {
+                    let active = if s.active { "active" } else { "inactive" };
+                    println!("{} [{active}] provider={}", s.id, s.provider);
+                }
+            }
+            Ok(())
+        }
+        SubscriptionCommands::Add {
+            provider,
+            email,
+            inactive,
+            json,
+        } => {
+            let req = build_notification_setting_request(*provider, email.as_ref(), *inactive)?;
+            let setting = client.create_notification_setting(&req).await?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&setting)?);
+            } else {
+                let active = if setting.active { "active" } else { "inactive" };
+                println!(
+                    "Created subscription setting {} ({} [{active}])",
+                    setting.id, setting.provider
+                );
+            }
+            Ok(())
+        }
+        SubscriptionCommands::Update {
+            id,
+            provider,
+            email,
+            inactive,
+            json,
+        } => {
+            let req = build_notification_setting_request(*provider, email.as_ref(), *inactive)?;
+            let setting = client.update_notification_setting(id, &req).await?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&setting)?);
+            } else {
+                let active = if setting.active { "active" } else { "inactive" };
+                println!(
+                    "Updated subscription setting {} ({} [{active}])",
+                    setting.id, setting.provider
+                );
+            }
+            Ok(())
+        }
+        SubscriptionCommands::EmailDestinations { json } => {
+            let destinations = client.list_email_destinations().await?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&destinations)?);
+            } else if destinations.is_empty() {
+                println!("No email destinations registered.");
+            } else {
+                for d in &destinations {
+                    println!("{} {}", d.id, d.email);
+                }
+            }
+            Ok(())
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{NotificationKind, format_notification_body, resolve_goal_id, terminal_message};
+    use super::{
+        NotificationKind, NotificationProvider, build_notification_setting_request,
+        flatten_categories, format_notification_body, resolve_goal_id, resolve_read_filter,
+        split_csv, terminal_message,
+    };
 
     #[test]
     fn resolve_goal_id_prefers_explicit_goal() {
@@ -236,6 +647,61 @@ mod tests {
             resolve_goal_id(Some(&"goal-explicit".to_string())).unwrap(),
             "goal-explicit"
         );
+    }
+
+    #[test]
+    fn split_csv_trims_and_drops_empty_entries() {
+        assert_eq!(
+            split_csv(" id-1, id-2 ,,id-3"),
+            vec!["id-1", "id-2", "id-3"]
+        );
+    }
+
+    #[test]
+    fn flatten_categories_supports_repeated_and_comma_separated_forms() {
+        let raw = vec!["mention,reply".to_string(), "goal".to_string()];
+        assert_eq!(flatten_categories(&raw), vec!["mention", "reply", "goal"]);
+    }
+
+    #[test]
+    fn resolve_read_filter_prefers_unread_only() {
+        assert_eq!(resolve_read_filter(true, false), Some(false));
+        assert_eq!(resolve_read_filter(false, true), Some(true));
+        assert_eq!(resolve_read_filter(false, false), None);
+    }
+
+    #[test]
+    fn build_notification_setting_request_defaults_to_active() {
+        let req =
+            build_notification_setting_request(NotificationProvider::Slack, None, false).unwrap();
+        assert_eq!(req.provider, "slack");
+        assert!(req.active);
+        assert!(req.email.is_none());
+    }
+
+    #[test]
+    fn build_notification_setting_request_requires_email_for_active_email_provider() {
+        let err = build_notification_setting_request(NotificationProvider::Email, None, false)
+            .unwrap_err();
+        assert!(err.to_string().contains("--email"));
+    }
+
+    #[test]
+    fn build_notification_setting_request_allows_inactive_email_without_address() {
+        let req =
+            build_notification_setting_request(NotificationProvider::Email, None, true).unwrap();
+        assert!(!req.active);
+        assert!(req.email.is_none());
+    }
+
+    #[test]
+    fn build_notification_setting_request_accepts_email_when_active() {
+        let email = "user@example.com".to_string();
+        let req =
+            build_notification_setting_request(NotificationProvider::Email, Some(&email), false)
+                .unwrap();
+        assert!(req.active);
+        assert_eq!(req.email.as_deref(), Some("user@example.com"));
     }
 
     #[test]

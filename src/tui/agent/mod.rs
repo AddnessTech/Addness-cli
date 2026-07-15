@@ -670,6 +670,20 @@ fn normalize_command_display(command: &str) -> String {
         .unwrap_or_else(|| trimmed.to_string())
 }
 
+fn visible_command_display(command: &str) -> String {
+    let normalized = normalize_command_display(command);
+    addness_command_display(&normalized).unwrap_or(normalized)
+}
+
+fn addness_command_display(command: &str) -> Option<String> {
+    let rest = addness_command_rest(command)?;
+    if rest.is_empty() {
+        Some("addness".to_string())
+    } else {
+        Some(format!("addness {rest}"))
+    }
+}
+
 fn shell_command_with_args_display(command: &str, args: &[String]) -> String {
     let mut parts = split_codex_command_args(command)
         .ok()
@@ -5939,7 +5953,7 @@ impl CodexPane {
         use codex_appserver::ThreadItemKind as K;
         match item.kind {
             K::CommandExecution { command, .. } => {
-                let display_command = normalize_command_display(&command);
+                let display_command = visible_command_display(&command);
                 self.record_current_command(
                     RecentActionKind::Command,
                     compact_tool_text(&display_command),
@@ -6585,16 +6599,20 @@ impl CodexPane {
             let Some(text) = first_text_field(value).filter(|text| !text.is_empty()) else {
                 return;
             };
+            let display_text = visible_command_display(&text);
             if is_tool_completion_event(event_type) {
                 self.current_command = None;
                 self.current_command_started_at = None;
             } else {
-                self.record_current_command(RecentActionKind::Tool, compact_tool_text(&text));
+                self.record_current_command(
+                    RecentActionKind::Tool,
+                    compact_tool_text(&display_text),
+                );
             }
-            self.refresh_action_from_text(&text);
+            self.refresh_action_from_text(&display_text);
             self.push_log(
                 CodexLogKind::Tool,
-                format!("{} {text}", generic_tool_state_label(event_type)),
+                format!("{} {display_text}", generic_tool_state_label(event_type)),
             );
             return;
         }
@@ -12087,7 +12105,9 @@ fn tool_display(event_type: &str, value: &Value) -> Option<ToolDisplay> {
     }
 
     let name = tool_name(value).unwrap_or_else(|| event_type.to_string());
-    let command = command_text(value).map(|text| compact_tool_text(&text));
+    let command = command_text(value)
+        .map(|text| visible_command_display(&text))
+        .map(|text| compact_tool_text(&text));
     let output = tool_output_text(value).map(|text| compact_tool_text(&text));
     let exit_code = scalar_field_text(value, &["exit_code", "exitCode"]);
 
@@ -15776,6 +15796,13 @@ mod tests {
         );
 
         assert_eq!(pane.work_action(), Some("ゴール文脈を読込中"));
+        assert_eq!(
+            pane.current_command(),
+            Some("addness goal get goal-1 --json")
+        );
+        let line = pane.log.last().unwrap();
+        assert!(line.text.contains("addness goal get goal-1 --json"));
+        assert!(!line.text.contains("$ADDNESS_BIN"));
         assert!(pane.last_addness_read_at.is_some());
     }
 
@@ -16341,6 +16368,26 @@ mod tests {
             "cargo clippy --all-targets"
         );
         assert_eq!(normalize_command_display("cargo build"), "cargo build");
+    }
+
+    #[test]
+    fn visible_command_display_expands_addness_bin_invocation() {
+        assert_eq!(
+            visible_command_display(r#""$ADDNESS_BIN" goal get goal-1 --json"#),
+            "addness goal get goal-1 --json"
+        );
+        assert_eq!(
+            visible_command_display(
+                r#"/Users/bearwash/.local/bin/addness link progress --goal goal-1 --message ok"#
+            ),
+            "addness link progress --goal goal-1 --message ok"
+        );
+        assert_eq!(
+            visible_command_display(
+                r#"/bin/zsh -lc '"$ADDNESS_BIN" comment list --goal goal-1 --json'"#
+            ),
+            "addness comment list --goal goal-1 --json"
+        );
     }
 
     #[test]

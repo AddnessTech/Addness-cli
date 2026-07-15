@@ -375,3 +375,57 @@ jobs:
               -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
               commit -m "chore(ci): upstream-sync state: ${TARGET} を ${NEW_VERSION} に更新"
           git push origin HEAD:automation/upstream-state
+
+      # Codex が PR / Issue を作成した場合、Addness にゴールを作成して追跡する。
+      # secret ADDNESS_API_TOKEN が未設定ならスキップ。ゴール作成失敗で sync 自体は落とさない。
+      - name: Addness ゴール作成
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ADDNESS_API_TOKEN: ${{ secrets.ADDNESS_API_TOKEN }}
+          ADDNESS_ORG_ID: ${{ vars.ADDNESS_ORG_ID }}
+          ADDNESS_PARENT_GOAL_ID: ${{ vars.ADDNESS_PARENT_GOAL_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ADDNESS_API_TOKEN:-}" ]; then
+            echo "::notice::ADDNESS_API_TOKEN が未設定のため Addness ゴール作成をスキップします"
+            exit 0
+          fi
+
+          # Codex が作成した対応先を探す（PR を優先し、無ければ Issue を探す）。
+          url="$(gh pr list --state open --head "upstream-sync/${TARGET}-${NEW_VERSION}" \
+            --json url --jq '.[0].url // empty')"
+          if [ -z "$url" ]; then
+            url="$(gh issue list --label upstream-sync --state open \
+              --search "${NEW_VERSION} in:title" --json url --jq '.[0].url // empty')"
+          fi
+          if [ -z "$url" ]; then
+            echo "PR / Issue が作成されていないためゴール作成は不要"
+            exit 0
+          fi
+          echo "対応先: ${url}"
+
+          # 環境変数トークン認証で addness を使うため、CLI をビルドする
+          # （Rust toolchain / rust-cache はジョブに設定済み）。
+          cargo build --release --locked
+
+          # ゴールを作成する。ADDNESS_ORG_ID / ADDNESS_PARENT_GOAL_ID が
+          # 設定されていれば --org / --parent を付ける（未設定なら省略）。
+          title="[upstream-sync] ${TARGET} ${NEW_VERSION} 追随"
+          description="上流 ${TARGET} の ${LAST_VERSION} -> ${NEW_VERSION} 追随対応。対応先: ${url}"
+          goal_json="$(./target/release/addness goal create \
+            --title "$title" \
+            --description "$description" \
+            ${ADDNESS_ORG_ID:+--org "$ADDNESS_ORG_ID"} \
+            ${ADDNESS_PARENT_GOAL_ID:+--parent "$ADDNESS_PARENT_GOAL_ID"} \
+            --json)"
+          goal_id="$(printf '%s' "$goal_json" | jq -r '.id')"
+          if [ -z "$goal_id" ] || [ "$goal_id" = "null" ]; then
+            echo "::error::ゴール作成レスポンスから ID を取得できませんでした"
+            printf '%s\n' "$goal_json"
+            exit 1
+          fi
+
+          # 作成したゴールに PR / Issue の URL をリンクする。
+          ./target/release/addness link pr --goal "$goal_id" --url "$url"
+          echo "::notice::Addness ゴールを作成しました: ${goal_id}（対応先: ${url}）"

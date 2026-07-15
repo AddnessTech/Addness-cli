@@ -830,9 +830,22 @@ fn copy_current_token_for_created_org(created_org_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Resolve an org id from a raw env value, treating empty/whitespace-only as
+/// unset. Split out from `std::env::var` so it can be unit-tested without racing
+/// on process-global env state in parallel `cargo test` runs.
+fn org_id_from_env_value(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
 pub fn resolve_org_id(flag: Option<&str>) -> Result<String> {
     if let Some(id) = flag {
         return Ok(id.to_string());
+    }
+    if let Some(id) = org_id_from_env_value(std::env::var("ADDNESS_ORG_ID").ok().as_deref()) {
+        return Ok(id);
     }
     let settings = Settings::load()?;
     match settings.current_organization_id() {
@@ -846,7 +859,18 @@ pub fn resolve_org_id(flag: Option<&str>) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::content_type_for_path;
+    use super::{content_type_for_path, org_id_from_env_value};
+
+    #[test]
+    fn org_id_from_env_value_trims_and_filters_blank() {
+        assert_eq!(org_id_from_env_value(None), None);
+        assert_eq!(org_id_from_env_value(Some("")), None);
+        assert_eq!(org_id_from_env_value(Some("   ")), None);
+        assert_eq!(
+            org_id_from_env_value(Some("  org-123  ")).as_deref(),
+            Some("org-123")
+        );
+    }
 
     #[test]
     fn content_type_for_path_maps_known_image_extensions() {

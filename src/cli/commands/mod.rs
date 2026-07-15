@@ -1,3 +1,4 @@
+pub mod activity;
 pub mod assignment;
 pub mod comment;
 pub mod configure;
@@ -12,6 +13,7 @@ pub mod member;
 pub mod notification;
 pub mod org;
 pub mod skills;
+pub mod streak;
 pub mod summary;
 pub mod today;
 pub mod update;

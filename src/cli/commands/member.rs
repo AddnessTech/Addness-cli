@@ -1,8 +1,20 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::Subcommand;
 
 use crate::api::ApiClient;
 use crate::cli::commands::org::resolve_org_id;
+
+/// 自分自身の組織内メンバーIDを解決する。
+/// `--member` が未指定のstreak/activityコマンドで「自分の」情報をデフォルト表示するために使う。
+pub async fn resolve_self_member_id(client: &ApiClient, org_id: &str) -> Result<String> {
+    let resp = client.get_members(org_id).await?;
+    match resp.data.members.into_iter().find(|m| m.is_current_user) {
+        Some(member) => Ok(member.id),
+        None => bail!(
+            "Could not determine your member ID in organization {org_id}. Specify --member <ID> explicitly."
+        ),
+    }
+}
 
 #[derive(Subcommand)]
 pub enum MemberCommands {

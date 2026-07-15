@@ -380,12 +380,25 @@ fn invitation_outputs_json(command: &invitation::InvitationCommands) -> bool {
     match command {
         invitation::InvitationCommands::Create { json, .. }
         | invitation::InvitationCommands::Resend { json, .. }
-        | invitation::InvitationCommands::Accept { json, .. } => *json,
+        | invitation::InvitationCommands::Accept { json, .. }
+        | invitation::InvitationCommands::LegacyAccept { json, .. }
+        | invitation::InvitationCommands::CheckPlanUpgrade { json, .. }
+        | invitation::InvitationCommands::Preview { json, .. }
+        | invitation::InvitationCommands::AcceptToken { json, .. }
+        | invitation::InvitationCommands::InvitedMembers { json, .. }
+        | invitation::InvitationCommands::Overview { json, .. } => *json,
         invitation::InvitationCommands::Link { command } => match command {
-            invitation::InviteLinkCommands::Create { json, .. } => *json,
+            invitation::InviteLinkCommands::Create { json, .. }
+            | invitation::InviteLinkCommands::List { json, .. }
+            | invitation::InviteLinkCommands::Join { json, .. } => *json,
             invitation::InviteLinkCommands::Deactivate { .. } => false,
         },
-        invitation::InvitationCommands::Revoke { .. } => false,
+        invitation::InvitationCommands::Pending { command } => match command {
+            invitation::PendingCommands::List { json }
+            | invitation::PendingCommands::Access { json, .. } => *json,
+        },
+        invitation::InvitationCommands::Revoke { .. }
+        | invitation::InvitationCommands::Decline { .. } => false,
     }
 }
 

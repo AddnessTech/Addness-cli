@@ -12,6 +12,7 @@ mod invitation;
 mod invoice;
 mod issue;
 mod kpi;
+mod meeting;
 mod member;
 mod notification;
 mod org;
@@ -30,6 +31,7 @@ pub use chat::{ChatMessageListParams, ChatRoomListParams, ChatSearchParams};
 pub use comment::{ListAllCommentsParams, ListCommentsParams};
 pub use invoice::InvoiceListParams;
 pub use issue::{GoalSectionListParams, IssueListParams};
+pub use meeting::{HuddleInviteableMembersParams, MinuteListParams};
 pub use member::BrowseMembersParams;
 pub use notification::ListNotificationsParams;
 pub use org::{CreateOrganizationParams, ListAllOrganizationsParams};
@@ -510,6 +512,19 @@ impl ApiClient {
             .header(reqwest::header::CONTENT_TYPE, content_type.to_string())
             .body(bytes);
         self.send_json(req, &url).await
+    }
+
+    /// POST a `multipart/form-data` body directly to our own API (unlike
+    /// `upload_attachment`, which posts to a third-party presigned URL).
+    /// Used by endpoints that accept a raw file upload alongside auth headers,
+    /// e.g. meeting-note audio transcription.
+    pub(super) async fn post_multipart<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        form: reqwest::multipart::Form,
+    ) -> Result<T> {
+        let (url, req) = self.request(Method::POST, path, true)?;
+        self.send_json(req.multipart(form), &url).await
     }
 }
 

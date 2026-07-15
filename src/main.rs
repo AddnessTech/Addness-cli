@@ -12,8 +12,8 @@ use crate::config::{Credentials, DEFAULT_API_URL, Settings};
 use api::ApiClient;
 use cli::commands::{
     activity, assignment, chat, comment, configure, deliverable, detect, diagnosis, execution,
-    goal, invitation, invoice, issue, kpi, link, login, media, member, notification, org, personal,
-    referral, search, sharetree, skills, streak, summary, today, update, user,
+    goal, invitation, invoice, issue, kpi, link, login, media, meeting, member, notification, org,
+    personal, referral, search, sharetree, skills, streak, summary, today, update, user,
 };
 
 #[derive(Parser)]
@@ -193,6 +193,13 @@ enum Commands {
         #[command(subcommand)]
         command: execution::ExecutionCommands,
     },
+    /// Manage meeting features: Huddle voice calls (status/recording/invites,
+    /// excluding live participation), Meeting Bot (Recall.ai) jobs, meeting-note
+    /// transcription/summary/goal workflow, and minutes CRUD
+    Meeting {
+        #[command(subcommand)]
+        command: meeting::MeetingCommands,
+    },
     /// Detect goal ID from current git branch name
     DetectGoal {
         /// Output as JSON
@@ -237,6 +244,7 @@ fn command_outputs_json(command: &Commands) -> bool {
         Commands::Media { command } => media_outputs_json(command),
         Commands::Personal { command } => personal_outputs_json(command),
         Commands::Execution { command } => execution_outputs_json(command),
+        Commands::Meeting { command } => meeting_outputs_json(command),
         Commands::Org { command } => org_outputs_json(command),
         Commands::Goal { command } => goal_outputs_json(command),
         Commands::Comment { command } => comment_outputs_json(command),
@@ -439,6 +447,42 @@ fn execution_outputs_json(command: &execution::ExecutionCommands) -> bool {
         execution::ExecutionCommands::Codex { command } => match command {
             execution::CodexCommands::View { json, .. }
             | execution::CodexCommands::Apply { json, .. } => *json,
+        },
+    }
+}
+
+fn meeting_outputs_json(command: &meeting::MeetingCommands) -> bool {
+    match command {
+        meeting::MeetingCommands::Huddle { command } => match command {
+            meeting::HuddleCommands::Status { json, .. }
+            | meeting::HuddleCommands::ActiveSubtree { json, .. }
+            | meeting::HuddleCommands::SessionStatus { json, .. }
+            | meeting::HuddleCommands::RecordingStart { json, .. }
+            | meeting::HuddleCommands::RecordingStop { json, .. }
+            | meeting::HuddleCommands::InviteableMembers { json, .. }
+            | meeting::HuddleCommands::Active { json, .. }
+            | meeting::HuddleCommands::TranscriptionProgress { json, .. }
+            | meeting::HuddleCommands::Invite { json, .. } => *json,
+        },
+        meeting::MeetingCommands::Bot { command } => match command {
+            meeting::BotCommands::List { json, .. }
+            | meeting::BotCommands::Get { json, .. }
+            | meeting::BotCommands::Create { json, .. }
+            | meeting::BotCommands::Delete { json, .. } => *json,
+        },
+        meeting::MeetingCommands::Notes { command } => match command {
+            meeting::NotesCommands::Transcribe { json, .. }
+            | meeting::NotesCommands::Summarize { json, .. }
+            | meeting::NotesCommands::PostMinutes { json, .. }
+            | meeting::NotesCommands::SuggestGoals { json, .. }
+            | meeting::NotesCommands::CreateGoals { json, .. } => *json,
+        },
+        meeting::MeetingCommands::Minutes { command } => match command {
+            meeting::MinutesCommands::Create { json, .. }
+            | meeting::MinutesCommands::List { json, .. }
+            | meeting::MinutesCommands::Get { json, .. }
+            | meeting::MinutesCommands::Update { json, .. }
+            | meeting::MinutesCommands::Delete { json, .. } => *json,
         },
     }
 }
@@ -892,6 +936,10 @@ async fn main() -> Result<()> {
         Some(Commands::Execution { command }) => {
             let client = build_client()?;
             execution::handle_execution(command, &client).await
+        }
+        Some(Commands::Meeting { command }) => {
+            let client = build_client()?;
+            meeting::handle_meeting(command, &client).await
         }
         Some(Commands::DetectGoal { json }) => detect::handle_detect_goal(*json),
         Some(Commands::Update { check }) => update::handle_update(*check).await,

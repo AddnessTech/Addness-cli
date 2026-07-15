@@ -3,12 +3,64 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+/// TUIから起動するエージェントの応答言語設定。
+///
+/// - `Auto`: 環境変数 `LANG`（無ければ `LC_ALL`）から判定する
+/// - `Ja` / `En`: 明示指定
+/// - `Off`: 言語指示を注入しない
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentLanguage {
+    #[default]
+    Auto,
+    Ja,
+    En,
+    Off,
+}
+
+impl AgentLanguage {
+    /// `/lang <値>` や config.json の文字列から解釈する。未知の値は `None`。
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "ja" | "japanese" | "日本語" => Some(Self::Ja),
+            "en" | "english" => Some(Self::En),
+            "off" | "none" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    /// config / CLI 引数で使う正規値。
+    pub fn config_value(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Ja => "ja",
+            Self::En => "en",
+            Self::Off => "off",
+        }
+    }
+
+    /// ピッカー・ログ表示用のラベル。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto（自動判定）",
+            Self::Ja => "日本語（ja）",
+            Self::En => "English（en）",
+            Self::Off => "off（指示しない）",
+        }
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Settings {
     /// 現在選択中の組織のID
     /// getter, setterを介して、取得、更新(およびsave)する
     #[serde(skip_serializing_if = "Option::is_none")]
     current_organization_id: Option<String>,
+    /// TUIから起動するエージェントの応答言語設定。
+    /// 既存configとの後方互換のため serde default（未設定は `Auto`）。
+    #[serde(default)]
+    agent_language: AgentLanguage,
 }
 
 fn settings_path() -> Result<PathBuf> {
@@ -72,6 +124,15 @@ impl Settings {
         self.save()
     }
 
+    pub fn agent_language(&self) -> AgentLanguage {
+        self.agent_language
+    }
+
+    pub fn set_agent_language(&mut self, language: AgentLanguage) -> Result<()> {
+        self.agent_language = language;
+        self.save()
+    }
+
     pub fn delete() -> Result<()> {
         let path = settings_path()?;
         if path.exists() {
@@ -79,5 +140,39 @@ impl Settings {
                 .with_context(|| format!("Failed to delete {}", path.display()))?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_language_parse_accepts_known_values() {
+        assert_eq!(AgentLanguage::parse("auto"), Some(AgentLanguage::Auto));
+        assert_eq!(AgentLanguage::parse("JA"), Some(AgentLanguage::Ja));
+        assert_eq!(AgentLanguage::parse("english"), Some(AgentLanguage::En));
+        assert_eq!(AgentLanguage::parse(" off "), Some(AgentLanguage::Off));
+        assert_eq!(AgentLanguage::parse("日本語"), Some(AgentLanguage::Ja));
+        assert_eq!(AgentLanguage::parse("bogus"), None);
+    }
+
+    #[test]
+    fn agent_language_config_value_round_trips_through_parse() {
+        for lang in [
+            AgentLanguage::Auto,
+            AgentLanguage::Ja,
+            AgentLanguage::En,
+            AgentLanguage::Off,
+        ] {
+            assert_eq!(AgentLanguage::parse(lang.config_value()), Some(lang));
+        }
+    }
+
+    #[test]
+    fn settings_defaults_agent_language_to_auto_for_legacy_config() {
+        // agent_language を持たない旧 config.json でも読み込めること。
+        let settings: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.agent_language(), AgentLanguage::Auto);
     }
 }

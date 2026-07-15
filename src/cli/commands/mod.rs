@@ -1,6 +1,7 @@
 pub mod activity;
 pub mod assignment;
 pub mod chat;
+pub mod codex_job;
 pub mod comment;
 pub mod configure;
 pub mod deliverable;

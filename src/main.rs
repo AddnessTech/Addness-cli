@@ -11,10 +11,10 @@ use clap::{CommandFactory, Parser, Subcommand};
 use crate::config::{Credentials, DEFAULT_API_URL, Settings};
 use api::ApiClient;
 use cli::commands::{
-    activity, assignment, chat, comment, configure, deliverable, detect, diagnosis, execution,
-    goal, invitation, invoice, issue, kpi, link, login, media, meeting, member, notification, org,
-    personal, referral, search, sharetree, skill, skills, streak, summary, today, tool, update,
-    user,
+    activity, assignment, chat, codex_job, comment, configure, deliverable, detect, diagnosis,
+    execution, goal, invitation, invoice, issue, kpi, link, login, media, meeting, member,
+    notification, org, personal, referral, search, sharetree, skill, skills, streak, summary,
+    today, tool, update, user,
 };
 
 #[derive(Parser)]
@@ -213,6 +213,12 @@ enum Commands {
         #[command(subcommand)]
         command: tool::ToolCommands,
     },
+    /// Manage cloud Codex jobs (agent sessions): create, list, follow-up input,
+    /// resume, cancel/close, delete, and the live event stream
+    CodexJob {
+        #[command(subcommand)]
+        command: codex_job::CodexJobCommands,
+    },
     /// Detect goal ID from current git branch name
     DetectGoal {
         /// Output as JSON
@@ -260,6 +266,7 @@ fn command_outputs_json(command: &Commands) -> bool {
         Commands::Meeting { command } => meeting_outputs_json(command),
         Commands::Skill { command } => skill_outputs_json(command),
         Commands::Tool { command } => tool_outputs_json(command),
+        Commands::CodexJob { command } => codex_job_outputs_json(command),
         Commands::Org { command } => org_outputs_json(command),
         Commands::Goal { command } => goal_outputs_json(command),
         Commands::Comment { command } => comment_outputs_json(command),
@@ -523,6 +530,20 @@ fn skill_outputs_json(command: &skill::SkillCommands) -> bool {
             skill::SkillRefinementCommands::Accept { json, .. }
             | skill::SkillRefinementCommands::Reject { json, .. } => *json,
         },
+    }
+}
+
+fn codex_job_outputs_json(command: &codex_job::CodexJobCommands) -> bool {
+    match command {
+        codex_job::CodexJobCommands::List { json, .. }
+        | codex_job::CodexJobCommands::Get { json, .. }
+        | codex_job::CodexJobCommands::Create { json, .. }
+        | codex_job::CodexJobCommands::Input { json, .. }
+        | codex_job::CodexJobCommands::Resume { json, .. }
+        | codex_job::CodexJobCommands::Cancel { json, .. }
+        | codex_job::CodexJobCommands::Events { json, .. } => *json,
+        codex_job::CodexJobCommands::Close { json, force, .. }
+        | codex_job::CodexJobCommands::Delete { json, force, .. } => *json && *force,
     }
 }
 
@@ -999,6 +1020,10 @@ async fn main() -> Result<()> {
         Some(Commands::Tool { command }) => {
             let client = build_client()?;
             tool::handle_tool(command, &client).await
+        }
+        Some(Commands::CodexJob { command }) => {
+            let client = build_client()?;
+            codex_job::handle_codex_job(command, &client).await
         }
         Some(Commands::DetectGoal { json }) => detect::handle_detect_goal(*json),
         Some(Commands::Update { check }) => update::handle_update(*check).await,

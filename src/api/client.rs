@@ -1,6 +1,7 @@
 mod activity;
 mod assignment;
 mod chat;
+mod codex_job;
 mod comment;
 mod deliverable;
 mod diagnosis;
@@ -52,6 +53,10 @@ use std::time::Duration;
 const API_RESOLVE_ENV: &str = "ADDNESS_API_RESOLVE";
 const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 120;
 const REQUEST_SEND_ATTEMPTS: usize = 3;
+/// Long-lived SSE connections (e.g. Codex job event streams) outlive the
+/// default per-request timeout, so `get_stream` overrides it with this much
+/// larger budget instead of leaving the whole request unbounded.
+const EVENT_STREAM_TIMEOUT_SECS: u64 = 1800;
 
 fn http_timeout_from_env_value(value: Option<&str>) -> Duration {
     value
@@ -527,6 +532,17 @@ impl ApiClient {
     ) -> Result<T> {
         let (url, req) = self.request(Method::POST, path, true)?;
         self.send_json(req.multipart(form), &url).await
+    }
+
+    /// GET a server-sent-events endpoint, returning the raw `Response` for
+    /// the caller to consume as a byte stream (e.g. via `bytes_stream()` +
+    /// `eventsource_stream::Eventsource`). Overrides the client's default
+    /// timeout — SSE connections are kept alive far longer than a normal
+    /// request/response round trip.
+    pub(super) async fn get_stream(&self, path: &str) -> Result<Response> {
+        let (url, req) = self.request(Method::GET, path, true)?;
+        let req = req.timeout(Duration::from_secs(EVENT_STREAM_TIMEOUT_SECS));
+        self.send(req, &url).await
     }
 }
 

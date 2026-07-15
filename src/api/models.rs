@@ -1,6 +1,7 @@
 mod activity;
 mod assignment;
 mod chat;
+mod codex_job;
 mod comment;
 mod deliverable;
 mod diagnosis;
@@ -28,6 +29,7 @@ mod user;
 pub use activity::*;
 pub use assignment::*;
 pub use chat::*;
+pub use codex_job::*;
 pub use comment::*;
 pub use deliverable::*;
 pub use diagnosis::*;

@@ -13,7 +13,8 @@ use api::ApiClient;
 use cli::commands::{
     activity, assignment, chat, comment, configure, deliverable, detect, diagnosis, execution,
     goal, invitation, invoice, issue, kpi, link, login, media, meeting, member, notification, org,
-    personal, referral, search, sharetree, skills, streak, summary, today, update, user,
+    personal, referral, search, sharetree, skill, skills, streak, summary, today, tool, update,
+    user,
 };
 
 #[derive(Parser)]
@@ -200,6 +201,18 @@ enum Commands {
         #[command(subcommand)]
         command: meeting::MeetingCommands,
     },
+    /// Manage skills (reusable AI prompt templates): CRUD, search, performance,
+    /// supplementary resources, and improvement-suggestion accept/reject.
+    /// Distinct from `addness skills` (this CLI's own usage prompt).
+    Skill {
+        #[command(subcommand)]
+        command: skill::SkillCommands,
+    },
+    /// Manage tools (executable actions an AI skill can invoke): CRUD, search, and execution
+    Tool {
+        #[command(subcommand)]
+        command: tool::ToolCommands,
+    },
     /// Detect goal ID from current git branch name
     DetectGoal {
         /// Output as JSON
@@ -245,6 +258,8 @@ fn command_outputs_json(command: &Commands) -> bool {
         Commands::Personal { command } => personal_outputs_json(command),
         Commands::Execution { command } => execution_outputs_json(command),
         Commands::Meeting { command } => meeting_outputs_json(command),
+        Commands::Skill { command } => skill_outputs_json(command),
+        Commands::Tool { command } => tool_outputs_json(command),
         Commands::Org { command } => org_outputs_json(command),
         Commands::Goal { command } => goal_outputs_json(command),
         Commands::Comment { command } => comment_outputs_json(command),
@@ -484,6 +499,42 @@ fn meeting_outputs_json(command: &meeting::MeetingCommands) -> bool {
             | meeting::MinutesCommands::Update { json, .. }
             | meeting::MinutesCommands::Delete { json, .. } => *json,
         },
+    }
+}
+
+fn skill_outputs_json(command: &skill::SkillCommands) -> bool {
+    match command {
+        skill::SkillCommands::Create { json, .. }
+        | skill::SkillCommands::List { json, .. }
+        | skill::SkillCommands::General { json, .. }
+        | skill::SkillCommands::Search { json, .. }
+        | skill::SkillCommands::Get { json, .. }
+        | skill::SkillCommands::Update { json, .. }
+        | skill::SkillCommands::Delete { json, .. }
+        | skill::SkillCommands::Performance { json, .. } => *json,
+        skill::SkillCommands::Resource { command } => match command {
+            skill::SkillResourceCommands::Create { json, .. }
+            | skill::SkillResourceCommands::List { json, .. }
+            | skill::SkillResourceCommands::Get { json, .. }
+            | skill::SkillResourceCommands::Update { json, .. }
+            | skill::SkillResourceCommands::Delete { json, .. } => *json,
+        },
+        skill::SkillCommands::Refinement { command } => match command {
+            skill::SkillRefinementCommands::Accept { json, .. }
+            | skill::SkillRefinementCommands::Reject { json, .. } => *json,
+        },
+    }
+}
+
+fn tool_outputs_json(command: &tool::ToolCommands) -> bool {
+    match command {
+        tool::ToolCommands::Create { json, .. }
+        | tool::ToolCommands::List { json, .. }
+        | tool::ToolCommands::Search { json, .. }
+        | tool::ToolCommands::Get { json, .. }
+        | tool::ToolCommands::Update { json, .. }
+        | tool::ToolCommands::Delete { json, .. }
+        | tool::ToolCommands::Execute { json, .. } => *json,
     }
 }
 
@@ -940,6 +991,14 @@ async fn main() -> Result<()> {
         Some(Commands::Meeting { command }) => {
             let client = build_client()?;
             meeting::handle_meeting(command, &client).await
+        }
+        Some(Commands::Skill { command }) => {
+            let client = build_client()?;
+            skill::handle_skill(command, &client).await
+        }
+        Some(Commands::Tool { command }) => {
+            let client = build_client()?;
+            tool::handle_tool(command, &client).await
         }
         Some(Commands::DetectGoal { json }) => detect::handle_detect_goal(*json),
         Some(Commands::Update { check }) => update::handle_update(*check).await,

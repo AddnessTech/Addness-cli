@@ -5361,6 +5361,10 @@ impl CodexPane {
             K::FileChange { changes, .. } => {
                 let paths = codex_appserver_change_paths(&changes);
                 let label = codex_appserver_paths_label(&paths);
+                // 「今なにをしているか」表示へ反映する（Claude Code 経路と対称）。
+                self.current_command = Some(label.clone());
+                self.current_command_started_at = Some(Instant::now());
+                self.action = Some(format!("ファイル変更: {label}"));
                 self.push_log(CodexLogKind::Tool, format!("ファイル変更 {label}"));
             }
             // reasoning / agentMessage はデルタ・完了で扱う。
@@ -5415,6 +5419,8 @@ impl CodexPane {
                 }
             }
             K::FileChange { changes, status } => {
+                self.current_command = None;
+                self.current_command_started_at = None;
                 let paths = codex_appserver_change_paths(&changes);
                 let label = codex_appserver_paths_label(&paths);
                 let status = status.unwrap_or_else(|| "完了".to_string());
@@ -12876,6 +12882,64 @@ mod tests {
                 .iter()
                 .any(|l| l.kind == CodexLogKind::Tool && l.text.contains("OK"))
         );
+    }
+
+    #[test]
+    fn codex_appserver_filechange_item_updates_current_activity() {
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        pane.turn_running = true;
+        // started で「今」表示（current_command / action）へ対象パスが載る。
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0", "method": "item/started",
+            "params": {"item": {"id": "fc_1", "type": "fileChange", "changes": [
+                {"path": "src/tui/ui.rs", "kind": {"type": "update"}}
+            ]}}
+        }));
+        assert_eq!(pane.current_command.as_deref(), Some("src/tui/ui.rs"));
+        assert!(pane.current_command_started_at.is_some());
+        assert_eq!(pane.action.as_deref(), Some("ファイル変更: src/tui/ui.rs"));
+        assert!(
+            pane.log
+                .iter()
+                .any(|l| l.kind == CodexLogKind::Tool
+                    && l.text.contains("ファイル変更 src/tui/ui.rs"))
+        );
+        // completed でクリアし、確定行を残す。
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0", "method": "item/completed",
+            "params": {"item": {"id": "fc_1", "type": "fileChange", "status": "completed", "changes": [
+                {"path": "src/tui/ui.rs", "kind": {"type": "update"}}
+            ]}}
+        }));
+        assert!(pane.current_command.is_none());
+        assert!(pane.current_command_started_at.is_none());
+        assert!(
+            pane.log
+                .iter()
+                .any(|l| l.kind == CodexLogKind::Tool && l.text.contains("completed"))
+        );
+    }
+
+    #[test]
+    fn codex_appserver_filechange_multiple_paths_show_rest_count() {
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        pane.turn_running = true;
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0", "method": "item/started",
+            "params": {"item": {"id": "fc_2", "type": "fileChange", "changes": [
+                {"path": "a.rs", "kind": {"type": "update"}},
+                {"path": "b.rs", "kind": {"type": "add"}},
+                {"path": "c.rs", "kind": {"type": "update"}},
+                {"path": "d.rs", "kind": {"type": "delete"}}
+            ]}}
+        }));
+        let command = pane.current_command.as_deref().unwrap();
+        assert!(command.contains("a.rs"));
+        assert!(command.contains("ほか1件"));
     }
 
     #[test]

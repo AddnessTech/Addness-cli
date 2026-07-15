@@ -1,12 +1,12 @@
 use anyhow::Result;
 
 use crate::api::{
-    ApiClient, ApiResponse, PersonalAgentSession, PersonalAgentSessionCreateRequest,
-    PersonalAgentSessionUpdateRequest, PersonalDailyEntry, PersonalMarkdownAnalyzeResponse,
-    PersonalMarkdownEditRequest, PersonalMarkdownEditResponse, PersonalNow,
-    PersonalOrganizationEnsureResponse, PersonalProject, PersonalProjectCreateRequest,
+    ApiClient, ApiResponse, DailyActivityCount, PersonalAgentSession,
+    PersonalAgentSessionCreateRequest, PersonalAgentSessionUpdateRequest, PersonalDailyEntry,
+    PersonalMarkdownAnalyzeResponse, PersonalMarkdownEditRequest, PersonalMarkdownEditResponse,
+    PersonalNow, PersonalOrganizationEnsureResponse, PersonalProject, PersonalProjectCreateRequest,
     PersonalProjectUpdateRequest, PersonalResetResponse, PersonalTextPatchRequest,
-    PersonalTextPatchResponse, PersonalTodayAppendRequest,
+    PersonalTextPatchResponse, PersonalTodayAppendRequest, PersonalTodayItem,
 };
 
 /// Build the query-string suffix for the personal `list`/`get` endpoints
@@ -260,6 +260,43 @@ impl ApiClient {
         let resp: ApiResponse<PersonalOrganizationEnsureResponse> = self
             .post_empty("/api/v1/team/personal-organization/ensure")
             .await?;
+        Ok(resp.data)
+    }
+
+    /// GET /api/v2/personal/today-list?date=&exclude_completed= — the
+    /// caller's "today's todos" aggregated across every organization they
+    /// belong to (org-independent, unlike `today list` which is a single
+    /// organization's `todays-goals`).
+    pub async fn get_personal_today_list(
+        &self,
+        date: Option<&str>,
+        exclude_completed: Option<bool>,
+    ) -> Result<Vec<PersonalTodayItem>> {
+        let exclude_completed_str = exclude_completed.map(|v| v.to_string());
+        let path = format!(
+            "/api/v2/personal/today-list{}",
+            query_suffix(&[
+                ("date", date),
+                ("exclude_completed", exclude_completed_str.as_deref()),
+            ])
+        );
+        let resp: ApiResponse<Vec<PersonalTodayItem>> = self.get(&path).await?;
+        Ok(resp.data)
+    }
+
+    /// GET /api/v2/personal/daily-activity?start=&end= — cross-organization
+    /// planned/done counts per activity day (used to render the "footsteps"
+    /// history heatmap).
+    pub async fn get_personal_daily_activity(
+        &self,
+        start: &str,
+        end: &str,
+    ) -> Result<Vec<DailyActivityCount>> {
+        let path = format!(
+            "/api/v2/personal/daily-activity{}",
+            query_suffix(&[("start", Some(start)), ("end", Some(end))])
+        );
+        let resp: ApiResponse<Vec<DailyActivityCount>> = self.get(&path).await?;
         Ok(resp.data)
     }
 }

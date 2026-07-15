@@ -11,10 +11,10 @@ use clap::{CommandFactory, Parser, Subcommand};
 use crate::config::{Credentials, DEFAULT_API_URL, Settings};
 use api::ApiClient;
 use cli::commands::{
-    activity, assignment, chat, codex_job, comment, configure, deliverable, detect, diagnosis,
-    execution, goal, invitation, invoice, issue, kpi, link, login, media, meeting, member,
-    notification, org, personal, referral, search, sharetree, skill, skills, streak, summary,
-    today, tool, update, user,
+    activity, api_key, assignment, chat, codex_job, comment, configure, deliverable, detect,
+    diagnosis, execution, goal, invitation, invoice, issue, kpi, link, login, media, meeting,
+    member, notification, org, personal, referral, search, sharetree, skill, skills, streak,
+    summary, today, tool, update, user,
 };
 
 #[derive(Parser)]
@@ -219,6 +219,12 @@ enum Commands {
         #[command(subcommand)]
         command: codex_job::CodexJobCommands,
     },
+    /// Manage personal API keys (list, create, revoke). The plaintext key is
+    /// only ever returned by `create` — it cannot be retrieved again
+    ApiKey {
+        #[command(subcommand)]
+        command: api_key::ApiKeyCommands,
+    },
     /// Detect goal ID from current git branch name
     DetectGoal {
         /// Output as JSON
@@ -267,6 +273,7 @@ fn command_outputs_json(command: &Commands) -> bool {
         Commands::Skill { command } => skill_outputs_json(command),
         Commands::Tool { command } => tool_outputs_json(command),
         Commands::CodexJob { command } => codex_job_outputs_json(command),
+        Commands::ApiKey { command } => api_key_outputs_json(command),
         Commands::Org { command } => org_outputs_json(command),
         Commands::Goal { command } => goal_outputs_json(command),
         Commands::Comment { command } => comment_outputs_json(command),
@@ -544,6 +551,14 @@ fn codex_job_outputs_json(command: &codex_job::CodexJobCommands) -> bool {
         | codex_job::CodexJobCommands::Events { json, .. } => *json,
         codex_job::CodexJobCommands::Close { json, force, .. }
         | codex_job::CodexJobCommands::Delete { json, force, .. } => *json && *force,
+    }
+}
+
+fn api_key_outputs_json(command: &api_key::ApiKeyCommands) -> bool {
+    match command {
+        api_key::ApiKeyCommands::List { json, .. }
+        | api_key::ApiKeyCommands::Create { json, .. } => *json,
+        api_key::ApiKeyCommands::Rm { json, force, .. } => *json && *force,
     }
 }
 
@@ -1024,6 +1039,10 @@ async fn main() -> Result<()> {
         Some(Commands::CodexJob { command }) => {
             let client = build_client()?;
             codex_job::handle_codex_job(command, &client).await
+        }
+        Some(Commands::ApiKey { command }) => {
+            let client = build_client()?;
+            api_key::handle_api_key(command, &client).await
         }
         Some(Commands::DetectGoal { json }) => detect::handle_detect_goal(*json),
         Some(Commands::Update { check }) => update::handle_update(*check).await,

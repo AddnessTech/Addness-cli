@@ -1,4 +1,5 @@
 mod activity;
+mod api_key;
 mod assignment;
 mod chat;
 mod codex_job;
@@ -27,6 +28,7 @@ mod tool;
 mod user;
 
 pub use activity::*;
+pub use api_key::*;
 pub use assignment::*;
 pub use chat::*;
 pub use codex_job::*;

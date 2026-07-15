@@ -194,7 +194,39 @@ fn org_outputs_json(command: &org::OrgCommands) -> bool {
         | org::OrgCommands::Current { json }
         | org::OrgCommands::Create { json, .. }
         | org::OrgCommands::Update { json, .. }
-        | org::OrgCommands::SetContext { json, .. } => *json,
+        | org::OrgCommands::SetContext { json, .. }
+        | org::OrgCommands::Get { json, .. }
+        | org::OrgCommands::ListAll { json, .. }
+        | org::OrgCommands::RootOwner { json, .. }
+        | org::OrgCommands::AccessibleRoot { json, .. }
+        | org::OrgCommands::AiAgentMember { json, .. }
+        | org::OrgCommands::AccessState { json, .. }
+        | org::OrgCommands::CurrentMember { json, .. }
+        | org::OrgCommands::AdminCheck { json, .. }
+        | org::OrgCommands::GetContext { json, .. }
+        | org::OrgCommands::ContextRevisions { json, .. }
+        | org::OrgCommands::SetTimezone { json, .. }
+        | org::OrgCommands::SetLogo { json, .. }
+        | org::OrgCommands::PushTokenRegister { json, .. } => *json,
+        org::OrgCommands::OnboardingBilling { command } => match command {
+            org::OnboardingBillingCommands::State { json, .. }
+            | org::OnboardingBillingCommands::Require { json, .. }
+            | org::OnboardingBillingCommands::Free { json, .. } => *json,
+        },
+        org::OrgCommands::AiScheduleSettings { command } => match command {
+            org::AiScheduleSettingsCommands::Get { json, .. }
+            | org::AiScheduleSettingsCommands::Set { json, .. } => *json,
+        },
+        org::OrgCommands::AdSettings { command } => match command {
+            org::AdSettingsCommands::Get { json, .. }
+            | org::AdSettingsCommands::Set { json, .. }
+            | org::AdSettingsCommands::SetMe { json, .. } => *json,
+        },
+        org::OrgCommands::Subscription { command } => match command {
+            org::SubscriptionCommands::Register { json, .. }
+            | org::SubscriptionCommands::Current { json, .. } => *json,
+            org::SubscriptionCommands::Cancel { json, force, .. } => *json && *force,
+        },
         org::OrgCommands::Switch { .. } | org::OrgCommands::Rm { .. } => false,
     }
 }
@@ -281,7 +313,33 @@ fn kpi_outputs_json(command: &kpi::KpiCommands) -> bool {
 }
 
 fn member_outputs_json(command: &member::MemberCommands) -> bool {
-    matches!(command, member::MemberCommands::List { json: true, .. })
+    match command {
+        member::MemberCommands::List { json, .. }
+        | member::MemberCommands::Search { json, .. }
+        | member::MemberCommands::Children { json, .. }
+        | member::MemberCommands::Admins { json, .. }
+        | member::MemberCommands::DeletePreview { json, .. }
+        | member::MemberCommands::Browse { json, .. }
+        | member::MemberCommands::Objectives { json, .. }
+        | member::MemberCommands::SetAvatar { json, .. }
+        | member::MemberCommands::Get { json, .. } => *json,
+        member::MemberCommands::Update { .. }
+        | member::MemberCommands::Pin { .. }
+        | member::MemberCommands::Unpin { .. }
+        | member::MemberCommands::Rm { .. }
+        | member::MemberCommands::SetSourceOrg { .. } => false,
+        member::MemberCommands::Admin { command } => match command {
+            member::AdminCommands::Grant { .. } | member::AdminCommands::Revoke { .. } => false,
+        },
+        member::MemberCommands::Tag { command } => match command {
+            member::MemberTagCommands::List { json, .. }
+            | member::MemberTagCommands::Create { json, .. }
+            | member::MemberTagCommands::ListFor { json, .. } => *json,
+            member::MemberTagCommands::Rm { .. }
+            | member::MemberTagCommands::Assign { .. }
+            | member::MemberTagCommands::Unassign { .. } => false,
+        },
+    }
 }
 
 fn user_outputs_json(command: &user::UserCommands) -> bool {
@@ -322,12 +380,25 @@ fn invitation_outputs_json(command: &invitation::InvitationCommands) -> bool {
     match command {
         invitation::InvitationCommands::Create { json, .. }
         | invitation::InvitationCommands::Resend { json, .. }
-        | invitation::InvitationCommands::Accept { json, .. } => *json,
+        | invitation::InvitationCommands::Accept { json, .. }
+        | invitation::InvitationCommands::LegacyAccept { json, .. }
+        | invitation::InvitationCommands::CheckPlanUpgrade { json, .. }
+        | invitation::InvitationCommands::Preview { json, .. }
+        | invitation::InvitationCommands::AcceptToken { json, .. }
+        | invitation::InvitationCommands::InvitedMembers { json, .. }
+        | invitation::InvitationCommands::Overview { json, .. } => *json,
         invitation::InvitationCommands::Link { command } => match command {
-            invitation::InviteLinkCommands::Create { json, .. } => *json,
+            invitation::InviteLinkCommands::Create { json, .. }
+            | invitation::InviteLinkCommands::List { json, .. }
+            | invitation::InviteLinkCommands::Join { json, .. } => *json,
             invitation::InviteLinkCommands::Deactivate { .. } => false,
         },
-        invitation::InvitationCommands::Revoke { .. } => false,
+        invitation::InvitationCommands::Pending { command } => match command {
+            invitation::PendingCommands::List { json }
+            | invitation::PendingCommands::Access { json, .. } => *json,
+        },
+        invitation::InvitationCommands::Revoke { .. }
+        | invitation::InvitationCommands::Decline { .. } => false,
     }
 }
 

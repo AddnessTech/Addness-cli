@@ -17,8 +17,9 @@ pub use activity::{
     GoalActivitySummaryParams,
 };
 pub use comment::ListCommentsParams;
+pub use member::BrowseMembersParams;
 pub use notification::ListNotificationsParams;
-pub use org::CreateOrganizationParams;
+pub use org::{CreateOrganizationParams, ListAllOrganizationsParams};
 pub use user::ListUsersParams;
 
 use anyhow::{Context, Result};
@@ -465,6 +466,22 @@ impl ApiClient {
     pub(super) async fn delete_no_body(&self, path: &str) -> Result<()> {
         let (url, req) = self.request(Method::DELETE, path, true)?;
         self.send_no_content(req, &url).await
+    }
+
+    /// PUT with a raw binary body (e.g. organization logo upload), expects JSON response.
+    /// The backend reads the request body directly as the uploaded file, so this
+    /// sends the bytes as-is with an explicit `Content-Type`.
+    pub(super) async fn put_bytes<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        bytes: Vec<u8>,
+        content_type: &str,
+    ) -> Result<T> {
+        let (url, req) = self.request(Method::PUT, path, true)?;
+        let req = req
+            .header(reqwest::header::CONTENT_TYPE, content_type.to_string())
+            .body(bytes);
+        self.send_json(req, &url).await
     }
 }
 

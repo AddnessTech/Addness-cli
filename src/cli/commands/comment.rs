@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use clap::Subcommand;
 use std::io::{self, Read};
 
-use crate::api::{ApiClient, CommentDetail, ListCommentsParams};
+use crate::api::{ApiClient, CommentDetail, ListAllCommentsParams, ListCommentsParams};
 use crate::cli::output::print_comments_table;
 
 #[derive(Subcommand)]
@@ -34,10 +34,65 @@ pub enum CommentCommands {
         #[arg(long)]
         json: bool,
     },
+    /// List comments across goals (global feed with filters)
+    ListAll {
+        /// Filter by goal ID
+        #[arg(long)]
+        goal: Option<String>,
+        /// Filter by author (organization member ID)
+        #[arg(long)]
+        author: Option<String>,
+        /// Parent comment ID (list replies to this comment)
+        #[arg(long)]
+        parent: Option<String>,
+        /// Filter by resolved status
+        #[arg(long)]
+        resolved: Option<bool>,
+        /// Max number of comments to return (1-1000)
+        #[arg(long)]
+        limit: Option<u16>,
+        /// Pagination offset
+        #[arg(long)]
+        offset: Option<u64>,
+        /// Sort order: asc or desc
+        #[arg(long)]
+        sort: Option<String>,
+        /// Include thread replies when supported by the API
+        #[arg(long)]
+        include_replies: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Get a comment and its replies
     Get {
         /// Comment ID
         id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Get a comment with its surrounding comments (notification highlight)
+    Context {
+        /// Comment ID
+        id: String,
+        /// Number of comments before/after the target (1-50, default 5)
+        #[arg(long)]
+        radius: Option<u8>,
+        /// Filter surrounding comments by resolved status
+        #[arg(long)]
+        resolved: Option<bool>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// List members who reacted to a comment with a given emoji
+    Reactions {
+        /// Comment ID
+        id: String,
+        /// Emoji to look up
+        #[arg(long)]
+        emoji: String,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -133,7 +188,9 @@ pub enum AttachmentCommands {
     },
 }
 
-fn read_body(inline: Option<&String>, file: Option<&String>) -> Result<String> {
+/// Read a message body from an inline flag, a file, or stdin (`-`).
+/// Shared with the goal-issue commands (`issue.rs`).
+pub(super) fn read_body(inline: Option<&String>, file: Option<&String>) -> Result<String> {
     match (inline, file) {
         (Some(s), None) if s == "-" => read_stdin(),
         (Some(s), None) => Ok(s.clone()),
@@ -177,6 +234,16 @@ fn validate_limit(limit: Option<u16>) -> Result<Option<u16>> {
     Ok(limit)
 }
 
+/// Radius accepted by GET /comments/:id/context (backend rejects outside 1-50).
+fn validate_radius(radius: Option<u8>) -> Result<Option<u8>> {
+    if let Some(value) = radius
+        && !(1..=50).contains(&value)
+    {
+        bail!("--radius must be between 1 and 50.");
+    }
+    Ok(radius)
+}
+
 fn print_comment_detail(detail: &CommentDetail) {
     print_comments_table(std::slice::from_ref(&detail.comment));
     if !detail.replies.is_empty() {
@@ -217,12 +284,100 @@ pub async fn handle_comments(cmd: &CommentCommands, client: &ApiClient) -> Resul
             }
             Ok(())
         }
+        CommentCommands::ListAll {
+            goal,
+            author,
+            parent,
+            resolved,
+            limit,
+            offset,
+            sort,
+            include_replies,
+            json,
+        } => {
+            let resp = client
+                .list_all_comments(ListAllCommentsParams {
+                    goal_id: goal.as_deref(),
+                    author_id: author.as_deref(),
+                    parent_id: parent.as_deref(),
+                    resolved: *resolved,
+                    limit: validate_limit(*limit)?,
+                    offset: *offset,
+                    sort: validate_sort(sort.as_ref())?,
+                    include_replies: *include_replies,
+                })
+                .await?;
+
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&resp.comments)?);
+            } else {
+                print_comments_table(&resp.comments);
+                let shown = resp.comments.len() as i64;
+                if shown < resp.total_count {
+                    println!(
+                        "Showing {shown} of {} comments (use --offset or --limit).",
+                        resp.total_count
+                    );
+                }
+            }
+            Ok(())
+        }
         CommentCommands::Get { id, json } => {
             let comment = client.get_comment(id).await?;
             if *json {
                 println!("{}", serde_json::to_string_pretty(&comment)?);
             } else {
                 print_comment_detail(&comment);
+            }
+            Ok(())
+        }
+        CommentCommands::Context {
+            id,
+            radius,
+            resolved,
+            json,
+        } => {
+            let context = client
+                .get_comment_context(id, validate_radius(*radius)?, *resolved)
+                .await?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&context)?);
+            } else {
+                if let Some(parent) = &context.parent_comment {
+                    println!("Parent comment:");
+                    print_comments_table(std::slice::from_ref(parent));
+                    println!();
+                }
+                print_comments_table(&context.comments);
+                let target = context
+                    .comments
+                    .get(usize::try_from(context.target_index).unwrap_or(usize::MAX))
+                    .map(|c| c.id.as_str())
+                    .unwrap_or("-");
+                println!();
+                println!(
+                    "Target: {target} (more above: {}, more below: {}, total: {})",
+                    context.has_above, context.has_below, context.total_count
+                );
+            }
+            Ok(())
+        }
+        CommentCommands::Reactions { id, emoji, json } => {
+            let users = client.get_comment_reaction_users(id, emoji).await?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&users)?);
+            } else {
+                match users.as_array() {
+                    Some(members) if !members.is_empty() => {
+                        for member in members {
+                            let member_id =
+                                member.get("id").and_then(|v| v.as_str()).unwrap_or("-");
+                            let name = member.get("name").and_then(|v| v.as_str()).unwrap_or("-");
+                            println!("{member_id} — {name}");
+                        }
+                    }
+                    _ => println!("No reactions with {emoji} on comment {id}."),
+                }
             }
             Ok(())
         }
@@ -315,5 +470,61 @@ pub async fn handle_comments(cmd: &CommentCommands, client: &ApiClient) -> Resul
                 Ok(())
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ensure_body, validate_limit, validate_radius, validate_sort};
+
+    #[test]
+    fn validate_sort_accepts_asc_and_desc() {
+        assert_eq!(
+            validate_sort(Some(&"asc".to_string())).unwrap(),
+            Some("asc")
+        );
+        assert_eq!(
+            validate_sort(Some(&"desc".to_string())).unwrap(),
+            Some("desc")
+        );
+        assert_eq!(validate_sort(None).unwrap(), None);
+    }
+
+    #[test]
+    fn validate_sort_rejects_other_values() {
+        assert!(validate_sort(Some(&"newest".to_string())).is_err());
+    }
+
+    #[test]
+    fn validate_limit_accepts_range_bounds() {
+        assert_eq!(validate_limit(Some(1)).unwrap(), Some(1));
+        assert_eq!(validate_limit(Some(1000)).unwrap(), Some(1000));
+        assert_eq!(validate_limit(None).unwrap(), None);
+    }
+
+    #[test]
+    fn validate_limit_rejects_out_of_range() {
+        assert!(validate_limit(Some(0)).is_err());
+        assert!(validate_limit(Some(1001)).is_err());
+    }
+
+    #[test]
+    fn validate_radius_accepts_range_bounds() {
+        assert_eq!(validate_radius(Some(1)).unwrap(), Some(1));
+        assert_eq!(validate_radius(Some(50)).unwrap(), Some(50));
+        assert_eq!(validate_radius(None).unwrap(), None);
+    }
+
+    #[test]
+    fn validate_radius_rejects_out_of_range() {
+        assert!(validate_radius(Some(0)).is_err());
+        assert!(validate_radius(Some(51)).is_err());
+    }
+
+    #[test]
+    fn ensure_body_rejects_empty_and_oversized_content() {
+        assert!(ensure_body("  \n".to_string()).is_err());
+        assert!(ensure_body("a".repeat(10_001)).is_err());
+        assert_eq!(ensure_body("hello".to_string()).unwrap(), "hello");
     }
 }

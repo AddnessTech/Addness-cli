@@ -261,9 +261,128 @@ pub struct GoalSearchItem {
     pub owner: Option<Owner>,
 }
 
+// GET/POST/PUT /api/v2/objectives/:id/recurring
+// レスポンスは { "data": ... } でラップされる（他のv2エンドポイントと同様）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecurringGoal {
+    pub id: String,
+    pub objective_id: String,
+    /// 基本パターン（DAILY/WEEKLY/MONTHLY/WEEKDAYS）。カスタムパターン使用時はNone。
+    #[serde(default)]
+    pub pattern: Option<String>,
+    pub description: String,
+    pub is_basic_pattern: bool,
+    /// 基本パターンがWEEKLYの場合のみ設定（updatedAtから導出、Go time.Weekday: Sunday=0）
+    #[serde(default)]
+    pub day_of_week: Option<i32>,
+    /// 基本パターンがMONTHLYの場合のみ設定（updatedAtから導出）
+    #[serde(default)]
+    pub day_of_month: Option<i32>,
+    /// カスタムパターンの種別（DAILY/WEEKLY/MONTHLY/YEARLY）。基本パターン使用時はNone。
+    #[serde(default)]
+    pub recurrence_type: Option<String>,
+    #[serde(default)]
+    pub interval: Option<i32>,
+    #[serde(default)]
+    pub days_of_week: Vec<String>,
+    #[serde(default)]
+    pub days_of_month: Vec<i32>,
+    #[serde(default)]
+    pub end_date: Option<String>,
+    #[serde(default)]
+    pub is_last_day: Option<bool>,
+    #[serde(default)]
+    pub nth_week: Option<i32>,
+    #[serde(default)]
+    pub repeat_from_completion: Option<bool>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+// POST/PUT /api/v2/objectives/:id/recurring
+// Create/Updateで同一のリクエスト形。基本パターン(pattern)とカスタムパターン(recurrenceType以下)は排他。
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecurringGoalRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recurrence_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interval: Option<i32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub days_of_week: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub days_of_month: Vec<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_last_day: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nth_week: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repeat_from_completion: Option<bool>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recurring_goal_request_omits_unset_fields() {
+        let req = RecurringGoalRequest {
+            pattern: Some("WEEKLY".to_string()),
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(req).unwrap();
+
+        assert_eq!(value["pattern"], "WEEKLY");
+        assert!(value.get("recurrenceType").is_none());
+        assert!(value.get("daysOfWeek").is_none());
+        assert!(value.get("isLastDay").is_none());
+    }
+
+    #[test]
+    fn recurring_goal_request_serializes_custom_pattern_fields() {
+        let req = RecurringGoalRequest {
+            recurrence_type: Some("WEEKLY".to_string()),
+            interval: Some(2),
+            days_of_week: vec!["MONDAY".to_string(), "THURSDAY".to_string()],
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(req).unwrap();
+
+        assert_eq!(value["recurrenceType"], "WEEKLY");
+        assert_eq!(value["interval"], 2);
+        assert_eq!(value["daysOfWeek"][0], "MONDAY");
+        assert!(value.get("pattern").is_none());
+    }
+
+    #[test]
+    fn recurring_goal_deserializes_basic_pattern_response() {
+        let json = serde_json::json!({
+            "id": "rg-1",
+            "objectiveId": "goal-1",
+            "pattern": "WEEKLY",
+            "description": "毎週月曜",
+            "isBasicPattern": true,
+            "dayOfWeek": 1,
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-01T00:00:00Z"
+        });
+
+        let goal: RecurringGoal = serde_json::from_value(json).unwrap();
+
+        assert_eq!(goal.pattern.as_deref(), Some("WEEKLY"));
+        assert!(goal.is_basic_pattern);
+        assert_eq!(goal.day_of_week, Some(1));
+        assert!(goal.recurrence_type.is_none());
+    }
 
     #[test]
     fn update_goal_request_serializes_writable_goal_fields() {

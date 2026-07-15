@@ -16,10 +16,7 @@ use anyhow::Result;
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::{
-    CodexSessionCandidate, addness_tui_developer_instructions, config_override_value,
-    split_codex_command_args,
-};
+use super::{CodexSessionCandidate, config_override_value, split_codex_command_args};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodexModelChoice {
@@ -626,6 +623,7 @@ fn codex_command_with_vec_default(
 pub(super) fn codex_named_subcommand_args_with_settings(
     mut args: Vec<String>,
     settings: &CodexExecSettings,
+    developer_instructions: &str,
 ) -> Vec<String> {
     if matches!(args.first().map(String::as_str), Some("--version" | "help")) {
         return args;
@@ -655,7 +653,7 @@ pub(super) fn codex_named_subcommand_args_with_settings(
         out.push(feature.clone());
     }
     if codex_command_needs_addness_developer_instructions(&args) {
-        push_addness_developer_instructions(&mut out);
+        push_developer_instructions(&mut out, developer_instructions);
     }
     out.append(&mut args);
     out
@@ -1045,17 +1043,13 @@ pub(super) fn codex_exec_resume_args(
     include_all: bool,
     prompt: &str,
     settings: &CodexExecSettings,
+    developer_instructions: &str,
 ) -> Vec<String> {
-    let developer_instructions = codex_config_arg(
-        CodexConfigKey::DeveloperInstructions,
-        addness_tui_developer_instructions(),
-    );
     let mut args = Vec::new();
     push_global_exec_settings(&mut args, settings, true);
     args.extend(["exec", "resume", "--json"].into_iter().map(str::to_string));
     push_optional_exec_settings(&mut args, settings);
-    args.push("-c".to_string());
-    args.push(developer_instructions);
+    push_developer_instructions(&mut args, developer_instructions);
     if include_all {
         args.push("--all".to_string());
     }
@@ -1097,11 +1091,14 @@ fn push_root_interactive_settings(
     }
 }
 
-fn push_addness_developer_instructions(args: &mut Vec<String>) {
+/// developer instructions（base指示＋応答言語指示を合成済みの文字列）を `-c` で渡す。
+/// 合成は呼び出し側（`CodexPane::composed_developer_instructions`）で行い、
+/// ここは受け取った文字列をそのまま注入する共通ヘルパ。
+fn push_developer_instructions(args: &mut Vec<String>, developer_instructions: &str) {
     args.push("-c".to_string());
     args.push(codex_config_arg(
         CodexConfigKey::DeveloperInstructions,
-        addness_tui_developer_instructions(),
+        developer_instructions,
     ));
 }
 
@@ -1109,16 +1106,18 @@ pub(super) fn codex_root_interactive_args(
     prompt: &str,
     cwd: &str,
     settings: &CodexExecSettings,
+    developer_instructions: &str,
 ) -> Vec<String> {
     let mut args = Vec::new();
     push_root_interactive_settings(&mut args, cwd, settings, true);
-    push_addness_developer_instructions(&mut args);
+    push_developer_instructions(&mut args, developer_instructions);
     if !prompt.is_empty() {
         args.push(prompt.to_string());
     }
     args
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn codex_root_resume_args(
     session_id: Option<&str>,
     use_last: bool,
@@ -1127,10 +1126,11 @@ pub(super) fn codex_root_resume_args(
     prompt: &str,
     cwd: &str,
     settings: &CodexExecSettings,
+    developer_instructions: &str,
 ) -> Vec<String> {
     let mut args = Vec::new();
     push_root_interactive_settings(&mut args, cwd, settings, true);
-    push_addness_developer_instructions(&mut args);
+    push_developer_instructions(&mut args, developer_instructions);
     args.push("resume".to_string());
     if include_all {
         args.push("--all".to_string());
@@ -1154,11 +1154,12 @@ pub(super) fn codex_root_session_command_args(
     raw_args: &str,
     cwd: &str,
     settings: &CodexExecSettings,
+    developer_instructions: &str,
 ) -> Result<Vec<String>> {
     let mut parsed = split_codex_command_args(raw_args)?;
     let mut args = Vec::new();
     push_root_interactive_settings(&mut args, cwd, settings, true);
-    push_addness_developer_instructions(&mut args);
+    push_developer_instructions(&mut args, developer_instructions);
     args.push(command_name.to_string());
     args.append(&mut parsed);
     Ok(args)
@@ -1171,10 +1172,11 @@ pub(super) fn codex_fork_args(
     prompt: &str,
     cwd: &str,
     settings: &CodexExecSettings,
+    developer_instructions: &str,
 ) -> Vec<String> {
     let mut args = Vec::new();
     push_root_interactive_settings(&mut args, cwd, settings, true);
-    push_addness_developer_instructions(&mut args);
+    push_developer_instructions(&mut args, developer_instructions);
     args.push("fork".to_string());
     if include_all {
         args.push("--all".to_string());
@@ -1213,17 +1215,13 @@ pub(super) fn codex_review_args(
     raw_args: &str,
     cwd: &str,
     settings: &CodexExecSettings,
+    developer_instructions: &str,
 ) -> Result<Vec<String>> {
     let mut parsed = split_codex_command_args(raw_args)?;
-    let developer_instructions = codex_config_arg(
-        CodexConfigKey::DeveloperInstructions,
-        addness_tui_developer_instructions(),
-    );
     let mut args = Vec::new();
     push_root_interactive_settings(&mut args, cwd, settings, false);
     args.push("review".to_string());
-    args.push("-c".to_string());
-    args.push(developer_instructions);
+    push_developer_instructions(&mut args, developer_instructions);
     args.append(&mut parsed);
     Ok(args)
 }
@@ -1292,20 +1290,16 @@ pub(super) fn codex_exec_review_args(
     raw_args: &str,
     cwd: &str,
     settings: &CodexExecSettings,
+    developer_instructions: &str,
 ) -> Result<Vec<String>> {
     let mut parsed = split_codex_command_args(raw_args)?;
-    let developer_instructions = codex_config_arg(
-        CodexConfigKey::DeveloperInstructions,
-        addness_tui_developer_instructions(),
-    );
     let mut args = Vec::new();
     push_global_exec_settings(&mut args, settings, true);
     args.push("-C".to_string());
     args.push(cwd.to_string());
     args.extend(["exec", "review", "--json"].into_iter().map(str::to_string));
     push_optional_exec_review_settings(&mut args, settings);
-    args.push("-c".to_string());
-    args.push(developer_instructions);
+    push_developer_instructions(&mut args, developer_instructions);
     args.append(&mut parsed);
     Ok(args)
 }
@@ -1314,18 +1308,14 @@ pub(super) fn codex_exec_args(
     thread_id: Option<&str>,
     cwd: &str,
     settings: &CodexExecSettings,
+    developer_instructions: &str,
 ) -> Vec<String> {
-    let developer_instructions = codex_config_arg(
-        CodexConfigKey::DeveloperInstructions,
-        addness_tui_developer_instructions(),
-    );
     let mut args = Vec::new();
     if let Some(thread_id) = thread_id {
         push_global_exec_settings(&mut args, settings, true);
         args.extend(["exec", "resume", "--json"].into_iter().map(str::to_string));
         push_optional_exec_settings(&mut args, settings);
-        args.push("-c".to_string());
-        args.push(developer_instructions);
+        push_developer_instructions(&mut args, developer_instructions);
         args.push(thread_id.to_string());
         args.push("-".to_string());
         return args;
@@ -1345,8 +1335,7 @@ pub(super) fn codex_exec_args(
     args.push("-C".to_string());
     args.push(cwd.to_string());
     push_optional_exec_settings(&mut args, settings);
-    args.push("-c".to_string());
-    args.push(developer_instructions);
+    push_developer_instructions(&mut args, developer_instructions);
     args.push("-".to_string());
     args
 }
@@ -1373,6 +1362,11 @@ fn toml_basic_string(value: &str) -> String {
 mod tests {
     use super::*;
 
+    /// arg ビルダへ渡す developer instructions のテスト用センチネル。
+    /// base指示＋応答言語指示の合成は `CodexPane` 側で行うため、ここでは
+    /// 「渡された文字列が developer_instructions として注入される」ことだけを検証する。
+    const TEST_DEV_INSTRUCTIONS: &str = "TEST-DEV-INSTRUCTIONS";
+
     fn has_addness_developer_instructions(args: &[String]) -> bool {
         args.iter()
             .any(|arg| arg.starts_with("developer_instructions="))
@@ -1389,7 +1383,7 @@ mod tests {
     #[test]
     fn codex_exec_args_start_new_json_turn() {
         let settings = CodexExecSettings::default();
-        let args = codex_exec_args(None, "/repo", &settings);
+        let args = codex_exec_args(None, "/repo", &settings, TEST_DEV_INSTRUCTIONS);
 
         assert!(args.windows(2).any(|pair| pair == ["exec", "--json"]));
         assert!(args.contains(&"--json".to_string()));
@@ -1399,25 +1393,8 @@ mod tests {
         );
         assert!(args.windows(2).any(|pair| pair == ["-C", "/repo"]));
         assert_eq!(args.last().map(String::as_str), Some("-"));
-        assert!(
-            args.iter()
-                .any(|arg| arg.starts_with("developer_instructions="))
-        );
         assert!(args.iter().any(|arg| {
-            arg.starts_with("developer_instructions=")
-                && arg.contains("ADDNESS_WORKTREE_BRANCH")
-                && arg.contains("Addness TUIは誰でも `addness` と打てば起動")
-                && arg.contains("snapshotを最初の想起として扱ってください")
-                && arg.contains("実装判断を変え得る場合だけ")
-                && arg.contains("TUI snapshotを見る → リポジトリを読む → 実装/調査する → 検証する")
-                && arg.contains("追加読込が必要な時")
-                && arg.contains("実装判断に必要な不足分だけ")
-                && arg.contains("turn完了・セッション終了サマリ")
-                && arg.contains("手動でbody更新しなくて構いません")
-                && arg.contains("手を止めてAddness更新ターンへ寄せない")
-                && arg.contains("手動でAddnessに書き込むのは、自動メモでは足りない")
-                && !arg.contains("Addnessに書き込むのは、作業を始めた時")
-                && !arg.contains("読み取り時:")
+            arg.starts_with("developer_instructions=") && arg.contains(TEST_DEV_INSTRUCTIONS)
         }));
         assert!(
             args.windows(2)
@@ -1432,7 +1409,7 @@ mod tests {
     #[test]
     fn codex_exec_args_resume_existing_json_thread() {
         let settings = CodexExecSettings::default();
-        let args = codex_exec_args(Some("thread-1"), "/repo", &settings);
+        let args = codex_exec_args(Some("thread-1"), "/repo", &settings, TEST_DEV_INSTRUCTIONS);
 
         assert!(
             args.windows(3)
@@ -1447,16 +1424,25 @@ mod tests {
 
     #[test]
     fn codex_exec_resume_args_include_selected_settings() {
-        let mut settings = CodexExecSettings::default();
-        settings.model = CodexModelChoice::Gpt5;
-        settings.reasoning = CodexReasoningChoice::Medium;
-        settings.approval = CodexApprovalChoice::OnRequest;
-        settings.sandbox = CodexSandboxChoice::ReadOnly;
+        let mut settings = CodexExecSettings {
+            model: CodexModelChoice::Gpt5,
+            reasoning: CodexReasoningChoice::Medium,
+            approval: CodexApprovalChoice::OnRequest,
+            sandbox: CodexSandboxChoice::ReadOnly,
+            ..Default::default()
+        };
         settings.image_paths.push("/tmp/shot.png".to_string());
         settings.output_schema = Some("/tmp/schema.json".to_string());
         settings.output_last_message = Some("/tmp/last.txt".to_string());
 
-        let args = codex_exec_resume_args(None, true, false, "continue", &settings);
+        let args = codex_exec_resume_args(
+            None,
+            true,
+            false,
+            "continue",
+            &settings,
+            TEST_DEV_INSTRUCTIONS,
+        );
 
         assert!(args.windows(2).any(|pair| pair == ["-a", "on-request"]));
         assert!(args.windows(2).any(|pair| pair == ["-s", "read-only"]));
@@ -1478,8 +1464,14 @@ mod tests {
         );
         assert_eq!(args.last().map(String::as_str), Some("continue"));
 
-        let session_args =
-            codex_exec_resume_args(Some("session-1"), false, true, "next", &settings);
+        let session_args = codex_exec_resume_args(
+            Some("session-1"),
+            false,
+            true,
+            "next",
+            &settings,
+            TEST_DEV_INSTRUCTIONS,
+        );
         assert!(session_args.contains(&"session-1".to_string()));
         assert!(!session_args.contains(&"--last".to_string()));
         assert!(session_args.contains(&"--all".to_string()));
@@ -1488,13 +1480,16 @@ mod tests {
 
     #[test]
     fn codex_root_interactive_args_include_prompt_and_settings() {
-        let mut settings = CodexExecSettings::default();
-        settings.model_override = Some("gpt-custom".to_string());
-        settings.approval = CodexApprovalChoice::OnRequest;
-        settings.sandbox = CodexSandboxChoice::ReadOnly;
-        settings.web_search = true;
+        let settings = CodexExecSettings {
+            model_override: Some("gpt-custom".to_string()),
+            approval: CodexApprovalChoice::OnRequest,
+            sandbox: CodexSandboxChoice::ReadOnly,
+            web_search: true,
+            ..Default::default()
+        };
 
-        let args = codex_root_interactive_args("hello codex", "/repo", &settings);
+        let args =
+            codex_root_interactive_args("hello codex", "/repo", &settings, TEST_DEV_INSTRUCTIONS);
 
         assert!(args.windows(2).any(|pair| pair == ["-a", "on-request"]));
         assert!(args.windows(2).any(|pair| pair == ["-s", "read-only"]));
@@ -1509,20 +1504,31 @@ mod tests {
         assert!(has_addness_memory_defaults(&args));
         assert_eq!(args.last().map(String::as_str), Some("hello codex"));
 
-        let no_prompt = codex_root_interactive_args("", "/repo", &settings);
+        let no_prompt = codex_root_interactive_args("", "/repo", &settings, TEST_DEV_INSTRUCTIONS);
         assert!(has_addness_memory_defaults(&no_prompt));
         assert_ne!(no_prompt.last().map(String::as_str), Some(""));
     }
 
     #[test]
     fn codex_root_resume_args_include_interactive_resume_settings() {
-        let mut settings = CodexExecSettings::default();
-        settings.model = CodexModelChoice::Gpt5;
-        settings.approval = CodexApprovalChoice::OnRequest;
-        settings.sandbox = CodexSandboxChoice::ReadOnly;
-        settings.web_search = true;
+        let settings = CodexExecSettings {
+            model: CodexModelChoice::Gpt5,
+            approval: CodexApprovalChoice::OnRequest,
+            sandbox: CodexSandboxChoice::ReadOnly,
+            web_search: true,
+            ..Default::default()
+        };
 
-        let args = codex_root_resume_args(None, true, true, true, "continue", "/repo", &settings);
+        let args = codex_root_resume_args(
+            None,
+            true,
+            true,
+            true,
+            "continue",
+            "/repo",
+            &settings,
+            TEST_DEV_INSTRUCTIONS,
+        );
 
         assert!(args.windows(2).any(|pair| pair == ["-a", "on-request"]));
         assert!(args.windows(2).any(|pair| pair == ["-s", "read-only"]));
@@ -1547,6 +1553,7 @@ mod tests {
             "next",
             "/repo",
             &settings,
+            TEST_DEV_INSTRUCTIONS,
         );
         assert!(session_args.contains(&"session-1".to_string()));
         assert!(!session_args.contains(&"--last".to_string()));
@@ -1558,17 +1565,20 @@ mod tests {
 
     #[test]
     fn codex_root_session_command_args_pass_through_args_and_settings() {
-        let mut settings = CodexExecSettings::default();
-        settings.model_override = Some("gpt-custom".to_string());
-        settings.approval = CodexApprovalChoice::OnRequest;
-        settings.sandbox = CodexSandboxChoice::ReadOnly;
-        settings.web_search = true;
+        let settings = CodexExecSettings {
+            model_override: Some("gpt-custom".to_string()),
+            approval: CodexApprovalChoice::OnRequest,
+            sandbox: CodexSandboxChoice::ReadOnly,
+            web_search: true,
+            ..Default::default()
+        };
 
         let args = codex_root_session_command_args(
             "fork",
             "--all 019f3042-1234-7000-8000-123456789abc \"try this\"",
             "/repo",
             &settings,
+            TEST_DEV_INSTRUCTIONS,
         )
         .unwrap();
 
@@ -1588,15 +1598,25 @@ mod tests {
 
     #[test]
     fn codex_fork_args_include_root_interactive_settings() {
-        let mut settings = CodexExecSettings::default();
-        settings.model = CodexModelChoice::Gpt5;
-        settings.reasoning = CodexReasoningChoice::High;
-        settings.approval = CodexApprovalChoice::OnRequest;
-        settings.sandbox = CodexSandboxChoice::ReadOnly;
-        settings.web_search = true;
+        let mut settings = CodexExecSettings {
+            model: CodexModelChoice::Gpt5,
+            reasoning: CodexReasoningChoice::High,
+            approval: CodexApprovalChoice::OnRequest,
+            sandbox: CodexSandboxChoice::ReadOnly,
+            web_search: true,
+            ..Default::default()
+        };
         settings.image_paths.push("/tmp/shot.png".to_string());
 
-        let args = codex_fork_args(Some("session-1"), false, true, "branch", "/repo", &settings);
+        let args = codex_fork_args(
+            Some("session-1"),
+            false,
+            true,
+            "branch",
+            "/repo",
+            &settings,
+            TEST_DEV_INSTRUCTIONS,
+        );
 
         assert!(args.windows(2).any(|pair| pair == ["-a", "on-request"]));
         assert!(args.windows(2).any(|pair| pair == ["-s", "read-only"]));
@@ -1616,7 +1636,15 @@ mod tests {
         assert!(args.contains(&"session-1".to_string()));
         assert_eq!(args.last().map(String::as_str), Some("branch"));
 
-        let last_args = codex_fork_args(None, true, false, "", "/repo", &settings);
+        let last_args = codex_fork_args(
+            None,
+            true,
+            false,
+            "",
+            "/repo",
+            &settings,
+            TEST_DEV_INSTRUCTIONS,
+        );
         assert!(last_args.contains(&"--last".to_string()));
         assert!(!last_args.contains(&"--all".to_string()));
         assert!(has_addness_developer_instructions(&last_args));
@@ -1625,10 +1653,12 @@ mod tests {
 
     #[test]
     fn codex_session_admin_args_include_root_interactive_settings() {
-        let mut settings = CodexExecSettings::default();
-        settings.remote_addr = Some("ws://127.0.0.1:7777".to_string());
-        settings.model = CodexModelChoice::Gpt5;
-        settings.sandbox = CodexSandboxChoice::ReadOnly;
+        let mut settings = CodexExecSettings {
+            remote_addr: Some("ws://127.0.0.1:7777".to_string()),
+            model: CodexModelChoice::Gpt5,
+            sandbox: CodexSandboxChoice::ReadOnly,
+            ..Default::default()
+        };
         settings
             .config_overrides
             .push("features.foo=true".to_string());
@@ -1662,15 +1692,23 @@ mod tests {
 
     #[test]
     fn codex_exec_review_args_include_exec_review_settings() {
-        let mut settings = CodexExecSettings::default();
-        settings.model = CodexModelChoice::Gpt5;
-        settings.reasoning = CodexReasoningChoice::High;
-        settings.approval = CodexApprovalChoice::OnRequest;
-        settings.strict_config = true;
-        settings.ignore_rules = true;
-        settings.output_schema = Some("/tmp/schema.json".to_string());
+        let settings = CodexExecSettings {
+            model: CodexModelChoice::Gpt5,
+            reasoning: CodexReasoningChoice::High,
+            approval: CodexApprovalChoice::OnRequest,
+            strict_config: true,
+            ignore_rules: true,
+            output_schema: Some("/tmp/schema.json".to_string()),
+            ..Default::default()
+        };
 
-        let args = codex_exec_review_args("--uncommitted --title WIP", "/repo", &settings).unwrap();
+        let args = codex_exec_review_args(
+            "--uncommitted --title WIP",
+            "/repo",
+            &settings,
+            TEST_DEV_INSTRUCTIONS,
+        )
+        .unwrap();
 
         assert!(args.windows(2).any(|pair| pair == ["-a", "on-request"]));
         assert!(args.contains(&"--strict-config".to_string()));
@@ -1700,15 +1738,23 @@ mod tests {
 
     #[test]
     fn codex_review_args_include_root_review_settings() {
-        let mut settings = CodexExecSettings::default();
-        settings.remote_addr = Some("ws://127.0.0.1:7777".to_string());
-        settings.model = CodexModelChoice::Gpt5;
-        settings.strict_config = true;
+        let mut settings = CodexExecSettings {
+            remote_addr: Some("ws://127.0.0.1:7777".to_string()),
+            model: CodexModelChoice::Gpt5,
+            strict_config: true,
+            ..Default::default()
+        };
         settings
             .config_overrides
             .push("features.foo=true".to_string());
 
-        let args = codex_review_args("--base main --title Check", "/repo", &settings).unwrap();
+        let args = codex_review_args(
+            "--base main --title Check",
+            "/repo",
+            &settings,
+            TEST_DEV_INSTRUCTIONS,
+        )
+        .unwrap();
 
         assert!(
             args.windows(2)
@@ -1764,12 +1810,14 @@ mod tests {
 
     #[test]
     fn codex_exec_args_include_selected_exec_settings() {
-        let mut settings = CodexExecSettings::default();
-        settings.model = CodexModelChoice::Gpt5;
-        settings.reasoning = CodexReasoningChoice::High;
-        settings.approval = CodexApprovalChoice::OnRequest;
-        settings.sandbox = CodexSandboxChoice::ReadOnly;
-        let args = codex_exec_args(None, "/repo", &settings);
+        let settings = CodexExecSettings {
+            model: CodexModelChoice::Gpt5,
+            reasoning: CodexReasoningChoice::High,
+            approval: CodexApprovalChoice::OnRequest,
+            sandbox: CodexSandboxChoice::ReadOnly,
+            ..Default::default()
+        };
+        let args = codex_exec_args(None, "/repo", &settings, TEST_DEV_INSTRUCTIONS);
 
         assert!(
             args.windows(2)
@@ -1786,24 +1834,28 @@ mod tests {
 
     #[test]
     fn codex_exec_args_include_custom_model_override() {
-        let mut settings = CodexExecSettings::default();
-        settings.model_override = Some("gpt-custom".to_string());
+        let settings = CodexExecSettings {
+            model_override: Some("gpt-custom".to_string()),
+            ..Default::default()
+        };
 
-        let args = codex_exec_args(None, "/repo", &settings);
+        let args = codex_exec_args(None, "/repo", &settings, TEST_DEV_INSTRUCTIONS);
 
         assert!(args.windows(2).any(|pair| pair == ["-m", "gpt-custom"]));
     }
 
     #[test]
     fn codex_exec_args_include_advanced_codex_cli_options() {
-        let mut settings = CodexExecSettings::default();
-        settings.web_search = true;
-        settings.oss = true;
-        settings.remote_addr = Some("ws://127.0.0.1:7777".to_string());
-        settings.remote_auth_token_env = Some("CODEX_REMOTE_TOKEN".to_string());
-        settings.no_alt_screen = true;
-        settings.local_provider = CodexLocalProviderChoice::Ollama;
-        settings.profile = Some("work".to_string());
+        let mut settings = CodexExecSettings {
+            web_search: true,
+            oss: true,
+            remote_addr: Some("ws://127.0.0.1:7777".to_string()),
+            remote_auth_token_env: Some("CODEX_REMOTE_TOKEN".to_string()),
+            no_alt_screen: true,
+            local_provider: CodexLocalProviderChoice::Ollama,
+            profile: Some("work".to_string()),
+            ..Default::default()
+        };
         settings.additional_dirs.push("/tmp/extra".to_string());
         settings.image_paths.push("/tmp/shot.png".to_string());
         settings
@@ -1820,7 +1872,7 @@ mod tests {
         settings.color = CodexColorChoice::Always;
         settings.output_schema = Some("/tmp/schema.json".to_string());
         settings.output_last_message = Some("/tmp/last.txt".to_string());
-        let args = codex_exec_args(None, "/repo", &settings);
+        let args = codex_exec_args(None, "/repo", &settings, TEST_DEV_INSTRUCTIONS);
 
         assert!(args.contains(&"--search".to_string()));
         assert!(args.contains(&"--oss".to_string()));
@@ -1871,12 +1923,14 @@ mod tests {
 
     #[test]
     fn codex_exec_args_bypass_omits_approval_and_sandbox_flags() {
-        let mut settings = CodexExecSettings::default();
-        settings.approval = CodexApprovalChoice::OnRequest;
-        settings.sandbox = CodexSandboxChoice::ReadOnly;
-        settings.bypass_approvals_and_sandbox = true;
+        let settings = CodexExecSettings {
+            approval: CodexApprovalChoice::OnRequest,
+            sandbox: CodexSandboxChoice::ReadOnly,
+            bypass_approvals_and_sandbox: true,
+            ..Default::default()
+        };
 
-        let args = codex_exec_args(None, "/repo", &settings);
+        let args = codex_exec_args(None, "/repo", &settings, TEST_DEV_INSTRUCTIONS);
 
         assert!(args.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
         assert!(!args.contains(&"-a".to_string()));
@@ -1978,17 +2032,22 @@ mod tests {
 
     #[test]
     fn codex_named_subcommand_args_with_settings_prefixes_global_config() {
-        let mut settings = CodexExecSettings::default();
-        settings.remote_addr = Some("ws://127.0.0.1:7777".to_string());
-        settings.strict_config = true;
+        let mut settings = CodexExecSettings {
+            remote_addr: Some("ws://127.0.0.1:7777".to_string()),
+            strict_config: true,
+            ..Default::default()
+        };
         settings
             .config_overrides
             .push("features.foo=true".to_string());
         settings.enabled_features.push("responses_api".to_string());
         settings.disabled_features.push("legacy_mode".to_string());
 
-        let args =
-            codex_named_subcommand_args_with_settings(vec!["mcp".into(), "list".into()], &settings);
+        let args = codex_named_subcommand_args_with_settings(
+            vec!["mcp".into(), "list".into()],
+            &settings,
+            TEST_DEV_INSTRUCTIONS,
+        );
 
         assert!(
             args.windows(2)
@@ -2009,8 +2068,11 @@ mod tests {
         );
         assert_eq!(codex_command_category(&args), "config");
 
-        let version_args =
-            codex_named_subcommand_args_with_settings(vec!["--version".into()], &settings);
+        let version_args = codex_named_subcommand_args_with_settings(
+            vec!["--version".into()],
+            &settings,
+            TEST_DEV_INSTRUCTIONS,
+        );
         assert_eq!(version_args, vec!["--version".to_string()]);
     }
 
@@ -2024,18 +2086,25 @@ mod tests {
             vec!["resume".to_string(), "--last".to_string()],
             vec!["fork".to_string(), "--last".to_string()],
         ] {
-            let args = codex_named_subcommand_args_with_settings(raw, &settings);
+            let args =
+                codex_named_subcommand_args_with_settings(raw, &settings, TEST_DEV_INSTRUCTIONS);
             assert!(has_addness_memory_defaults(&args), "{args:?}");
             assert!(has_addness_developer_instructions(&args), "{args:?}");
         }
 
-        let config_args =
-            codex_named_subcommand_args_with_settings(vec!["mcp".into(), "list".into()], &settings);
+        let config_args = codex_named_subcommand_args_with_settings(
+            vec!["mcp".into(), "list".into()],
+            &settings,
+            TEST_DEV_INSTRUCTIONS,
+        );
         assert!(has_addness_memory_defaults(&config_args));
         assert!(!has_addness_developer_instructions(&config_args));
 
-        let version_args =
-            codex_named_subcommand_args_with_settings(vec!["--version".into()], &settings);
+        let version_args = codex_named_subcommand_args_with_settings(
+            vec!["--version".into()],
+            &settings,
+            TEST_DEV_INSTRUCTIONS,
+        );
         assert_eq!(version_args, vec!["--version".to_string()]);
     }
 

@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::config::{AgentLanguage, Settings};
+
 mod claude;
 mod claude_resident;
 mod codex;
@@ -80,6 +82,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/permissions", "承認 / sandbox 権限を設定"),
     ("/personality", "通信スタイルを切替"),
     ("/settings", "モデル・推論・承認・sandbox 設定を表示"),
+    ("/lang", "エージェントの応答言語を設定"),
     ("/cd", "次セッションの作業ルートを変更"),
     ("/add-dir", "書込許可ディレクトリを追加"),
     ("/image", "画像を添付する"),
@@ -1063,6 +1066,8 @@ pub enum CodexListPickerAction {
     SetApproval,
     /// Codex のみ。
     SetSandbox,
+    /// エージェントの応答言語（両バックエンド共通）。
+    SetLanguage,
     /// Enter=resume / f=fork。
     ResumeSession,
 }
@@ -1245,6 +1250,9 @@ pub struct CodexPane {
     search_query: String,
     /// 検索入力中か。
     search_editing: bool,
+    /// エージェントへ注入する応答言語設定（両バックエンド共通）。
+    /// `~/.addness/config.json` に永続化し、起動時に読み込む。
+    agent_language: AgentLanguage,
     /// 次回 `codex exec` 起動時に使う設定。
     exec_settings: CodexExecSettings,
     /// 現在turnを承認後に再実行する場合だけ使う一時的な approval override。
@@ -1454,6 +1462,11 @@ impl CodexPane {
             input_state.history = load_input_history(path);
         }
 
+        // グローバル設定から応答言語を読み込む（未設定・読込失敗時は auto）。
+        let agent_language = Settings::load()
+            .map(|settings| settings.agent_language())
+            .unwrap_or_default();
+
         let mut pane = Self {
             kind,
             codex_bin: codex_bin.to_path_buf(),
@@ -1531,6 +1544,7 @@ impl CodexPane {
             log_filter: CodexLogFilter::Conversation,
             search_query: String::new(),
             search_editing: false,
+            agent_language,
             exec_settings: CodexExecSettings::default(),
             one_shot_approval: None,
             diff_view: None,
@@ -1663,6 +1677,7 @@ impl CodexPane {
         pane.log_filter = CodexLogFilter::Conversation;
         pane.search_query.clear();
         pane.search_editing = false;
+        pane.agent_language = AgentLanguage::Auto;
         pane.exec_settings = CodexExecSettings::default();
         pane.one_shot_approval = None;
         pane.claude_settings = claude::ClaudeExecSettings::default();
@@ -2473,6 +2488,11 @@ impl CodexPane {
             CodexListPickerAction::SetReasoning => self.handle_reasoning_slash_command(&value),
             CodexListPickerAction::SetApproval => self.handle_approval_slash_command(&value),
             CodexListPickerAction::SetSandbox => self.handle_sandbox_slash_command(&value),
+            CodexListPickerAction::SetLanguage => {
+                if let Some(choice) = AgentLanguage::parse(&value) {
+                    self.set_agent_language(choice);
+                }
+            }
             CodexListPickerAction::ResumeSession => {
                 if self.kind == AgentKind::ClaudeCode {
                     self.start_claude_resume(Some(&value), fork, "");
@@ -3014,6 +3034,92 @@ impl CodexPane {
         self.push_activity(format!("Codex model を {value} に変更"));
         self.push_log(CodexLogKind::System, format!("次回ターンの model: {value}"));
         self.push_codex_appserver_model();
+    }
+
+    /// 現在の応答言語設定と環境変数から合成した最終的な developer instructions。
+    /// 全バックエンドの起動引数はこの文字列を使う（言語指示の注入漏れ防止）。
+    fn composed_developer_instructions(&self) -> String {
+        compose_developer_instructions(self.agent_language, current_lang_env().as_deref())
+    }
+
+    /// `/lang`（`/language`）: 引数なしはピッカー、引数ありは直接設定。
+    fn handle_language_slash_command(&mut self, args: &str) {
+        if args.is_empty() {
+            self.open_language_picker();
+            return;
+        }
+        match AgentLanguage::parse(args) {
+            Some(choice) => self.set_agent_language(choice),
+            None => self.push_log(
+                CodexLogKind::Error,
+                "応答言語は auto / ja / en / off を指定してください",
+            ),
+        }
+    }
+
+    /// `/lang`（引数なし）: auto / 日本語 / English / off の選択ピッカーを開く。
+    fn open_language_picker(&mut self) {
+        let current = self.agent_language;
+        let items = [
+            AgentLanguage::Auto,
+            AgentLanguage::Ja,
+            AgentLanguage::En,
+            AgentLanguage::Off,
+        ]
+        .into_iter()
+        .map(|choice| CodexListPickerItem {
+            label: choice.label().to_string(),
+            detail: String::new(),
+            value: choice.config_value().to_string(),
+            current: choice == current,
+        })
+        .collect::<Vec<_>>();
+        let selected = list_picker_initial_selection(&items);
+        self.open_list_picker(CodexListPicker {
+            title: " 応答言語を選択 ".to_string(),
+            action: CodexListPickerAction::SetLanguage,
+            items,
+            selected,
+        });
+    }
+
+    /// 応答言語を設定し、グローバル設定へ永続化する。
+    /// 常駐プロセス（Claude / Codex app-server）は起動時に developer instructions を
+    /// 渡すため、変更は次の thread/セッションから有効。生存中の常駐には再起動保留を立てる。
+    fn set_agent_language(&mut self, language: AgentLanguage) {
+        self.agent_language = language;
+        if let Err(err) =
+            Settings::load().and_then(|mut settings| settings.set_agent_language(language))
+        {
+            self.push_log(
+                CodexLogKind::Error,
+                format!("応答言語設定の保存に失敗しました: {err}"),
+            );
+        }
+        let label = language.label();
+        self.action = Some(format!("lang: {}", language.config_value()));
+        self.push_activity(format!("応答言語を {label} に変更"));
+
+        let mut resident_pending = false;
+        if self.claude_resident.is_some() {
+            self.claude_resident_restart_pending = true;
+            resident_pending = true;
+        }
+        if self.codex_appserver.is_some() {
+            self.codex_appserver_restart_pending = true;
+            resident_pending = true;
+        }
+        if resident_pending {
+            self.push_log(
+                CodexLogKind::System,
+                format!("応答言語を {label} に変更しました（常駐プロセス再起動後に反映）"),
+            );
+        } else {
+            self.push_log(
+                CodexLogKind::System,
+                format!("応答言語を {label} に変更しました（次のセッションから反映）"),
+            );
+        }
     }
 
     pub fn cycle_reasoning(&mut self) {
@@ -4484,11 +4590,12 @@ impl CodexPane {
     /// 常駐 claude プロセスを spawn する（stdout/stderr は既存の line reader で読む）。
     fn spawn_claude_resident(&mut self) -> Result<claude_resident::ResidentClient> {
         let mut cmd = Command::new(&self.codex_bin);
+        let developer_instructions = self.composed_developer_instructions();
         for arg in claude::resident_args(
             self.thread_id.as_deref(),
             &self.claude_settings,
             self.claude_fork_next,
-            addness_tui_developer_instructions(),
+            &developer_instructions,
         ) {
             cmd.arg(arg);
         }
@@ -5024,7 +5131,7 @@ impl CodexPane {
             model: settings.model_cli_arg().map(str::to_string),
             approval_policy: approval,
             sandbox: Some(sandbox),
-            developer_instructions: Some(addness_tui_developer_instructions().to_string()),
+            developer_instructions: Some(self.composed_developer_instructions()),
         }
     }
 
@@ -7081,6 +7188,10 @@ impl CodexPane {
                 self.handle_reasoning_slash_command(args);
                 true
             }
+            "lang" | "language" => {
+                self.handle_language_slash_command(args);
+                true
+            }
             "approval" | "approvals" => {
                 self.handle_approval_slash_command(args);
                 true
@@ -7318,7 +7429,12 @@ impl CodexPane {
                 return;
             }
         };
-        let args = codex_named_subcommand_args_with_settings(args, &self.exec_settings);
+        let developer_instructions = self.composed_developer_instructions();
+        let args = codex_named_subcommand_args_with_settings(
+            args,
+            &self.exec_settings,
+            &developer_instructions,
+        );
         let label = format!("codex {}", command_preview(&args));
         self.start_codex_subcommand(args, label);
     }
@@ -7599,19 +7715,36 @@ impl CodexPane {
                 return;
             }
         };
-        let args = codex_named_subcommand_args_with_settings(args, &self.exec_settings);
+        let developer_instructions = self.composed_developer_instructions();
+        let args = codex_named_subcommand_args_with_settings(
+            args,
+            &self.exec_settings,
+            &developer_instructions,
+        );
         let label = format!("codex {}", command_preview(&args));
         self.start_codex_subcommand(args, label);
     }
 
     fn handle_root_interactive_slash_command(&mut self, prompt: &str) {
-        let args = codex_root_interactive_args(prompt.trim(), &self.cwd, &self.exec_settings);
+        let developer_instructions = self.composed_developer_instructions();
+        let args = codex_root_interactive_args(
+            prompt.trim(),
+            &self.cwd,
+            &self.exec_settings,
+            &developer_instructions,
+        );
         let label = format!("codex {}", command_preview(&args));
         self.start_codex_subcommand(args, label);
     }
 
     fn handle_review_slash_command(&mut self, args: &str) {
-        let args = match codex_review_args(args, &self.cwd, &self.exec_settings) {
+        let developer_instructions = self.composed_developer_instructions();
+        let args = match codex_review_args(
+            args,
+            &self.cwd,
+            &self.exec_settings,
+            &developer_instructions,
+        ) {
             Ok(args) => args,
             Err(e) => {
                 self.push_log(CodexLogKind::Error, e.to_string());
@@ -7623,7 +7756,13 @@ impl CodexPane {
     }
 
     fn handle_exec_review_slash_command(&mut self, args: &str) {
-        let args = match codex_exec_review_args(args, &self.cwd, &self.exec_settings) {
+        let developer_instructions = self.composed_developer_instructions();
+        let args = match codex_exec_review_args(
+            args,
+            &self.cwd,
+            &self.exec_settings,
+            &developer_instructions,
+        ) {
             Ok(args) => args,
             Err(e) => {
                 self.push_log(CodexLogKind::Error, e.to_string());
@@ -7881,7 +8020,15 @@ impl CodexPane {
         } else {
             args.trim().to_string()
         };
-        let command = codex_exec_resume_args(None, true, include_all, &prompt, &self.exec_settings);
+        let developer_instructions = self.composed_developer_instructions();
+        let command = codex_exec_resume_args(
+            None,
+            true,
+            include_all,
+            &prompt,
+            &self.exec_settings,
+            &developer_instructions,
+        );
         let label = format!("codex {}", command_preview(&command));
         self.start_codex_subcommand(command, label);
     }
@@ -7906,12 +8053,14 @@ impl CodexPane {
         } else {
             prompt.trim().to_string()
         };
+        let developer_instructions = self.composed_developer_instructions();
         let command = codex_exec_resume_args(
             Some(&session),
             false,
             include_all,
             &prompt,
             &self.exec_settings,
+            &developer_instructions,
         );
         let label = format!("codex {}", command_preview(&command));
         self.start_codex_subcommand(command, label);
@@ -7923,6 +8072,7 @@ impl CodexPane {
         include_all: bool,
         include_non_interactive: bool,
     ) {
+        let developer_instructions = self.composed_developer_instructions();
         let command = codex_root_resume_args(
             None,
             true,
@@ -7931,6 +8081,7 @@ impl CodexPane {
             args.trim(),
             &self.cwd,
             &self.exec_settings,
+            &developer_instructions,
         );
         let label = format!("codex {}", command_preview(&command));
         self.start_codex_subcommand(command, label);
@@ -7947,6 +8098,7 @@ impl CodexPane {
         let Some(session) = self.resolve_session_ref(&session_ref) else {
             return;
         };
+        let developer_instructions = self.composed_developer_instructions();
         let command = codex_root_resume_args(
             Some(&session),
             false,
@@ -7955,17 +8107,20 @@ impl CodexPane {
             prompt.trim(),
             &self.cwd,
             &self.exec_settings,
+            &developer_instructions,
         );
         let label = format!("codex {}", command_preview(&command));
         self.start_codex_subcommand(command, label);
     }
 
     fn handle_root_session_command_slash_command(&mut self, command_name: &str, args: &str) {
+        let developer_instructions = self.composed_developer_instructions();
         let command = match codex_root_session_command_args(
             command_name,
             args,
             &self.cwd,
             &self.exec_settings,
+            &developer_instructions,
         ) {
             Ok(command) => command,
             Err(e) => {
@@ -7985,6 +8140,7 @@ impl CodexPane {
             );
             return;
         };
+        let developer_instructions = self.composed_developer_instructions();
         let command = codex_fork_args(
             Some(thread_id),
             false,
@@ -7992,6 +8148,7 @@ impl CodexPane {
             prompt.trim(),
             &self.cwd,
             &self.exec_settings,
+            &developer_instructions,
         );
         let label = format!("codex {}", command_preview(&command));
         self.start_codex_subcommand(command, label);
@@ -8002,6 +8159,7 @@ impl CodexPane {
             self.start_claude_resume(None, true, args);
             return;
         }
+        let developer_instructions = self.composed_developer_instructions();
         let command = codex_fork_args(
             None,
             true,
@@ -8009,6 +8167,7 @@ impl CodexPane {
             args.trim(),
             &self.cwd,
             &self.exec_settings,
+            &developer_instructions,
         );
         let label = format!("codex {}", command_preview(&command));
         self.start_codex_subcommand(command, label);
@@ -8029,6 +8188,7 @@ impl CodexPane {
         let Some(session) = self.resolve_session_ref(&session_ref) else {
             return;
         };
+        let developer_instructions = self.composed_developer_instructions();
         let command = codex_fork_args(
             Some(&session),
             false,
@@ -8036,6 +8196,7 @@ impl CodexPane {
             prompt.trim(),
             &self.cwd,
             &self.exec_settings,
+            &developer_instructions,
         );
         let label = format!("codex {}", command_preview(&command));
         self.start_codex_subcommand(command, label);
@@ -9514,10 +9675,16 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
 
     fn spawn_exec_process(&self, prompt: &str) -> Result<Child> {
         let mut cmd = Command::new(&self.codex_bin);
+        let developer_instructions = self.composed_developer_instructions();
         match self.kind {
             AgentKind::Codex => {
                 let exec_settings = self.exec_settings_for_spawn();
-                for arg in codex_exec_args(self.thread_id.as_deref(), &self.cwd, &exec_settings) {
+                for arg in codex_exec_args(
+                    self.thread_id.as_deref(),
+                    &self.cwd,
+                    &exec_settings,
+                    &developer_instructions,
+                ) {
                     cmd.arg(arg);
                 }
             }
@@ -9528,7 +9695,7 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
                     &self.claude_settings,
                     &self.claude_one_shot_allowed_tools,
                     self.claude_fork_next,
-                    addness_tui_developer_instructions(),
+                    &developer_instructions,
                 ) {
                     cmd.arg(arg);
                 }
@@ -9743,6 +9910,7 @@ Claude Code sessions:
   /fork-last [prompt], /fork-session <N|id> [prompt] - fork a session directly
 Claude Code options for next turn:
   /settings, /cd <dir>, /model [name|config], /reasoning|/effort [level]
+  /lang|/language [auto|ja|en|off] - エージェントの応答言語（既定 auto は LANG/LC_ALL から判定）
   /permissions|/approval [mode] - permission-mode: config/plan/acceptEdits/dontAsk/bypassPermissions/skip-permissions
   /add-dir <path|list|clear>
 TUI helpers:
@@ -9788,6 +9956,7 @@ Codex sessions:
   /archive <N|id>, /unarchive <N|id>, /delete <N|uuid>
 Codex options for next turn:
   /settings, /cd <dir>, /model [name|config], /reasoning [effort]
+  /lang|/language [auto|ja|en|off] - エージェントの応答言語（既定 auto は LANG/LC_ALL から判定）
   /permissions [approval <policy>|sandbox <mode>|bypass]
   /personality [friendly|pragmatic|clear], /statusline [items|colors on|off|clear]
   /theme [name|clear], /pets [name|hide|anchor <pos>|clear], /vim [on|off|clear], /raw [on|off|clear]
@@ -12464,6 +12633,70 @@ body の `## Codex作業メモ`、`## Codex決定ログ`、`## PR/Release Tracea
 
 共有:
 Addnessを読んだ/更新した場合は、対象(body/DoD/子ゴール/コメント/成果物)だけ短く共有してください。"#
+}
+
+/// 応答言語設定を解決した実効言語。`None` 相当（注入なし）は
+/// `resolve_agent_language` の戻り値 `Option` で表す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolvedAgentLanguage {
+    Japanese,
+    English,
+}
+
+/// `LANG`（無ければ `LC_ALL`）の現在値。空文字は未設定として扱う。
+/// auto 判定にのみ使う。テスト容易性のため env 読み取りはこの関数に閉じる。
+fn current_lang_env() -> Option<String> {
+    for key in ["LANG", "LC_ALL"] {
+        if let Ok(value) = std::env::var(key)
+            && !value.is_empty()
+        {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// 言語設定と `LANG`/`LC_ALL` 相当の値から、注入すべき実効言語を解決する。
+/// 環境変数を直接読まず引数で受け取るため、他テストと干渉せず検証できる。
+fn resolve_agent_language(
+    setting: AgentLanguage,
+    lang_env: Option<&str>,
+) -> Option<ResolvedAgentLanguage> {
+    match setting {
+        AgentLanguage::Off => None,
+        AgentLanguage::Ja => Some(ResolvedAgentLanguage::Japanese),
+        AgentLanguage::En => Some(ResolvedAgentLanguage::English),
+        AgentLanguage::Auto => match lang_env {
+            Some(value) if value.starts_with("ja") => Some(ResolvedAgentLanguage::Japanese),
+            Some(value) if value.starts_with("en") => Some(ResolvedAgentLanguage::English),
+            // 判定不能なら off と同じく注入しない。
+            _ => None,
+        },
+    }
+}
+
+/// 実効言語に対応する 1 行の応答言語指示。
+fn agent_language_instruction(language: ResolvedAgentLanguage) -> &'static str {
+    match language {
+        ResolvedAgentLanguage::Japanese => {
+            "ユーザーへの応答・説明は必ず日本語で書く。コード・識別子・技術用語は原文のままでよい。"
+        }
+        ResolvedAgentLanguage::English => {
+            "Always write your responses and explanations to the user in English. Code, identifiers, and technical terms may stay in their original form."
+        }
+    }
+}
+
+/// base 開発者指示に応答言語指示を合成する共通関数。
+/// 全バックエンド（Claude の `--append-system-prompt` / Codex の developerInstructions・
+/// ワンショット `-c`）の developer instructions 経路は必ずこの関数を通し、
+/// 言語指示の注入漏れを防ぐ。
+fn compose_developer_instructions(setting: AgentLanguage, lang_env: Option<&str>) -> String {
+    let base = addness_tui_developer_instructions();
+    match resolve_agent_language(setting, lang_env).map(agent_language_instruction) {
+        Some(line) => format!("{base}\n\n応答言語:\n{line}"),
+        None => base.to_string(),
+    }
 }
 
 /// DoD 自動判定で codex に強制する出力 JSON Schema。
@@ -15255,6 +15488,101 @@ mod tests {
     }
 
     #[test]
+    fn resolve_agent_language_auto_uses_lang_env_prefix() {
+        assert_eq!(
+            resolve_agent_language(AgentLanguage::Auto, Some("ja_JP.UTF-8")),
+            Some(ResolvedAgentLanguage::Japanese)
+        );
+        assert_eq!(
+            resolve_agent_language(AgentLanguage::Auto, Some("en_US.UTF-8")),
+            Some(ResolvedAgentLanguage::English)
+        );
+        // 判定不能・未設定は off と同じく注入しない。
+        assert_eq!(resolve_agent_language(AgentLanguage::Auto, Some("C")), None);
+        assert_eq!(resolve_agent_language(AgentLanguage::Auto, None), None);
+    }
+
+    #[test]
+    fn resolve_agent_language_explicit_ignores_env() {
+        assert_eq!(
+            resolve_agent_language(AgentLanguage::Ja, Some("en_US.UTF-8")),
+            Some(ResolvedAgentLanguage::Japanese)
+        );
+        assert_eq!(
+            resolve_agent_language(AgentLanguage::En, Some("ja_JP.UTF-8")),
+            Some(ResolvedAgentLanguage::English)
+        );
+        assert_eq!(
+            resolve_agent_language(AgentLanguage::Off, Some("ja_JP.UTF-8")),
+            None
+        );
+    }
+
+    #[test]
+    fn compose_developer_instructions_injects_language_line() {
+        let base = addness_tui_developer_instructions();
+
+        let ja = compose_developer_instructions(AgentLanguage::Ja, None);
+        assert!(ja.starts_with(base));
+        assert!(ja.contains("ユーザーへの応答・説明は必ず日本語で書く"));
+
+        let en = compose_developer_instructions(AgentLanguage::En, None);
+        assert!(en.contains("Always write your responses and explanations to the user in English"));
+
+        // auto + ja 環境は日本語指示、auto + 判定不能 は注入なし（base と一致）。
+        let auto_ja = compose_developer_instructions(AgentLanguage::Auto, Some("ja_JP.UTF-8"));
+        assert!(auto_ja.contains("必ず日本語で書く"));
+        let auto_unknown = compose_developer_instructions(AgentLanguage::Auto, Some("C"));
+        assert_eq!(auto_unknown, base);
+    }
+
+    #[test]
+    fn compose_developer_instructions_off_omits_language_line() {
+        let base = addness_tui_developer_instructions();
+        let off = compose_developer_instructions(AgentLanguage::Off, Some("ja_JP.UTF-8"));
+        assert_eq!(off, base);
+        assert!(!off.contains("応答言語:"));
+    }
+
+    #[test]
+    fn lang_slash_command_without_args_opens_picker_with_current_marker() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        assert!(pane.list_picker().is_none());
+
+        assert!(pane.handle_local_slash_command("/lang"));
+        let picker = pane.list_picker().expect("picker opened");
+        assert_eq!(picker.action, CodexListPickerAction::SetLanguage);
+        let values = picker
+            .items
+            .iter()
+            .map(|item| item.value.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec!["auto", "ja", "en", "off"]);
+        // 既定は auto なので auto のみ current。
+        assert!(picker.items[0].current);
+        assert!(picker.items.iter().skip(1).all(|item| !item.current));
+    }
+
+    #[test]
+    fn lang_alias_language_is_dispatched() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        assert!(pane.handle_local_slash_command("/language"));
+        assert_eq!(
+            pane.list_picker().map(|picker| picker.action),
+            Some(CodexListPickerAction::SetLanguage)
+        );
+    }
+
+    #[test]
+    fn agent_language_parse_maps_slash_argument() {
+        assert_eq!(AgentLanguage::parse("ja"), Some(AgentLanguage::Ja));
+        assert_eq!(AgentLanguage::parse("en"), Some(AgentLanguage::En));
+        assert_eq!(AgentLanguage::parse("auto"), Some(AgentLanguage::Auto));
+        assert_eq!(AgentLanguage::parse("off"), Some(AgentLanguage::Off));
+        assert_eq!(AgentLanguage::parse("bogus"), None);
+    }
+
+    #[test]
     fn split_codex_command_args_handles_quotes_and_escapes() {
         let args = split_codex_command_args(r#"review --title "hello world" a\ b"#).unwrap();
 
@@ -16148,7 +16476,12 @@ mod tests {
             line.kind == CodexLogKind::System && line.text.contains("新しい Codex セッション")
         }));
 
-        let args = codex_exec_args(pane.thread_id.as_deref(), &pane.cwd, &pane.exec_settings);
+        let args = codex_exec_args(
+            pane.thread_id.as_deref(),
+            &pane.cwd,
+            &pane.exec_settings,
+            "DEV",
+        );
         assert!(args.windows(2).any(|pair| pair == ["exec", "--json"]));
         assert!(!args.contains(&"resume".to_string()));
     }
@@ -16252,7 +16585,7 @@ mod tests {
         assert!(label.contains("approval:never"));
         assert!(label.contains("sandbox:read-only"));
 
-        let args = codex_exec_args(None, "/repo", &pane.exec_settings);
+        let args = codex_exec_args(None, "/repo", &pane.exec_settings, "DEV");
         assert!(args.windows(2).any(|pair| pair == ["-m", "gpt-custom"]));
         assert!(args.windows(2).any(|pair| pair == ["-a", "never"]));
         assert!(args.windows(2).any(|pair| pair == ["-s", "read-only"]));
@@ -16352,7 +16685,7 @@ mod tests {
 
         let expected = nested.canonicalize().unwrap();
         assert_eq!(Path::new(&pane.cwd), expected.as_path());
-        let args = codex_exec_args(None, &pane.cwd, &pane.exec_settings);
+        let args = codex_exec_args(None, &pane.cwd, &pane.exec_settings, "DEV");
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["-C", expected.to_string_lossy().as_ref()])

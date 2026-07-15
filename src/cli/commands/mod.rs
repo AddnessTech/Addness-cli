@@ -1,10 +1,13 @@
+pub mod activity;
 pub mod assignment;
+pub mod chat;
 pub mod comment;
 pub mod configure;
 pub mod deliverable;
 pub mod detect;
 pub mod goal;
 pub mod invitation;
+pub mod issue;
 pub mod kpi;
 pub mod link;
 pub mod login;
@@ -12,9 +15,11 @@ pub mod member;
 pub mod notification;
 pub mod org;
 pub mod skills;
+pub mod streak;
 pub mod summary;
 pub mod today;
 pub mod update;
+pub mod user;
 
 use anyhow::Result;
 use std::io::{self, Write};

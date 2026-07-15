@@ -12300,6 +12300,7 @@ Addness DBの置き場所:
 - 構造化フィールドに置けない短い質問や補足: コメント
 
 CLI最小操作:
+- Addnessの読み書きは必ずAddness CLI（`"$ADDNESS_BIN"`）で行う。`mcp__addness__*` のMCPツールが見えても使わない（認証・接続先がTUIと一致する保証がないため）。
 - 読む: `"$ADDNESS_BIN" goal get "$ADDNESS_GOAL_ID" --json --with-deliverable --with-comment`
 - body更新: `"$ADDNESS_BIN" goal update "$ADDNESS_GOAL_ID" --body-file <file> --json`
 - DoD更新: `"$ADDNESS_BIN" goal update "$ADDNESS_GOAL_ID" --description-file <file> --json`

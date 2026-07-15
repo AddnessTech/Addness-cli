@@ -1,6 +1,7 @@
 use crate::api::{
-    ApiClient, ApiResponse, CreateOrganizationRequest, Organization, OrganizationsResponse,
-    UpdateContextRequest, UpdateOrganizationRequest,
+    ApiClient, ApiResponse, CreateOrganizationRequest, EnabledFlagRequest, MyAdSettingRequest,
+    Organization, OrganizationsResponse, PushTokenRegisterRequest, RegisterSubscriptionRequest,
+    UpdateContextRequest, UpdateDefaultTimezoneRequest, UpdateOrganizationRequest,
 };
 use anyhow::Result;
 use serde_json::Value;
@@ -162,6 +163,154 @@ impl ApiClient {
     pub async fn get_organization_current_member(&self, org_id: &str) -> Result<Value> {
         let path = format!("/api/v2/organizations/{org_id}/current-member");
         let resp: ApiResponse<Value> = self.get(&path).await?;
+        Ok(resp.data)
+    }
+
+    // ---- Organization settings / subscription write endpoints ----
+
+    /// POST /api/v1/team/organizations/:id/push_tokens
+    pub async fn register_organization_push_token(
+        &self,
+        org_id: &str,
+        token: &str,
+    ) -> Result<Value> {
+        let path = format!("/api/v1/team/organizations/{org_id}/push_tokens");
+        let body = PushTokenRegisterRequest {
+            token: token.to_string(),
+        };
+        let resp: ApiResponse<Value> = self.post(&path, &body).await?;
+        Ok(resp.data)
+    }
+
+    /// POST /api/v1/team/organization_subscriptions/register
+    pub async fn register_organization_subscription(
+        &self,
+        univapay_subscription_id: &str,
+    ) -> Result<Value> {
+        let body = RegisterSubscriptionRequest {
+            univapay_subscription_id: univapay_subscription_id.to_string(),
+        };
+        let resp: ApiResponse<Value> = self
+            .post("/api/v1/team/organization_subscriptions/register", &body)
+            .await?;
+        Ok(resp.data)
+    }
+
+    /// PATCH /api/v1/team/organization_subscriptions/:id/cancel
+    pub async fn cancel_organization_subscription(&self, subscription_id: &str) -> Result<Value> {
+        let path = format!("/api/v1/team/organization_subscriptions/{subscription_id}/cancel");
+        let resp: ApiResponse<Value> = self.patch_empty(&path).await?;
+        Ok(resp.data)
+    }
+
+    /// GET /api/v1/team/organization_subscriptions/current
+    /// Resolves the subscription from the `X-Organization-ID` header.
+    pub async fn get_current_organization_subscription(&self) -> Result<Value> {
+        let resp: ApiResponse<Value> = self
+            .get("/api/v1/team/organization_subscriptions/current")
+            .await?;
+        Ok(resp.data)
+    }
+
+    /// PATCH /api/v2/organizations/:id/default-timezone
+    pub async fn update_organization_default_timezone(
+        &self,
+        org_id: &str,
+        timezone: &str,
+    ) -> Result<Value> {
+        let path = format!("/api/v2/organizations/{org_id}/default-timezone");
+        let body = UpdateDefaultTimezoneRequest {
+            default_timezone: timezone.to_string(),
+        };
+        let resp: ApiResponse<Value> = self.patch(&path, &body).await?;
+        Ok(resp.data)
+    }
+
+    /// GET /api/v2/organizations/:id/onboarding-billing-state
+    pub async fn get_organization_onboarding_billing_state(&self, org_id: &str) -> Result<Value> {
+        let path = format!("/api/v2/organizations/{org_id}/onboarding-billing-state");
+        let resp: ApiResponse<Value> = self.get(&path).await?;
+        Ok(resp.data)
+    }
+
+    /// POST /api/v2/organizations/:id/onboarding-billing/require
+    pub async fn require_organization_onboarding_billing(&self, org_id: &str) -> Result<Value> {
+        let path = format!("/api/v2/organizations/{org_id}/onboarding-billing/require");
+        let resp: ApiResponse<Value> = self.post_empty(&path).await?;
+        Ok(resp.data)
+    }
+
+    /// POST /api/v2/organizations/:id/onboarding-billing/free
+    pub async fn complete_organization_onboarding_billing_free(
+        &self,
+        org_id: &str,
+    ) -> Result<Value> {
+        let path = format!("/api/v2/organizations/{org_id}/onboarding-billing/free");
+        let resp: ApiResponse<Value> = self.post_empty(&path).await?;
+        Ok(resp.data)
+    }
+
+    /// GET /api/v2/organizations/:id/ai-schedule-settings
+    pub async fn get_organization_ai_schedule_settings(&self, org_id: &str) -> Result<Value> {
+        let path = format!("/api/v2/organizations/{org_id}/ai-schedule-settings");
+        let resp: ApiResponse<Value> = self.get(&path).await?;
+        Ok(resp.data)
+    }
+
+    /// PUT /api/v2/organizations/:id/ai-schedule-settings
+    pub async fn set_organization_ai_schedule_settings(
+        &self,
+        org_id: &str,
+        enabled: bool,
+    ) -> Result<Value> {
+        let path = format!("/api/v2/organizations/{org_id}/ai-schedule-settings");
+        let body = EnabledFlagRequest { enabled };
+        let resp: ApiResponse<Value> = self.put(&path, &body).await?;
+        Ok(resp.data)
+    }
+
+    /// GET /api/v2/organizations/:id/ad-settings
+    pub async fn get_organization_ad_settings(&self, org_id: &str) -> Result<Value> {
+        let path = format!("/api/v2/organizations/{org_id}/ad-settings");
+        let resp: ApiResponse<Value> = self.get(&path).await?;
+        Ok(resp.data)
+    }
+
+    /// PUT /api/v2/organizations/:id/ad-settings
+    pub async fn set_organization_ad_settings(&self, org_id: &str, enabled: bool) -> Result<Value> {
+        let path = format!("/api/v2/organizations/{org_id}/ad-settings");
+        let body = EnabledFlagRequest { enabled };
+        let resp: ApiResponse<Value> = self.put(&path, &body).await?;
+        Ok(resp.data)
+    }
+
+    /// GET /api/v2/organizations/:id/ad-settings/me
+    pub async fn get_my_organization_ad_settings(&self, org_id: &str) -> Result<Value> {
+        let path = format!("/api/v2/organizations/{org_id}/ad-settings/me");
+        let resp: ApiResponse<Value> = self.get(&path).await?;
+        Ok(resp.data)
+    }
+
+    /// PUT /api/v2/organizations/:id/ad-settings/me
+    pub async fn set_my_organization_ad_settings(
+        &self,
+        org_id: &str,
+        body: &MyAdSettingRequest,
+    ) -> Result<Value> {
+        let path = format!("/api/v2/organizations/{org_id}/ad-settings/me");
+        let resp: ApiResponse<Value> = self.put(&path, body).await?;
+        Ok(resp.data)
+    }
+
+    /// PUT /api/v2/organizations/:id/logo (raw file bytes as the request body)
+    pub async fn upload_organization_logo(
+        &self,
+        org_id: &str,
+        bytes: Vec<u8>,
+        content_type: &str,
+    ) -> Result<Value> {
+        let path = format!("/api/v2/organizations/{org_id}/logo");
+        let resp: ApiResponse<Value> = self.put_bytes(&path, bytes, content_type).await?;
         Ok(resp.data)
     }
 }

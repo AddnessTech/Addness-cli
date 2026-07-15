@@ -1,6 +1,6 @@
 [package]
 name = "addness-cli"
-version = "0.7.4"
+version = "0.8.0"
 edition = "2024"
 description = "Command-line interface for Addness"
 license = "MIT"

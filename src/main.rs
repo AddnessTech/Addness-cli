@@ -11,8 +11,8 @@ use clap::{CommandFactory, Parser, Subcommand};
 use crate::config::{Credentials, DEFAULT_API_URL, Settings};
 use api::ApiClient;
 use cli::commands::{
-    activity, assignment, comment, configure, deliverable, detect, goal, invitation, issue, kpi,
-    link, login, member, notification, org, skills, streak, summary, today, update, user,
+    activity, assignment, chat, comment, configure, deliverable, detect, goal, invitation, issue,
+    kpi, link, login, member, notification, org, skills, streak, summary, today, update, user,
 };
 
 #[derive(Parser)]
@@ -66,6 +66,11 @@ enum Commands {
     Issue {
         #[command(subcommand)]
         command: issue::IssueCommands,
+    },
+    /// Manage organization chat (DM/group rooms, messages, invitations)
+    Chat {
+        #[command(subcommand)]
+        command: chat::ChatCommands,
     },
     /// Link PRs/URLs to goals and track progress
     Link {
@@ -174,6 +179,7 @@ fn command_outputs_json(command: &Commands) -> bool {
         Commands::Goal { command } => goal_outputs_json(command),
         Commands::Comment { command } => comment_outputs_json(command),
         Commands::Issue { command } => issue_outputs_json(command),
+        Commands::Chat { command } => chat_outputs_json(command),
         Commands::Link { command } => link_outputs_json(command),
         Commands::Deliverable { command } => deliverable_outputs_json(command),
         Commands::Assignment { command } => assignment_outputs_json(command),
@@ -308,6 +314,44 @@ fn issue_outputs_json(command: &issue::IssueCommands) -> bool {
             | issue::SectionCommands::UnreadCount { json, .. }
             | issue::SectionCommands::UnreadMentions { json, .. } => *json,
             issue::SectionCommands::Pin { .. } | issue::SectionCommands::Unpin { .. } => false,
+        },
+    }
+}
+
+fn chat_outputs_json(command: &chat::ChatCommands) -> bool {
+    match command {
+        chat::ChatCommands::Search { json, .. } => *json,
+        chat::ChatCommands::Room { command } => match command {
+            chat::RoomCommands::List { json, .. }
+            | chat::RoomCommands::ListPublic { json, .. }
+            | chat::RoomCommands::UnreadCount { json, .. }
+            | chat::RoomCommands::Get { json, .. }
+            | chat::RoomCommands::CreateDm { json, .. }
+            | chat::RoomCommands::CreateGroup { json, .. }
+            | chat::RoomCommands::Rename { json, .. }
+            | chat::RoomCommands::Members { json, .. }
+            | chat::RoomCommands::Join { json, .. }
+            | chat::RoomCommands::Invite { json, .. }
+            | chat::RoomCommands::SetIcon { json, .. } => *json,
+            chat::RoomCommands::Rm { .. }
+            | chat::RoomCommands::Leave { .. }
+            | chat::RoomCommands::RemoveMember { .. }
+            | chat::RoomCommands::RmIcon { .. }
+            | chat::RoomCommands::Read { .. }
+            | chat::RoomCommands::Hide { .. } => false,
+        },
+        chat::ChatCommands::Message { command } => match command {
+            chat::MessageCommands::List { json, .. }
+            | chat::MessageCommands::Post { json, .. }
+            | chat::MessageCommands::Update { json, .. }
+            | chat::MessageCommands::React { json, .. }
+            | chat::MessageCommands::Reactions { json, .. } => *json,
+            chat::MessageCommands::Rm { .. } | chat::MessageCommands::Unreact { .. } => false,
+        },
+        chat::ChatCommands::Invitation { command } => match command {
+            chat::ChatInvitationCommands::ListPending { json }
+            | chat::ChatInvitationCommands::Accept { json, .. } => *json,
+            chat::ChatInvitationCommands::Decline { .. } => false,
         },
     }
 }
@@ -557,6 +601,10 @@ async fn main() -> Result<()> {
         Some(Commands::Issue { command }) => {
             let client = build_client()?;
             issue::handle_issue(command, &client).await
+        }
+        Some(Commands::Chat { command }) => {
+            let client = build_client()?;
+            chat::handle_chat(command, &client).await
         }
         Some(Commands::Link { command }) => {
             let client = build_client()?;

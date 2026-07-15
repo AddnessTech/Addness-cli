@@ -13,4 +13,8 @@ pub use client::{
     ActivityLogByGoalParams, ActivityLogByMemberParams, ActivityLogSummaryParams,
     GoalActivitySummaryParams,
 };
+pub use client::{
+    ChatMessageListParams, ChatRoomListParams, ChatSearchParams, GoalSectionListParams,
+    IssueListParams, ListAllCommentsParams,
+};
 pub use models::*;

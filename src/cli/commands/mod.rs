@@ -1,11 +1,13 @@
 pub mod activity;
 pub mod assignment;
+pub mod chat;
 pub mod comment;
 pub mod configure;
 pub mod deliverable;
 pub mod detect;
 pub mod goal;
 pub mod invitation;
+pub mod issue;
 pub mod kpi;
 pub mod link;
 pub mod login;

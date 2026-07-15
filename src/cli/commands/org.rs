@@ -782,10 +782,11 @@ async fn handle_subscription(cmd: &SubscriptionCommands, client: &ApiClient) -> 
     }
 }
 
-/// Best-effort MIME type for an organization logo upload based on the file
-/// extension. Falls back to `application/octet-stream`; the backend also sniffs
-/// the actual bytes, so this only needs to be a reasonable hint.
-fn content_type_for_path(path: &str) -> &'static str {
+/// Best-effort MIME type for an image upload based on the file extension.
+/// Falls back to `application/octet-stream`; the backend also sniffs the
+/// actual bytes, so this only needs to be a reasonable hint. Shared with
+/// `chat::` room icon uploads (same image-file convention).
+pub(super) fn content_type_for_path(path: &str) -> &'static str {
     let ext = std::path::Path::new(path)
         .extension()
         .and_then(|e| e.to_str())

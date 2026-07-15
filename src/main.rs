@@ -313,7 +313,33 @@ fn kpi_outputs_json(command: &kpi::KpiCommands) -> bool {
 }
 
 fn member_outputs_json(command: &member::MemberCommands) -> bool {
-    matches!(command, member::MemberCommands::List { json: true, .. })
+    match command {
+        member::MemberCommands::List { json, .. }
+        | member::MemberCommands::Search { json, .. }
+        | member::MemberCommands::Children { json, .. }
+        | member::MemberCommands::Admins { json, .. }
+        | member::MemberCommands::DeletePreview { json, .. }
+        | member::MemberCommands::Browse { json, .. }
+        | member::MemberCommands::Objectives { json, .. }
+        | member::MemberCommands::SetAvatar { json, .. }
+        | member::MemberCommands::Get { json, .. } => *json,
+        member::MemberCommands::Update { .. }
+        | member::MemberCommands::Pin { .. }
+        | member::MemberCommands::Unpin { .. }
+        | member::MemberCommands::Rm { .. }
+        | member::MemberCommands::SetSourceOrg { .. } => false,
+        member::MemberCommands::Admin { command } => match command {
+            member::AdminCommands::Grant { .. } | member::AdminCommands::Revoke { .. } => false,
+        },
+        member::MemberCommands::Tag { command } => match command {
+            member::MemberTagCommands::List { json, .. }
+            | member::MemberTagCommands::Create { json, .. }
+            | member::MemberTagCommands::ListFor { json, .. } => *json,
+            member::MemberTagCommands::Rm { .. }
+            | member::MemberTagCommands::Assign { .. }
+            | member::MemberTagCommands::Unassign { .. } => false,
+        },
+    }
 }
 
 fn user_outputs_json(command: &user::UserCommands) -> bool {

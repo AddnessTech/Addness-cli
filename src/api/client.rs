@@ -17,6 +17,7 @@ pub use activity::{
     GoalActivitySummaryParams,
 };
 pub use comment::ListCommentsParams;
+pub use member::BrowseMembersParams;
 pub use notification::ListNotificationsParams;
 pub use org::{CreateOrganizationParams, ListAllOrganizationsParams};
 pub use user::ListUsersParams;

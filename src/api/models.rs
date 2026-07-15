@@ -20,7 +20,9 @@ mod personal;
 mod referral;
 mod search;
 mod sharetree;
+mod skill;
 mod streak;
+mod tool;
 mod user;
 
 pub use activity::*;
@@ -45,7 +47,9 @@ pub use personal::*;
 pub use referral::*;
 pub use search::*;
 pub use sharetree::*;
+pub use skill::*;
 pub use streak::*;
+pub use tool::*;
 pub use user::*;
 
 use serde::{Deserialize, Serialize};

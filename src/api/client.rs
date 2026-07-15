@@ -20,7 +20,9 @@ mod personal;
 mod referral;
 mod search;
 mod sharetree;
+mod skill;
 mod streak;
+mod tool;
 mod user;
 
 pub use activity::{

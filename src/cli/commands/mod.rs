@@ -23,10 +23,12 @@ pub mod personal;
 pub mod referral;
 pub mod search;
 pub mod sharetree;
+pub mod skill;
 pub mod skills;
 pub mod streak;
 pub mod summary;
 pub mod today;
+pub mod tool;
 pub mod update;
 pub mod user;
 

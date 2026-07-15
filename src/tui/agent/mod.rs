@@ -1488,8 +1488,9 @@ pub struct CodexPane {
     codex_appserver_turn_id: Option<String>,
     /// 送信済み turn/start の JSON-RPC id（応答で turn.id を確定するのに使う）。
     codex_appserver_turn_req_id: Option<u64>,
-    /// 承認バナー表示中のサーバ発リクエスト（応答用）。
-    codex_appserver_pending_approval: Option<codex_appserver::ApprovalRequest>,
+    /// 承認待ちのサーバ発リクエスト（応答用）。並列ツール実行では複数要求が同時に届くため、
+    /// 先頭だけをバナー表示し、残りは到着順に保持する。
+    codex_appserver_pending_approvals: VecDeque<codex_appserver::ApprovalRequest>,
     /// 送信済みの thread/settings/update 応答待ち。
     codex_appserver_pending_setting: Option<CodexAppServerSettingChange>,
     /// 設定変更が settings/update では反映できず、アイドル時に再起動が必要な状態。
@@ -1749,7 +1750,7 @@ impl CodexPane {
             codex_appserver_pending_images: Vec::new(),
             codex_appserver_turn_id: None,
             codex_appserver_turn_req_id: None,
-            codex_appserver_pending_approval: None,
+            codex_appserver_pending_approvals: VecDeque::new(),
             codex_appserver_pending_setting: None,
             codex_appserver_restart_pending: false,
             codex_appserver_last_activity: None,
@@ -1874,7 +1875,7 @@ impl CodexPane {
         pane.codex_appserver_pending_turn = None;
         pane.codex_appserver_turn_id = None;
         pane.codex_appserver_turn_req_id = None;
-        pane.codex_appserver_pending_approval = None;
+        pane.codex_appserver_pending_approvals.clear();
         pane.codex_appserver_pending_setting = None;
         pane.codex_appserver_restart_pending = false;
         pane.codex_appserver_last_activity = None;
@@ -5898,7 +5899,7 @@ impl CodexPane {
             self.codex_appserver_interrupting = false;
             self.codex_appserver_interrupt_deadline = None;
             self.pending_decision = None;
-            self.codex_appserver_pending_approval = None;
+            self.codex_appserver_pending_approvals.clear();
             self.current_turn_prompt = None;
             self.current_turn_retry_prompt = None;
             self.end_turn_work("中断完了");
@@ -5915,7 +5916,7 @@ impl CodexPane {
         }
 
         self.pending_decision = None;
-        self.codex_appserver_pending_approval = None;
+        self.codex_appserver_pending_approvals.clear();
         self.refresh_current_turn_title();
         self.queue_completed_turn_body_record();
         if status == "failed" {
@@ -5940,7 +5941,7 @@ impl CodexPane {
         self.streaming_assistant_index = None;
         self.codex_appserver_turn_id = None;
         self.pending_decision = None;
-        self.codex_appserver_pending_approval = None;
+        self.codex_appserver_pending_approvals.clear();
         self.codex_appserver_pending_turn = None;
         self.refresh_current_turn_title();
         self.current_turn_prompt = None;
@@ -6111,9 +6112,22 @@ impl CodexPane {
         self.codex_appserver_token_usage = Some(usage);
     }
 
-    /// サーバ発の承認リクエストを既存 CodexDecisionBanner で提示する。
+    /// サーバ発の承認リクエストを到着順に保持し、先頭だけをバナーで提示する。
     fn handle_codex_appserver_approval(&mut self, request: codex_appserver::ApprovalRequest) {
+        let should_present = self.codex_appserver_pending_approvals.is_empty();
+        self.codex_appserver_pending_approvals.push_back(request);
+        self.codex_appserver_last_activity = Some(Instant::now());
+        if should_present {
+            self.present_next_codex_appserver_approval();
+        }
+    }
+
+    /// キュー先頭の承認リクエストを既存 CodexDecisionBanner で提示する。
+    fn present_next_codex_appserver_approval(&mut self) {
         use codex_appserver::ApprovalKind as K;
+        let Some(request) = self.codex_appserver_pending_approvals.front() else {
+            return;
+        };
         let (heading, allow_hint) = match request.kind {
             K::Command => ("コマンド実行の許可を求めています", "許可すると実行します"),
             K::FileChange => ("ファイル変更の許可を求めています", "許可すると適用します"),
@@ -6129,8 +6143,6 @@ impl CodexPane {
             ""
         };
         let message = format!("{heading}: {target}。{allow_hint}。{session}");
-        self.codex_appserver_pending_approval = Some(request);
-        self.codex_appserver_last_activity = Some(Instant::now());
         self.set_pending_decision(CodexDecisionBanner::new(
             CodexDecisionKind::Permission,
             message,
@@ -6144,7 +6156,7 @@ impl CodexPane {
         response_label: &str,
     ) {
         use codex_appserver::ApprovalKind as K;
-        let Some(request) = self.codex_appserver_pending_approval.take() else {
+        let Some(request) = self.codex_appserver_pending_approvals.pop_front() else {
             return;
         };
         self.set_work_action(format!("確認応答: {response_label}"));
@@ -6200,6 +6212,7 @@ impl CodexPane {
                 "拒否しました（Codex はこの操作なしで続行します）",
             ),
         }
+        self.present_next_codex_appserver_approval();
     }
 
     /// 常駐モードで実行中ターンへ turn/interrupt（グレースフル中断）を送る。
@@ -6284,7 +6297,7 @@ impl CodexPane {
             self.current_command_started_at = None;
             self.streaming_assistant_index = None;
             self.pending_decision = None;
-            self.codex_appserver_pending_approval = None;
+            self.codex_appserver_pending_approvals.clear();
             self.codex_appserver_turn_id = None;
             self.codex_appserver_pending_turn = None;
             self.current_turn_prompt = None;
@@ -6329,7 +6342,7 @@ impl CodexPane {
         if self.codex_appserver_restart_pending
             && !self.turn_running
             && self.pending_decision.is_none()
-            && self.codex_appserver_pending_approval.is_none()
+            && self.codex_appserver_pending_approvals.is_empty()
         {
             self.codex_appserver_restart_pending = false;
             if let Some(client) = self.codex_appserver.as_mut() {
@@ -6345,7 +6358,7 @@ impl CodexPane {
         // 6. アイドル回収（無操作が続いたら閉じる）。
         if !self.turn_running
             && self.pending_decision.is_none()
-            && self.codex_appserver_pending_approval.is_none()
+            && self.codex_appserver_pending_approvals.is_empty()
             && let Some(last) = self.codex_appserver_last_activity
             && last.elapsed() >= CODEX_APPSERVER_IDLE_TIMEOUT
         {
@@ -6367,7 +6380,7 @@ impl CodexPane {
         self.codex_appserver_handshake_deadline = None;
         self.codex_appserver_interrupting = false;
         self.codex_appserver_pending_setting = None;
-        self.codex_appserver_pending_approval = None;
+        self.codex_appserver_pending_approvals.clear();
         self.codex_appserver_pending_turn = None;
         self.codex_appserver_pending_images.clear();
         self.codex_appserver_turn_id = None;
@@ -6437,7 +6450,7 @@ impl CodexPane {
         self.codex_appserver_handshake_deadline = None;
         self.codex_appserver_interrupting = false;
         self.codex_appserver_pending_setting = None;
-        self.codex_appserver_pending_approval = None;
+        self.codex_appserver_pending_approvals.clear();
         self.codex_appserver_pending_turn = None;
         self.codex_appserver_pending_images.clear();
         self.codex_appserver_turn_id = None;
@@ -6689,7 +6702,7 @@ impl CodexPane {
         }
 
         // 常駐 app-server の承認は JSON-RPC result を返してその場で続行する（resume 再実行しない）。
-        if self.codex_appserver_pending_approval.is_some() {
+        if !self.codex_appserver_pending_approvals.is_empty() {
             self.resolve_codex_appserver_approval(response, response_label);
             return;
         }
@@ -14025,11 +14038,60 @@ mod tests {
         }));
         let banner = pane.pending_decision.as_ref().expect("banner");
         assert_eq!(banner.kind, CodexDecisionKind::Permission);
-        assert!(pane.codex_appserver_pending_approval.is_some());
+        assert_eq!(pane.codex_appserver_pending_approvals.len(), 1);
         // a（許可）で応答し、バナーと pending を解消する。
         pane.handle_decision_key(key(KeyCode::Char('a')));
         assert!(pane.pending_decision.is_none());
-        assert!(pane.codex_appserver_pending_approval.is_none());
+        assert!(pane.codex_appserver_pending_approvals.is_empty());
+    }
+
+    #[test]
+    fn codex_appserver_parallel_approvals_are_presented_fifo() {
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        pane.turn_running = true;
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0", "id": 7, "method": "item/commandExecution/requestApproval",
+            "params": {"itemId": "call_7", "command": "gh pr update-branch 119", "availableDecisions": ["accept", "decline"]}
+        }));
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0", "id": 8, "method": "item/commandExecution/requestApproval",
+            "params": {"itemId": "call_8", "command": "gh pr update-branch 80", "availableDecisions": ["accept", "decline"]}
+        }));
+
+        assert_eq!(pane.codex_appserver_pending_approvals.len(), 2);
+        assert_eq!(
+            pane.codex_appserver_pending_approvals
+                .front()
+                .map(|request| &request.id),
+            Some(&serde_json::json!(7))
+        );
+        assert!(
+            pane.pending_decision
+                .as_ref()
+                .is_some_and(|banner| banner.message.contains("update-branch 119"))
+        );
+
+        pane.handle_decision_key(key(KeyCode::Char('a')));
+
+        assert_eq!(pane.codex_appserver_pending_approvals.len(), 1);
+        assert_eq!(
+            pane.codex_appserver_pending_approvals
+                .front()
+                .map(|request| &request.id),
+            Some(&serde_json::json!(8))
+        );
+        assert!(
+            pane.pending_decision
+                .as_ref()
+                .is_some_and(|banner| banner.message.contains("update-branch 80"))
+        );
+
+        pane.handle_decision_key(key(KeyCode::Char('a')));
+
+        assert!(pane.codex_appserver_pending_approvals.is_empty());
+        assert!(pane.pending_decision.is_none());
     }
 
     #[test]

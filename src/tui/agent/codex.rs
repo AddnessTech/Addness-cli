@@ -1424,11 +1424,13 @@ mod tests {
 
     #[test]
     fn codex_exec_resume_args_include_selected_settings() {
-        let mut settings = CodexExecSettings::default();
-        settings.model = CodexModelChoice::Gpt5;
-        settings.reasoning = CodexReasoningChoice::Medium;
-        settings.approval = CodexApprovalChoice::OnRequest;
-        settings.sandbox = CodexSandboxChoice::ReadOnly;
+        let mut settings = CodexExecSettings {
+            model: CodexModelChoice::Gpt5,
+            reasoning: CodexReasoningChoice::Medium,
+            approval: CodexApprovalChoice::OnRequest,
+            sandbox: CodexSandboxChoice::ReadOnly,
+            ..Default::default()
+        };
         settings.image_paths.push("/tmp/shot.png".to_string());
         settings.output_schema = Some("/tmp/schema.json".to_string());
         settings.output_last_message = Some("/tmp/last.txt".to_string());
@@ -1478,11 +1480,13 @@ mod tests {
 
     #[test]
     fn codex_root_interactive_args_include_prompt_and_settings() {
-        let mut settings = CodexExecSettings::default();
-        settings.model_override = Some("gpt-custom".to_string());
-        settings.approval = CodexApprovalChoice::OnRequest;
-        settings.sandbox = CodexSandboxChoice::ReadOnly;
-        settings.web_search = true;
+        let settings = CodexExecSettings {
+            model_override: Some("gpt-custom".to_string()),
+            approval: CodexApprovalChoice::OnRequest,
+            sandbox: CodexSandboxChoice::ReadOnly,
+            web_search: true,
+            ..Default::default()
+        };
 
         let args =
             codex_root_interactive_args("hello codex", "/repo", &settings, TEST_DEV_INSTRUCTIONS);
@@ -1507,11 +1511,13 @@ mod tests {
 
     #[test]
     fn codex_root_resume_args_include_interactive_resume_settings() {
-        let mut settings = CodexExecSettings::default();
-        settings.model = CodexModelChoice::Gpt5;
-        settings.approval = CodexApprovalChoice::OnRequest;
-        settings.sandbox = CodexSandboxChoice::ReadOnly;
-        settings.web_search = true;
+        let settings = CodexExecSettings {
+            model: CodexModelChoice::Gpt5,
+            approval: CodexApprovalChoice::OnRequest,
+            sandbox: CodexSandboxChoice::ReadOnly,
+            web_search: true,
+            ..Default::default()
+        };
 
         let args = codex_root_resume_args(
             None,
@@ -1559,11 +1565,13 @@ mod tests {
 
     #[test]
     fn codex_root_session_command_args_pass_through_args_and_settings() {
-        let mut settings = CodexExecSettings::default();
-        settings.model_override = Some("gpt-custom".to_string());
-        settings.approval = CodexApprovalChoice::OnRequest;
-        settings.sandbox = CodexSandboxChoice::ReadOnly;
-        settings.web_search = true;
+        let settings = CodexExecSettings {
+            model_override: Some("gpt-custom".to_string()),
+            approval: CodexApprovalChoice::OnRequest,
+            sandbox: CodexSandboxChoice::ReadOnly,
+            web_search: true,
+            ..Default::default()
+        };
 
         let args = codex_root_session_command_args(
             "fork",
@@ -1590,12 +1598,14 @@ mod tests {
 
     #[test]
     fn codex_fork_args_include_root_interactive_settings() {
-        let mut settings = CodexExecSettings::default();
-        settings.model = CodexModelChoice::Gpt5;
-        settings.reasoning = CodexReasoningChoice::High;
-        settings.approval = CodexApprovalChoice::OnRequest;
-        settings.sandbox = CodexSandboxChoice::ReadOnly;
-        settings.web_search = true;
+        let mut settings = CodexExecSettings {
+            model: CodexModelChoice::Gpt5,
+            reasoning: CodexReasoningChoice::High,
+            approval: CodexApprovalChoice::OnRequest,
+            sandbox: CodexSandboxChoice::ReadOnly,
+            web_search: true,
+            ..Default::default()
+        };
         settings.image_paths.push("/tmp/shot.png".to_string());
 
         let args = codex_fork_args(
@@ -1643,10 +1653,12 @@ mod tests {
 
     #[test]
     fn codex_session_admin_args_include_root_interactive_settings() {
-        let mut settings = CodexExecSettings::default();
-        settings.remote_addr = Some("ws://127.0.0.1:7777".to_string());
-        settings.model = CodexModelChoice::Gpt5;
-        settings.sandbox = CodexSandboxChoice::ReadOnly;
+        let mut settings = CodexExecSettings {
+            remote_addr: Some("ws://127.0.0.1:7777".to_string()),
+            model: CodexModelChoice::Gpt5,
+            sandbox: CodexSandboxChoice::ReadOnly,
+            ..Default::default()
+        };
         settings
             .config_overrides
             .push("features.foo=true".to_string());
@@ -1680,13 +1692,15 @@ mod tests {
 
     #[test]
     fn codex_exec_review_args_include_exec_review_settings() {
-        let mut settings = CodexExecSettings::default();
-        settings.model = CodexModelChoice::Gpt5;
-        settings.reasoning = CodexReasoningChoice::High;
-        settings.approval = CodexApprovalChoice::OnRequest;
-        settings.strict_config = true;
-        settings.ignore_rules = true;
-        settings.output_schema = Some("/tmp/schema.json".to_string());
+        let settings = CodexExecSettings {
+            model: CodexModelChoice::Gpt5,
+            reasoning: CodexReasoningChoice::High,
+            approval: CodexApprovalChoice::OnRequest,
+            strict_config: true,
+            ignore_rules: true,
+            output_schema: Some("/tmp/schema.json".to_string()),
+            ..Default::default()
+        };
 
         let args = codex_exec_review_args(
             "--uncommitted --title WIP",
@@ -1724,10 +1738,12 @@ mod tests {
 
     #[test]
     fn codex_review_args_include_root_review_settings() {
-        let mut settings = CodexExecSettings::default();
-        settings.remote_addr = Some("ws://127.0.0.1:7777".to_string());
-        settings.model = CodexModelChoice::Gpt5;
-        settings.strict_config = true;
+        let mut settings = CodexExecSettings {
+            remote_addr: Some("ws://127.0.0.1:7777".to_string()),
+            model: CodexModelChoice::Gpt5,
+            strict_config: true,
+            ..Default::default()
+        };
         settings
             .config_overrides
             .push("features.foo=true".to_string());
@@ -1794,11 +1810,13 @@ mod tests {
 
     #[test]
     fn codex_exec_args_include_selected_exec_settings() {
-        let mut settings = CodexExecSettings::default();
-        settings.model = CodexModelChoice::Gpt5;
-        settings.reasoning = CodexReasoningChoice::High;
-        settings.approval = CodexApprovalChoice::OnRequest;
-        settings.sandbox = CodexSandboxChoice::ReadOnly;
+        let settings = CodexExecSettings {
+            model: CodexModelChoice::Gpt5,
+            reasoning: CodexReasoningChoice::High,
+            approval: CodexApprovalChoice::OnRequest,
+            sandbox: CodexSandboxChoice::ReadOnly,
+            ..Default::default()
+        };
         let args = codex_exec_args(None, "/repo", &settings, TEST_DEV_INSTRUCTIONS);
 
         assert!(
@@ -1816,8 +1834,10 @@ mod tests {
 
     #[test]
     fn codex_exec_args_include_custom_model_override() {
-        let mut settings = CodexExecSettings::default();
-        settings.model_override = Some("gpt-custom".to_string());
+        let settings = CodexExecSettings {
+            model_override: Some("gpt-custom".to_string()),
+            ..Default::default()
+        };
 
         let args = codex_exec_args(None, "/repo", &settings, TEST_DEV_INSTRUCTIONS);
 
@@ -1826,14 +1846,16 @@ mod tests {
 
     #[test]
     fn codex_exec_args_include_advanced_codex_cli_options() {
-        let mut settings = CodexExecSettings::default();
-        settings.web_search = true;
-        settings.oss = true;
-        settings.remote_addr = Some("ws://127.0.0.1:7777".to_string());
-        settings.remote_auth_token_env = Some("CODEX_REMOTE_TOKEN".to_string());
-        settings.no_alt_screen = true;
-        settings.local_provider = CodexLocalProviderChoice::Ollama;
-        settings.profile = Some("work".to_string());
+        let mut settings = CodexExecSettings {
+            web_search: true,
+            oss: true,
+            remote_addr: Some("ws://127.0.0.1:7777".to_string()),
+            remote_auth_token_env: Some("CODEX_REMOTE_TOKEN".to_string()),
+            no_alt_screen: true,
+            local_provider: CodexLocalProviderChoice::Ollama,
+            profile: Some("work".to_string()),
+            ..Default::default()
+        };
         settings.additional_dirs.push("/tmp/extra".to_string());
         settings.image_paths.push("/tmp/shot.png".to_string());
         settings
@@ -1901,10 +1923,12 @@ mod tests {
 
     #[test]
     fn codex_exec_args_bypass_omits_approval_and_sandbox_flags() {
-        let mut settings = CodexExecSettings::default();
-        settings.approval = CodexApprovalChoice::OnRequest;
-        settings.sandbox = CodexSandboxChoice::ReadOnly;
-        settings.bypass_approvals_and_sandbox = true;
+        let settings = CodexExecSettings {
+            approval: CodexApprovalChoice::OnRequest,
+            sandbox: CodexSandboxChoice::ReadOnly,
+            bypass_approvals_and_sandbox: true,
+            ..Default::default()
+        };
 
         let args = codex_exec_args(None, "/repo", &settings, TEST_DEV_INSTRUCTIONS);
 
@@ -2008,9 +2032,11 @@ mod tests {
 
     #[test]
     fn codex_named_subcommand_args_with_settings_prefixes_global_config() {
-        let mut settings = CodexExecSettings::default();
-        settings.remote_addr = Some("ws://127.0.0.1:7777".to_string());
-        settings.strict_config = true;
+        let mut settings = CodexExecSettings {
+            remote_addr: Some("ws://127.0.0.1:7777".to_string()),
+            strict_config: true,
+            ..Default::default()
+        };
         settings
             .config_overrides
             .push("features.foo=true".to_string());

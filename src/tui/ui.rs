@@ -3124,11 +3124,15 @@ fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: 
         if input_chunk.height <= 1 {
             prompt_lines
         } else {
+            let status_style = if pane.decision_banner().is_some() {
+                Style::default()
+                    .fg(COLOR_DANGER)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(COLOR_MUTED)
+            };
             let mut lines = Vec::with_capacity(prompt_lines.len() + 1);
-            lines.push(Line::from(Span::styled(
-                status,
-                Style::default().fg(COLOR_MUTED),
-            )));
+            lines.push(Line::from(Span::styled(status, status_style)));
             lines.extend(prompt_lines);
             lines
         }
@@ -3725,7 +3729,13 @@ fn decision_always_choice_text(decision: &super::agent::CodexDecisionBanner) -> 
 fn codex_header_lines(pane: &CodexPane, max_width: usize, max_rows: usize) -> Vec<Line<'static>> {
     let run_state = pane.run_state();
     let focus = codex_current_activity_label(pane, max_width.saturating_sub(6));
-    let focus_style = if pane.decision_banner().is_some() || pane.is_turn_running() {
+    // 承認待ちは「作業を止めて人間の応答を待っている」状態なので、単なる実行中（WARN）より
+    // 目立つ危険色（DANGER）にして見逃しを防ぐ。
+    let focus_style = if pane.decision_banner().is_some() {
+        Style::default()
+            .fg(COLOR_DANGER)
+            .add_modifier(Modifier::BOLD)
+    } else if pane.is_turn_running() {
         Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(COLOR_TEXT_STRONG)
@@ -3764,7 +3774,11 @@ fn codex_header_lines(pane: &CodexPane, max_width: usize, max_rows: usize) -> Ve
     }
 
     let summary = format!(" {}", parts.join(" | "));
-    let summary_style = if pane.decision_banner().is_some() || pane.is_turn_running() {
+    let summary_style = if pane.decision_banner().is_some() {
+        Style::default()
+            .fg(COLOR_DANGER)
+            .add_modifier(Modifier::BOLD)
+    } else if pane.is_turn_running() {
         Style::default().fg(COLOR_WARN)
     } else {
         Style::default().fg(COLOR_MUTED)
@@ -4792,8 +4806,20 @@ fn codex_runtime_status(pane: &CodexPane, max_width: usize) -> String {
     ellipsize_width(&format!("  {state}  {detail}  |  {view}"), max_width)
 }
 
+/// 実行中スピナーのコマ送り文字。Addness ゴール同期の鼓動表示（`draw_codex` 内 SPIN 配列）と
+/// 揃えた点字スピナーを使う。
+const RUN_SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// tick を実行中スピナーの1文字へ変換する純関数。tick は単調増加のカウンタであればよく、
+/// 実際に何ミリ秒間隔で進めるかは呼び出し側（`CodexPane::advance_activity_spin`）が決める。
+/// 副作用を持たないため、コマ送りの見た目はここだけをテストすれば検証できる。
+fn run_spinner_glyph(tick: u64) -> &'static str {
+    RUN_SPINNER_FRAMES[(tick as usize) % RUN_SPINNER_FRAMES.len()]
+}
+
 fn codex_current_activity_label(pane: &CodexPane, max_width: usize) -> String {
     let detail = if pane.is_turn_running() {
+        let spin = run_spinner_glyph(pane.activity_spin_tick());
         let queued = pane.queued_prompt_count();
         let input_hint = if queued > 0 {
             format!(" / 予約{queued}件")
@@ -4801,7 +4827,8 @@ fn codex_current_activity_label(pane: &CodexPane, max_width: usize) -> String {
             " / Enterで次ターン予約".to_string()
         };
         if let Some(decision) = pane.decision_banner() {
-            format!("確認待ち: {}", decision.message)
+            // 承認待ちは他の実行中状態より目に留まりやすいラベルにする（色は呼び出し側で強調）。
+            format!("⏸ 承認待ち: {}", decision.message)
         } else if let Some(command) = pane.current_command() {
             let elapsed = pane
                 .current_command_elapsed_secs()
@@ -4814,13 +4841,16 @@ fn codex_current_activity_label(pane: &CodexPane, max_width: usize) -> String {
                 .map(|line| format!(" › {line}"))
                 .unwrap_or_default();
             format!(
-                "{}{elapsed}{live}{input_hint}",
+                "{spin} {}{elapsed}{live}{input_hint}",
                 codex_command_activity_summary(command)
             )
         } else if let Some(action) = pane.action.as_deref() {
-            format!("作業中: {action}{input_hint}")
+            format!("{spin} 作業中: {action}{input_hint}")
         } else {
-            format!("{}が考えています{input_hint}", pane.kind().display_name())
+            format!(
+                "{spin} {}が考えています{input_hint}",
+                pane.kind().display_name()
+            )
         }
     } else {
         codex_work_label(
@@ -4998,9 +5028,10 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
         super::agent::CodexRunState::Completed => {
             Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD)
         }
-        super::agent::CodexRunState::Confirming => {
-            Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD)
-        }
+        // 承認待ちは人間の応答をブロックしている状態なので、単なる実行中より目立つ危険色にする。
+        super::agent::CodexRunState::Confirming => Style::default()
+            .fg(COLOR_DANGER)
+            .add_modifier(Modifier::BOLD),
         super::agent::CodexRunState::CommandRunning | super::agent::CodexRunState::Thinking => {
             Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD)
         }
@@ -5009,10 +5040,11 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
         }
     };
     let focus = codex_current_activity_label(pane, prompt_width);
-    let focus_style = if pane.current_command().is_some()
-        || pane.is_turn_running()
-        || pane.decision_banner().is_some()
-    {
+    let focus_style = if pane.decision_banner().is_some() {
+        Style::default()
+            .fg(COLOR_DANGER)
+            .add_modifier(Modifier::BOLD)
+    } else if pane.current_command().is_some() || pane.is_turn_running() {
         Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(COLOR_TEXT_STRONG)
@@ -5313,13 +5345,14 @@ fn ellipsize_width(text: &str, max_width: usize) -> String {
 mod tests {
     use super::{
         ActivePane, App, CODEX_EDIT_DIFF_PREVIEW_LINES, COLOR_DANGER, COLOR_EVENT, COLOR_SUCCESS,
-        COLOR_WARN, cached_assistant_markdown_count, cached_assistant_markdown_lines,
-        code_edit_diff_preview, codex_activity_lines, codex_child_goal_lines,
-        codex_dashboard_shortcut_lines, codex_decision_choice_line, codex_decision_input_lines,
-        codex_decision_title_hint, codex_diff_lines, codex_header_line, codex_header_lines,
-        codex_input_prompt_render, codex_log_entry_lines, codex_log_lines, codex_markdown_styles,
-        codex_runtime_status, codex_visible_log_lines, codex_work_label, draw_status_bar,
-        ellipsize_width, markdown, prompt_preview, summarize_tool_display_text,
+        COLOR_WARN, RUN_SPINNER_FRAMES, cached_assistant_markdown_count,
+        cached_assistant_markdown_lines, code_edit_diff_preview, codex_activity_lines,
+        codex_child_goal_lines, codex_current_activity_label, codex_dashboard_shortcut_lines,
+        codex_decision_choice_line, codex_decision_input_lines, codex_decision_title_hint,
+        codex_diff_lines, codex_header_line, codex_header_lines, codex_input_prompt_render,
+        codex_log_entry_lines, codex_log_lines, codex_markdown_styles, codex_runtime_status,
+        codex_visible_log_lines, codex_work_label, draw_status_bar, ellipsize_width, markdown,
+        prompt_preview, run_spinner_glyph, summarize_tool_display_text,
     };
     use crate::api::ApiClient;
     use crate::tui::agent::{
@@ -5988,6 +6021,47 @@ mod tests {
         assert!(status.contains("入力待ち"));
         assert!(status.contains("表示:会話"));
         assert!(status.contains("ゴール文脈を読込中"));
+    }
+
+    #[test]
+    fn run_spinner_glyph_cycles_through_all_frames_and_wraps() {
+        // 純関数: 同じtickは同じ文字を返し、周期(フレーム数)で元へ戻る。
+        let frames: Vec<&str> = (0..RUN_SPINNER_FRAMES.len() as u64)
+            .map(run_spinner_glyph)
+            .collect();
+        assert_eq!(frames, RUN_SPINNER_FRAMES.to_vec());
+        assert_eq!(
+            run_spinner_glyph(RUN_SPINNER_FRAMES.len() as u64),
+            run_spinner_glyph(0)
+        );
+        assert_eq!(run_spinner_glyph(7), run_spinner_glyph(7));
+    }
+
+    #[test]
+    fn codex_current_activity_label_shows_spinner_while_turn_running() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.finished = false;
+        pane.test_set_turn_running(true);
+        pane.action = Some("作業中".to_string());
+
+        let label = codex_current_activity_label(&pane, 80);
+        assert!(label.starts_with(run_spinner_glyph(0)));
+
+        pane.test_set_turn_running(false);
+        let idle_label = codex_current_activity_label(&pane, 80);
+        assert!(!idle_label.starts_with(run_spinner_glyph(0)));
+    }
+
+    #[test]
+    fn codex_current_activity_label_marks_confirming_state_distinctly() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.finished = false;
+        pane.test_set_turn_running(true);
+        pane.test_set_pending_decision(CodexDecisionKind::Approval, "Run cargo test?");
+
+        let label = codex_current_activity_label(&pane, 80);
+        assert!(label.contains("⏸ 承認待ち"));
+        assert!(label.contains("Run cargo test?"));
     }
 
     #[test]

@@ -44,6 +44,25 @@ cargo build --release
 
 `addness login` を実行し、ブラウザでの認証フローを完了してください。
 
+### 環境変数によるトークン認証（CI 向け）
+
+ブラウザ認証が使えない CI 等では、環境変数で API トークンを渡して認証できます。
+以下の環境変数が設定されている場合、`~/.addness/credentials.json` より **優先** されます:
+
+| 環境変数 | 必須 | 説明 |
+|---|---|---|
+| `ADDNESS_API_TOKEN` | 必須 | Bearer トークン（発行済み API キー）。空文字・空白のみは未設定として扱われる |
+| `ADDNESS_API_URL` | 任意 | API ベース URL。未設定時は既定の `https://vt.api.addness.com` |
+| `ADDNESS_ORG_ID` | 任意 | 対象組織 ID。`--org` フラグ未指定時のデフォルト組織としても使われる |
+
+```bash
+ADDNESS_API_TOKEN=<api-key> ADDNESS_ORG_ID=<org-id> \
+  addness goal create --title "CI から作成" --json
+```
+
+`ADDNESS_API_TOKEN` が未設定（または空白のみ）の場合は、従来どおり
+`~/.addness/credentials.json` の資格情報が使われます。
+
 DNS が制限された環境で `failed to lookup address information` が出る場合は、一時回避として
 `ADDNESS_API_RESOLVE` で API ホストの解決先を固定できます:
 

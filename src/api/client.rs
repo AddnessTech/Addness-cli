@@ -3,14 +3,21 @@ mod assignment;
 mod chat;
 mod comment;
 mod deliverable;
+mod diagnosis;
 mod goal;
 mod goal_execution;
+mod goalreport;
+mod inlinemedia;
 mod invitation;
+mod invoice;
 mod issue;
 mod kpi;
 mod member;
 mod notification;
 mod org;
+mod referral;
+mod search;
+mod sharetree;
 mod streak;
 mod user;
 
@@ -20,10 +27,12 @@ pub use activity::{
 };
 pub use chat::{ChatMessageListParams, ChatRoomListParams, ChatSearchParams};
 pub use comment::{ListAllCommentsParams, ListCommentsParams};
+pub use invoice::InvoiceListParams;
 pub use issue::{GoalSectionListParams, IssueListParams};
 pub use member::BrowseMembersParams;
 pub use notification::ListNotificationsParams;
 pub use org::{CreateOrganizationParams, ListAllOrganizationsParams};
+pub use search::SearchQueryParams;
 pub use user::ListUsersParams;
 
 use anyhow::{Context, Result};
@@ -476,6 +485,14 @@ impl ApiClient {
     pub(super) async fn delete_no_body(&self, path: &str) -> Result<()> {
         let (url, req) = self.request(Method::DELETE, path, true)?;
         self.send_no_content(req, &url).await
+    }
+
+    /// DELETE with no request body, expects a JSON response body (unlike
+    /// `delete_no_body`; used by endpoints that return a status payload on
+    /// deletion, e.g. the goal activity report schedule).
+    pub(super) async fn delete_json<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+        let (url, req) = self.request(Method::DELETE, path, true)?;
+        self.send_json(req, &url).await
     }
 
     /// PUT with a raw binary body (e.g. organization logo upload), expects JSON response.

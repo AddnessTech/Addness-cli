@@ -147,6 +147,15 @@ impl ApiClient {
         self.delete_no_body(&path).await
     }
 
+    /// GET /api/v1/public/objectives/:publicId (no auth required).
+    /// Response is not envelope-wrapped and has many fields
+    /// (`resources.SharedObjectiveResponse`), so it is surfaced as raw JSON
+    /// rather than a fully-typed struct.
+    pub async fn get_public_shared_objective(&self, public_id: &str) -> Result<serde_json::Value> {
+        let path = format!("/api/v1/public/objectives/{public_id}");
+        self.get_without_org(&path).await
+    }
+
     pub async fn create_alias(
         &self,
         parent_goal_id: &str,

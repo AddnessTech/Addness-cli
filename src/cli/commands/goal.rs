@@ -438,6 +438,11 @@ pub enum GoalCommands {
         #[command(subcommand)]
         command: RecurringCommands,
     },
+    /// Manage a goal's activity report schedule (periodic digest emails)
+    ReportSchedule {
+        #[command(subcommand)]
+        command: ReportScheduleCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -454,6 +459,75 @@ pub enum ShareCommands {
     Revoke {
         /// Goal ID
         id: String,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
+    },
+    /// Fetch a publicly shared goal by its public ID (no auth required)
+    GetPublic {
+        /// Public ID (from the share URL, e.g. the last path segment)
+        public_id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Report frequency (`internal/goalreport/usecase/types.go`).
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum ReportFrequency {
+    Daily,
+    EveryTwoDays,
+    Weekly,
+}
+
+impl ReportFrequency {
+    fn as_str(self) -> &'static str {
+        match self {
+            ReportFrequency::Daily => "daily",
+            ReportFrequency::EveryTwoDays => "every_two_days",
+            ReportFrequency::Weekly => "weekly",
+        }
+    }
+}
+
+#[derive(Subcommand)]
+pub enum ReportScheduleCommands {
+    /// Show the current activity report schedule for a goal
+    Get {
+        /// Goal ID
+        id: String,
+        /// Organization ID (uses default if not specified)
+        #[arg(long)]
+        org: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create or update the activity report schedule for a goal
+    Set {
+        /// Goal ID
+        id: String,
+        /// Organization ID (uses default if not specified)
+        #[arg(long)]
+        org: Option<String>,
+        /// Report frequency
+        #[arg(long, value_enum)]
+        frequency: ReportFrequency,
+        /// Enable or disable the schedule (default: enabled)
+        #[arg(long)]
+        enabled: Option<bool>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete the activity report schedule for a goal
+    Rm {
+        /// Goal ID
+        id: String,
+        /// Organization ID (uses default if not specified)
+        #[arg(long)]
+        org: Option<String>,
         /// Skip confirmation prompt
         #[arg(long)]
         force: bool,
@@ -1134,6 +1208,7 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
         GoalCommands::Share { command } => handle_share(command, client).await,
         GoalCommands::Alias { command } => handle_alias(command, client).await,
         GoalCommands::Recurring { command } => handle_recurring(command, client).await,
+        GoalCommands::ReportSchedule { command } => handle_report_schedule(command, client).await,
     }
 }
 
@@ -1176,6 +1251,17 @@ async fn handle_share(cmd: &ShareCommands, client: &ApiClient) -> Result<()> {
             }
             client.revoke_share_link(id).await?;
             println!("Share link revoked for goal {id}");
+            Ok(())
+        }
+        ShareCommands::GetPublic { public_id, json } => {
+            let goal = client.get_public_shared_objective(public_id).await?;
+            // Response shape has many fields and no dedicated table view;
+            // always render JSON, compact unless --json (pretty) is set.
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&goal)?);
+            } else {
+                println!("{goal}");
+            }
             Ok(())
         }
     }
@@ -1353,6 +1439,64 @@ async fn handle_recurring(cmd: &RecurringCommands, client: &ApiClient) -> Result
             } else {
                 println!("Recurring schedule removed for goal {id}");
             }
+            Ok(())
+        }
+    }
+}
+
+async fn handle_report_schedule(cmd: &ReportScheduleCommands, client: &ApiClient) -> Result<()> {
+    match cmd {
+        ReportScheduleCommands::Get { id, org, json } => {
+            let org_id = resolve_org_id(org.as_deref())?;
+            let schedule = client.get_goal_report_schedule(&org_id, id).await?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&schedule)?);
+            } else {
+                match &schedule {
+                    Some(s) => println!(
+                        "frequency={} enabled={} next_run={}",
+                        s.frequency,
+                        s.enabled,
+                        s.next_run_at.as_deref().unwrap_or("-")
+                    ),
+                    None => println!("No report schedule set for goal {id}."),
+                }
+            }
+            Ok(())
+        }
+        ReportScheduleCommands::Set {
+            id,
+            org,
+            frequency,
+            enabled,
+            json,
+        } => {
+            let org_id = resolve_org_id(org.as_deref())?;
+            let schedule = client
+                .upsert_goal_report_schedule(&org_id, id, frequency.as_str(), *enabled)
+                .await?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&schedule)?);
+            } else {
+                println!(
+                    "Report schedule set for goal {id}: frequency={} enabled={}",
+                    schedule.frequency, schedule.enabled
+                );
+            }
+            Ok(())
+        }
+        ReportScheduleCommands::Rm { id, org, force } => {
+            let org_id = resolve_org_id(org.as_deref())?;
+            if !*force
+                && !crate::cli::commands::confirm(&format!(
+                    "Delete report schedule for goal {id}?"
+                ))?
+            {
+                println!("Cancelled.");
+                return Ok(());
+            }
+            client.delete_goal_report_schedule(&org_id, id).await?;
+            println!("Report schedule deleted for goal {id}");
             Ok(())
         }
     }

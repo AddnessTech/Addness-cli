@@ -17,4 +17,5 @@ pub use client::{
     ChatMessageListParams, ChatRoomListParams, ChatSearchParams, GoalSectionListParams,
     IssueListParams, ListAllCommentsParams,
 };
+pub use client::{InvoiceListParams, SearchQueryParams};
 pub use models::*;

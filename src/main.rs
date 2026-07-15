@@ -194,7 +194,17 @@ fn org_outputs_json(command: &org::OrgCommands) -> bool {
         | org::OrgCommands::Current { json }
         | org::OrgCommands::Create { json, .. }
         | org::OrgCommands::Update { json, .. }
-        | org::OrgCommands::SetContext { json, .. } => *json,
+        | org::OrgCommands::SetContext { json, .. }
+        | org::OrgCommands::Get { json, .. }
+        | org::OrgCommands::ListAll { json, .. }
+        | org::OrgCommands::RootOwner { json, .. }
+        | org::OrgCommands::AccessibleRoot { json, .. }
+        | org::OrgCommands::AiAgentMember { json, .. }
+        | org::OrgCommands::AccessState { json, .. }
+        | org::OrgCommands::CurrentMember { json, .. }
+        | org::OrgCommands::AdminCheck { json, .. }
+        | org::OrgCommands::GetContext { json, .. }
+        | org::OrgCommands::ContextRevisions { json, .. } => *json,
         org::OrgCommands::Switch { .. } | org::OrgCommands::Rm { .. } => false,
     }
 }

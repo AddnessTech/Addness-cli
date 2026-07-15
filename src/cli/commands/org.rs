@@ -1,7 +1,9 @@
 use anyhow::{Result, bail};
 use clap::Subcommand;
 
-use crate::api::{ApiClient, CreateOrganizationParams, OrganizationsResponse};
+use crate::api::{
+    ApiClient, CreateOrganizationParams, ListAllOrganizationsParams, OrganizationsResponse,
+};
 use crate::cli::output::print_organizations_table;
 use crate::config::{Credentials, Settings};
 
@@ -90,6 +92,115 @@ pub enum OrgCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Show a single organization's details
+    Get {
+        /// Organization ID
+        id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// List all organizations (subscription-scoped, paginated) matching an optional name
+    ListAll {
+        /// Filter by organization name (partial match)
+        #[arg(long)]
+        name: Option<String>,
+        /// Maximum number of results
+        #[arg(long)]
+        limit: Option<u16>,
+        /// Number of results to skip
+        #[arg(long)]
+        offset: Option<u64>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the organization's root goal owner
+    RootOwner {
+        /// Organization ID
+        id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the root goal you can access in the organization
+    AccessibleRoot {
+        /// Organization ID
+        id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the organization's AI agent member
+    AiAgentMember {
+        /// Organization ID
+        id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the organization's payment access state
+    AccessState {
+        /// Organization ID
+        id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show your member record within the organization
+    CurrentMember {
+        /// Organization ID
+        id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Check whether you are an admin of the organization
+    AdminCheck {
+        /// Organization ID
+        id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the organization's context text
+    GetContext {
+        /// Organization ID
+        id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// List revisions of the organization's context text
+    ContextRevisions {
+        /// Organization ID
+        id: String,
+        /// Maximum number of revisions to return
+        #[arg(long)]
+        limit: Option<u16>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Build a client whose `X-Organization-ID` header targets `id`.
+///
+/// The v2 organization endpoints are guarded by `OrganizationMemberGuard` and
+/// several handlers additionally require the header org to equal the path `:id`,
+/// so id-scoped subcommands must send the header for the organization named in
+/// the argument rather than the shell's current organization.
+fn client_for_org(client: &ApiClient, id: &str) -> ApiClient {
+    let mut scoped = client.clone();
+    scoped.set_org_id(Some(id.to_string()));
+    scoped
+}
+
+/// Print a JSON value as pretty-printed text (used by the read-only subcommands
+/// whose response shapes vary per endpoint and are surfaced verbatim).
+fn print_json_value(value: &serde_json::Value) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
 }
 
 pub async fn handle_org(cmd: &OrgCommands, client: &ApiClient) -> Result<()> {
@@ -274,6 +385,73 @@ pub async fn handle_org(cmd: &OrgCommands, client: &ApiClient) -> Result<()> {
                 );
             }
             Ok(())
+        }
+        OrgCommands::Get { id, json: _ } => {
+            let data = client_for_org(client, id).get_organization(id).await?;
+            print_json_value(&data)
+        }
+        OrgCommands::ListAll {
+            name,
+            limit,
+            offset,
+            json: _,
+        } => {
+            let data = client
+                .list_all_organizations(ListAllOrganizationsParams {
+                    name: name.as_deref(),
+                    limit: *limit,
+                    offset: *offset,
+                })
+                .await?;
+            print_json_value(&data)
+        }
+        OrgCommands::RootOwner { id, json: _ } => {
+            let data = client_for_org(client, id)
+                .get_organization_root_owner(id)
+                .await?;
+            print_json_value(&data)
+        }
+        OrgCommands::AccessibleRoot { id, json: _ } => {
+            let data = client_for_org(client, id)
+                .get_organization_accessible_root(id)
+                .await?;
+            print_json_value(&data)
+        }
+        OrgCommands::AiAgentMember { id, json: _ } => {
+            let data = client_for_org(client, id)
+                .get_organization_ai_agent_member(id)
+                .await?;
+            print_json_value(&data)
+        }
+        OrgCommands::AccessState { id, json: _ } => {
+            let data = client_for_org(client, id)
+                .get_organization_access_state(id)
+                .await?;
+            print_json_value(&data)
+        }
+        OrgCommands::CurrentMember { id, json: _ } => {
+            let data = client_for_org(client, id)
+                .get_organization_current_member(id)
+                .await?;
+            print_json_value(&data)
+        }
+        OrgCommands::AdminCheck { id, json: _ } => {
+            let data = client_for_org(client, id)
+                .check_organization_admin(id)
+                .await?;
+            print_json_value(&data)
+        }
+        OrgCommands::GetContext { id, json: _ } => {
+            let data = client_for_org(client, id)
+                .get_organization_context(id)
+                .await?;
+            print_json_value(&data)
+        }
+        OrgCommands::ContextRevisions { id, limit, json: _ } => {
+            let data = client_for_org(client, id)
+                .list_organization_context_revisions(id, *limit)
+                .await?;
+            print_json_value(&data)
         }
     }
 }

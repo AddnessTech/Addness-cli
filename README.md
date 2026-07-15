@@ -107,6 +107,7 @@ addness link --help
 ### 認証・設定
 
 - `login` / `logout` / `status` / `configure` — ブラウザ認証・資格情報と API 設定の管理。
+- `api-key` — 個人APIキーの一覧・作成・失効。例: `addness api-key list`
 - `update` / `completions` — CLI 自体の更新、シェル補完の生成。
 
 ### ゴール・成果物
@@ -148,8 +149,17 @@ addness link --help
   例: `addness today todo list`
 - `execution` — 実行タブのサマリ・実行レコードの生成/更新/履歴・ゴール折りたたみ設定・
   アクティブハドル・Codex エージェントビュー。例: `addness execution summary`
+- `meeting` — Huddle の状態/録音/招待、Meeting Bot、議事録文字起こし・要約・投稿、
+  Minutes CRUD。例: `addness meeting minutes list`
 - `activity` — メンバー別/ゴール別/組織全体のアクティビティログと集計。例: `addness activity list`
 - `streak` — 連続達成ストリークの確認・フリーズ・復活・公開共有。例: `addness streak get`
+
+### AI・自動化
+
+- `skill` — AIスキルのCRUD・検索・パフォーマンス・リソース・改善提案の承認/却下。
+- `tool` — AIツールのCRUD・検索・実行。例: `addness tool list`
+- `codex-job` — クラウドCodexジョブの作成・入力送信・resume・cancel/close・イベント購読。
+  例: `addness codex-job list`
 
 ### 個人スペース・横断機能
 

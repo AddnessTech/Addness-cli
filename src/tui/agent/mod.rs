@@ -1111,6 +1111,42 @@ fn session_picker_items(
         .collect()
 }
 
+/// 状態パネルに表示する直近アクション履歴の保持件数（パンくず表示用）。
+const RECENT_ACTIONS_CAP: usize = 5;
+
+/// アクション種別（状態パネルのパンくずで先頭に付けるアイコンを決める）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecentActionKind {
+    /// シェルコマンド実行（CommandExecution / codex サブコマンド等）。
+    Command,
+    /// MCP ツール呼び出し。
+    Mcp,
+    /// ファイル変更。
+    FileChange,
+    /// 上記に当てはまらないツール利用（Claude の ToolUse 汎用イベント等）。
+    Tool,
+}
+
+impl RecentActionKind {
+    fn icon(self) -> &'static str {
+        match self {
+            RecentActionKind::Command => "▶",
+            RecentActionKind::Mcp => "◆",
+            RecentActionKind::FileChange => "✎",
+            RecentActionKind::Tool => "•",
+        }
+    }
+}
+
+/// 状態パネルのパンくずに表示する 1 件の直近アクション。
+#[derive(Debug, Clone)]
+struct RecentAction {
+    kind: RecentActionKind,
+    label: String,
+    /// 現在のターン内での通し番号（1 始まり）。
+    turn_seq: u32,
+}
+
 /// 埋め込み codex セッションの状態。
 pub struct CodexPane {
     /// このペインが起動するエージェントバックエンドの種別。
@@ -1162,6 +1198,13 @@ pub struct CodexPane {
     /// codex が現在実行中として報告したコマンド。
     current_command: Option<String>,
     current_command_started_at: Option<Instant>,
+    /// 直近アクション履歴（固定長リングバッファ）。「今」表示は最新 1 件しか見せないため、
+    /// コマンドが高速連続実行されると途中のアクションが一瞬で上書きされ見逃される。
+    /// ここに直近 N 件を種別アイコン付きラベルとターン内通し番号として積み、状態パネルの
+    /// パンくずに表示する。ターン開始でクリアする。
+    recent_actions: VecDeque<RecentAction>,
+    /// `recent_actions` に積んだ直近アクションの総数（ターン内通し番号の採番に使う）。
+    recent_action_seq: u32,
     /// 実行中ターンの開始時刻。経過時間表示と完了時の所要時間算出に使う。
     turn_started_at: Option<Instant>,
     /// 直近に再描画へ反映した経過秒。秒表示が変わったフレームだけ再描画するために保持する。
@@ -1497,6 +1540,8 @@ impl CodexPane {
             action: None,
             current_command: None,
             current_command_started_at: None,
+            recent_actions: VecDeque::new(),
+            recent_action_seq: 0,
             turn_started_at: None,
             last_elapsed_tick_secs: None,
             child_process_label: None,
@@ -1825,6 +1870,51 @@ impl CodexPane {
     pub fn current_command_elapsed_secs(&self) -> Option<u64> {
         self.current_command_started_at
             .map(|t| t.elapsed().as_secs())
+    }
+
+    /// 「今」欄（current_command）を更新すると同時に、状態パネルのパンくず表示用リングバッファへ
+    /// 直近アクションとして積む一元ヘルパー。CommandExecution / McpToolCall / FileChange の開始や
+    /// Claude の ToolUse 等、"いま何をしているか" を更新する箇所はすべてここを経由する。
+    fn record_current_command(&mut self, kind: RecentActionKind, label: impl Into<String>) {
+        let label = label.into();
+        self.current_command = Some(label.clone());
+        self.current_command_started_at = Some(Instant::now());
+        self.recent_action_seq = self.recent_action_seq.saturating_add(1);
+        self.recent_actions.push_back(RecentAction {
+            kind,
+            label,
+            turn_seq: self.recent_action_seq,
+        });
+        while self.recent_actions.len() > RECENT_ACTIONS_CAP {
+            self.recent_actions.pop_front();
+        }
+    }
+
+    /// ターン開始時に直近アクション履歴をクリアする（パンくずは実行中ターンの分だけ見せる）。
+    fn clear_recent_actions(&mut self) {
+        self.recent_actions.clear();
+        self.recent_action_seq = 0;
+    }
+
+    /// 状態パネルのパンくず表示用に、直近アクションを古い順に整形して返す。
+    /// 各要素は「アイコン ラベル #ターン内通し番号」の形式で、幅に応じたトリムは呼び出し側で行う。
+    pub fn recent_action_breadcrumbs(&self) -> Vec<String> {
+        self.recent_actions
+            .iter()
+            .map(|action| {
+                format!(
+                    "{} {} #{}",
+                    action.kind.icon(),
+                    action.label,
+                    action.turn_seq
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn recent_actions_len(&self) -> usize {
+        self.recent_actions.len()
     }
 
     /// 実行中ターンの経過秒（開始からの秒）。ターン非実行時は None。
@@ -4161,6 +4251,7 @@ impl CodexPane {
                 self.turn_finished_by_event = false;
                 self.current_command = None;
                 self.current_command_started_at = None;
+                self.clear_recent_actions();
                 self.pending_decision = None;
                 self.action = Some("依頼を確認中".to_string());
                 if self.turn_count > 0 {
@@ -4286,6 +4377,7 @@ impl CodexPane {
         self.turn_finished_by_event = false;
         self.current_command = None;
         self.current_command_started_at = None;
+        self.clear_recent_actions();
         self.action = Some("依頼を確認中".to_string());
         self.turn_count = self.turn_count.saturating_add(1);
         let label = self
@@ -4328,8 +4420,10 @@ impl CodexPane {
                     edit_patch,
                 } => {
                     if let Some(summary) = &summary {
-                        self.current_command = Some(compact_tool_text(summary));
-                        self.current_command_started_at = Some(Instant::now());
+                        self.record_current_command(
+                            RecentActionKind::Tool,
+                            compact_tool_text(summary),
+                        );
                     }
                     self.action = Some(format!("ツール実行: {name}"));
                     // Edit/Write は変更内容を色付き差分プレビュー行（見出し + diff）として残す。
@@ -5491,6 +5585,7 @@ impl CodexPane {
         }
         self.current_command = None;
         self.current_command_started_at = None;
+        self.clear_recent_actions();
         self.action = Some("依頼を確認中".to_string());
         self.turn_count = self.turn_count.saturating_add(1);
         let label = self
@@ -5577,8 +5672,7 @@ impl CodexPane {
         use codex_appserver::ThreadItemKind as K;
         match item.kind {
             K::CommandExecution { command, .. } => {
-                self.current_command = Some(compact_tool_text(&command));
-                self.current_command_started_at = Some(Instant::now());
+                self.record_current_command(RecentActionKind::Command, compact_tool_text(&command));
                 self.refresh_action_from_text(&command);
                 self.codex_appserver_running_item = Some(item.id.clone());
                 self.codex_appserver_output.insert(item.id, VecDeque::new());
@@ -5589,8 +5683,7 @@ impl CodexPane {
             }
             K::McpToolCall { server, tool, .. } => {
                 let label = format!("{server}.{tool}");
-                self.current_command = Some(label.clone());
-                self.current_command_started_at = Some(Instant::now());
+                self.record_current_command(RecentActionKind::Mcp, label.clone());
                 self.action = Some(format!("ツール実行: {label}"));
                 self.push_log(CodexLogKind::Tool, format!("MCP {label}"));
             }
@@ -5598,8 +5691,7 @@ impl CodexPane {
                 let paths = codex_appserver_change_paths(&changes);
                 let label = codex_appserver_paths_label(&paths);
                 // 「今なにをしているか」表示へ反映する（Claude Code 経路と対称）。
-                self.current_command = Some(label.clone());
-                self.current_command_started_at = Some(Instant::now());
+                self.record_current_command(RecentActionKind::FileChange, label.clone());
                 self.action = Some(format!("ファイル変更: {label}"));
                 self.push_log(CodexLogKind::Tool, format!("ファイル変更 {label}"));
             }
@@ -6183,8 +6275,7 @@ impl CodexPane {
                     self.current_command = None;
                     self.current_command_started_at = None;
                 } else {
-                    self.current_command = Some(compact_tool_text(command));
-                    self.current_command_started_at = Some(Instant::now());
+                    self.record_current_command(RecentActionKind::Tool, compact_tool_text(command));
                 }
             }
             if let Some(action_text) = display.action_text.as_deref() {
@@ -6220,8 +6311,7 @@ impl CodexPane {
                 self.current_command = None;
                 self.current_command_started_at = None;
             } else {
-                self.current_command = Some(compact_tool_text(&text));
-                self.current_command_started_at = Some(Instant::now());
+                self.record_current_command(RecentActionKind::Tool, compact_tool_text(&text));
             }
             self.refresh_action_from_text(&text);
             self.push_log(
@@ -7907,8 +7997,8 @@ impl CodexPane {
                 self.turn_finished_by_event = false;
                 self.pending_decision = None;
                 self.diff_view = None;
-                self.current_command = Some(label.clone());
-                self.current_command_started_at = Some(Instant::now());
+                self.clear_recent_actions();
+                self.record_current_command(RecentActionKind::Command, label.clone());
                 self.child_process_label = Some(label.clone());
                 self.child_process_output.clear();
                 self.child_process_error_output.clear();
@@ -15280,6 +15370,95 @@ mod tests {
         pane.handle_stdout_line(r#"{"type":"turn.completed"}"#);
 
         assert_eq!(pane.current_command(), None);
+    }
+
+    #[test]
+    fn record_current_command_pushes_recent_action_breadcrumb() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        assert_eq!(pane.recent_actions_len(), 0);
+
+        pane.record_current_command(RecentActionKind::Command, "cargo test".to_string());
+
+        assert_eq!(pane.current_command(), Some("cargo test"));
+        assert_eq!(pane.recent_actions_len(), 1);
+        let breadcrumbs = pane.recent_action_breadcrumbs();
+        assert_eq!(breadcrumbs, vec!["▶ cargo test #1".to_string()]);
+    }
+
+    #[test]
+    fn recent_action_breadcrumbs_keep_oldest_to_newest_order_with_turn_seq() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+
+        pane.record_current_command(RecentActionKind::Command, "cargo test".to_string());
+        pane.record_current_command(RecentActionKind::Mcp, "addness.get_goal".to_string());
+        pane.record_current_command(RecentActionKind::FileChange, "src/main.rs".to_string());
+
+        let breadcrumbs = pane.recent_action_breadcrumbs();
+        assert_eq!(
+            breadcrumbs,
+            vec![
+                "▶ cargo test #1".to_string(),
+                "◆ addness.get_goal #2".to_string(),
+                "✎ src/main.rs #3".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn recent_actions_buffer_is_capped_at_recent_actions_cap() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+
+        for i in 0..(RECENT_ACTIONS_CAP + 2) {
+            pane.record_current_command(RecentActionKind::Tool, format!("action-{i}"));
+        }
+
+        assert_eq!(pane.recent_actions_len(), RECENT_ACTIONS_CAP);
+        let breadcrumbs = pane.recent_action_breadcrumbs();
+        assert_eq!(breadcrumbs.len(), RECENT_ACTIONS_CAP);
+        // 古い順で保持されるので、末尾の要素が直近の action-(N-1) になる。
+        assert!(
+            breadcrumbs
+                .last()
+                .unwrap()
+                .contains(&format!("action-{}", RECENT_ACTIONS_CAP + 1))
+        );
+        // 先頭 2 件は溢れて消えている（action-0, action-1 は含まれない）。
+        assert!(!breadcrumbs.iter().any(|b| b.contains("action-0 ")));
+        assert!(!breadcrumbs.iter().any(|b| b.contains("action-1 ")));
+    }
+
+    #[test]
+    fn clear_recent_actions_resets_buffer_and_sequence() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.record_current_command(RecentActionKind::Command, "cargo test".to_string());
+        pane.record_current_command(RecentActionKind::Command, "cargo build".to_string());
+        assert_eq!(pane.recent_actions_len(), 2);
+
+        pane.clear_recent_actions();
+        assert_eq!(pane.recent_actions_len(), 0);
+        assert!(pane.recent_action_breadcrumbs().is_empty());
+
+        // クリア後に積み直すと通し番号は 1 から振り直される。
+        pane.record_current_command(RecentActionKind::Command, "cargo fmt".to_string());
+        assert_eq!(
+            pane.recent_action_breadcrumbs(),
+            vec!["▶ cargo fmt #1".to_string()]
+        );
+    }
+
+    #[test]
+    fn turn_started_clears_recent_action_history() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.handle_stdout_line(
+            r#"{"type":"exec_command_begin","parsed_cmd":"cargo check","codex_cwd":"/repo"}"#,
+        );
+        assert_eq!(pane.recent_actions_len(), 1);
+
+        // 新しいターンが始まると、前ターンのパンくずは残さずクリアする。
+        pane.handle_stdout_line(r#"{"type":"turn.started"}"#);
+
+        assert_eq!(pane.recent_actions_len(), 0);
+        assert!(pane.recent_action_breadcrumbs().is_empty());
     }
 
     #[test]

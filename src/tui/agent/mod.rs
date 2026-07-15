@@ -464,6 +464,17 @@ fn matches_log_filter(kind: CodexLogKind, filter: CodexLogFilter) -> bool {
     }
 }
 
+/// 実行中ターン中、会話フィルタでも直近のTool/Eventログを混ぜて見せるための判定。
+/// `live_tool_start` は現在実行中ターンの開始インデックス（`None` なら混在させない）。
+fn is_live_turn_tool_line(
+    kind: CodexLogKind,
+    index: usize,
+    live_tool_start: Option<usize>,
+) -> bool {
+    matches!(kind, CodexLogKind::Tool | CodexLogKind::Event)
+        && live_tool_start.is_some_and(|start| index >= start)
+}
+
 fn on_off(enabled: bool) -> &'static str {
     if enabled { "on" } else { "off" }
 }
@@ -2168,13 +2179,14 @@ impl CodexPane {
     pub fn filtered_log_lines(&self) -> Vec<&CodexLogLine> {
         let query = self.normalized_search_query();
         let collapse_turns = self.turns_are_collapsible_in_current_view();
+        let live_tool_start = self.live_turn_tool_start_index();
         let mut current_collapsed_turn = None;
         let mut visible = Vec::new();
-        for line in &self.log {
+        for (index, line) in self.log.iter().enumerate() {
             if line.kind == CodexLogKind::Turn {
                 current_collapsed_turn = turn_number_from_label(&line.text)
                     .filter(|n| collapse_turns && self.collapsed_turns.contains(n));
-                if self.log_line_visible(line, &query) {
+                if self.log_line_visible(line, &query, index, live_tool_start) {
                     visible.push(line);
                 }
                 continue;
@@ -2182,11 +2194,23 @@ impl CodexPane {
             if current_collapsed_turn.is_some() {
                 continue;
             }
-            if self.log_line_visible(line, &query) {
+            if self.log_line_visible(line, &query, index, live_tool_start) {
                 visible.push(line);
             }
         }
         visible
+    }
+
+    /// 実行中ターン中は会話フィルタでも直近のTool/Eventログを混ぜて表示するため、
+    /// 現在実行中ターンの開始位置（直近のTurn行のインデックス）を返す。
+    /// 実行中でない、または会話フィルタ以外のときは None（従来通りログを汚さない）。
+    fn live_turn_tool_start_index(&self) -> Option<usize> {
+        if self.log_filter != CodexLogFilter::Conversation || !self.is_turn_running() {
+            return None;
+        }
+        self.log
+            .iter()
+            .rposition(|line| line.kind == CodexLogKind::Turn)
     }
 
     /// ストリーミング中（未完成）の assistant ログ行への参照を返す。
@@ -2754,6 +2778,16 @@ impl CodexPane {
 
     pub fn log_filter_label(&self) -> &'static str {
         self.log_filter.label()
+    }
+
+    /// ヘッダー表示用のフィルタラベル。実行中ターン中は会話フィルタでも
+    /// 直近のTool/Eventログを混ぜて表示しているため、その旨を示す接尾辞を付ける。
+    pub fn log_filter_display_label(&self) -> String {
+        if self.live_turn_tool_start_index().is_some() {
+            format!("{}+実行中", self.log_filter_label())
+        } else {
+            self.log_filter_label().to_string()
+        }
     }
 
     pub fn search_query(&self) -> &str {
@@ -3499,8 +3533,16 @@ impl CodexPane {
         self.search_query.trim().to_lowercase()
     }
 
-    fn log_line_visible(&self, line: &CodexLogLine, query: &str) -> bool {
-        if !matches_log_filter(line.kind, self.log_filter) {
+    fn log_line_visible(
+        &self,
+        line: &CodexLogLine,
+        query: &str,
+        index: usize,
+        live_tool_start: Option<usize>,
+    ) -> bool {
+        let matches_filter = matches_log_filter(line.kind, self.log_filter)
+            || is_live_turn_tool_line(line.kind, index, live_tool_start);
+        if !matches_filter {
             return false;
         }
         if query.is_empty()
@@ -14412,6 +14454,82 @@ mod tests {
         let tools = pane.filtered_log_lines();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].kind, CodexLogKind::Tool);
+    }
+
+    #[test]
+    fn conversation_filter_mixes_in_live_tool_lines_while_turn_running() {
+        let mut pane = CodexPane::test_with_output(8, 40, 0, "");
+        pane.push_log(CodexLogKind::Turn, "Turn 1");
+        pane.push_log(CodexLogKind::User, "cargo test して");
+        pane.push_log(CodexLogKind::Tool, "old turn tool line");
+
+        // ターンが実行中でなければ、従来通り会話フィルタは Tool/Event を含まない。
+        let idle = pane
+            .filtered_log_lines()
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(!idle.contains(&"old turn tool line"));
+        assert_eq!(pane.log_filter_display_label(), "会話");
+
+        // ターン実行中は直近ターンの Tool/Event 行を会話フィルタでも混ぜて表示する。
+        pane.turn_running = true;
+        pane.push_log(CodexLogKind::Turn, "Turn 2");
+        pane.push_log(CodexLogKind::Assistant, "確認します");
+        pane.push_log(CodexLogKind::Tool, "exec_command_begin: cargo test");
+        pane.push_log(CodexLogKind::Event, "file changed: src/lib.rs");
+
+        let running = pane
+            .filtered_log_lines()
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(running.contains(&"exec_command_begin: cargo test"));
+        assert!(running.contains(&"file changed: src/lib.rs"));
+        // 完了済みの前ターンの Tool 行は引き続き隠れたまま。
+        assert!(!running.contains(&"old turn tool line"));
+        assert_eq!(pane.log_filter_display_label(), "会話+実行中");
+
+        // ターンが終われば従来の会話フィルタ挙動に戻る（ログは汚さない）。
+        pane.turn_running = false;
+        let finished = pane
+            .filtered_log_lines()
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(!finished.contains(&"exec_command_begin: cargo test"));
+        assert!(!finished.contains(&"file changed: src/lib.rs"));
+        assert_eq!(pane.log_filter_display_label(), "会話");
+    }
+
+    #[test]
+    fn live_tool_mixing_only_applies_to_conversation_filter() {
+        let mut pane = CodexPane::test_with_output(8, 40, 0, "");
+        pane.turn_running = true;
+        pane.push_log(CodexLogKind::Turn, "Turn 1");
+        pane.push_log(CodexLogKind::Tool, "exec_command_begin: ls");
+
+        // 実行フィルタでは元々 Tool 行が見えるため、混在ロジックは表示件数へ影響しない。
+        pane.cycle_log_filter();
+        assert_eq!(pane.log_filter, CodexLogFilter::Tools);
+        let tools = pane.filtered_log_lines();
+        assert!(
+            tools
+                .iter()
+                .any(|line| line.text == "exec_command_begin: ls")
+        );
+        assert_eq!(pane.log_filter_display_label(), "実行");
+
+        // 失敗フィルタは対象外（Tool行は依然として現れない）。
+        pane.cycle_log_filter();
+        assert_eq!(pane.log_filter, CodexLogFilter::Errors);
+        let errors = pane.filtered_log_lines();
+        assert!(
+            !errors
+                .iter()
+                .any(|line| line.text == "exec_command_begin: ls")
+        );
+        assert_eq!(pane.log_filter_display_label(), "失敗");
     }
 
     #[test]

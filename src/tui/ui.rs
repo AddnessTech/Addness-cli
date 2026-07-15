@@ -3733,7 +3733,7 @@ fn codex_header_lines(pane: &CodexPane, max_width: usize, max_rows: usize) -> Ve
     let mut parts = vec![
         format!("状態: {}", run_state.label()),
         format!("Turn {}", pane.turn_count()),
-        format!("表示:{}", pane.log_filter_label()),
+        format!("表示:{}", pane.log_filter_display_label()),
     ];
     if let Some(usage) = pane.usage_header_label() {
         parts.push(usage);
@@ -4784,7 +4784,7 @@ fn json_output_summary(output: &str) -> Option<String> {
 
 fn codex_runtime_status(pane: &CodexPane, max_width: usize) -> String {
     let state = pane.run_state_elapsed_label();
-    let view = format!("表示:{} Ctrl-Tで切替", pane.log_filter_label());
+    let view = format!("表示:{} Ctrl-Tで切替", pane.log_filter_display_label());
     let fixed_width = UnicodeWidthStr::width(state.as_str())
         .saturating_add(UnicodeWidthStr::width(view.as_str()))
         .saturating_add(8);
@@ -5039,7 +5039,7 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane) {
     let view = ellipsize_width(
         &format!(
             "{} / {} / 格納{}",
-            pane.log_filter_label(),
+            pane.log_filter_display_label(),
             pane.history_label(),
             pane.collapsed_turn_count()
         ),

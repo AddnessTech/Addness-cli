@@ -204,7 +204,29 @@ fn org_outputs_json(command: &org::OrgCommands) -> bool {
         | org::OrgCommands::CurrentMember { json, .. }
         | org::OrgCommands::AdminCheck { json, .. }
         | org::OrgCommands::GetContext { json, .. }
-        | org::OrgCommands::ContextRevisions { json, .. } => *json,
+        | org::OrgCommands::ContextRevisions { json, .. }
+        | org::OrgCommands::SetTimezone { json, .. }
+        | org::OrgCommands::SetLogo { json, .. }
+        | org::OrgCommands::PushTokenRegister { json, .. } => *json,
+        org::OrgCommands::OnboardingBilling { command } => match command {
+            org::OnboardingBillingCommands::State { json, .. }
+            | org::OnboardingBillingCommands::Require { json, .. }
+            | org::OnboardingBillingCommands::Free { json, .. } => *json,
+        },
+        org::OrgCommands::AiScheduleSettings { command } => match command {
+            org::AiScheduleSettingsCommands::Get { json, .. }
+            | org::AiScheduleSettingsCommands::Set { json, .. } => *json,
+        },
+        org::OrgCommands::AdSettings { command } => match command {
+            org::AdSettingsCommands::Get { json, .. }
+            | org::AdSettingsCommands::Set { json, .. }
+            | org::AdSettingsCommands::SetMe { json, .. } => *json,
+        },
+        org::OrgCommands::Subscription { command } => match command {
+            org::SubscriptionCommands::Register { json, .. }
+            | org::SubscriptionCommands::Current { json, .. } => *json,
+            org::SubscriptionCommands::Cancel { json, force, .. } => *json && *force,
+        },
         org::OrgCommands::Switch { .. } | org::OrgCommands::Rm { .. } => false,
     }
 }

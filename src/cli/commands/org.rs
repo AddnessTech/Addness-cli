@@ -1,8 +1,9 @@
 use anyhow::{Result, bail};
-use clap::Subcommand;
+use clap::{ArgAction, Subcommand};
 
 use crate::api::{
-    ApiClient, CreateOrganizationParams, ListAllOrganizationsParams, OrganizationsResponse,
+    ApiClient, CreateOrganizationParams, ListAllOrganizationsParams, MyAdSettingRequest,
+    OrganizationsResponse,
 };
 use crate::cli::output::print_organizations_table;
 use crate::config::{Credentials, Settings};
@@ -178,6 +179,180 @@ pub enum OrgCommands {
         /// Maximum number of revisions to return
         #[arg(long)]
         limit: Option<u16>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Update the organization's default timezone (IANA name; owner + admin only)
+    SetTimezone {
+        /// Organization ID
+        id: String,
+        /// IANA timezone name, e.g. Asia/Tokyo
+        #[arg(long)]
+        timezone: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Upload the organization's logo (owner + admin only)
+    SetLogo {
+        /// Organization ID
+        id: String,
+        /// Path to the image file to upload
+        #[arg(long)]
+        file: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Register a push notification token for the organization
+    PushTokenRegister {
+        /// Organization ID
+        id: String,
+        /// Push token to register
+        #[arg(long)]
+        token: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read or change the onboarding billing state
+    OnboardingBilling {
+        #[command(subcommand)]
+        command: OnboardingBillingCommands,
+    },
+    /// Read or toggle the organization's AI schedule master switch
+    AiScheduleSettings {
+        #[command(subcommand)]
+        command: AiScheduleSettingsCommands,
+    },
+    /// Read or change in-app ad settings (organization-wide or your own)
+    AdSettings {
+        #[command(subcommand)]
+        command: AdSettingsCommands,
+    },
+    /// Manage the organization's paid subscription
+    Subscription {
+        #[command(subcommand)]
+        command: SubscriptionCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum OnboardingBillingCommands {
+    /// Show the onboarding billing state
+    State {
+        /// Organization ID
+        id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Mark onboarding billing as required
+    Require {
+        /// Organization ID
+        id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Complete onboarding billing on the free plan
+    Free {
+        /// Organization ID
+        id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AiScheduleSettingsCommands {
+    /// Show the AI schedule master switch state
+    Get {
+        /// Organization ID
+        id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Enable or disable the AI schedule master switch
+    Set {
+        /// Organization ID
+        id: String,
+        /// Whether the master switch is enabled (true/false)
+        #[arg(long, action = ArgAction::Set)]
+        enabled: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AdSettingsCommands {
+    /// Show the organization-wide ad settings (or your own with --me)
+    Get {
+        /// Organization ID
+        id: String,
+        /// Read your own ad settings instead of the organization-wide switch
+        #[arg(long)]
+        me: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Change the organization-wide ad kill switch (owner + admin only)
+    Set {
+        /// Organization ID
+        id: String,
+        /// Whether ads are enabled organization-wide (true/false)
+        #[arg(long, action = ArgAction::Set)]
+        enabled: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Change your own ad settings (opt-out and/or a temporary hide window)
+    SetMe {
+        /// Organization ID
+        id: String,
+        /// Permanently opt out of ads (true/false)
+        #[arg(long, action = ArgAction::Set)]
+        enabled: Option<bool>,
+        /// Hide ads until this RFC3339 timestamp (within 48 hours)
+        #[arg(long)]
+        hidden_until: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SubscriptionCommands {
+    /// Register a paid subscription from an Univapay subscription ID
+    Register {
+        /// Univapay subscription ID
+        #[arg(long)]
+        univapay_subscription_id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Cancel a subscription by its ID
+    Cancel {
+        /// Organization subscription ID
+        id: String,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the current subscription for the active organization
+    Current {
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -453,6 +628,175 @@ pub async fn handle_org(cmd: &OrgCommands, client: &ApiClient) -> Result<()> {
                 .await?;
             print_json_value(&data)
         }
+        OrgCommands::SetTimezone {
+            id,
+            timezone,
+            json: _,
+        } => {
+            let data = client_for_org(client, id)
+                .update_organization_default_timezone(id, timezone)
+                .await?;
+            print_json_value(&data)
+        }
+        OrgCommands::SetLogo { id, file, json: _ } => {
+            let bytes = std::fs::read(file)
+                .map_err(|e| anyhow::anyhow!("Failed to read logo file '{file}': {e}"))?;
+            let content_type = content_type_for_path(file);
+            let data = client_for_org(client, id)
+                .upload_organization_logo(id, bytes, content_type)
+                .await?;
+            print_json_value(&data)
+        }
+        OrgCommands::PushTokenRegister { id, token, json: _ } => {
+            let data = client_for_org(client, id)
+                .register_organization_push_token(id, token)
+                .await?;
+            print_json_value(&data)
+        }
+        OrgCommands::OnboardingBilling { command } => {
+            handle_onboarding_billing(command, client).await
+        }
+        OrgCommands::AiScheduleSettings { command } => {
+            handle_ai_schedule_settings(command, client).await
+        }
+        OrgCommands::AdSettings { command } => handle_ad_settings(command, client).await,
+        OrgCommands::Subscription { command } => handle_subscription(command, client).await,
+    }
+}
+
+async fn handle_onboarding_billing(
+    cmd: &OnboardingBillingCommands,
+    client: &ApiClient,
+) -> Result<()> {
+    match cmd {
+        OnboardingBillingCommands::State { id, json: _ } => {
+            let data = client_for_org(client, id)
+                .get_organization_onboarding_billing_state(id)
+                .await?;
+            print_json_value(&data)
+        }
+        OnboardingBillingCommands::Require { id, json: _ } => {
+            let data = client_for_org(client, id)
+                .require_organization_onboarding_billing(id)
+                .await?;
+            print_json_value(&data)
+        }
+        OnboardingBillingCommands::Free { id, json: _ } => {
+            let data = client_for_org(client, id)
+                .complete_organization_onboarding_billing_free(id)
+                .await?;
+            print_json_value(&data)
+        }
+    }
+}
+
+async fn handle_ai_schedule_settings(
+    cmd: &AiScheduleSettingsCommands,
+    client: &ApiClient,
+) -> Result<()> {
+    match cmd {
+        AiScheduleSettingsCommands::Get { id, json: _ } => {
+            let data = client_for_org(client, id)
+                .get_organization_ai_schedule_settings(id)
+                .await?;
+            print_json_value(&data)
+        }
+        AiScheduleSettingsCommands::Set {
+            id,
+            enabled,
+            json: _,
+        } => {
+            let data = client_for_org(client, id)
+                .set_organization_ai_schedule_settings(id, *enabled)
+                .await?;
+            print_json_value(&data)
+        }
+    }
+}
+
+async fn handle_ad_settings(cmd: &AdSettingsCommands, client: &ApiClient) -> Result<()> {
+    match cmd {
+        AdSettingsCommands::Get { id, me, json: _ } => {
+            let scoped = client_for_org(client, id);
+            let data = if *me {
+                scoped.get_my_organization_ad_settings(id).await?
+            } else {
+                scoped.get_organization_ad_settings(id).await?
+            };
+            print_json_value(&data)
+        }
+        AdSettingsCommands::Set {
+            id,
+            enabled,
+            json: _,
+        } => {
+            let data = client_for_org(client, id)
+                .set_organization_ad_settings(id, *enabled)
+                .await?;
+            print_json_value(&data)
+        }
+        AdSettingsCommands::SetMe {
+            id,
+            enabled,
+            hidden_until,
+            json: _,
+        } => {
+            if enabled.is_none() && hidden_until.is_none() {
+                bail!("Specify at least one of --enabled or --hidden-until");
+            }
+            let body = MyAdSettingRequest {
+                enabled: *enabled,
+                hidden_until: hidden_until.clone(),
+            };
+            let data = client_for_org(client, id)
+                .set_my_organization_ad_settings(id, &body)
+                .await?;
+            print_json_value(&data)
+        }
+    }
+}
+
+async fn handle_subscription(cmd: &SubscriptionCommands, client: &ApiClient) -> Result<()> {
+    match cmd {
+        SubscriptionCommands::Register {
+            univapay_subscription_id,
+            json: _,
+        } => {
+            let data = client
+                .register_organization_subscription(univapay_subscription_id)
+                .await?;
+            print_json_value(&data)
+        }
+        SubscriptionCommands::Cancel { id, force, json: _ } => {
+            if !*force && !crate::cli::commands::confirm(&format!("Cancel subscription {id}?"))? {
+                println!("Cancelled.");
+                return Ok(());
+            }
+            let data = client.cancel_organization_subscription(id).await?;
+            print_json_value(&data)
+        }
+        SubscriptionCommands::Current { json: _ } => {
+            let data = client.get_current_organization_subscription().await?;
+            print_json_value(&data)
+        }
+    }
+}
+
+/// Best-effort MIME type for an organization logo upload based on the file
+/// extension. Falls back to `application/octet-stream`; the backend also sniffs
+/// the actual bytes, so this only needs to be a reasonable hint.
+fn content_type_for_path(path: &str) -> &'static str {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        _ => "application/octet-stream",
     }
 }
 
@@ -496,5 +840,30 @@ pub fn resolve_org_id(flag: Option<&str>) -> Result<String> {
             "No organization specified.\n\
              Use --org <id> or set a current with: addness org switch <id>"
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::content_type_for_path;
+
+    #[test]
+    fn content_type_for_path_maps_known_image_extensions() {
+        assert_eq!(content_type_for_path("logo.png"), "image/png");
+        assert_eq!(content_type_for_path("LOGO.PNG"), "image/png");
+        assert_eq!(content_type_for_path("a/b/logo.jpg"), "image/jpeg");
+        assert_eq!(content_type_for_path("logo.jpeg"), "image/jpeg");
+        assert_eq!(content_type_for_path("logo.gif"), "image/gif");
+        assert_eq!(content_type_for_path("logo.webp"), "image/webp");
+        assert_eq!(content_type_for_path("logo.svg"), "image/svg+xml");
+    }
+
+    #[test]
+    fn content_type_for_path_falls_back_for_unknown_or_missing_extension() {
+        assert_eq!(
+            content_type_for_path("logo.bin"),
+            "application/octet-stream"
+        );
+        assert_eq!(content_type_for_path("logo"), "application/octet-stream");
     }
 }

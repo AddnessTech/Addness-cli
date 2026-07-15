@@ -205,6 +205,11 @@ fn goal_outputs_json(command: &goal::GoalCommands) -> bool {
             goal::AliasCommands::Add { json, .. } => *json,
             goal::AliasCommands::Rm { .. } | goal::AliasCommands::Reorder { .. } => false,
         },
+        goal::GoalCommands::Recurring { command } => match command {
+            goal::RecurringCommands::Get { json, .. }
+            | goal::RecurringCommands::Set { json, .. }
+            | goal::RecurringCommands::Remove { json, .. } => *json,
+        },
     }
 }
 

@@ -4,7 +4,8 @@ use clap::Subcommand;
 
 use crate::api::{
     ApiClient, ApiResponse, Comment, CreateGoalRequest, Deliverable, DeliverableType, Goal,
-    GoalStatus, GoalTreeData, GoalTreeItem, RelatedFetchError, UpdateGoalRequest,
+    GoalStatus, GoalTreeData, GoalTreeItem, RecurringGoal, RecurringGoalRequest, RelatedFetchError,
+    UpdateGoalRequest,
 };
 use crate::cli::commands::org::resolve_org_id;
 use crate::cli::output::{
@@ -35,6 +36,169 @@ fn normalize_due_date(input: &str) -> Result<String> {
     let date = NaiveDate::parse_from_str(input, "%Y-%m-%d")
         .map_err(|_| anyhow::anyhow!("--due-date must be YYYY-MM-DD or RFC3339"))?;
     Ok(format!("{}T00:00:00Z", date.format("%Y-%m-%d")))
+}
+
+/// `--days-of-week` のCSVをバリデーションしつつ大文字化された曜日リストに変換する。
+fn parse_days_of_week(csv: &str) -> Result<Vec<String>> {
+    csv.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            let day = s.to_uppercase();
+            match day.as_str() {
+                "MONDAY" | "TUESDAY" | "WEDNESDAY" | "THURSDAY" | "FRIDAY" | "SATURDAY"
+                | "SUNDAY" => Ok(day),
+                _ => bail!(
+                    "--days-of-week contains an invalid day: '{s}'. Use MONDAY, TUESDAY, WEDNESDAY, THURSDAY, FRIDAY, SATURDAY, or SUNDAY."
+                ),
+            }
+        })
+        .collect()
+}
+
+/// `--days-of-month` のCSVをバリデーションしつつ整数リストに変換する（1〜31）。
+fn parse_days_of_month(csv: &str) -> Result<Vec<i32>> {
+    csv.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            let day: i32 = s.parse().map_err(|_| {
+                anyhow::anyhow!("--days-of-month must contain integers between 1 and 31, got '{s}'")
+            })?;
+            if !(1..=31).contains(&day) {
+                bail!("--days-of-month must contain integers between 1 and 31, got '{day}'");
+            }
+            Ok(day)
+        })
+        .collect()
+}
+
+/// `goal recurring set` の各種フラグをバリデーションし、リクエストボディを組み立てる。
+/// 基本パターン(`--pattern`)とカスタムパターン(`--recurrence-type`以下)は排他。
+#[allow(clippy::too_many_arguments)]
+fn build_recurring_goal_request(
+    pattern: Option<&str>,
+    recurrence_type: Option<&str>,
+    interval: Option<i32>,
+    days_of_week: Option<&str>,
+    days_of_month: Option<&str>,
+    end_date: Option<&str>,
+    last_day: bool,
+    nth_week: Option<i32>,
+    repeat_from_completion: bool,
+) -> Result<RecurringGoalRequest> {
+    let has_basic = pattern.is_some();
+    let has_custom = recurrence_type.is_some()
+        || interval.is_some()
+        || days_of_week.is_some()
+        || days_of_month.is_some()
+        || end_date.is_some()
+        || last_day
+        || nth_week.is_some()
+        || repeat_from_completion;
+
+    if has_basic && has_custom {
+        bail!(
+            "--pattern cannot be combined with custom recurrence options (--recurrence-type, --interval, --days-of-week, --days-of-month, --end-date, --last-day, --nth-week, --repeat-from-completion)."
+        );
+    }
+    if !has_basic && !has_custom {
+        bail!(
+            "Specify either --pattern <DAILY|WEEKLY|MONTHLY|WEEKDAYS> or custom recurrence options starting with --recurrence-type <DAILY|WEEKLY|MONTHLY|YEARLY>."
+        );
+    }
+
+    if has_basic {
+        let pattern = pattern
+            .expect("has_basic implies pattern is Some")
+            .to_uppercase();
+        if !matches!(
+            pattern.as_str(),
+            "DAILY" | "WEEKLY" | "MONTHLY" | "WEEKDAYS"
+        ) {
+            bail!("--pattern must be one of: DAILY, WEEKLY, MONTHLY, WEEKDAYS");
+        }
+        return Ok(RecurringGoalRequest {
+            pattern: Some(pattern),
+            ..Default::default()
+        });
+    }
+
+    let recurrence_type = recurrence_type
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "--recurrence-type is required for a custom recurrence (DAILY, WEEKLY, MONTHLY, YEARLY)."
+            )
+        })?
+        .to_uppercase();
+    if !matches!(
+        recurrence_type.as_str(),
+        "DAILY" | "WEEKLY" | "MONTHLY" | "YEARLY"
+    ) {
+        bail!("--recurrence-type must be one of: DAILY, WEEKLY, MONTHLY, YEARLY");
+    }
+    let interval = interval.ok_or_else(|| {
+        anyhow::anyhow!("--interval is required for a custom recurrence (must be 1 or greater).")
+    })?;
+    if interval < 1 {
+        bail!("--interval must be 1 or greater");
+    }
+
+    let days_of_week_list = days_of_week
+        .map(parse_days_of_week)
+        .transpose()?
+        .unwrap_or_default();
+    if recurrence_type == "WEEKLY" && days_of_week_list.is_empty() {
+        bail!("--days-of-week is required when --recurrence-type is WEEKLY");
+    }
+
+    let days_of_month_list = days_of_month
+        .map(parse_days_of_month)
+        .transpose()?
+        .unwrap_or_default();
+    if recurrence_type == "MONTHLY"
+        && days_of_month_list.is_empty()
+        && !last_day
+        && nth_week.is_none()
+    {
+        bail!(
+            "For --recurrence-type MONTHLY, specify --days-of-month, --last-day, or --nth-week (with --days-of-week)."
+        );
+    }
+
+    if recurrence_type == "YEARLY"
+        && (!days_of_month_list.is_empty() || !days_of_week_list.is_empty() || last_day)
+    {
+        bail!(
+            "--days-of-month, --days-of-week, and --last-day cannot be used with --recurrence-type YEARLY."
+        );
+    }
+
+    let end_date = end_date.map(normalize_due_date).transpose()?;
+    if let Some(nth) = nth_week
+        && !(1..=5).contains(&nth)
+    {
+        bail!("--nth-week must be between 1 and 5");
+    }
+
+    Ok(RecurringGoalRequest {
+        recurrence_type: Some(recurrence_type),
+        interval: Some(interval),
+        days_of_week: days_of_week_list,
+        days_of_month: days_of_month_list,
+        end_date,
+        is_last_day: last_day.then_some(true),
+        nth_week,
+        repeat_from_completion: repeat_from_completion.then_some(true),
+        ..Default::default()
+    })
+}
+
+/// GET /recurring が404の場合、バックエンドは
+/// `{"error": "繰り返し設定が見つかりません"}` を返す（=まだ設定が無い状態）。
+/// これはエラーではなくCLI上は正常系として扱う。
+fn is_recurring_goal_not_found(err: &anyhow::Error) -> bool {
+    err.to_string().contains("繰り返し設定が見つかりません")
 }
 
 fn should_fetch_child_related(json: bool, include_related: bool) -> bool {
@@ -269,6 +433,11 @@ pub enum GoalCommands {
         #[command(subcommand)]
         command: AliasCommands,
     },
+    /// Manage a goal's recurring (repeating) schedule
+    Recurring {
+        #[command(subcommand)]
+        command: RecurringCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -324,6 +493,64 @@ pub enum AliasCommands {
         /// Comma-separated alias IDs in the desired order
         #[arg(long)]
         order: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RecurringCommands {
+    /// Get the recurring schedule configured for a goal
+    Get {
+        /// Goal ID
+        id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create or update the recurring schedule for a goal
+    Set {
+        /// Goal ID
+        id: String,
+        /// Basic pattern: DAILY, WEEKLY, MONTHLY, WEEKDAYS (mutually exclusive with custom options below)
+        #[arg(long)]
+        pattern: Option<String>,
+        /// Custom recurrence type: DAILY, WEEKLY, MONTHLY, YEARLY
+        #[arg(long)]
+        recurrence_type: Option<String>,
+        /// Repeat every N days/weeks/months/years (required for custom recurrence)
+        #[arg(long)]
+        interval: Option<i32>,
+        /// Comma-separated days of week (MONDAY,TUESDAY,...). Required when --recurrence-type is WEEKLY.
+        #[arg(long)]
+        days_of_week: Option<String>,
+        /// Comma-separated days of month (1-31). One option for MONTHLY.
+        #[arg(long)]
+        days_of_month: Option<String>,
+        /// End date (YYYY-MM-DD or RFC3339) after which the schedule stops
+        #[arg(long)]
+        end_date: Option<String>,
+        /// Use the last day of the month (MONTHLY only)
+        #[arg(long)]
+        last_day: bool,
+        /// Nth week of the month (1-5), used together with --days-of-week for MONTHLY
+        #[arg(long)]
+        nth_week: Option<i32>,
+        /// Count the interval from the completion date instead of the schedule date
+        #[arg(long)]
+        repeat_from_completion: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove the recurring schedule from a goal
+    Remove {
+        /// Goal ID
+        id: String,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -976,6 +1203,7 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
         }
         GoalCommands::Share { command } => handle_share(command, client).await,
         GoalCommands::Alias { command } => handle_alias(command, client).await,
+        GoalCommands::Recurring { command } => handle_recurring(command, client).await,
     }
 }
 
@@ -1070,6 +1298,131 @@ async fn handle_alias(cmd: &AliasCommands, client: &ApiClient) -> Result<()> {
             }
             client.reorder_aliases(parent_id, ids).await?;
             println!("Aliases reordered under parent {parent_id}");
+            Ok(())
+        }
+    }
+}
+
+fn print_recurring_goal(goal: &RecurringGoal) {
+    println!("{}", goal.description);
+    println!("   {}: {}", "ID".dimmed(), goal.id);
+    println!("   {}: {}", "Goal".dimmed(), goal.objective_id);
+    if let Some(pattern) = &goal.pattern {
+        println!("   {}: {pattern}", "Pattern".dimmed());
+    }
+    if let Some(recurrence_type) = &goal.recurrence_type {
+        println!("   {}: {recurrence_type}", "Recurrence type".dimmed());
+    }
+    if let Some(interval) = goal.interval {
+        println!("   {}: {interval}", "Interval".dimmed());
+    }
+    if !goal.days_of_week.is_empty() {
+        println!(
+            "   {}: {}",
+            "Days of week".dimmed(),
+            goal.days_of_week.join(", ")
+        );
+    }
+    if !goal.days_of_month.is_empty() {
+        let days = goal
+            .days_of_month
+            .iter()
+            .map(i32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("   {}: {days}", "Days of month".dimmed());
+    }
+    if let Some(nth_week) = goal.nth_week {
+        println!("   {}: {nth_week}", "Nth week".dimmed());
+    }
+    if goal.is_last_day == Some(true) {
+        println!("   {}: yes", "Last day of month".dimmed());
+    }
+    if goal.repeat_from_completion == Some(true) {
+        println!("   {}: yes", "Repeat from completion".dimmed());
+    }
+    if let Some(end_date) = &goal.end_date {
+        println!("   {}: {end_date}", "End date".dimmed());
+    }
+}
+
+async fn handle_recurring(cmd: &RecurringCommands, client: &ApiClient) -> Result<()> {
+    match cmd {
+        RecurringCommands::Get { id, json } => match client.get_recurring_goal(id).await {
+            Ok(resp) => {
+                if *json {
+                    println!("{}", serde_json::to_string_pretty(&resp.data)?);
+                } else {
+                    print_recurring_goal(&resp.data);
+                }
+                Ok(())
+            }
+            Err(err) if is_recurring_goal_not_found(&err) => {
+                if *json {
+                    println!("null");
+                } else {
+                    println!("No recurring schedule set for goal {id}.");
+                }
+                Ok(())
+            }
+            Err(err) => Err(err),
+        },
+        RecurringCommands::Set {
+            id,
+            pattern,
+            recurrence_type,
+            interval,
+            days_of_week,
+            days_of_month,
+            end_date,
+            last_day,
+            nth_week,
+            repeat_from_completion,
+            json,
+        } => {
+            let req = build_recurring_goal_request(
+                pattern.as_deref(),
+                recurrence_type.as_deref(),
+                *interval,
+                days_of_week.as_deref(),
+                days_of_month.as_deref(),
+                end_date.as_deref(),
+                *last_day,
+                *nth_week,
+                *repeat_from_completion,
+            )?;
+            let resp = client.set_recurring_goal(id, &req).await?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&resp.data)?);
+            } else {
+                println!(
+                    "Recurring schedule set for goal {id}: {}",
+                    resp.data.description
+                );
+            }
+            Ok(())
+        }
+        RecurringCommands::Remove { id, force, json } => {
+            if !*force
+                && !crate::cli::commands::confirm(&format!(
+                    "Remove recurring schedule for goal {id}?"
+                ))?
+            {
+                println!("Cancelled.");
+                return Ok(());
+            }
+            client.remove_recurring_goal(id).await?;
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "removed": true,
+                        "id": id
+                    }))?
+                );
+            } else {
+                println!("Recurring schedule removed for goal {id}");
+            }
             Ok(())
         }
     }
@@ -1301,5 +1654,210 @@ impl GoalNode {
                 c.print_goal_detail_subtree(1, with_deliverable, with_comment);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod recurring_tests {
+    use super::{
+        build_recurring_goal_request, is_recurring_goal_not_found, parse_days_of_month,
+        parse_days_of_week,
+    };
+
+    #[test]
+    fn parse_days_of_week_uppercases_and_trims() {
+        assert_eq!(
+            parse_days_of_week(" monday, thursday ").unwrap(),
+            vec!["MONDAY", "THURSDAY"]
+        );
+    }
+
+    #[test]
+    fn parse_days_of_week_rejects_invalid_day() {
+        let err = parse_days_of_week("monday,someday").unwrap_err();
+        assert!(err.to_string().contains("someday"));
+    }
+
+    #[test]
+    fn parse_days_of_month_accepts_valid_range() {
+        assert_eq!(parse_days_of_month("1, 15,31").unwrap(), vec![1, 15, 31]);
+    }
+
+    #[test]
+    fn parse_days_of_month_rejects_out_of_range() {
+        assert!(parse_days_of_month("0").is_err());
+        assert!(parse_days_of_month("32").is_err());
+    }
+
+    #[test]
+    fn build_recurring_goal_request_accepts_basic_pattern() {
+        let req = build_recurring_goal_request(
+            Some("weekly"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(req.pattern.as_deref(), Some("WEEKLY"));
+        assert!(req.recurrence_type.is_none());
+    }
+
+    #[test]
+    fn build_recurring_goal_request_rejects_invalid_basic_pattern() {
+        let err = build_recurring_goal_request(
+            Some("YEARLY"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--pattern"));
+    }
+
+    #[test]
+    fn build_recurring_goal_request_rejects_pattern_and_custom_together() {
+        let err = build_recurring_goal_request(
+            Some("DAILY"),
+            None,
+            Some(2),
+            None,
+            None,
+            None,
+            false,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("cannot be combined"));
+    }
+
+    #[test]
+    fn build_recurring_goal_request_rejects_nothing_specified() {
+        let err =
+            build_recurring_goal_request(None, None, None, None, None, None, false, None, false)
+                .unwrap_err();
+        assert!(err.to_string().contains("Specify either"));
+    }
+
+    #[test]
+    fn build_recurring_goal_request_weekly_requires_days_of_week() {
+        let err = build_recurring_goal_request(
+            None,
+            Some("WEEKLY"),
+            Some(1),
+            None,
+            None,
+            None,
+            false,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--days-of-week"));
+    }
+
+    #[test]
+    fn build_recurring_goal_request_monthly_requires_day_selector() {
+        let err = build_recurring_goal_request(
+            None,
+            Some("MONTHLY"),
+            Some(1),
+            None,
+            None,
+            None,
+            false,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("MONTHLY"));
+    }
+
+    #[test]
+    fn build_recurring_goal_request_monthly_last_day_is_sufficient() {
+        let req = build_recurring_goal_request(
+            None,
+            Some("monthly"),
+            Some(1),
+            None,
+            None,
+            None,
+            true,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(req.is_last_day, Some(true));
+        assert!(req.days_of_month.is_empty());
+    }
+
+    #[test]
+    fn build_recurring_goal_request_yearly_rejects_day_fields() {
+        let err = build_recurring_goal_request(
+            None,
+            Some("YEARLY"),
+            Some(1),
+            None,
+            Some("1"),
+            None,
+            false,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("YEARLY"));
+    }
+
+    #[test]
+    fn build_recurring_goal_request_normalizes_end_date() {
+        let req = build_recurring_goal_request(
+            None,
+            Some("DAILY"),
+            Some(1),
+            None,
+            None,
+            Some("2026-12-31"),
+            false,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(req.end_date.as_deref(), Some("2026-12-31T00:00:00Z"));
+    }
+
+    #[test]
+    fn build_recurring_goal_request_rejects_invalid_interval() {
+        let err = build_recurring_goal_request(
+            None,
+            Some("DAILY"),
+            Some(0),
+            None,
+            None,
+            None,
+            false,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--interval"));
+    }
+
+    #[test]
+    fn is_recurring_goal_not_found_matches_backend_message() {
+        let err = anyhow::anyhow!("API error (404 Not Found): 繰り返し設定が見つかりません");
+        assert!(is_recurring_goal_not_found(&err));
+
+        let other = anyhow::anyhow!("API error (500 Internal Server Error): oops");
+        assert!(!is_recurring_goal_not_found(&other));
     }
 }

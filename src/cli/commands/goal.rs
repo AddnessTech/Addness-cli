@@ -424,76 +424,6 @@ impl GoalNode {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        handle_related_fetch_errors, normalize_due_date, related_fetch_error_message,
-        should_fetch_child_related,
-    };
-    use crate::api::RelatedFetchError;
-
-    #[test]
-    fn normalize_due_date_accepts_yyyy_mm_dd() {
-        assert_eq!(
-            normalize_due_date("2026-07-01").unwrap(),
-            "2026-07-01T00:00:00Z"
-        );
-    }
-
-    #[test]
-    fn normalize_due_date_keeps_rfc3339() {
-        assert_eq!(
-            normalize_due_date("2026-07-01T12:30:00Z").unwrap(),
-            "2026-07-01T12:30:00Z"
-        );
-    }
-
-    #[test]
-    fn normalize_due_date_rejects_invalid_input() {
-        // 'T' を含むだけの不正な値は素通しせず、エラーにする。
-        assert!(normalize_due_date("Tomorrow").is_err());
-        assert!(normalize_due_date("2026-13-99T99:99:99Z").is_err());
-        assert!(normalize_due_date("2026-07-01T12:30:00").is_err());
-    }
-
-    #[test]
-    fn child_related_fetch_preserves_json_compatibility() {
-        assert!(should_fetch_child_related(true, false));
-    }
-
-    #[test]
-    fn child_related_fetch_for_human_output_requires_flag() {
-        assert!(should_fetch_child_related(false, true));
-        assert!(!should_fetch_child_related(false, false));
-    }
-
-    #[test]
-    fn related_fetch_error_message_lists_each_failure() {
-        let errors = vec![RelatedFetchError {
-            kind: "deliverables",
-            goal_id: "goal-1".to_string(),
-            message: "network error".to_string(),
-        }];
-
-        assert_eq!(
-            related_fetch_error_message(&errors),
-            "Failed to fetch related goal data:\ndeliverables for goal-1: network error"
-        );
-    }
-
-    #[test]
-    fn related_fetch_errors_only_fail_in_strict_mode() {
-        let errors = vec![RelatedFetchError {
-            kind: "comments",
-            goal_id: "goal-2".to_string(),
-            message: "forbidden".to_string(),
-        }];
-
-        assert!(handle_related_fetch_errors(false, errors.clone()).is_ok());
-        assert!(handle_related_fetch_errors(true, errors).is_err());
-    }
-}
-
 use crate::api::GoalChildItem;
 use colored::Colorize;
 use std::collections::HashMap;
@@ -1301,5 +1231,75 @@ impl GoalNode {
                 c.print_goal_detail_subtree(1, with_deliverable, with_comment);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        handle_related_fetch_errors, normalize_due_date, related_fetch_error_message,
+        should_fetch_child_related,
+    };
+    use crate::api::RelatedFetchError;
+
+    #[test]
+    fn normalize_due_date_accepts_yyyy_mm_dd() {
+        assert_eq!(
+            normalize_due_date("2026-07-01").unwrap(),
+            "2026-07-01T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn normalize_due_date_keeps_rfc3339() {
+        assert_eq!(
+            normalize_due_date("2026-07-01T12:30:00Z").unwrap(),
+            "2026-07-01T12:30:00Z"
+        );
+    }
+
+    #[test]
+    fn normalize_due_date_rejects_invalid_input() {
+        // 'T' を含むだけの不正な値は素通しせず、エラーにする。
+        assert!(normalize_due_date("Tomorrow").is_err());
+        assert!(normalize_due_date("2026-13-99T99:99:99Z").is_err());
+        assert!(normalize_due_date("2026-07-01T12:30:00").is_err());
+    }
+
+    #[test]
+    fn child_related_fetch_preserves_json_compatibility() {
+        assert!(should_fetch_child_related(true, false));
+    }
+
+    #[test]
+    fn child_related_fetch_for_human_output_requires_flag() {
+        assert!(should_fetch_child_related(false, true));
+        assert!(!should_fetch_child_related(false, false));
+    }
+
+    #[test]
+    fn related_fetch_error_message_lists_each_failure() {
+        let errors = vec![RelatedFetchError {
+            kind: "deliverables",
+            goal_id: "goal-1".to_string(),
+            message: "network error".to_string(),
+        }];
+
+        assert_eq!(
+            related_fetch_error_message(&errors),
+            "Failed to fetch related goal data:\ndeliverables for goal-1: network error"
+        );
+    }
+
+    #[test]
+    fn related_fetch_errors_only_fail_in_strict_mode() {
+        let errors = vec![RelatedFetchError {
+            kind: "comments",
+            goal_id: "goal-2".to_string(),
+            message: "forbidden".to_string(),
+        }];
+
+        assert!(handle_related_fetch_errors(false, errors.clone()).is_ok());
+        assert!(handle_related_fetch_errors(true, errors).is_err());
     }
 }

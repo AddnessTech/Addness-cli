@@ -472,11 +472,9 @@ fn parse_server_request(id: Value, method: &str, params: &Value) -> ServerMessag
         .map(|arr| arr.iter().filter_map(decision_label).collect())
         .unwrap_or_default();
     let summary = match kind {
-        ApprovalKind::Command => params
-            .get("command")
-            .and_then(Value::as_str)
-            .unwrap_or("(コマンド不明)")
-            .to_string(),
+        ApprovalKind::Command => {
+            super::command_text(params).unwrap_or_else(|| "(コマンド不明)".to_string())
+        }
         ApprovalKind::FileChange => params
             .get("reason")
             .and_then(Value::as_str)
@@ -587,11 +585,7 @@ fn parse_thread_item(item: Option<&Value>) -> Option<ThreadItemInfo> {
     let item_type = item.get("type").and_then(Value::as_str)?;
     let kind = match item_type {
         "commandExecution" => ThreadItemKind::CommandExecution {
-            command: item
-                .get("command")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
+            command: super::command_text(item).unwrap_or_default(),
             exit_code: item.get("exitCode").and_then(Value::as_i64),
             duration_ms: item.get("durationMs").and_then(Value::as_i64),
             status: item
@@ -1006,7 +1000,7 @@ mod tests {
                 assert_eq!(req.kind, ApprovalKind::Command);
                 assert_eq!(req.id, json!(0));
                 assert_eq!(req.item_id.as_deref(), Some("call_1"));
-                assert!(req.summary.contains("ls"));
+                assert_eq!(req.summary, "ls");
                 assert_eq!(
                     req.available_decisions,
                     vec![
@@ -1016,6 +1010,28 @@ mod tests {
                     ]
                 );
                 assert!(!req.allows_session());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_command_approval_request_with_args() {
+        let v = json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+                "itemId": "call_1",
+                "command": "/bin/zsh",
+                "args": ["-lc", "cargo test"],
+                "availableDecisions": ["accept", "decline"]
+            }
+        });
+        match parse_message(&v) {
+            Some(ServerMessage::Approval(req)) => {
+                assert_eq!(req.kind, ApprovalKind::Command);
+                assert_eq!(req.summary, "cargo test");
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -1118,6 +1134,24 @@ mod tests {
                     } => {
                         assert_eq!(command, "cargo build");
                         assert!(exit_code.is_none());
+                    }
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let started_with_args = json!({
+            "jsonrpc": "2.0",
+            "method": "item/started",
+            "params": {"item": {"id": "call_2", "type": "commandExecution", "command": "/bin/zsh", "args": ["-lc", "cargo test"]}}
+        });
+        match parse_message(&started_with_args) {
+            Some(ServerMessage::Notification(Notification::ItemStarted(item))) => {
+                assert_eq!(item.id, "call_2");
+                match item.kind {
+                    ThreadItemKind::CommandExecution { command, .. } => {
+                        assert_eq!(command, "cargo test");
                     }
                     other => panic!("unexpected {other:?}"),
                 }

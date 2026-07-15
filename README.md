@@ -108,6 +108,7 @@ addness link --help
 
 - `login` / `logout` / `status` / `configure` — ブラウザ認証・資格情報と API 設定の管理。
 - `api-key` — 個人APIキーの一覧・作成・失効。例: `addness api-key list`
+- `desktop-auth` — デスクトップ認証の browser handoff 補助操作。例: `addness desktop-auth redeem --start-token <token> --browser-nonce-hash <hash>`
 - `update` / `completions` — CLI 自体の更新、シェル補完の生成。
 
 ### ゴール・成果物

@@ -624,6 +624,66 @@ fn split_codex_command_args(input: &str) -> Result<Vec<String>> {
     Ok(args)
 }
 
+fn is_shell_program(program: &str) -> bool {
+    let name = program.rsplit('/').next().unwrap_or(program);
+    matches!(name, "sh" | "bash" | "zsh")
+}
+
+fn shell_script_from_command_parts(parts: &[String]) -> Option<String> {
+    let program = parts.first()?.trim();
+    if !is_shell_program(program) {
+        return None;
+    }
+
+    let mut idx = 1;
+    while idx < parts.len() {
+        let arg = parts[idx].trim();
+        if arg == "-c" {
+            return parts
+                .get(idx + 1)
+                .map(|script| script.trim().to_string())
+                .filter(|script| !script.is_empty());
+        }
+        if let Some(flags) = arg.strip_prefix('-') {
+            if flags.contains('c') {
+                return parts
+                    .get(idx + 1)
+                    .map(|script| script.trim().to_string())
+                    .filter(|script| !script.is_empty());
+            }
+            idx += 1;
+            continue;
+        }
+        break;
+    }
+    None
+}
+
+fn normalize_command_display(command: &str) -> String {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    split_codex_command_args(trimmed)
+        .ok()
+        .and_then(|parts| shell_script_from_command_parts(&parts))
+        .unwrap_or_else(|| trimmed.to_string())
+}
+
+fn shell_command_with_args_display(command: &str, args: &[String]) -> String {
+    let mut parts = split_codex_command_args(command)
+        .ok()
+        .filter(|parts| !parts.is_empty())
+        .unwrap_or_else(|| vec![command.trim().to_string()]);
+    parts.extend(args.iter().map(|arg| arg.trim().to_string()));
+
+    if let Some(script) = shell_script_from_command_parts(&parts) {
+        return script;
+    }
+
+    command_preview(&parts)
+}
+
 fn command_preview(args: &[String]) -> String {
     args.iter()
         .map(|arg| {
@@ -5879,13 +5939,17 @@ impl CodexPane {
         use codex_appserver::ThreadItemKind as K;
         match item.kind {
             K::CommandExecution { command, .. } => {
-                self.record_current_command(RecentActionKind::Command, compact_tool_text(&command));
-                self.refresh_action_from_text(&command);
+                let display_command = normalize_command_display(&command);
+                self.record_current_command(
+                    RecentActionKind::Command,
+                    compact_tool_text(&display_command),
+                );
+                self.refresh_action_from_text(&display_command);
                 self.codex_appserver_running_item = Some(item.id.clone());
                 self.codex_appserver_output.insert(item.id, VecDeque::new());
                 self.push_log(
                     CodexLogKind::Tool,
-                    format!("$ {}", compact_tool_text(&command)),
+                    format!("$ {}", compact_tool_text(&display_command)),
                 );
             }
             K::McpToolCall { server, tool, .. } => {
@@ -5922,6 +5986,7 @@ impl CodexPane {
                 if self.codex_appserver_running_item.as_deref() == Some(item.id.as_str()) {
                     self.codex_appserver_running_item = None;
                 }
+                let display_command = normalize_command_display(&command);
                 let exit = exit_code
                     .map(|code| format!("exit {code}"))
                     .unwrap_or_else(|| "終了".to_string());
@@ -5929,7 +5994,10 @@ impl CodexPane {
                 let state = if exit_code == Some(0) { "OK" } else { "FAIL" };
                 self.push_log(
                     CodexLogKind::Tool,
-                    format!("{state} {} ({exit}{duration})", compact_tool_text(&command)),
+                    format!(
+                        "{state} {} ({exit}{duration})",
+                        compact_tool_text(&display_command)
+                    ),
                 );
             }
             K::AgentMessage { text, .. } => {
@@ -6037,7 +6105,10 @@ impl CodexPane {
             K::FileChange => ("ファイル変更の許可を求めています", "許可すると適用します"),
             K::Permissions => ("権限昇格の許可を求めています", "許可すると権限を付与します"),
         };
-        let target = compact_one_line(&request.summary, 100);
+        let target = match request.kind {
+            K::Command => compact_one_line(&normalize_command_display(&request.summary), 100),
+            K::FileChange | K::Permissions => compact_one_line(&request.summary, 100),
+        };
         let session = if request.allows_session() {
             " l=このセッション中は許可"
         } else {
@@ -12571,9 +12642,46 @@ fn first_text_field(value: &Value) -> Option<String> {
     }
 }
 
+fn command_args_from_value(value: &Value) -> Vec<String> {
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .filter_map(|value| match value {
+                Value::String(s) => Some(s.to_string()),
+                Value::Number(_) | Value::Bool(_) => Some(value.to_string()),
+                _ => command_text(value),
+            })
+            .collect(),
+        Value::String(s) => json_string_value(s)
+            .map(|value| command_args_from_value(&value))
+            .unwrap_or_else(|| split_codex_command_args(s).unwrap_or_else(|_| vec![s.clone()])),
+        Value::Number(_) | Value::Bool(_) => vec![value.to_string()],
+        _ => command_text(value).into_iter().collect(),
+    }
+}
+
+fn command_from_command_and_args(map: &serde_json::Map<String, Value>) -> Option<String> {
+    let command = ["command", "cmd"]
+        .iter()
+        .filter_map(|key| map.get(*key).and_then(Value::as_str))
+        .find(|command| !command.trim().is_empty())?;
+    let args = ["args", "arguments", "argv"]
+        .iter()
+        .filter_map(|key| map.get(*key))
+        .map(command_args_from_value)
+        .find(|args| !args.is_empty())?;
+
+    Some(shell_command_with_args_display(command, &args))
+}
+
 fn command_text(value: &Value) -> Option<String> {
     match value {
         Value::Object(map) => {
+            if let Some(text) = command_from_command_and_args(map)
+                && !text.is_empty()
+            {
+                return Some(text);
+            }
             for key in [
                 "command",
                 "cmd",
@@ -12620,7 +12728,7 @@ fn command_text(value: &Value) -> Option<String> {
         }
         Value::String(s) => json_string_value(s)
             .and_then(|value| command_text(&value))
-            .or_else(|| Some(s.clone())),
+            .or_else(|| Some(normalize_command_display(s))),
         _ => None,
     }
 }
@@ -16220,6 +16328,29 @@ mod tests {
         let err = split_codex_command_args(r#"doctor "oops"#).unwrap_err();
 
         assert!(err.to_string().contains("引用符"));
+    }
+
+    #[test]
+    fn normalize_command_display_unwraps_shell_c() {
+        assert_eq!(
+            normalize_command_display(r#"/bin/zsh -lc 'cargo test'"#),
+            "cargo test"
+        );
+        assert_eq!(
+            normalize_command_display(r#"bash -c "cargo clippy --all-targets""#),
+            "cargo clippy --all-targets"
+        );
+        assert_eq!(normalize_command_display("cargo build"), "cargo build");
+    }
+
+    #[test]
+    fn command_text_combines_shell_command_and_args() {
+        let value = serde_json::json!({
+            "command": "/bin/zsh",
+            "args": ["-lc", "cargo build"]
+        });
+
+        assert_eq!(command_text(&value).as_deref(), Some("cargo build"));
     }
 
     #[test]

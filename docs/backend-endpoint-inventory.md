@@ -54,8 +54,6 @@
 | POST | /api/v1/public/desktop/auth/start-sessions/redeem | desktopAuthHandler.RedeemStartSession | 不要（IPレート制限） | 開始セッションの引き換え | |
 | POST | /api/v1/public/desktop/auth/token-exchange | desktopAuthHandler.ExchangeToken | 不要（IPレート制限） | デスクトップ認証トークン交換 | |
 | POST | /api/v1/team/desktop/auth/intents/:id/complete | desktopAuthHandler.CompleteIntent | Clerk/APIKey | デスクトップ認証インテント完了 | |
-| GET | /api/v2/me/consents/:consentType | userConsentHandler.GetConsent | Clerk/APIKey（個人スコープ） | 法的同意状態取得（チャットの通信の秘密） | |
-| POST | /api/v2/me/consents | userConsentHandler.RecordConsent | Clerk専用（APIKey不可） | 法的同意の本人記録 | |
 
 ## 3. Webhook（すべて認証不要・署名/トークンで検証）
 

@@ -15,6 +15,7 @@ pub mod kpi;
 pub mod link;
 pub mod login;
 pub mod media;
+pub mod meeting;
 pub mod member;
 pub mod notification;
 pub mod org;

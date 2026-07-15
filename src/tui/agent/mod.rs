@@ -3371,7 +3371,7 @@ impl CodexPane {
             );
         }
         let label = language.label();
-        self.action = Some(format!("lang: {}", language.config_value()));
+        self.set_status_note(format!("lang: {}", language.config_value()));
         self.push_activity(format!("応答言語を {label} に変更"));
 
         let mut resident_pending = false;

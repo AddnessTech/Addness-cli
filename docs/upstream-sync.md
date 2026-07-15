@@ -35,17 +35,51 @@
 │    - 自動マージは禁止                                          │
 │ 3. ジョブ成功時のみ state.json の該当 target を新版へ更新      │
 │    （失敗時は state を進めず翌日リトライ）                     │
+│ 4. Codex が PR / Issue を作成していれば Addness ゴールを作成し  │
+│    対応先 URL をリンク（ADDNESS_API_TOKEN 未設定ならスキップ・ │
+│    失敗しても sync 本体は落とさない）                          │
 └────────────────────────────────────────────────────────────────┘
 ```
 
 ## 必要な secret / 前提
 
-| 名前 | 用途 |
-|---|---|
-| `OPENAI_API_KEY` | codex CLI（`codex exec`）の実行。リポジトリの Actions secret に登録済み。ワークフロー内では env 経由でのみ参照し、`codex login --with-api-key` に stdin で渡す |
+| 名前 | 種別 | 用途 |
+|---|---|---|
+| `OPENAI_API_KEY` | secret | codex CLI（`codex exec`）の実行。リポジトリの Actions secret に登録済み。ワークフロー内では env 経由でのみ参照し、`codex login --with-api-key` に stdin で渡す |
+| `ADDNESS_API_TOKEN` | secret（任意） | Addness ゴール作成ステップの認証トークン。未設定ならゴール作成はスキップされる（sync 本体には影響しない） |
+| `ADDNESS_ORG_ID` | variable（任意） | ゴールを作成する組織 ID。設定時は `addness goal create --org` に渡され、`link pr` の組織スコープにも使われる |
+| `ADDNESS_PARENT_GOAL_ID` | variable（任意） | 作成するゴールの親ゴール ID。設定時は `addness goal create --parent` に渡される（未設定ならルートゴールとして作成） |
 
 `GITHUB_TOKEN` は Actions 標準のものを使用（追加設定不要）。
 label `upstream-sync` は実行時に `gh label create --force` で自動作成される。
+
+### Addness ゴール作成ステップ
+
+sync ジョブの最後（state 更新の後）に、Codex が作成した追随対応を Addness の
+ゴールとして起票し追跡する **Addness ゴール作成** ステップがある。
+
+- **スキップ条件**: secret `ADDNESS_API_TOKEN` が未設定なら `::notice::` を出して
+  何もせず終了する。ゴール作成の失敗（ビルド・API エラー等）でも `continue-on-error`
+  により sync ジョブ自体は落とさない。
+- **対応先の特定**: `upstream-sync/<target>-<新バージョン>` の open PR を優先して探し、
+  無ければ label `upstream-sync` の open Issue をタイトルの新バージョンで検索する。
+  どちらも無ければ「作成不要」として終了する。
+- **ゴール作成**: `cargo build --release --locked` で CLI をビルドし、
+  環境変数トークン認証（`ADDNESS_API_TOKEN` / 任意で `ADDNESS_ORG_ID`）で
+  `addness goal create --title "[upstream-sync] <target> <ver> 追随" --description ... --json`
+  を実行。`ADDNESS_ORG_ID` があれば `--org`、`ADDNESS_PARENT_GOAL_ID` があれば `--parent`
+  を付ける。作成後、レスポンスの `id` に対して `addness link pr` で対応先 URL をリンクする。
+
+**セットアップ手順**（ゴール作成を有効化する場合）:
+
+1. リポジトリの発行済み API キー（個人 API キー等。`addness api-key list` で確認）を
+   secret に登録する: GitHub → Settings → Secrets and variables → Actions →
+   **Secrets** タブ → New repository secret → 名前 `ADDNESS_API_TOKEN`。
+2. 組織を固定したい場合は **Variables** タブに `ADDNESS_ORG_ID` を追加する（任意）。
+3. 追随ゴールを特定の親ゴール配下にまとめたい場合は **Variables** タブに
+   `ADDNESS_PARENT_GOAL_ID` を追加する（任意。未設定ならルートゴール）。
+4. `ADDNESS_API_TOKEN` を登録しなければゴール作成ステップは静かにスキップされるため、
+   この機能を使わない運用も可能。
 
 > 注意: `GITHUB_TOKEN` で作成された PR では CI（`ci.yml` 等）が自動起動しない。
 > レビュー時に PR を開いて手動で CI を起動するか、PR を一度 close/reopen すること。

@@ -860,7 +860,58 @@ fn today_calendar_outputs_json(command: &today::CalendarCommands) -> bool {
     }
 }
 
+/// Resolved token-auth settings taken from the `ADDNESS_*` environment
+/// variables. Separated from the raw `std::env::var` reads so the trim/empty
+/// handling can be unit-tested without racing on process-global env state in
+/// parallel `cargo test` runs (same pattern as `http_timeout_from_env_value`).
+struct EnvClientConfig {
+    token: String,
+    api_url: String,
+    org_id: Option<String>,
+}
+
+/// Build an [`EnvClientConfig`] from raw env values. Returns `None` when no
+/// usable token is present (unset, empty, or whitespace-only), in which case
+/// callers fall back to `credentials.json`.
+fn env_client_config(
+    token: Option<&str>,
+    api_url: Option<&str>,
+    org_id: Option<&str>,
+) -> Option<EnvClientConfig> {
+    let token = token.map(str::trim).filter(|t| !t.is_empty())?;
+    let api_url = api_url
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .unwrap_or(DEFAULT_API_URL)
+        .to_string();
+    let org_id = org_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+    Some(EnvClientConfig {
+        token: token.to_string(),
+        api_url,
+        org_id,
+    })
+}
+
+/// Construct an [`ApiClient`] from the `ADDNESS_*` environment variables when a
+/// token is present. Used in CI (e.g. upstream-sync) where `addness login` is
+/// unavailable. Returns `None` when no token env var is set so callers fall
+/// back to the stored credentials.
+fn client_from_env() -> Option<Result<ApiClient>> {
+    let cfg = env_client_config(
+        std::env::var("ADDNESS_API_TOKEN").ok().as_deref(),
+        std::env::var("ADDNESS_API_URL").ok().as_deref(),
+        std::env::var("ADDNESS_ORG_ID").ok().as_deref(),
+    )?;
+    Some(ApiClient::new(&cfg.token, &cfg.api_url).map(|client| client.with_org_id(cfg.org_id)))
+}
+
 fn build_client() -> Result<ApiClient> {
+    if let Some(client) = client_from_env() {
+        return client;
+    }
     let creds = Credentials::load()?;
     let settings = Settings::load()?;
     match creds {
@@ -889,6 +940,9 @@ fn build_client() -> Result<ApiClient> {
 /// Build a client for org-level commands (org list, org current, etc.)
 /// Falls back to any available token when the current org has no key stored.
 fn build_client_for_org_commands() -> Result<ApiClient> {
+    if let Some(client) = client_from_env() {
+        return client;
+    }
     let creds = Credentials::load()?;
     let settings = Settings::load()?;
     match creds {
@@ -1085,6 +1139,44 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_client_config_none_without_token() {
+        assert!(env_client_config(None, None, None).is_none());
+    }
+
+    #[test]
+    fn env_client_config_treats_blank_token_as_unset() {
+        assert!(env_client_config(Some(""), None, None).is_none());
+        assert!(env_client_config(Some("   "), None, None).is_none());
+    }
+
+    #[test]
+    fn env_client_config_trims_token_and_defaults_api_url() {
+        let cfg = env_client_config(Some("  secret-token  "), None, None).expect("some");
+        assert_eq!(cfg.token, "secret-token");
+        assert_eq!(cfg.api_url, DEFAULT_API_URL);
+        assert_eq!(cfg.org_id, None);
+    }
+
+    #[test]
+    fn env_client_config_uses_custom_api_url_and_org_id() {
+        let cfg = env_client_config(
+            Some("token"),
+            Some("  https://api.example.test  "),
+            Some("  org-123  "),
+        )
+        .expect("some");
+        assert_eq!(cfg.api_url, "https://api.example.test");
+        assert_eq!(cfg.org_id.as_deref(), Some("org-123"));
+    }
+
+    #[test]
+    fn env_client_config_ignores_blank_api_url_and_org_id() {
+        let cfg = env_client_config(Some("token"), Some("   "), Some("   ")).expect("some");
+        assert_eq!(cfg.api_url, DEFAULT_API_URL);
+        assert_eq!(cfg.org_id, None);
+    }
 
     #[test]
     fn update_check_runs_for_tui_and_human_commands() {

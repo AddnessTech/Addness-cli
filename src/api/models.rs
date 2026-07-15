@@ -10,6 +10,7 @@ mod member;
 mod notification;
 mod org;
 mod streak;
+mod user;
 
 pub use activity::*;
 pub use assignment::*;
@@ -23,6 +24,7 @@ pub use member::*;
 pub use notification::*;
 pub use org::*;
 pub use streak::*;
+pub use user::*;
 
 use serde::{Deserialize, Serialize};
 

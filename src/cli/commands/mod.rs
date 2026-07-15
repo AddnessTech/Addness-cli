@@ -17,6 +17,7 @@ pub mod streak;
 pub mod summary;
 pub mod today;
 pub mod update;
+pub mod user;
 
 use anyhow::Result;
 use std::io::{self, Write};

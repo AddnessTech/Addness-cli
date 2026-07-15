@@ -467,6 +467,17 @@ fn matches_log_filter(kind: CodexLogKind, filter: CodexLogFilter) -> bool {
     }
 }
 
+/// 実行中ターン中、会話フィルタでも直近のTool/Eventログを混ぜて見せるための判定。
+/// `live_tool_start` は現在実行中ターンの開始インデックス（`None` なら混在させない）。
+fn is_live_turn_tool_line(
+    kind: CodexLogKind,
+    index: usize,
+    live_tool_start: Option<usize>,
+) -> bool {
+    matches!(kind, CodexLogKind::Tool | CodexLogKind::Event)
+        && live_tool_start.is_some_and(|start| index >= start)
+}
+
 fn on_off(enabled: bool) -> &'static str {
     if enabled { "on" } else { "off" }
 }
@@ -862,7 +873,8 @@ impl CodexRunState {
             Self::InputWaiting => "入力待ち",
             Self::Thinking => "考え中",
             Self::CommandRunning => "コマンド実行中",
-            Self::Confirming => "確認待ち",
+            // 見た目の目立ちやすさのため、他の状態と区別できるアイコンを付ける。
+            Self::Confirming => "⏸ 承認待ち",
             Self::Completed => "完了",
         }
     }
@@ -1343,6 +1355,15 @@ pub struct CodexPane {
     pending_undo_request: Option<UndoRequest>,
     /// 確認バナー（YesNo）に紐づく Accept 時アクション。/undo 確認で使う。
     pending_decision_action: Option<PaneDecisionAction>,
+    /// 実行中スピナーのtick。ターン実行中のみ一定間隔で進める（純関数でtick→文字を選ぶため、
+    /// ここでは単調増加するカウンタとして保持するだけ）。
+    activity_spin_tick: u64,
+    /// 直近にスピナーtickを進めた時刻。次に進めるべきタイミングの判定に使う。
+    last_spin_advance_at: Option<Instant>,
+    /// 承認待ち（`pending_decision`）が始まった時刻。長時間放置の検知に使う。
+    pending_decision_started_at: Option<Instant>,
+    /// 承認待ちの再通知（リマインド）を最後に送った時刻。
+    last_confirming_reminder_at: Option<Instant>,
 }
 
 impl CodexPane {
@@ -1574,6 +1595,10 @@ impl CodexPane {
             pending_checkpoint_requests: VecDeque::new(),
             pending_undo_request: None,
             pending_decision_action: None,
+            activity_spin_tick: 0,
+            last_spin_advance_at: None,
+            pending_decision_started_at: None,
+            last_confirming_reminder_at: None,
         };
         let name = kind.display_name();
         if pane.loaded_history_count > 0 {
@@ -1707,6 +1732,10 @@ impl CodexPane {
         pane.current_turn_prompt = None;
         pane.current_turn_retry_prompt = None;
         pane.goal_mode = CodexGoalMode::default();
+        pane.activity_spin_tick = 0;
+        pane.last_spin_advance_at = None;
+        pane.pending_decision_started_at = None;
+        pane.last_confirming_reminder_at = None;
         for line in output.lines() {
             pane.push_log(CodexLogKind::Assistant, line.to_string());
         }
@@ -1721,6 +1750,18 @@ impl CodexPane {
         self.push_log(CodexLogKind::Turn, format!("Turn {}", self.turn_count));
         self.push_log(CodexLogKind::Assistant, assistant_text.to_string());
         self.queue_completed_turn_body_record();
+    }
+
+    /// テスト用: 承認待ちバナーを直接立てる（ui 側のレンダリングテストから使う）。
+    #[cfg(test)]
+    pub(crate) fn test_set_pending_decision(&mut self, kind: CodexDecisionKind, message: &str) {
+        self.set_pending_decision(CodexDecisionBanner::new(kind, message.to_string()));
+    }
+
+    /// テスト用: ターン実行中フラグを直接切り替える（ui 側のレンダリングテストから使う）。
+    #[cfg(test)]
+    pub(crate) fn test_set_turn_running(&mut self, running: bool) {
+        self.turn_running = running;
     }
 
     /// このペインのエージェントバックエンド種別。
@@ -1833,6 +1874,59 @@ impl CodexPane {
         } else {
             false
         }
+    }
+
+    /// 実行中スピナーのtick（文字選択は ui 側の純関数に任せる）。
+    pub fn activity_spin_tick(&self) -> u64 {
+        self.activity_spin_tick
+    }
+
+    /// ターン実行中のみ、一定間隔でスピナーtickを進める。動いていることが見た目で分かるように、
+    /// 進んだフレームだけ再描画対象として true を返す（アイドル時は無駄な再描画をしない）。
+    fn advance_activity_spin(&mut self) -> bool {
+        const SPIN_INTERVAL: Duration = Duration::from_millis(120);
+        if !self.is_turn_running() {
+            self.last_spin_advance_at = None;
+            return false;
+        }
+        let should_advance = match self.last_spin_advance_at {
+            Some(t) => t.elapsed() >= SPIN_INTERVAL,
+            None => true,
+        };
+        if should_advance {
+            self.activity_spin_tick = self.activity_spin_tick.wrapping_add(1);
+            self.last_spin_advance_at = Some(Instant::now());
+        }
+        should_advance
+    }
+
+    /// 承認待ち（`pending_decision`）が一定時間続いたら、見逃し防止のため通知を再送する。
+    /// 一度きりの通知（`set_pending_decision` 時）だけでは長時間の放置に気づけないため、
+    /// 待機が続く間は間隔を空けて繰り返し知らせる。
+    fn remind_confirming_if_stale(&mut self) {
+        const REMIND_INTERVAL: Duration = Duration::from_secs(5 * 60);
+        if self.pending_decision.is_none() {
+            self.pending_decision_started_at = None;
+            self.last_confirming_reminder_at = None;
+            return;
+        }
+        let started = *self
+            .pending_decision_started_at
+            .get_or_insert_with(Instant::now);
+        let last_reminder = *self.last_confirming_reminder_at.get_or_insert(started);
+        if last_reminder.elapsed() < REMIND_INTERVAL {
+            return;
+        }
+        self.last_confirming_reminder_at = Some(Instant::now());
+        let Some(decision) = self.pending_decision.clone() else {
+            return;
+        };
+        let name = self.kind.display_name();
+        let waited = format_elapsed(started.elapsed().as_secs());
+        self.push_terminal_notice(
+            format!("{name} 承認待ち継続中 ({waited})"),
+            decision.message,
+        );
     }
 
     /// 完了したターンの所要時間を控えめな System 行として残す。
@@ -2183,13 +2277,14 @@ impl CodexPane {
     pub fn filtered_log_lines(&self) -> Vec<&CodexLogLine> {
         let query = self.normalized_search_query();
         let collapse_turns = self.turns_are_collapsible_in_current_view();
+        let live_tool_start = self.live_turn_tool_start_index();
         let mut current_collapsed_turn = None;
         let mut visible = Vec::new();
-        for line in &self.log {
+        for (index, line) in self.log.iter().enumerate() {
             if line.kind == CodexLogKind::Turn {
                 current_collapsed_turn = turn_number_from_label(&line.text)
                     .filter(|n| collapse_turns && self.collapsed_turns.contains(n));
-                if self.log_line_visible(line, &query) {
+                if self.log_line_visible(line, &query, index, live_tool_start) {
                     visible.push(line);
                 }
                 continue;
@@ -2197,11 +2292,23 @@ impl CodexPane {
             if current_collapsed_turn.is_some() {
                 continue;
             }
-            if self.log_line_visible(line, &query) {
+            if self.log_line_visible(line, &query, index, live_tool_start) {
                 visible.push(line);
             }
         }
         visible
+    }
+
+    /// 実行中ターン中は会話フィルタでも直近のTool/Eventログを混ぜて表示するため、
+    /// 現在実行中ターンの開始位置（直近のTurn行のインデックス）を返す。
+    /// 実行中でない、または会話フィルタ以外のときは None（従来通りログを汚さない）。
+    fn live_turn_tool_start_index(&self) -> Option<usize> {
+        if self.log_filter != CodexLogFilter::Conversation || !self.is_turn_running() {
+            return None;
+        }
+        self.log
+            .iter()
+            .rposition(|line| line.kind == CodexLogKind::Turn)
     }
 
     /// ストリーミング中（未完成）の assistant ログ行への参照を返す。
@@ -2774,6 +2881,16 @@ impl CodexPane {
 
     pub fn log_filter_label(&self) -> &'static str {
         self.log_filter.label()
+    }
+
+    /// ヘッダー表示用のフィルタラベル。実行中ターン中は会話フィルタでも
+    /// 直近のTool/Eventログを混ぜて表示しているため、その旨を示す接尾辞を付ける。
+    pub fn log_filter_display_label(&self) -> String {
+        if self.live_turn_tool_start_index().is_some() {
+            format!("{}+実行中", self.log_filter_label())
+        } else {
+            self.log_filter_label().to_string()
+        }
     }
 
     pub fn search_query(&self) -> &str {
@@ -3605,8 +3722,16 @@ impl CodexPane {
         self.search_query.trim().to_lowercase()
     }
 
-    fn log_line_visible(&self, line: &CodexLogLine, query: &str) -> bool {
-        if !matches_log_filter(line.kind, self.log_filter) {
+    fn log_line_visible(
+        &self,
+        line: &CodexLogLine,
+        query: &str,
+        index: usize,
+        live_tool_start: Option<usize>,
+    ) -> bool {
+        let matches_filter = matches_log_filter(line.kind, self.log_filter)
+            || is_live_turn_tool_line(line.kind, index, live_tool_start);
+        if !matches_filter {
             return false;
         }
         if query.is_empty()
@@ -3917,6 +4042,10 @@ impl CodexPane {
 
         // 経過時間タイマー: 表示秒が繰り上がったフレームだけ再描画させる。
         changed |= self.manage_turn_timer();
+        // 実行中スピナー: ターン実行中だけ一定間隔で回す。
+        changed |= self.advance_activity_spin();
+        // 承認待ちが長時間続いていたら見逃し防止の再通知を送る。
+        self.remind_confirming_if_stale();
 
         changed
     }
@@ -6136,6 +6265,10 @@ impl CodexPane {
         self.pending_decision_action = None;
         let message = decision.message.clone();
         self.pending_decision = Some(decision);
+        // 承認待ち経過時間の起点をリセットする（リマインド通知の間隔もここから数える）。
+        let now = Instant::now();
+        self.pending_decision_started_at = Some(now);
+        self.last_confirming_reminder_at = Some(now);
         let name = self.kind.display_name();
         self.push_terminal_notice(format!("{name} 確認待ち"), message);
     }
@@ -14648,6 +14781,82 @@ mod tests {
     }
 
     #[test]
+    fn conversation_filter_mixes_in_live_tool_lines_while_turn_running() {
+        let mut pane = CodexPane::test_with_output(8, 40, 0, "");
+        pane.push_log(CodexLogKind::Turn, "Turn 1");
+        pane.push_log(CodexLogKind::User, "cargo test して");
+        pane.push_log(CodexLogKind::Tool, "old turn tool line");
+
+        // ターンが実行中でなければ、従来通り会話フィルタは Tool/Event を含まない。
+        let idle = pane
+            .filtered_log_lines()
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(!idle.contains(&"old turn tool line"));
+        assert_eq!(pane.log_filter_display_label(), "会話");
+
+        // ターン実行中は直近ターンの Tool/Event 行を会話フィルタでも混ぜて表示する。
+        pane.turn_running = true;
+        pane.push_log(CodexLogKind::Turn, "Turn 2");
+        pane.push_log(CodexLogKind::Assistant, "確認します");
+        pane.push_log(CodexLogKind::Tool, "exec_command_begin: cargo test");
+        pane.push_log(CodexLogKind::Event, "file changed: src/lib.rs");
+
+        let running = pane
+            .filtered_log_lines()
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(running.contains(&"exec_command_begin: cargo test"));
+        assert!(running.contains(&"file changed: src/lib.rs"));
+        // 完了済みの前ターンの Tool 行は引き続き隠れたまま。
+        assert!(!running.contains(&"old turn tool line"));
+        assert_eq!(pane.log_filter_display_label(), "会話+実行中");
+
+        // ターンが終われば従来の会話フィルタ挙動に戻る（ログは汚さない）。
+        pane.turn_running = false;
+        let finished = pane
+            .filtered_log_lines()
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(!finished.contains(&"exec_command_begin: cargo test"));
+        assert!(!finished.contains(&"file changed: src/lib.rs"));
+        assert_eq!(pane.log_filter_display_label(), "会話");
+    }
+
+    #[test]
+    fn live_tool_mixing_only_applies_to_conversation_filter() {
+        let mut pane = CodexPane::test_with_output(8, 40, 0, "");
+        pane.turn_running = true;
+        pane.push_log(CodexLogKind::Turn, "Turn 1");
+        pane.push_log(CodexLogKind::Tool, "exec_command_begin: ls");
+
+        // 実行フィルタでは元々 Tool 行が見えるため、混在ロジックは表示件数へ影響しない。
+        pane.cycle_log_filter();
+        assert_eq!(pane.log_filter, CodexLogFilter::Tools);
+        let tools = pane.filtered_log_lines();
+        assert!(
+            tools
+                .iter()
+                .any(|line| line.text == "exec_command_begin: ls")
+        );
+        assert_eq!(pane.log_filter_display_label(), "実行");
+
+        // 失敗フィルタは対象外（Tool行は依然として現れない）。
+        pane.cycle_log_filter();
+        assert_eq!(pane.log_filter, CodexLogFilter::Errors);
+        let errors = pane.filtered_log_lines();
+        assert!(
+            !errors
+                .iter()
+                .any(|line| line.text == "exec_command_begin: ls")
+        );
+        assert_eq!(pane.log_filter_display_label(), "失敗");
+    }
+
+    #[test]
     fn conversation_filter_hides_routine_system_noise() {
         let mut pane = CodexPane::test_with_output(8, 40, 0, "");
         pane.push_log(CodexLogKind::System, "Codex セッションを開始しました");
@@ -14696,6 +14905,57 @@ mod tests {
         assert_eq!(first.title, "Codex 確認待ち");
         assert!(first.message.contains("yes/no"));
         assert_eq!(second.title, "Codex 完了");
+    }
+
+    #[test]
+    fn confirming_reminder_is_not_sent_before_interval_elapses() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.handle_stdout_line(r#"{"type":"approval_requested","message":"Run command? yes/no"}"#);
+        // 初回の通知（set_pending_decision 時点）を消費しておく。
+        pane.take_terminal_notice();
+
+        // まだリマインド間隔（5分）が経っていないので追加通知は来ない。
+        pane.remind_confirming_if_stale();
+        assert!(pane.take_terminal_notice().is_none());
+    }
+
+    #[test]
+    fn confirming_reminder_repeats_while_still_pending() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.handle_stdout_line(r#"{"type":"approval_requested","message":"Run command? yes/no"}"#);
+        pane.take_terminal_notice();
+
+        // リマインド間隔が経過した状態を作る（実時間を待たずにテストするための時刻巻き戻し）。
+        pane.last_confirming_reminder_at = Some(Instant::now() - Duration::from_secs(5 * 60 + 1));
+        pane.remind_confirming_if_stale();
+
+        let reminder = pane
+            .take_terminal_notice()
+            .expect("承認待ちが続いていればリマインド通知が来るはず");
+        assert!(reminder.title.contains("承認待ち継続中"));
+        assert!(reminder.message.contains("yes/no"));
+
+        // 直後にもう一度呼んでも、間隔内なので再送されない。
+        pane.remind_confirming_if_stale();
+        assert!(pane.take_terminal_notice().is_none());
+    }
+
+    #[test]
+    fn confirming_reminder_stops_once_decision_resolved() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.handle_stdout_line(r#"{"type":"approval_requested","message":"Run command? yes/no"}"#);
+        pane.take_terminal_notice();
+
+        pane.resolve_pending_decision(
+            pane.pending_decision.clone().unwrap(),
+            CodexDecisionResponse::Accept,
+            false,
+        );
+        pane.take_terminal_notice(); // 応答時の通知を消費
+
+        pane.last_confirming_reminder_at = Some(Instant::now() - Duration::from_secs(5 * 60 + 1));
+        pane.remind_confirming_if_stale();
+        assert!(pane.take_terminal_notice().is_none());
     }
 
     #[test]

@@ -11,8 +11,8 @@ use clap::{CommandFactory, Parser, Subcommand};
 use crate::config::{Credentials, DEFAULT_API_URL, Settings};
 use api::ApiClient;
 use cli::commands::{
-    activity, assignment, chat, comment, configure, deliverable, detect, diagnosis, goal,
-    invitation, invoice, issue, kpi, link, login, media, member, notification, org, personal,
+    activity, assignment, chat, comment, configure, deliverable, detect, diagnosis, execution,
+    goal, invitation, invoice, issue, kpi, link, login, media, member, notification, org, personal,
     referral, search, sharetree, skills, streak, summary, today, update, user,
 };
 
@@ -187,6 +187,12 @@ enum Commands {
         #[command(subcommand)]
         command: personal::PersonalCommands,
     },
+    /// Execution-tab reporting: summaries, execution-record generation/history, goal-collapse
+    /// preferences, active huddles, and the Codex-agent today's-goals view/apply
+    Execution {
+        #[command(subcommand)]
+        command: execution::ExecutionCommands,
+    },
     /// Detect goal ID from current git branch name
     DetectGoal {
         /// Output as JSON
@@ -230,6 +236,7 @@ fn command_outputs_json(command: &Commands) -> bool {
         Commands::ShareTree { command } => sharetree_outputs_json(command),
         Commands::Media { command } => media_outputs_json(command),
         Commands::Personal { command } => personal_outputs_json(command),
+        Commands::Execution { command } => execution_outputs_json(command),
         Commands::Org { command } => org_outputs_json(command),
         Commands::Goal { command } => goal_outputs_json(command),
         Commands::Comment { command } => comment_outputs_json(command),
@@ -390,7 +397,9 @@ fn personal_outputs_json(command: &personal::PersonalCommands) -> bool {
         | personal::PersonalCommands::TodayAppend { json, .. }
         | personal::PersonalCommands::Day { json, .. }
         | personal::PersonalCommands::TextPatch { json, .. }
-        | personal::PersonalCommands::EnsureOrganization { json } => *json,
+        | personal::PersonalCommands::EnsureOrganization { json }
+        | personal::PersonalCommands::TodayList { json, .. }
+        | personal::PersonalCommands::DailyActivity { json, .. } => *json,
         personal::PersonalCommands::Reset { json, force } => *json && *force,
         personal::PersonalCommands::Markdown { command } => match command {
             personal::MarkdownCommands::Analyze { json, .. }
@@ -411,6 +420,25 @@ fn personal_outputs_json(command: &personal::PersonalCommands) -> bool {
             | personal::ProjectCommands::Create { json, .. }
             | personal::ProjectCommands::Get { json, .. }
             | personal::ProjectCommands::Update { json, .. } => *json,
+        },
+    }
+}
+
+fn execution_outputs_json(command: &execution::ExecutionCommands) -> bool {
+    match command {
+        execution::ExecutionCommands::Summary { json, .. }
+        | execution::ExecutionCommands::MemberSummary { json, .. }
+        | execution::ExecutionCommands::Generate { json, .. }
+        | execution::ExecutionCommands::Update { json, .. }
+        | execution::ExecutionCommands::History { json, .. }
+        | execution::ExecutionCommands::ActiveHuddles { json, .. } => *json,
+        execution::ExecutionCommands::Preference { command } => match command {
+            execution::PreferenceCommands::Get { json, .. }
+            | execution::PreferenceCommands::Set { json, .. } => *json,
+        },
+        execution::ExecutionCommands::Codex { command } => match command {
+            execution::CodexCommands::View { json, .. }
+            | execution::CodexCommands::Apply { json, .. } => *json,
         },
     }
 }
@@ -652,6 +680,39 @@ fn today_outputs_json(command: &today::TodayCommands) -> bool {
         | today::TodayCommands::Done { json, .. }
         | today::TodayCommands::Reopen { json, .. }
         | today::TodayCommands::Status { json, .. } => *json,
+        today::TodayCommands::Todo { command } => today_todo_outputs_json(command),
+        today::TodayCommands::Planned { command } => today_planned_outputs_json(command),
+        today::TodayCommands::Calendar { command } => today_calendar_outputs_json(command),
+    }
+}
+
+fn today_todo_outputs_json(command: &today::TodoCommands) -> bool {
+    match command {
+        today::TodoCommands::List { json, .. }
+        | today::TodoCommands::Add { json, .. }
+        | today::TodoCommands::Update { json, .. }
+        | today::TodoCommands::Rm { json, .. }
+        | today::TodoCommands::Activity { json, .. } => *json,
+    }
+}
+
+fn today_planned_outputs_json(command: &today::PlannedCommands) -> bool {
+    match command {
+        today::PlannedCommands::List { json, .. }
+        | today::PlannedCommands::Material { json, .. }
+        | today::PlannedCommands::Add { json, .. }
+        | today::PlannedCommands::Update { json, .. }
+        | today::PlannedCommands::Rm { json, .. }
+        | today::PlannedCommands::Adopt { json, .. } => *json,
+    }
+}
+
+fn today_calendar_outputs_json(command: &today::CalendarCommands) -> bool {
+    match command {
+        today::CalendarCommands::Events { json, .. }
+        | today::CalendarCommands::Complete { json, .. }
+        | today::CalendarCommands::GoalCalendar { json, .. }
+        | today::CalendarCommands::GoalHistory { json, .. } => *json,
     }
 }
 
@@ -827,6 +888,10 @@ async fn main() -> Result<()> {
         Some(Commands::Personal { command }) => {
             let client = build_client()?;
             personal::handle_personal(command, &client).await
+        }
+        Some(Commands::Execution { command }) => {
+            let client = build_client()?;
+            execution::handle_execution(command, &client).await
         }
         Some(Commands::DetectGoal { json }) => detect::handle_detect_goal(*json),
         Some(Commands::Update { check }) => update::handle_update(*check).await,

@@ -3730,7 +3730,6 @@ fn decision_always_choice_text(decision: &super::agent::CodexDecisionBanner) -> 
 }
 
 fn codex_header_lines(pane: &CodexPane, max_width: usize, max_rows: usize) -> Vec<Line<'static>> {
-    let run_state = pane.run_state();
     let focus = codex_current_activity_label(pane, max_width.saturating_sub(6));
     // 承認待ちは「作業を止めて人間の応答を待っている」状態なので、単なる実行中（WARN）より
     // 目立つ危険色（DANGER）にして見逃しを防ぐ。
@@ -3738,13 +3737,13 @@ fn codex_header_lines(pane: &CodexPane, max_width: usize, max_rows: usize) -> Ve
         Style::default()
             .fg(COLOR_DANGER)
             .add_modifier(Modifier::BOLD)
-    } else if pane.is_turn_running() {
+    } else if pane.is_turn_running() || pane.background_task_running_count() > 0 {
         Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(COLOR_TEXT_STRONG)
     };
     let mut parts = vec![
-        format!("状態: {}", run_state.label()),
+        format!("状態: {}", pane.run_state_display_label()),
         format!("Turn {}", pane.turn_count()),
         format!("表示:{}", pane.log_filter_display_label()),
     ];
@@ -3756,6 +3755,9 @@ fn codex_header_lines(pane: &CodexPane, max_width: usize, max_rows: usize) -> Ve
     }
     if pane.subagent_running_count() > 0 {
         parts.push(format!("Sub:{}", pane.subagent_running_count()));
+    }
+    if pane.background_task_running_count() > 0 {
+        parts.push(format!("BG:{}", pane.background_task_running_count()));
     }
     if pane.diff_view().is_some() {
         parts.push("差分表示中".to_string());
@@ -4906,6 +4908,10 @@ fn codex_current_activity_label(pane: &CodexPane, max_width: usize) -> String {
                 pane.kind().display_name()
             )
         }
+    } else if let Some(bg_label) = pane.background_status_label() {
+        // ターンは終了していても、通知待ちのバックグラウンドタスクが残っている間は
+        // 「入力待ち」ではなくこちらを出す（入力欄自体はブロックしない）。
+        bg_label
     } else {
         codex_work_label(
             pane.finished,
@@ -5069,6 +5075,11 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane, scro
         super::agent::CodexRunState::CommandRunning | super::agent::CodexRunState::Thinking => {
             Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD)
         }
+        super::agent::CodexRunState::InputWaiting if pane.background_task_running_count() > 0 => {
+            // 未完了のバックグラウンドタスクが残っている間は、ただの入力待ちより目立たせる
+            // （実際には作業が続いている状態を「入力待ち」と誤認させないため）。
+            Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD)
+        }
         super::agent::CodexRunState::InputWaiting => {
             Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD)
         }
@@ -5078,7 +5089,10 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane, scro
         Style::default()
             .fg(COLOR_DANGER)
             .add_modifier(Modifier::BOLD)
-    } else if pane.current_command().is_some() || pane.is_turn_running() {
+    } else if pane.current_command().is_some()
+        || pane.is_turn_running()
+        || pane.background_task_running_count() > 0
+    {
         Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(COLOR_TEXT_STRONG)
@@ -5246,6 +5260,30 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane, scro
             ),
         ]));
         for label in &subagent_lines {
+            lines.push(Line::from(Span::styled(
+                ellipsize_width(&format!("  {label}"), prompt_width),
+                Style::default().fg(COLOR_MUTED),
+            )));
+        }
+    }
+    // バックグラウンドタスク稼働状況（Bash の run_in_background、および Task/Agent の
+    // バックグラウンド起動）。ターンが終了していても通知待ちの間はここに残り続ける。
+    let bg_running = pane.background_task_running_count();
+    let bg_visible = codex_subagent_visible_count(area.height);
+    let bg_lines = pane.background_task_status_lines(bg_visible);
+    if !bg_lines.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("バックグラウンド ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(
+                format!("{bg_running}件・通知待ち"),
+                if bg_running > 0 {
+                    Style::default().fg(COLOR_WARN)
+                } else {
+                    Style::default().fg(COLOR_MUTED)
+                },
+            ),
+        ]));
+        for label in &bg_lines {
             lines.push(Line::from(Span::styled(
                 ellipsize_width(&format!("  {label}"), prompt_width),
                 Style::default().fg(COLOR_MUTED),
@@ -6329,6 +6367,28 @@ mod tests {
 
         let label = codex_current_activity_label(&pane, 120);
         assert_eq!(label, "model: gpt-5");
+    }
+
+    #[test]
+    fn codex_current_activity_label_shows_background_task_instead_of_input_waiting() {
+        // 「入力待ち表示の誤り」修正の中核: ターンが終了していても、未完了のバックグラウンド
+        // タスクが残っている間は「今」欄に通知待ちであることを表示する。
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.finished = false;
+
+        let idle_label = codex_current_activity_label(&pane, 120);
+        assert!(
+            !idle_label.contains("バックグラウンド"),
+            "label={idle_label}"
+        );
+
+        pane.test_add_running_background_task("マージ処理");
+        let bg_label = codex_current_activity_label(&pane, 120);
+        assert!(
+            bg_label.contains("バックグラウンド処理中"),
+            "label={bg_label}"
+        );
+        assert!(bg_label.contains('1'), "label={bg_label}");
     }
 
     #[test]

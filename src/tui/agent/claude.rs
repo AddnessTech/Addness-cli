@@ -623,6 +623,9 @@ pub(super) enum ClaudeBlock {
         id: Option<String>,
         /// `Task` / `Agent` ツールならサブエージェント起動情報。
         subagent: Option<SubagentLaunch>,
+        /// `input.run_in_background == true` を指定した起動か
+        /// （Bash のバックグラウンド実行 / Task・Agent のバックグラウンド起動）。
+        background: bool,
     },
 }
 
@@ -648,6 +651,15 @@ pub(super) fn subagent_launch(name: &str, input: &Value) -> Option<SubagentLaunc
         .or_else(|| agent_type.clone())
         .unwrap_or_else(|| name.to_string());
     Some(SubagentLaunch { label, agent_type })
+}
+
+/// tool_use の `input.run_in_background` が `true` かどうか。
+/// Bash のバックグラウンド実行、および Task/Agent のバックグラウンド起動の両方で使う共通フラグ。
+pub(super) fn wants_background_run(input: &Value) -> bool {
+    input
+        .get("run_in_background")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// assistant イベントの content を順序どおりに分解する。
@@ -691,12 +703,14 @@ pub(super) fn assistant_blocks(value: &Value) -> Vec<ClaudeBlock> {
                 let edit_patch =
                     input.and_then(|input| super::claude_edit_patch_text(&name, input));
                 let subagent = input.and_then(|input| subagent_launch(&name, input));
+                let background = input.is_some_and(wants_background_run);
                 blocks.push(ClaudeBlock::ToolUse {
                     name,
                     summary,
                     edit_patch,
                     id,
                     subagent,
+                    background,
                 });
             }
             _ => {}
@@ -782,6 +796,82 @@ fn tool_result_text(content: Option<&Value>) -> String {
         }
         _ => String::new(),
     }
+}
+
+/// user イベントの content から、tool_result 以外のプレーンテキスト（task-notification 等の
+/// 差し込みメッセージを含む）を拾う。content が配列でなく文字列そのものの場合にも対応する。
+pub(super) fn user_event_plain_texts(value: &Value) -> Vec<String> {
+    let Some(content) = value.get("message").and_then(|m| m.get("content")) else {
+        return Vec::new();
+    };
+    match content {
+        Value::String(text) => vec![text.clone()],
+        Value::Array(items) => items
+            .iter()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|item| item.get("text").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// `background_confirmation_id` / `background_completion_signal` 共通のトークン抽出。
+/// `marker` の直後（`:`/` `/`=` を読み飛ばした位置）から空白・句読点までを 1 トークンとして返す。
+fn extract_token_after_marker(text: &str, lower: &str, marker: &str) -> Option<String> {
+    let pos = lower.find(marker)?;
+    let rest = &text[pos + marker.len()..];
+    let rest = rest.trim_start_matches([':', ' ', '=']);
+    let token: String = rest
+        .chars()
+        .take_while(|c| !c.is_whitespace() && !matches!(c, '.' | ',' | ')' | '"' | '\''))
+        .collect();
+    if token.is_empty() { None } else { Some(token) }
+}
+
+/// Bash を `run_in_background: true` で起動した直後の tool_result（バックグラウンド化の確認応答）
+/// から、実行中コマンドの ID を取り出す。実 Claude Code CLI の文言例:
+/// 「Command running in background with ID: bash_1」。
+pub(super) fn background_confirmation_id(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    extract_token_after_marker(text, &lower, "background with id")
+}
+
+/// バックグラウンドタスクの完了通知（task-notification 相当）の検知結果。
+/// 完了通知の正確なワイヤーフォーマットは stream-json 上で確認できていないため
+/// （PR 本文の制約を参照）、代表的なキーワードを緩めに拾うヒューリスティックとする。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum BackgroundCompletionSignal {
+    /// 完了通知らしき記述は見当たらない。
+    None,
+    /// 完了通知らしいが、対象 ID を特定できなかった（フォールバック解決の対象）。
+    Unmatched,
+    /// 完了通知から対象 ID を特定できた。
+    ForId(String),
+}
+
+/// テキストがバックグラウンドタスクの完了通知らしいかを判定し、対象 ID を推定する。
+pub(super) fn background_completion_signal(text: &str) -> BackgroundCompletionSignal {
+    let lower = text.to_ascii_lowercase();
+    let looks_like_notice = lower.contains("task-notification")
+        || lower.contains("task-id")
+        || lower.contains("background command")
+        || (lower.contains("background")
+            && (lower.contains("completed")
+                || lower.contains("finished")
+                || lower.contains("exit code")
+                || lower.contains("exited")));
+    if !looks_like_notice {
+        return BackgroundCompletionSignal::None;
+    }
+    // 「background command」自体はキーワード判定にのみ使う（直後の語が常に ID とは
+    // 限らないため、抽出は id 系マーカーに限定する）。
+    for marker in ["task-id", "background id", "id:", "id "] {
+        if let Some(id) = extract_token_after_marker(text, &lower, marker) {
+            return BackgroundCompletionSignal::ForId(id);
+        }
+    }
+    BackgroundCompletionSignal::Unmatched
 }
 
 /// 承認拒否 1 件。
@@ -1402,6 +1492,7 @@ mod tests {
                 edit_patch: None,
                 id: Some("t1".to_string()),
                 subagent: None,
+                background: false,
             }
         );
         assert_eq!(
@@ -1415,6 +1506,7 @@ mod tests {
                 ),
                 id: Some("t2".to_string()),
                 subagent: None,
+                background: false,
             }
         );
     }
@@ -1448,7 +1540,142 @@ mod tests {
                     label: "stream-jsonイベント調査".to_string(),
                     agent_type: Some("Explore".to_string()),
                 }),
+                background: false,
             }
+        );
+    }
+
+    #[test]
+    fn assistant_blocks_bash_run_in_background_is_flagged() {
+        let value = json!({
+            "type": "assistant",
+            "message": {"content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_bg1",
+                    "name": "Bash",
+                    "input": {"command": "./merge.sh", "run_in_background": true}
+                }
+            ]}
+        });
+        let blocks = assistant_blocks(&value);
+        match &blocks[0] {
+            ClaudeBlock::ToolUse {
+                name, background, ..
+            } => {
+                assert_eq!(name, "Bash");
+                assert!(background);
+            }
+            other => panic!("unexpected block: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assistant_blocks_task_run_in_background_is_flagged() {
+        let value = json!({
+            "type": "assistant",
+            "message": {"content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_bg2",
+                    "name": "Task",
+                    "input": {
+                        "description": "長期調査",
+                        "subagent_type": "Explore",
+                        "run_in_background": true
+                    }
+                }
+            ]}
+        });
+        let blocks = assistant_blocks(&value);
+        match &blocks[0] {
+            ClaudeBlock::ToolUse {
+                background,
+                subagent,
+                ..
+            } => {
+                assert!(background);
+                assert!(subagent.is_some());
+            }
+            other => panic!("unexpected block: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn background_confirmation_id_parses_known_phrasing() {
+        assert_eq!(
+            background_confirmation_id("Command running in background with ID: bash_1"),
+            Some("bash_1".to_string())
+        );
+        assert_eq!(
+            background_confirmation_id("command running in background with id bash_2."),
+            Some("bash_2".to_string())
+        );
+        assert_eq!(background_confirmation_id("通常の出力です"), None);
+    }
+
+    #[test]
+    fn background_completion_signal_extracts_id_when_present() {
+        assert_eq!(
+            background_completion_signal("task-id: bash_1 が完了しました"),
+            BackgroundCompletionSignal::ForId("bash_1".to_string())
+        );
+        assert_eq!(
+            background_completion_signal("Background command finished (id: bash_2)"),
+            BackgroundCompletionSignal::ForId("bash_2".to_string())
+        );
+    }
+
+    #[test]
+    fn background_completion_signal_background_command_without_id_is_unmatched() {
+        // 「Background command」直後の語は完了を表す動詞のこともあるため、
+        // id 系マーカーが無ければ ID として誤抽出せず Unmatched に倒す。
+        assert_eq!(
+            background_completion_signal("Background command bash_2 exited with code 0"),
+            BackgroundCompletionSignal::Unmatched
+        );
+    }
+
+    #[test]
+    fn background_completion_signal_falls_back_to_unmatched() {
+        // 完了通知らしいキーワードはあるが ID を抽出できないケース。
+        // 注: 現在の検知はキーワードが英語表記であることを前提にしている
+        // （PR本文の制約: 日本語での通知文言は検知できない可能性がある）。
+        assert_eq!(
+            background_completion_signal("Background job completed successfully"),
+            BackgroundCompletionSignal::Unmatched
+        );
+    }
+
+    #[test]
+    fn background_completion_signal_ignores_unrelated_text() {
+        assert_eq!(
+            background_completion_signal("cargo test が成功しました"),
+            BackgroundCompletionSignal::None
+        );
+    }
+
+    #[test]
+    fn user_event_plain_texts_extracts_text_blocks_and_plain_strings() {
+        let array_form = json!({
+            "type": "user",
+            "message": {"content": [
+                {"type": "text", "text": "task-notification: bash_1 完了"},
+                {"type": "tool_result", "tool_use_id": "t1", "content": "無視されるべき"}
+            ]}
+        });
+        assert_eq!(
+            user_event_plain_texts(&array_form),
+            vec!["task-notification: bash_1 完了".to_string()]
+        );
+
+        let string_form = json!({
+            "type": "user",
+            "message": {"content": "task-id bash_2 完了"}
+        });
+        assert_eq!(
+            user_event_plain_texts(&string_form),
+            vec!["task-id bash_2 完了".to_string()]
         );
     }
 

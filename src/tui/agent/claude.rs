@@ -402,6 +402,7 @@ pub(super) fn exec_args(
         OsString::from("--output-format"),
         OsString::from("stream-json"),
         OsString::from("--verbose"),
+        OsString::from("--forward-subagent-text"),
     ];
     push_partial_messages_flag(&mut args, settings);
     push_resume_args(&mut args, session_id, fork);
@@ -457,6 +458,7 @@ pub(super) fn resident_args(
         OsString::from("--output-format"),
         OsString::from("stream-json"),
         OsString::from("--verbose"),
+        OsString::from("--forward-subagent-text"),
     ];
     push_partial_messages_flag(&mut args, settings);
     // その場承認（can_use_tool）を stdio 経由で受けるための隠しフラグ。
@@ -1236,12 +1238,13 @@ mod tests {
         let settings = ClaudeExecSettings::default();
         let args = os(&exec_args(None, &settings, &[], false, "INSTRUCTIONS"));
         assert_eq!(
-            &args[0..5],
+            &args[0..6],
             &[
                 "-p",
                 "--output-format",
                 "stream-json",
                 "--verbose",
+                "--forward-subagent-text",
                 "--include-partial-messages"
             ]
         );
@@ -1341,6 +1344,7 @@ mod tests {
     fn resident_args_disallows_addness_mcp() {
         let settings = ClaudeExecSettings::default();
         let args = os(&resident_args(None, &settings, false, "x"));
+        assert!(args.iter().any(|a| a == "--forward-subagent-text"));
         let idx = args.iter().position(|a| a == "--disallowedTools").unwrap();
         assert_eq!(args[idx + 1], "mcp__addness");
     }
@@ -1355,8 +1359,14 @@ mod tests {
         assert!(!args.iter().any(|a| a == "--include-partial-messages"));
         // 他の基本フラグは維持される。
         assert_eq!(
-            &args[0..4],
-            &["-p", "--output-format", "stream-json", "--verbose"]
+            &args[0..5],
+            &[
+                "-p",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--forward-subagent-text"
+            ]
         );
     }
 
@@ -1951,6 +1961,7 @@ mod tests {
             "--output-format",                // stream-json 出力
             "--input-format",                 // 常駐（双方向）stream-json 入力
             "--include-partial-messages",     // トークン単位ストリーミング
+            "--forward-subagent-text",        // サブエージェント本文・thinking の転送
             "--verbose",                      // stream-json 全イベント出力
             "--permission-mode",              // 権限モード
             "--dangerously-skip-permissions", // 全権限スキップ（起動時フラグ）

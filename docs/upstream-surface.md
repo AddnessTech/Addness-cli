@@ -25,6 +25,7 @@
 | `-p` | 非対話（print）モード | `exec_args` |
 | `--output-format stream-json` | イベントを JSON Lines で受信 | `exec_args` |
 | `--verbose` | stream-json の全イベント出力に必要 | `exec_args` |
+| `--forward-subagent-text` | サブエージェントの本文・thinking を stream-json へ転送 | `exec_args` |
 | `--resume <session_id>` | 2 ターン目以降のセッション継続 | `exec_args` |
 | `--fork-session` | resume 時のセッション複製 | `exec_args` |
 | `--model <name>` | モデル指定（下記 1.2） | `exec_args` |
@@ -96,6 +97,7 @@ stream-json 入力とその場承認用の追加フラグを渡す（`src/tui/ag
 | `--permission-prompt-tool stdio` | `can_use_tool` 承認を stdio 経由で受ける隠しフラグ |
 
 `--output-format stream-json` / `--include-partial-messages` / `--verbose` /
+`--forward-subagent-text` /
 `--resume` / `--fork-session` / `--model` / `--effort` / `--permission-mode` /
 `--allowedTools` / `--add-dir` / `--append-system-prompt` は 1.1 と共通のヘルパで組む。
 **これらのフラグの改名・廃止・挙動変更は関係あり**（常駐 spawn が起動時に失敗し、

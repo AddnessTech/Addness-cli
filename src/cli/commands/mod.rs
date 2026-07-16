@@ -36,6 +36,7 @@ pub mod skill;
 pub mod skills;
 pub mod streak;
 pub mod summary;
+pub mod thread;
 pub mod today;
 pub mod todo_chat;
 pub mod tool;

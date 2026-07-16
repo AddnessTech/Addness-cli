@@ -30,6 +30,7 @@ mod search;
 mod sharetree;
 mod skill;
 mod streak;
+mod thread;
 mod todo_chat;
 mod tool;
 mod user;
@@ -48,6 +49,7 @@ pub use member::BrowseMembersParams;
 pub use notification::ListNotificationsParams;
 pub use org::{CreateOrganizationParams, ListAllOrganizationsParams};
 pub use search::SearchQueryParams;
+pub use thread::ThreadListParams;
 pub use user::ListUsersParams;
 
 use anyhow::{Context, Result};
@@ -575,6 +577,19 @@ impl ApiClient {
     /// is initiated with a POST + JSON payload rather than a GET.
     pub(super) async fn post_stream<B: Serialize>(&self, path: &str, body: &B) -> Result<Response> {
         let (url, req) = self.request(Method::POST, path, true)?;
+        let req = req
+            .json(body)
+            .timeout(Duration::from_secs(EVENT_STREAM_TIMEOUT_SECS));
+        self.send(req, &url).await
+    }
+
+    /// PUT a JSON body to a server-sent-events endpoint, returning the raw
+    /// `Response` for the caller to consume as a byte stream. Mirrors
+    /// `post_stream`; used by `addness thread edit-and-regenerate`
+    /// (`PUT .../messages/:messageId/edit-and-regenerate`), the only SSE
+    /// route in this CLI initiated with PUT rather than GET/POST.
+    pub(super) async fn put_stream<B: Serialize>(&self, path: &str, body: &B) -> Result<Response> {
+        let (url, req) = self.request(Method::PUT, path, true)?;
         let req = req
             .json(body)
             .timeout(Duration::from_secs(EVENT_STREAM_TIMEOUT_SECS));

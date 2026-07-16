@@ -14,7 +14,7 @@ use cli::commands::{
     activity, api_key, assignment, chat, codex_job, comment, configure, consent, deliverable,
     desktop_auth, detect, diagnosis, execution, goal, goal_chat, invitation, invoice, issue, kpi,
     link, login, media, meeting, member, notification, org, personal, referral, search, sharetree,
-    skill, skills, streak, summary, today, tool, update, user,
+    skill, skills, streak, summary, today, todo_chat, tool, update, user,
 };
 
 #[derive(Parser)]
@@ -64,6 +64,13 @@ enum Commands {
     GoalChat {
         #[command(subcommand)]
         command: goal_chat::GoalChatCommands,
+    },
+    /// AI agent chat for the today's-todo walk-and-talk mode (not scoped to
+    /// a single goal): send a message and stream the reply (SSE), fire the
+    /// silent "opening" turn, and browse threads/messages
+    TodoChat {
+        #[command(subcommand)]
+        command: todo_chat::TodoChatCommands,
     },
     /// Manage comments on goals
     Comment {
@@ -297,6 +304,7 @@ fn command_outputs_json(command: &Commands) -> bool {
         Commands::Org { command } => org_outputs_json(command),
         Commands::Goal { command } => goal_outputs_json(command),
         Commands::GoalChat { command } => goal_chat_outputs_json(command),
+        Commands::TodoChat { command } => todo_chat_outputs_json(command),
         Commands::Comment { command } => comment_outputs_json(command),
         Commands::Issue { command } => issue_outputs_json(command),
         Commands::Chat { command } => chat_outputs_json(command),
@@ -581,6 +589,15 @@ fn goal_chat_outputs_json(command: &goal_chat::GoalChatCommands) -> bool {
         | goal_chat::GoalChatCommands::Encouragement { json, .. }
         | goal_chat::GoalChatCommands::Threads { json, .. }
         | goal_chat::GoalChatCommands::Messages { json, .. } => *json,
+    }
+}
+
+fn todo_chat_outputs_json(command: &todo_chat::TodoChatCommands) -> bool {
+    match command {
+        todo_chat::TodoChatCommands::Send { json, .. }
+        | todo_chat::TodoChatCommands::Start { json, .. }
+        | todo_chat::TodoChatCommands::Threads { json, .. }
+        | todo_chat::TodoChatCommands::Messages { json, .. } => *json,
     }
 }
 
@@ -1026,6 +1043,10 @@ async fn main() -> Result<()> {
         Some(Commands::GoalChat { command }) => {
             let client = build_client()?;
             goal_chat::handle_goal_chat(command, &client).await
+        }
+        Some(Commands::TodoChat { command }) => {
+            let client = build_client()?;
+            todo_chat::handle_todo_chat(command, &client).await
         }
         Some(Commands::Comment { command }) => {
             let client = build_client()?;

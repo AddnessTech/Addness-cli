@@ -1,4 +1,5 @@
 pub mod activity;
+pub mod ai_chat_render;
 pub mod api_key;
 pub mod assignment;
 pub mod chat;
@@ -33,6 +34,7 @@ pub mod skills;
 pub mod streak;
 pub mod summary;
 pub mod today;
+pub mod todo_chat;
 pub mod tool;
 pub mod update;
 pub mod user;

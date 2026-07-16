@@ -368,12 +368,13 @@ comment系（chat-v1）はDEPRECATEDだが、後継の本流であるgoal-issue/
 | 対象 | 本数 | 状態 |
 |---|---|---|
 | goal-chat（stream/encouragement/threads/messages） | 4本 | 未実装 |
-| todo-chat（stream/threads/messages） | 3本 | 未実装 |
+| todo-chat（stream/threads/messages） | 3本 | 実装済み（`addness todo-chat send/start/threads/messages`） |
 | todo-chat/validate/*（同上の検証用並走） | 3本 | 対象外（検証用並走ルート） |
 | core-values（stream/threads/messages） | 3本 | 未実装 |
 | master-plan（stream/threads/messages） | 3本 | 未実装 |
 
-いずれもSSEストリーミング。CLIで実装する場合はストリーミング出力のUX設計が必要。
+いずれもSSEストリーミング。CLIで実装する場合はストリーミング出力のUX設計が必要。todo-chatはgoal-chatと同一のジェネリックハンドラ（`internal/chat/handler`）を共有するが、
+`openGoalId`不要・`opening`（口火）対応・`goal`イベント無し、かつ`threads`一覧はページング未対応（常に配列レスポンス）という差異がある。
 
 ## 14. 通知 (Notification) / 通知設定 / プッシュトークン / メール宛先
 

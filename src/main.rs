@@ -14,8 +14,8 @@ use cli::commands::{
     activity, api_key, assignment, chat, codex_job, comment, configure, consent, core_values,
     deliverable, desktop_auth, detect, diagnosis, execution, goal, goal_chat, invitation, invoice,
     issue, kpi, link, login, master_plan, media, meeting, member, notification, org, personal,
-    referral, search, sharetree, skill, skills, streak, summary, today, todo_chat, tool, update,
-    user,
+    referral, search, sharetree, skill, skills, streak, summary, thread, today, todo_chat, tool,
+    update, user,
 };
 
 #[derive(Parser)]
@@ -87,6 +87,13 @@ enum Commands {
     MasterPlan {
         #[command(subcommand)]
         command: master_plan::MasterPlanCommands,
+    },
+    /// Manage AI threads (legacy V1 "AI エージェント" layer): CRUD, chat
+    /// (SSE), action traces, share links, question responses, and
+    /// tool-confirmation responses
+    Thread {
+        #[command(subcommand)]
+        command: thread::ThreadCommands,
     },
     /// Manage comments on goals
     Comment {
@@ -323,6 +330,7 @@ fn command_outputs_json(command: &Commands) -> bool {
         Commands::TodoChat { command } => todo_chat_outputs_json(command),
         Commands::CoreValues { command } => core_values_outputs_json(command),
         Commands::MasterPlan { command } => master_plan_outputs_json(command),
+        Commands::Thread { command } => thread_outputs_json(command),
         Commands::Comment { command } => comment_outputs_json(command),
         Commands::Issue { command } => issue_outputs_json(command),
         Commands::Chat { command } => chat_outputs_json(command),
@@ -635,6 +643,27 @@ fn master_plan_outputs_json(command: &master_plan::MasterPlanCommands) -> bool {
         | master_plan::MasterPlanCommands::Start { json, .. }
         | master_plan::MasterPlanCommands::Threads { json, .. }
         | master_plan::MasterPlanCommands::Messages { json, .. } => *json,
+    }
+}
+
+fn thread_outputs_json(command: &thread::ThreadCommands) -> bool {
+    match command {
+        thread::ThreadCommands::Create { json, .. }
+        | thread::ThreadCommands::List { json, .. }
+        | thread::ThreadCommands::Get { json, .. }
+        | thread::ThreadCommands::Update { json, .. }
+        | thread::ThreadCommands::Messages { json, .. }
+        | thread::ThreadCommands::Chat { json, .. }
+        | thread::ThreadCommands::EditAndRegenerate { json, .. }
+        | thread::ThreadCommands::Traces { json, .. }
+        | thread::ThreadCommands::RevertTrace { json, .. }
+        | thread::ThreadCommands::ShareCreate { json, .. }
+        | thread::ThreadCommands::QuestionRespond { json, .. }
+        | thread::ThreadCommands::ToolConfirmationRespond { json, .. }
+        | thread::ThreadCommands::Assignment { json, .. } => *json,
+        thread::ThreadCommands::Delete { .. }
+        | thread::ThreadCommands::Cancel { .. }
+        | thread::ThreadCommands::ShareRevoke { .. } => false,
     }
 }
 
@@ -1092,6 +1121,10 @@ async fn main() -> Result<()> {
         Some(Commands::MasterPlan { command }) => {
             let client = build_client()?;
             master_plan::handle_master_plan(command, &client).await
+        }
+        Some(Commands::Thread { command }) => {
+            let client = build_client()?;
+            thread::handle_thread(command, &client).await
         }
         Some(Commands::Comment { command }) => {
             let client = build_client()?;

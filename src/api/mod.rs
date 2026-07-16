@@ -9,6 +9,7 @@ pub use client::ListCommentsParams;
 pub use client::ListNotificationsParams;
 pub use client::ListUsersParams;
 pub use client::RelatedFetchError;
+pub use client::ThreadListParams;
 pub use client::{
     ActivityLogByGoalParams, ActivityLogByMemberParams, ActivityLogSummaryParams,
     GoalActivitySummaryParams,

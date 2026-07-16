@@ -48,8 +48,12 @@ impl ApiClient {
 
 /// Reads the `type` field out of a decode SSE frame's JSON `data` payload.
 /// Falls back to `"unknown"` if the payload isn't a JSON object or lacks a
-/// string `type` field, which should not happen in practice.
-fn extract_event_type(data: &str) -> String {
+/// string `type` field, which should not happen in practice. `pub(super)`
+/// so `client::thread` can reuse it for the Thread `chat`/
+/// `edit-and-regenerate` SSE routes, which share the same bare
+/// `data: {"type": ...}` wire format (both back onto
+/// `infra/ai/streaming.SSEWriter`).
+pub(super) fn extract_event_type(data: &str) -> String {
     serde_json::from_str::<Value>(data)
         .ok()
         .and_then(|value| {

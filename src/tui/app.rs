@@ -3450,6 +3450,17 @@ impl App {
             return Ok(());
         }
 
+        // 画面切り替え（他ウィンドウ/タブへ移って戻ってくる等）でフォーカスが戻った時、
+        // 離れている間に端末側の表示が乱れていても ratatui の差分描画では検知できず
+        // 黒画面のまま固まることがあるため、全クリアを予約して確実に再描画させる。
+        if let Event::FocusGained = event {
+            self.needs_full_clear = true;
+            return Ok(());
+        }
+        if let Event::FocusLost = event {
+            return Ok(());
+        }
+
         if let Event::Mouse(me) = event {
             // codex 使用中のみ有効なマウスキャプチャを、右側の会話領域に限定して扱う。
             self.handle_codex_mouse_batch(me)?;
@@ -5922,6 +5933,39 @@ mod status_message_tests {
         assert!(app.status_deadline.is_some());
         assert!(!app.expire_status_messages());
         assert_eq!(app.error_message.as_deref(), Some("same"));
+    }
+}
+
+#[cfg(test)]
+mod focus_event_tests {
+    //! 画面切り替えから戻った時に黒画面のまま固まらないよう、FocusGained で
+    //! 全クリアを予約することを検証する（handle_event 経由の実際の経路で確認）。
+    use super::*;
+
+    fn app() -> (tokio::runtime::Runtime, App) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = ApiClient::new("t", "http://localhost").unwrap();
+        let app = App::new(client, rt.handle().clone());
+        (rt, app)
+    }
+
+    #[test]
+    fn focus_gained_schedules_full_clear() {
+        let (_rt, mut app) = app();
+        assert!(!app.needs_full_clear);
+
+        app.handle_event(Event::FocusGained).unwrap();
+
+        assert!(app.needs_full_clear);
+    }
+
+    #[test]
+    fn focus_lost_does_not_schedule_full_clear() {
+        let (_rt, mut app) = app();
+
+        app.handle_event(Event::FocusLost).unwrap();
+
+        assert!(!app.needs_full_clear);
     }
 }
 

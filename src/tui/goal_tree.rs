@@ -462,14 +462,16 @@ impl GoalTree {
 
         // Build root nodes for this response. A today's-goals payload can contain
         // a scoped slice whose real parent is outside the response, so treat those
-        // orphans as roots of the visible tree instead of dropping them.
+        // orphans as roots of the visible tree instead of dropping them. But a
+        // completed orphan is just a leaked ancestor row with no real place in
+        // today's view, so drop it rather than promoting it to the top.
         let mut root_ids = children_map.get(&None).cloned().unwrap_or_default();
         for (id, node) in &node_map {
-            if node
+            let is_orphan = node
                 .parent_id
                 .as_ref()
-                .is_some_and(|parent_id| !node_map.contains_key(parent_id))
-            {
+                .is_some_and(|parent_id| !node_map.contains_key(parent_id));
+            if is_orphan && !node.is_completed() {
                 root_ids.push(id.clone());
             }
         }
@@ -1211,13 +1213,22 @@ mod tests {
     }
 
     fn mk_today_node(id: &str, parent_id: Option<&str>, order_no: f64) -> TodaysGoalNode {
+        mk_today_node_with_completion(id, parent_id, order_no, false)
+    }
+
+    fn mk_today_node_with_completion(
+        id: &str,
+        parent_id: Option<&str>,
+        order_no: f64,
+        is_completed: bool,
+    ) -> TodaysGoalNode {
         TodaysGoalNode {
             id: id.to_string(),
             parent_id: parent_id.map(ToString::to_string),
             depth: 0,
             title: format!("Goal {id}"),
             status: "NONE".to_string(),
-            completed_at: None,
+            completed_at: is_completed.then(|| "2026-07-16T00:00:00Z".to_string()),
             order_no,
             is_leaf: false,
             has_recurring: false,
@@ -1338,6 +1349,26 @@ mod tests {
             goal_rows,
             vec![("child".to_string(), 0), ("grandchild".to_string(), 1)]
         );
+    }
+
+    #[test]
+    fn todays_tree_drops_completed_orphan_instead_of_promoting_to_top() {
+        let nodes = vec![
+            mk_today_node_with_completion("done-child", Some("parent-outside-response"), 1.0, true),
+            mk_today_node("active-root", None, 2.0),
+        ];
+
+        let tree = GoalTree::from_todays_goal_nodes(nodes);
+
+        let goal_ids = tree
+            .flatten()
+            .into_iter()
+            .filter_map(|row| match row {
+                TreeRow::Goal { goal_id, .. } => Some(goal_id.to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(goal_ids, vec!["active-root".to_string()]);
     }
 
     #[test]

@@ -4,6 +4,7 @@ mod assignment;
 mod chat;
 mod codex_job;
 mod comment;
+mod consent;
 mod deliverable;
 mod desktop_auth;
 mod diagnosis;

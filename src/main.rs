@@ -11,10 +11,10 @@ use clap::{CommandFactory, Parser, Subcommand};
 use crate::config::{Credentials, DEFAULT_API_URL, Settings};
 use api::ApiClient;
 use cli::commands::{
-    activity, api_key, assignment, chat, codex_job, comment, configure, deliverable, desktop_auth,
-    detect, diagnosis, execution, goal, invitation, invoice, issue, kpi, link, login, media,
-    meeting, member, notification, org, personal, referral, search, sharetree, skill, skills,
-    streak, summary, today, tool, update, user,
+    activity, api_key, assignment, chat, codex_job, comment, configure, consent, deliverable,
+    desktop_auth, detect, diagnosis, execution, goal, invitation, invoice, issue, kpi, link, login,
+    media, meeting, member, notification, org, personal, referral, search, sharetree, skill,
+    skills, streak, summary, today, tool, update, user,
 };
 
 #[derive(Parser)]
@@ -230,6 +230,13 @@ enum Commands {
         #[command(subcommand)]
         command: desktop_auth::DesktopAuthCommands,
     },
+    /// Show your consent status for admin-visibility disclosures (e.g. DM/group
+    /// chat secrecy). Read-only: recording consent requires a browser session
+    /// and cannot be done via the CLI's API key auth.
+    Consent {
+        #[command(subcommand)]
+        command: consent::ConsentCommands,
+    },
     /// Detect goal ID from current git branch name
     DetectGoal {
         /// Output as JSON
@@ -280,6 +287,7 @@ fn command_outputs_json(command: &Commands) -> bool {
         Commands::CodexJob { command } => codex_job_outputs_json(command),
         Commands::ApiKey { command } => api_key_outputs_json(command),
         Commands::DesktopAuth { command } => desktop_auth_outputs_json(command),
+        Commands::Consent { command } => consent_outputs_json(command),
         Commands::Org { command } => org_outputs_json(command),
         Commands::Goal { command } => goal_outputs_json(command),
         Commands::Comment { command } => comment_outputs_json(command),
@@ -572,6 +580,12 @@ fn desktop_auth_outputs_json(command: &desktop_auth::DesktopAuthCommands) -> boo
     match command {
         desktop_auth::DesktopAuthCommands::Redeem { json, .. }
         | desktop_auth::DesktopAuthCommands::Complete { json, .. } => *json,
+    }
+}
+
+fn consent_outputs_json(command: &consent::ConsentCommands) -> bool {
+    match command {
+        consent::ConsentCommands::Get { json, .. } => *json,
     }
 }
 
@@ -1114,6 +1128,10 @@ async fn main() -> Result<()> {
         Some(Commands::DesktopAuth { command }) => {
             let client = build_client()?;
             desktop_auth::handle_desktop_auth(command, &client).await
+        }
+        Some(Commands::Consent { command }) => {
+            let client = build_client()?;
+            consent::handle_consent(command, &client).await
         }
         Some(Commands::DetectGoal { json }) => detect::handle_detect_goal(*json),
         Some(Commands::Update { check }) => update::handle_update(*check).await,

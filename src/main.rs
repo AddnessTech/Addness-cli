@@ -1082,11 +1082,11 @@ fn build_client_for_org_commands() -> Result<ApiClient> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let update_handle = cli
-        .should_check_for_update()
-        .then(|| tokio::spawn(update_check::check_for_update()));
+    if cli.should_check_for_update() {
+        update_check::auto_update_before_launch().await;
+    }
 
-    let result = match &cli.command {
+    match &cli.command {
         None => {
             let client = build_client()?;
             tui::run(client)
@@ -1264,13 +1264,7 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
-    };
-
-    if let Some(handle) = update_handle {
-        let _ = handle.await;
     }
-
-    result
 }
 
 #[cfg(test)]

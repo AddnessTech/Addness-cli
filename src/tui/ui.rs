@@ -829,9 +829,9 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
             )
         } else {
             let fkeys = if kind == AgentKind::ClaudeCode {
-                "F2-F4:設定  |  F6:差分"
+                "F2-F4:設定  |  F6:差分  |  F8:bypass"
             } else {
-                "F2-F6:設定/差分"
+                "F2-F6:設定/差分  |  F8:bypass"
             };
             format!(
                 " 入力してEnterで{name}へ送信  |  Ctrl-T:表示切替  |  F7:turn一覧  |  {fkeys}  |  ?/Ctrl+Q:操作一覧 "
@@ -1034,6 +1034,7 @@ fn draw_help_overlay(frame: &mut Frame, app: &mut App) {
         kv("F2 / F3", "モデル / 推論強度を切替"),
         kv("F4 / F5", "承認モード / sandboxを切替"),
         kv("F6", "作業ツリーのdiffビューを表示 / 戻る"),
+        kv("F8", "権限スキップ切替（危険）: codex/Claude Code共通"),
         kv("F9", "Addnessの作業メモ・決定ログから再開"),
         kv(
             "Trackpad/ホイール",
@@ -1120,6 +1121,7 @@ fn draw_codex_help_overlay(frame: &mut Frame, app: &mut App) {
     lines.extend([
         kv("F6", "ファイル編集diffビューを表示 / ログへ戻る"),
         kv("F7", "turn一覧パネルを開く"),
+        kv("F8", "権限スキップ切替（危険）: /bypass と同じ"),
         kv("F9", "Addnessの作業メモ・決定ログから再開"),
         kv("F12", &format!("{name}ペインを終了して戻る")),
         blank(),
@@ -2854,9 +2856,9 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
             (format!(" {name} 履歴表示 — Esc: 最新へ戻る "), COLOR_PANEL)
         } else {
             let fkeys = if pane.kind() == AgentKind::ClaudeCode {
-                "F2-F4:設定  F6:差分"
+                "F2-F4:設定  F6:差分  F8:bypass"
             } else {
-                "F2-F6:設定/差分"
+                "F2-F6:設定/差分  F8:bypass"
             };
             (
                 format!(

@@ -2720,6 +2720,10 @@ impl App {
                         pane.open_turn_picker();
                         return;
                     }
+                    KeyCode::F(8) => {
+                        pane.toggle_bypass();
+                        return;
+                    }
                     _ => {}
                 }
             }
@@ -5733,6 +5737,37 @@ mod codex_turn_key_tests {
         assert!(pane.turn_picker_open());
         assert_eq!(pane.collapsed_turn_count(), 1);
         assert!(!pane.turn_picker_items()[0].collapsed);
+    }
+
+    #[test]
+    fn f8_toggles_bypass_without_starting_turn() {
+        let (_rt, mut app) = app_with_codex_live_input();
+
+        assert!(
+            !app.codex
+                .as_ref()
+                .unwrap()
+                .settings_label()
+                .contains("bypass-all")
+        );
+
+        app.handle_codex_key(key(KeyCode::F(8)));
+        assert!(
+            app.codex
+                .as_ref()
+                .unwrap()
+                .settings_label()
+                .contains("bypass-all")
+        );
+
+        app.handle_codex_key(key(KeyCode::F(8)));
+        assert!(
+            !app.codex
+                .as_ref()
+                .unwrap()
+                .settings_label()
+                .contains("bypass-all")
+        );
     }
 
     #[test]

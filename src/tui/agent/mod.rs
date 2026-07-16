@@ -81,6 +81,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/approval", "承認モードを切替"),
     ("/sandbox", "sandbox を切替 / 指定"),
     ("/permissions", "承認 / sandbox 権限を設定"),
+    ("/bypass", "権限チェックをスキップ（危険）: ON/OFF トグル"),
     ("/personality", "通信スタイルを切替"),
     ("/settings", "モデル・推論・承認・sandbox 設定を表示"),
     ("/lang", "エージェントの応答言語を設定"),
@@ -4005,6 +4006,58 @@ impl CodexPane {
         );
     }
 
+    /// `/bypass` `/permissions bypass` 共通。両バックエンドの「権限チェック全スキップ」を
+    /// 統一入口として ON/OFF トグルする。
+    /// codex: `--dangerously-bypass-approvals-and-sandbox`（`toggle_bypass_approvals_and_sandbox` に委譲）。
+    /// Claude Code: permission-mode を `dangerously-skip-permissions` へ切替、OFF 時は
+    /// `config`（既定）へ戻す。常駐プロセスの再起動が必要な場合は `set_claude_permission_mode`
+    /// 経由の既存処理（`push_claude_resident_permission_mode`）に乗る。
+    /// ON にする瞬間は危険性の警告ログを出す。
+    fn handle_bypass_slash_command(&mut self, args: &str) {
+        if matches!(args.trim().to_ascii_lowercase().as_str(), "status" | "show") {
+            self.push_bypass_status();
+            return;
+        }
+        let turning_on = !self.bypass_enabled();
+        if self.kind == AgentKind::ClaudeCode {
+            let mode = if turning_on {
+                claude::ClaudePermissionMode::DangerouslySkipPermissions
+            } else {
+                claude::ClaudePermissionMode::Config
+            };
+            self.set_claude_permission_mode(mode);
+        } else {
+            self.toggle_bypass_approvals_and_sandbox();
+        }
+        if turning_on {
+            self.push_log(
+                CodexLogKind::Error,
+                "危険: すべての承認・サンドボックスがスキップされます（/bypass で OFF に戻せます）",
+            );
+        }
+    }
+
+    /// 現在の bypass 状態（バックエンドごとに背後の実フィールドを参照）。
+    fn bypass_enabled(&self) -> bool {
+        if self.kind == AgentKind::ClaudeCode {
+            self.claude_settings.permission_mode_choice()
+                == claude::ClaudePermissionMode::DangerouslySkipPermissions
+        } else {
+            self.exec_settings.bypass_approvals_and_sandbox
+        }
+    }
+
+    fn push_bypass_status(&mut self) {
+        let value = on_off(self.bypass_enabled());
+        self.push_log(CodexLogKind::System, format!("bypass: {value}"));
+    }
+
+    /// `F8` のワンタッチ割当。`/bypass` と同じ統一トグル（`handle_bypass_slash_command`）を、
+    /// 引数なし（トグル）で呼び出す公開エントリ（`app.rs` のキーハンドラから使う）。
+    pub fn toggle_bypass(&mut self) {
+        self.handle_bypass_slash_command("");
+    }
+
     fn toggle_bypass_hook_trust(&mut self) {
         self.exec_settings.bypass_hook_trust = !self.exec_settings.bypass_hook_trust;
         let value = on_off(self.exec_settings.bypass_hook_trust);
@@ -7740,7 +7793,7 @@ impl CodexPane {
                 true
             }
             "bypass" | "dangerously-bypass" => {
-                self.toggle_bypass_approvals_and_sandbox();
+                self.handle_bypass_slash_command(args);
                 true
             }
             "bypass-hook-trust" | "dangerously-bypass-hook-trust" | "hook-trust-bypass" => {
@@ -8842,7 +8895,7 @@ impl CodexPane {
                 }
             }
             "bypass" | "dangerously-bypass" => {
-                self.toggle_bypass_approvals_and_sandbox();
+                self.handle_bypass_slash_command("");
             }
             value => {
                 if let Some(choice) = parse_approval_choice(value) {
@@ -10345,6 +10398,7 @@ Claude Code options for next turn:
   /settings, /cd <dir>, /model [name|config], /reasoning|/effort [level]
   /lang|/language [auto|ja|en|off] - エージェントの応答言語（既定 auto は LANG/LC_ALL から判定）
   /permissions|/approval [mode] - permission-mode: config/plan/acceptEdits/dontAsk/bypassPermissions/skip-permissions
+  /bypass [status] - dangerously-skip-permissions を ON/OFF トグル（危険: 全権限チェックをスキップ）
   /add-dir <path|list|clear>
 TUI helpers:
   /goal <目標>, /goal pause, /goal resume, /goal clear
@@ -10402,7 +10456,7 @@ Codex options for next turn:
   /add-dir <path|list|clear>
   /config <key=value|list|clear>, /enable <feature>, /disable <feature>
   /strict-config, /ignore-user-config, /ignore-rules, /skip-git-check, /ephemeral
-  /bypass, /bypass-hook-trust, /output-schema <path|clear>, /output-last-message <path|clear>
+  /bypass [status], /bypass-hook-trust, /output-schema <path|clear>, /output-last-message <path|clear>
 TUI helpers:
   /goal <目標>, /goal pause, /goal resume, /goal clear
   /organize|/team [task] - Addness子ゴールへ分解し、最初の実装単位へ進む
@@ -17703,6 +17757,88 @@ mod tests {
         assert!(label.contains("color:auto"));
         assert!(label.contains("output-schema"));
         assert!(label.contains("output-last-message"));
+    }
+
+    #[test]
+    fn bypass_slash_command_visible_for_both_backends() {
+        assert!(slash_command_visible_for_kind("/bypass", AgentKind::Codex));
+        assert!(slash_command_visible_for_kind(
+            "/bypass",
+            AgentKind::ClaudeCode
+        ));
+    }
+
+    #[test]
+    fn bypass_slash_toggles_codex_dangerously_bypass_flag() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.finished = false;
+
+        submit_line(&mut pane, "/bypass");
+
+        assert_eq!(pane.turn_count(), 0);
+        assert!(pane.exec_settings.bypass_approvals_and_sandbox);
+        assert!(pane.settings_label().contains("bypass-all"));
+        assert!(
+            pane.log
+                .iter()
+                .any(|line| { line.kind == CodexLogKind::Error && line.text.contains("危険") })
+        );
+
+        submit_line(&mut pane, "/bypass");
+        assert!(!pane.exec_settings.bypass_approvals_and_sandbox);
+        assert!(!pane.settings_label().contains("bypass-all"));
+    }
+
+    #[test]
+    fn bypass_slash_toggles_claude_dangerously_skip_permissions() {
+        let mut pane = claude_pane();
+        pane.finished = false;
+
+        submit_line(&mut pane, "/bypass");
+
+        assert_eq!(pane.turn_count(), 0);
+        assert_eq!(
+            pane.claude_settings.permission_mode_choice(),
+            claude::ClaudePermissionMode::DangerouslySkipPermissions
+        );
+        assert!(pane.settings_label().contains("skip-permissions"));
+        assert!(
+            pane.log
+                .iter()
+                .any(|line| { line.kind == CodexLogKind::Error && line.text.contains("危険") })
+        );
+
+        submit_line(&mut pane, "/bypass");
+        assert_eq!(
+            pane.claude_settings.permission_mode_choice(),
+            claude::ClaudePermissionMode::Config
+        );
+        assert!(!pane.settings_label().contains("skip-permissions"));
+    }
+
+    #[test]
+    fn bypass_status_subcommand_reports_without_toggling() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.finished = false;
+
+        submit_line(&mut pane, "/bypass status");
+
+        assert_eq!(pane.turn_count(), 0);
+        assert!(!pane.exec_settings.bypass_approvals_and_sandbox);
+        assert!(pane.log.iter().any(|line| {
+            line.kind == CodexLogKind::System && line.text.contains("bypass: off")
+        }));
+    }
+
+    #[test]
+    fn permissions_bypass_subcommand_still_toggles_codex_flag() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.finished = false;
+
+        submit_line(&mut pane, "/permissions bypass");
+
+        assert_eq!(pane.turn_count(), 0);
+        assert!(pane.exec_settings.bypass_approvals_and_sandbox);
     }
 
     #[test]

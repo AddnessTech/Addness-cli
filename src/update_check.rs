@@ -1,7 +1,9 @@
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::{Duration, SystemTime};
 
+use anyhow::{Result, bail};
 use semver::Version;
 
 pub const CDN_VERSION_URL: &str = "https://cli.addness.com/releases/latest/version.txt";
@@ -69,25 +71,94 @@ pub fn is_update_available(current: &str, latest: &str) -> bool {
     }
 }
 
-pub async fn check_for_update() {
+/// 起動前に更新をチェックし、更新があれば公式インストーラで自動更新した上で
+/// 同じ引数で新しいバイナリに実行を委譲する。
+///
+/// 更新チェック自体は24時間に1回のみ（`should_check`）なので、通常の起動には
+/// ネットワーク待ちを追加しない。更新チェックが必要なタイミングで新版が見つかった
+/// 場合のみ、インストーラ実行 → 再起動という同期フローが走る。インストーラ失敗時は
+/// 警告を出すだけで起動をブロックしない（現在のバイナリでそのまま続行する）。
+pub async fn auto_update_before_launch() {
     if !should_check() {
         return;
     }
-
     touch_check_file();
 
     let current = env!("CARGO_PKG_VERSION");
-
     let Some(latest) = fetch_latest_version().await else {
         return;
     };
     let latest = latest.as_str();
 
-    if is_update_available(current, latest) {
+    if !is_update_available(current, latest) {
+        return;
+    }
+
+    eprintln!();
+    eprintln!("  \x1b[33mUpdating addness: v{current} → v{latest}...\x1b[0m");
+    if let Err(e) = run_installer() {
+        eprintln!("  \x1b[2mAuto-update failed ({e}); continuing with v{current}\x1b[0m");
+        eprintln!("  \x1b[2mYou can retry manually: addness update\x1b[0m");
         eprintln!();
-        eprintln!("  \x1b[33mA new version of addness is available: v{current} → v{latest}\x1b[0m");
-        eprintln!("  \x1b[2mUpdate: addness update\x1b[0m");
-        eprintln!();
+        return;
+    }
+    eprintln!("  \x1b[32mUpdated to v{latest}. Relaunching...\x1b[0m");
+    eprintln!();
+
+    relaunch_with_current_args();
+    // 到達した場合は再起動に失敗しているので、現在のバイナリでそのまま続行する。
+}
+
+/// プラットフォーム別に公式インストーラを実行する。
+/// インストーラがターゲット判定・チェックサム検証・バイナリ置換を担う。
+/// `addness update` コマンドと起動時の自動更新の両方から使う。
+pub(crate) fn run_installer() -> Result<()> {
+    #[cfg(windows)]
+    let status = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "irm https://cli.addness.com/install.ps1 | iex",
+        ])
+        .status();
+
+    #[cfg(not(windows))]
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg("curl -fsSL https://cli.addness.com/install.sh | sh")
+        .status();
+
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => bail!("Installer exited with status {s}"),
+        Err(e) => bail!("Failed to launch the installer: {e}"),
+    }
+}
+
+/// 更新直後、同じコマンドライン引数で新しいバイナリへ実行を引き継ぐ。
+/// Unix ではプロセスイメージを置き換えるため成功時は戻らない。失敗時のみ return する。
+fn relaunch_with_current_args() {
+    let Ok(exe) = std::env::current_exe() else {
+        eprintln!(
+            "  \x1b[2mFailed to relaunch after update: could not resolve current executable\x1b[0m"
+        );
+        return;
+    };
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = Command::new(&exe).args(&args).exec();
+        eprintln!("  \x1b[2mFailed to relaunch after update: {err}\x1b[0m");
+    }
+
+    #[cfg(not(unix))]
+    {
+        match Command::new(&exe).args(&args).status() {
+            Ok(status) => std::process::exit(status.code().unwrap_or(0)),
+            Err(e) => eprintln!("  \x1b[2mFailed to relaunch after update: {e}\x1b[0m"),
+        }
     }
 }
 

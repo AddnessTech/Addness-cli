@@ -1,8 +1,8 @@
-use std::process::Command;
-
 use anyhow::{Result, bail};
 
-use crate::update_check::{CDN_VERSION_URL, fetch_latest_version, is_update_available};
+use crate::update_check::{
+    CDN_VERSION_URL, fetch_latest_version, is_update_available, run_installer,
+};
 
 /// `addness update` — 公式インストーラ経由で最新版へ更新する。
 ///
@@ -37,29 +37,4 @@ pub async fn handle_update(check_only: bool) -> Result<()> {
     run_installer()?;
     println!("Updated to v{latest}. Restart any running `addness` sessions to use it.");
     Ok(())
-}
-
-/// プラットフォーム別に公式インストーラを実行する。
-/// インストーラがターゲット判定・チェックサム検証・バイナリ置換を担う。
-fn run_installer() -> Result<()> {
-    #[cfg(windows)]
-    let status = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "irm https://cli.addness.com/install.ps1 | iex",
-        ])
-        .status();
-
-    #[cfg(not(windows))]
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg("curl -fsSL https://cli.addness.com/install.sh | sh")
-        .status();
-
-    match status {
-        Ok(s) if s.success() => Ok(()),
-        Ok(s) => bail!("Installer exited with status {s}"),
-        Err(e) => bail!("Failed to launch the installer: {e}"),
-    }
 }

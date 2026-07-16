@@ -822,16 +822,16 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
             .map(|c| c.is_turn_running())
             .unwrap_or(false);
         let hint = if finished {
-            " [c]コメント  [s]状態  [d]成果物(PR/Release)  [v]DoD判定  ?/Ctrl+Q:操作一覧  Esc/q:閉じる ".to_string()
+            " [c]コメント  [s]状態  [d]成果物(PR/Release)  [v]DoD判定  F10:Addness  ?/Ctrl+Q:操作一覧  Esc/q:閉じる ".to_string()
         } else if running {
             format!(
-                " {name} 実行中  |  Ctrl-T:表示切替  |  F7:turn一覧  |  入力+Enter:次ターン予約  |  Ctrl-C:中断 "
+                " {name} 実行中  |  Ctrl-T:表示切替  |  F7:turn一覧  |  入力+Enter:次ターン予約  |  F10:Addness  |  Ctrl-C:中断 "
             )
         } else {
             let fkeys = if kind == AgentKind::ClaudeCode {
-                "F2-F4:設定  |  F6:差分  |  F8:bypass"
+                "F2-F4:設定  |  F6:差分  |  F8:bypass  |  F10:Addness"
             } else {
-                "F2-F6:設定/差分  |  F8:bypass"
+                "F2-F6:設定/差分  |  F8:bypass  |  F10:Addness"
             };
             format!(
                 " 入力してEnterで{name}へ送信  |  Ctrl-T:表示切替  |  F7:turn一覧  |  {fkeys}  |  ?/Ctrl+Q:操作一覧 "
@@ -1123,6 +1123,10 @@ fn draw_codex_help_overlay(frame: &mut Frame, app: &mut App) {
         kv("F7", "turn一覧パネルを開く"),
         kv("F8", "権限スキップ切替（危険）: /bypass と同じ"),
         kv("F9", "Addnessの作業メモ・決定ログから再開"),
+        kv(
+            "F10",
+            "左のAddnessペイン（ゴールツリー/状態）を開閉（会話ペインが全幅に）",
+        ),
         kv("F12", &format!("{name}ペインを終了して戻る")),
         blank(),
         section("履歴 / 検索"),
@@ -2583,12 +2587,34 @@ fn draw_members(frame: &mut Frame, area: Rect, app: &mut App, border_color: Colo
 /// 左に対象ゴール／DoD（契約）、右に Codex の会話履歴を描画する。
 fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
     // 左の Addness ペインは固定幅で広めに取り、進行が読み取りやすいようにする。
-    let addness_w = (area.width / 3).clamp(28, 52);
+    // F10 で折りたたんでいる間は幅 0 にして、会話ペインを全幅で使う。
+    let collapsed = app.codex_left_panel_collapsed;
+    let addness_w = if collapsed {
+        0
+    } else {
+        (area.width / 3).clamp(28, 52)
+    };
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(addness_w), Constraint::Min(0)])
         .split(area);
 
+    if collapsed {
+        // 描画しないので、マウスでのスクロール判定対象からも外す。
+        app.codex_status_area = None;
+        app.codex_contract_area = None;
+        app.codex_activity_area = None;
+    } else {
+        draw_codex_addness_pane(frame, chunks[0], app);
+    }
+
+    // --- codex 会話ペイン ---
+    draw_codex_terminal_pane(frame, chunks[1], app);
+}
+
+/// 左の Addness ペイン（参照中 + ゴール状態 + DoD + 子ゴール + 更新ログ）を描く。
+/// F10 で折りたたまれている間はこの関数自体が呼ばれない。
+fn draw_codex_addness_pane(frame: &mut Frame, area: Rect, app: &mut App) {
     // 同期の鼓動（スピナー＋最終同期からの経過秒）。可変借用前に App から読む。
     let sync_label = {
         const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -2599,7 +2625,6 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
         }
     };
 
-    // --- Addness ペイン（参照中 + ゴール状態 + DoD + 子ゴール + 更新ログ）---
     // 上段=ゴール/DoD/子ゴール、下段=Addnessの更新ログ。不変借用のまま描いて clone を避ける。
     if let Some(pane) = app.codex.as_ref() {
         let now = Instant::now();
@@ -2607,9 +2632,9 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
             at.is_some_and(|t| now.duration_since(t) < std::time::Duration::from_secs(4))
         };
 
-        let status_panel_h = if chunks[0].height >= 30 {
+        let status_panel_h = if area.height >= 30 {
             12
-        } else if chunks[0].height >= 22 {
+        } else if area.height >= 22 {
             10
         } else {
             8
@@ -2621,7 +2646,7 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
                 Constraint::Min(0),
                 Constraint::Length(8),
             ])
-            .split(chunks[0]);
+            .split(area);
         app.codex_status_area = Some(panes[0]);
         app.codex_contract_area = Some(panes[1]);
         app.codex_activity_area = Some(panes[2]);
@@ -2820,9 +2845,12 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
         );
         frame.render_widget(log, panes[2]);
     }
+}
 
-    // --- codex 会話ペイン ---
-    let term_area = chunks[1];
+/// codex/claude の会話ペイン（右側）を描く。左の Addness ペインが F10 で
+/// 折りたたまれている間はここが全幅になる。
+fn draw_codex_terminal_pane(frame: &mut Frame, area: Rect, app: &mut App) {
+    let term_area = area;
     app.codex_terminal_area = Some(term_area);
     let rows = term_area.height.saturating_sub(2);
     let cols = term_area.width.saturating_sub(2);
@@ -2856,9 +2884,9 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
             (format!(" {name} 履歴表示 — Esc: 最新へ戻る "), COLOR_PANEL)
         } else {
             let fkeys = if pane.kind() == AgentKind::ClaudeCode {
-                "F2-F4:設定  F6:差分  F8:bypass"
+                "F2-F4:設定  F6:差分  F8:bypass  F10:Addness"
             } else {
-                "F2-F6:設定/差分  F8:bypass"
+                "F2-F6:設定/差分  F8:bypass  F10:Addness"
             };
             (
                 format!(
@@ -2866,6 +2894,13 @@ fn draw_codex(frame: &mut Frame, area: Rect, app: &mut App) {
                 ),
                 COLOR_PANEL,
             )
+        };
+        // Addness ペインが折りたたまれている間は、タイトルの先頭に小さく印を出して
+        // 「隠れているだけで消えたわけではない」ことが分かるようにする。
+        let title = if app.codex_left_panel_collapsed {
+            format!("◀{title}")
+        } else {
+            title
         };
         let block = Block::default()
             .borders(Borders::ALL)
@@ -5503,8 +5538,8 @@ mod tests {
         codex_diff_lines, codex_header_line, codex_header_lines, codex_input_prompt_render,
         codex_log_entry_lines, codex_log_lines, codex_markdown_styles,
         codex_recent_action_visible_count, codex_runtime_status, codex_subagent_visible_count,
-        codex_visible_log_lines, codex_work_label, draw_status_bar, ellipsize_width, markdown,
-        prompt_preview, run_spinner_glyph, summarize_tool_display_text,
+        codex_visible_log_lines, codex_work_label, draw, draw_status_bar, ellipsize_width,
+        markdown, prompt_preview, run_spinner_glyph, summarize_tool_display_text,
     };
     use crate::api::ApiClient;
     use crate::tui::agent::{
@@ -6436,6 +6471,41 @@ mod tests {
         assert!(
             text.contains("Ctrl+Q"),
             "codex status should expose the help shortcut:\n{text}"
+        );
+    }
+
+    #[test]
+    fn codex_left_panel_collapse_gives_full_width_to_terminal_pane() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = ApiClient::new("t", "http://localhost").unwrap();
+        let mut app = App::new(client, rt.handle().clone());
+        app.active_pane = ActivePane::Codex;
+        app.codex = Some(CodexPane::test_with_output(10, 80, 0, ""));
+
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+
+        term.draw(|frame| draw(frame, &mut app)).unwrap();
+        let expanded_width = app.codex_terminal_area.unwrap().width;
+        assert!(
+            app.codex_status_area.is_some(),
+            "Addness status pane should be tracked while expanded"
+        );
+
+        app.codex_left_panel_collapsed = true;
+        term.draw(|frame| draw(frame, &mut app)).unwrap();
+        let collapsed_width = app.codex_terminal_area.unwrap().width;
+
+        assert!(
+            collapsed_width > expanded_width,
+            "collapsed={collapsed_width} expanded={expanded_width}"
+        );
+        assert_eq!(
+            collapsed_width, 100,
+            "collapsed terminal pane should take the full width"
+        );
+        assert!(
+            app.codex_status_area.is_none(),
+            "Addness status pane should not be tracked (or scroll-hit-tested) while collapsed"
         );
     }
 

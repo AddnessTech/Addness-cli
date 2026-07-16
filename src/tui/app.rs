@@ -959,6 +959,9 @@ pub struct App {
     pub(super) codex_status_area: Option<Rect>,
     pub(super) codex_contract_area: Option<Rect>,
     pub(super) codex_activity_area: Option<Rect>,
+    /// 左の Addness ペイン（ゴールツリー/状態パネル）を折りたたんでいるか。
+    /// セッション内のみ保持（設定ファイルへの永続化はしない）。F10 でトグルする。
+    pub(super) codex_left_panel_collapsed: bool,
     pub(super) codex_status_scroll: usize,
     pub(super) codex_contract_scroll: usize,
     pub(super) codex_activity_scroll: usize,
@@ -1033,6 +1036,7 @@ impl App {
             codex_status_area: None,
             codex_contract_area: None,
             codex_activity_area: None,
+            codex_left_panel_collapsed: false,
             codex_status_scroll: 0,
             codex_contract_scroll: 0,
             codex_activity_scroll: 0,
@@ -2583,6 +2587,12 @@ impl App {
         if self.codex_help_key_eligible(key) {
             self.show_help = true;
             self.help_scroll = 0;
+            return;
+        }
+        // 左の Addness ペイン（ゴールツリー/状態パネル）の開閉。検索入力中やピッカー表示中
+        // でも常に効くよう、他のキー処理より先に横取りする（F10はどのモードでも未使用）。
+        if key.modifiers.is_empty() && key.code == KeyCode::F(10) {
+            self.codex_left_panel_collapsed = !self.codex_left_panel_collapsed;
             return;
         }
         if let Some(pane) = self.codex.as_mut() {
@@ -5768,6 +5778,33 @@ mod codex_turn_key_tests {
                 .settings_label()
                 .contains("bypass-all")
         );
+    }
+
+    #[test]
+    fn f10_toggles_left_panel_collapsed_state() {
+        let (_rt, mut app) = app_with_codex_live_input();
+
+        assert!(!app.codex_left_panel_collapsed);
+
+        app.handle_codex_key(key(KeyCode::F(10)));
+        assert!(app.codex_left_panel_collapsed);
+
+        app.handle_codex_key(key(KeyCode::F(10)));
+        assert!(!app.codex_left_panel_collapsed);
+    }
+
+    #[test]
+    fn f10_toggles_left_panel_even_during_search_editing() {
+        // 検索入力中は他のキーがほぼ入力欄に吸われるが、F10 は例外的に常に効く必要がある。
+        let (_rt, mut app) = app_with_codex_live_input();
+        app.codex.as_mut().unwrap().begin_search();
+        assert!(app.codex.as_ref().unwrap().is_search_editing());
+
+        app.handle_codex_key(key(KeyCode::F(10)));
+
+        assert!(app.codex_left_panel_collapsed);
+        // 検索編集状態自体は F10 で崩れない。
+        assert!(app.codex.as_ref().unwrap().is_search_editing());
     }
 
     #[test]

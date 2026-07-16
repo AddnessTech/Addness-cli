@@ -13,8 +13,9 @@ use api::ApiClient;
 use cli::commands::{
     activity, api_key, assignment, chat, codex_job, comment, configure, consent, core_values,
     deliverable, desktop_auth, detect, diagnosis, execution, goal, goal_chat, invitation, invoice,
-    issue, kpi, link, login, media, meeting, member, notification, org, personal, referral, search,
-    sharetree, skill, skills, streak, summary, today, todo_chat, tool, update, user,
+    issue, kpi, link, login, master_plan, media, meeting, member, notification, org, personal,
+    referral, search, sharetree, skill, skills, streak, summary, today, todo_chat, tool, update,
+    user,
 };
 
 #[derive(Parser)]
@@ -79,6 +80,13 @@ enum Commands {
     CoreValues {
         #[command(subcommand)]
         command: core_values::CoreValuesCommands,
+    },
+    /// AI agent chat for the master-plan mode (not scoped to a single goal):
+    /// send a message and stream the reply (SSE), fire the silent "opening"
+    /// turn, and browse threads/messages
+    MasterPlan {
+        #[command(subcommand)]
+        command: master_plan::MasterPlanCommands,
     },
     /// Manage comments on goals
     Comment {
@@ -314,6 +322,7 @@ fn command_outputs_json(command: &Commands) -> bool {
         Commands::GoalChat { command } => goal_chat_outputs_json(command),
         Commands::TodoChat { command } => todo_chat_outputs_json(command),
         Commands::CoreValues { command } => core_values_outputs_json(command),
+        Commands::MasterPlan { command } => master_plan_outputs_json(command),
         Commands::Comment { command } => comment_outputs_json(command),
         Commands::Issue { command } => issue_outputs_json(command),
         Commands::Chat { command } => chat_outputs_json(command),
@@ -395,7 +404,8 @@ fn goal_outputs_json(command: &goal::GoalCommands) -> bool {
         | goal::GoalCommands::Unarchive { json, .. }
         | goal::GoalCommands::Restore { json, .. }
         | goal::GoalCommands::Duplicate { json, .. }
-        | goal::GoalCommands::Move { json, .. } => *json,
+        | goal::GoalCommands::Move { json, .. }
+        | goal::GoalCommands::Decompose { json, .. } => *json,
         goal::GoalCommands::Share { command } => match command {
             goal::ShareCommands::Create { json, .. }
             | goal::ShareCommands::GetPublic { json, .. } => *json,
@@ -616,6 +626,15 @@ fn core_values_outputs_json(command: &core_values::CoreValuesCommands) -> bool {
         | core_values::CoreValuesCommands::Start { json, .. }
         | core_values::CoreValuesCommands::Threads { json, .. }
         | core_values::CoreValuesCommands::Messages { json, .. } => *json,
+    }
+}
+
+fn master_plan_outputs_json(command: &master_plan::MasterPlanCommands) -> bool {
+    match command {
+        master_plan::MasterPlanCommands::Send { json, .. }
+        | master_plan::MasterPlanCommands::Start { json, .. }
+        | master_plan::MasterPlanCommands::Threads { json, .. }
+        | master_plan::MasterPlanCommands::Messages { json, .. } => *json,
     }
 }
 
@@ -1069,6 +1088,10 @@ async fn main() -> Result<()> {
         Some(Commands::CoreValues { command }) => {
             let client = build_client()?;
             core_values::handle_core_values(command, &client).await
+        }
+        Some(Commands::MasterPlan { command }) => {
+            let client = build_client()?;
+            master_plan::handle_master_plan(command, &client).await
         }
         Some(Commands::Comment { command }) => {
             let client = build_client()?;

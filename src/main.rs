@@ -11,10 +11,10 @@ use clap::{CommandFactory, Parser, Subcommand};
 use crate::config::{Credentials, DEFAULT_API_URL, Settings};
 use api::ApiClient;
 use cli::commands::{
-    activity, api_key, assignment, chat, codex_job, comment, configure, consent, deliverable,
-    desktop_auth, detect, diagnosis, execution, goal, goal_chat, invitation, invoice, issue, kpi,
-    link, login, media, meeting, member, notification, org, personal, referral, search, sharetree,
-    skill, skills, streak, summary, today, todo_chat, tool, update, user,
+    activity, api_key, assignment, chat, codex_job, comment, configure, consent, core_values,
+    deliverable, desktop_auth, detect, diagnosis, execution, goal, goal_chat, invitation, invoice,
+    issue, kpi, link, login, media, meeting, member, notification, org, personal, referral, search,
+    sharetree, skill, skills, streak, summary, today, todo_chat, tool, update, user,
 };
 
 #[derive(Parser)]
@@ -71,6 +71,14 @@ enum Commands {
     TodoChat {
         #[command(subcommand)]
         command: todo_chat::TodoChatCommands,
+    },
+    /// AI agent chat for the core-values diagnosis mode (tool-less
+    /// hearing-style dialogue, not scoped to a single goal): send a message
+    /// and stream the reply (SSE), fire the silent "opening" turn, and
+    /// browse threads/messages
+    CoreValues {
+        #[command(subcommand)]
+        command: core_values::CoreValuesCommands,
     },
     /// Manage comments on goals
     Comment {
@@ -305,6 +313,7 @@ fn command_outputs_json(command: &Commands) -> bool {
         Commands::Goal { command } => goal_outputs_json(command),
         Commands::GoalChat { command } => goal_chat_outputs_json(command),
         Commands::TodoChat { command } => todo_chat_outputs_json(command),
+        Commands::CoreValues { command } => core_values_outputs_json(command),
         Commands::Comment { command } => comment_outputs_json(command),
         Commands::Issue { command } => issue_outputs_json(command),
         Commands::Chat { command } => chat_outputs_json(command),
@@ -598,6 +607,15 @@ fn todo_chat_outputs_json(command: &todo_chat::TodoChatCommands) -> bool {
         | todo_chat::TodoChatCommands::Start { json, .. }
         | todo_chat::TodoChatCommands::Threads { json, .. }
         | todo_chat::TodoChatCommands::Messages { json, .. } => *json,
+    }
+}
+
+fn core_values_outputs_json(command: &core_values::CoreValuesCommands) -> bool {
+    match command {
+        core_values::CoreValuesCommands::Send { json, .. }
+        | core_values::CoreValuesCommands::Start { json, .. }
+        | core_values::CoreValuesCommands::Threads { json, .. }
+        | core_values::CoreValuesCommands::Messages { json, .. } => *json,
     }
 }
 
@@ -1047,6 +1065,10 @@ async fn main() -> Result<()> {
         Some(Commands::TodoChat { command }) => {
             let client = build_client()?;
             todo_chat::handle_todo_chat(command, &client).await
+        }
+        Some(Commands::CoreValues { command }) => {
+            let client = build_client()?;
+            core_values::handle_core_values(command, &client).await
         }
         Some(Commands::Comment { command }) => {
             let client = build_client()?;

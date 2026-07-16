@@ -5,6 +5,7 @@ mod chat;
 mod codex_job;
 mod comment;
 mod consent;
+mod core_values;
 mod deliverable;
 mod desktop_auth;
 mod diagnosis;

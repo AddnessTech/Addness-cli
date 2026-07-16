@@ -212,7 +212,22 @@ impl ApiClient {
             }
             // 403 Forbidden
             StatusCode::FORBIDDEN => {
-                if body.contains("ORG_NOT_MEMBER") || body.contains("AUTH_ORG_NOT_MEMBER") {
+                if body.contains("AUTH_API_KEY_SCOPE_FORBIDDEN") {
+                    Some(
+                        "このエンドポイントは現在のAPI Keyのスコープでは呼び出せません。\n\
+                         （例: `addness login` で発行されるキーは organization スコープのため、\n\
+                         personal スコープ必須のエンドポイントには使えません。\n\
+                         `addness api-key create` で作成したキーを `addness configure` で設定してください。）"
+                            .to_string(),
+                    )
+                } else if body.contains("AUTH_CLERK_ONLY") {
+                    Some(
+                        "このエンドポイントはブラウザ（Clerk）認証専用です。\n\
+                         API Keyによる代理実行は禁止されているため、CLIからは呼び出せません。\n\
+                         Webアプリから操作してください。"
+                            .to_string(),
+                    )
+                } else if body.contains("ORG_NOT_MEMBER") || body.contains("AUTH_ORG_NOT_MEMBER") {
                     Some(
                         "指定された組織に所属していません。\n\
                          Run `addness org list` で所属組織を確認し、\n\
@@ -594,6 +609,26 @@ mod tests {
 
         assert!(message.contains("API error (401 Unauthorized): AUTH_INVALID_API_KEY"));
         assert!(message.contains("Run: addness login"));
+    }
+
+    #[test]
+    fn api_error_hints_api_key_scope_forbidden() {
+        let err = ApiClient::api_error(
+            StatusCode::FORBIDDEN,
+            r#"{"code":"AUTH_API_KEY_SCOPE_FORBIDDEN"}"#,
+        );
+        let message = err.to_string();
+
+        assert!(message.contains("スコープでは呼び出せません"));
+        assert!(message.contains("addness api-key create"));
+    }
+
+    #[test]
+    fn api_error_hints_clerk_only_endpoints() {
+        let err = ApiClient::api_error(StatusCode::FORBIDDEN, r#"{"code":"AUTH_CLERK_ONLY"}"#);
+        let message = err.to_string();
+
+        assert!(message.contains("ブラウザ（Clerk）認証専用"));
     }
 
     #[test]

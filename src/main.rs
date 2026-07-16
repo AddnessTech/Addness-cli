@@ -13,8 +13,8 @@ use api::ApiClient;
 use cli::commands::{
     activity, api_key, assignment, chat, codex_job, comment, configure, consent, deliverable,
     desktop_auth, detect, diagnosis, execution, goal, goal_chat, invitation, invoice, issue, kpi,
-    link, login, media, meeting, member, notification, org, personal, referral, search,
-    sharetree, skill, skills, streak, summary, today, tool, update, user,
+    link, login, media, meeting, member, notification, org, personal, referral, search, sharetree,
+    skill, skills, streak, summary, today, tool, update, user,
 };
 
 #[derive(Parser)]

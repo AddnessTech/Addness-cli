@@ -35,7 +35,7 @@ const COLOR_PANEL: Color = Color::Rgb(76, 84, 96);
 const COLOR_INPUT_BG: Color = Color::Rgb(27, 30, 36);
 /// @メンションのファイル候補パレットで一度に表示する最大行数。
 const MENTION_PALETTE_VISIBLE_ROWS: usize = 10;
-const CODEX_EDIT_DIFF_PREVIEW_LINES: usize = 8;
+const CODEX_EDIT_DIFF_PREVIEW_LINES: usize = 16;
 
 /// Replace @uuid mentions in text with @member_name
 fn replace_member_mentions(text: &str, members: &HashMap<MemberId, Member>) -> String {
@@ -829,9 +829,9 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
             )
         } else {
             let fkeys = if kind == AgentKind::ClaudeCode {
-                "F2-F4:設定  |  F6:差分  |  F8:bypass  |  F10:Addness"
+                "F2:model  |  F3:effort  |  F4:permission  |  F6:差分  |  F8:bypass  |  F10:Addness"
             } else {
-                "F2-F6:設定/差分  |  F8:bypass  |  F10:Addness"
+                "F2:model  |  F3:effort  |  F4:approval  |  F5:sandbox  |  F6:差分  |  F8:bypass  |  F10:Addness"
             };
             format!(
                 " 入力してEnterで{name}へ送信  |  Ctrl-T:表示切替  |  F7:turn一覧  |  {fkeys}  |  ?/Ctrl+Q:操作一覧 "
@@ -2884,9 +2884,9 @@ fn draw_codex_terminal_pane(frame: &mut Frame, area: Rect, app: &mut App) {
             (format!(" {name} 履歴表示 — Esc: 最新へ戻る "), COLOR_PANEL)
         } else {
             let fkeys = if pane.kind() == AgentKind::ClaudeCode {
-                "F2-F4:設定  F6:差分  F8:bypass  F10:Addness"
+                "F2:model F3:effort F4:permission F6:差分 F8:bypass F10:Addness"
             } else {
-                "F2-F6:設定/差分  F8:bypass  F10:Addness"
+                "F2:model F3:effort F4:approval F5:sandbox F6:差分 F8:bypass F10:Addness"
             };
             (
                 format!(
@@ -4297,12 +4297,164 @@ fn codex_log_content_spans(
     if kind == CodexLogKind::Tool
         && let Some(rest) = part.strip_prefix("• ")
     {
+        if let Some((label, command)) = tool_command_label(rest) {
+            let mut spans = vec![Span::styled("•", marker_style)];
+            spans.push(Span::styled(format!(" {label}: "), text_style));
+            spans.extend(command_syntax_spans(command, text_style));
+            return spans;
+        }
         return vec![
             Span::styled("•", marker_style),
             Span::styled(format!(" {rest}"), text_style),
         ];
     }
     vec![Span::styled(part, text_style)]
+}
+
+fn tool_command_label(rest: &str) -> Option<(&str, &str)> {
+    for label in ["実行中", "実行"] {
+        let Some(command) = rest.strip_prefix(label) else {
+            continue;
+        };
+        let Some(command) = command.strip_prefix(':') else {
+            continue;
+        };
+        return Some((label, command.trim_start()));
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandSegmentKind {
+    Word,
+    Whitespace,
+    Operator,
+}
+
+fn command_syntax_spans(command: &str, fallback: Style) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut command_seen = false;
+    let mut word_index = 0usize;
+    for (segment, kind) in shell_command_segments(command) {
+        let style = match kind {
+            CommandSegmentKind::Whitespace => fallback,
+            CommandSegmentKind::Operator => Style::default().fg(COLOR_MUTED),
+            CommandSegmentKind::Word => {
+                let style = command_word_style(&segment, word_index, &mut command_seen, fallback);
+                word_index += 1;
+                style
+            }
+        };
+        spans.push(Span::styled(segment, style));
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled(command.to_string(), fallback));
+    }
+    spans
+}
+
+fn command_word_style(
+    token: &str,
+    word_index: usize,
+    command_seen: &mut bool,
+    fallback: Style,
+) -> Style {
+    let bare = token.trim_matches(|ch| ch == '"' || ch == '\'');
+    if word_index == 0 && is_tool_wrapper_word(bare) {
+        return Style::default().fg(COLOR_MUTED);
+    }
+    if is_env_assignment(bare) || bare.starts_with('$') || bare.contains("$") {
+        return Style::default().fg(COLOR_ADDNESS);
+    }
+    if bare.starts_with('-') {
+        return Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD);
+    }
+    if !*command_seen {
+        *command_seen = true;
+        return Style::default()
+            .fg(COLOR_CODEX)
+            .add_modifier(Modifier::BOLD);
+    }
+    if looks_like_path_token(bare) {
+        return Style::default().fg(COLOR_ADDNESS);
+    }
+    if token.starts_with('"') || token.starts_with('\'') {
+        return Style::default().fg(COLOR_SUCCESS);
+    }
+    Style::default()
+        .fg(fallback.fg.unwrap_or(COLOR_TEXT_STRONG))
+        .add_modifier(Modifier::BOLD)
+}
+
+fn is_tool_wrapper_word(token: &str) -> bool {
+    matches!(token, "Bash" | "Shell" | "Terminal" | "Run" | "Exec")
+}
+
+fn is_env_assignment(token: &str) -> bool {
+    let Some((name, value)) = token.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && !value.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        && name
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+}
+
+fn looks_like_path_token(token: &str) -> bool {
+    token.starts_with("./")
+        || token.starts_with("../")
+        || token.starts_with("~/")
+        || token.starts_with('/')
+        || token.contains('/')
+}
+
+fn shell_command_segments(command: &str) -> Vec<(String, CommandSegmentKind)> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut current_kind: Option<CommandSegmentKind> = None;
+    let mut quote: Option<char> = None;
+    let mut chars = command.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if let Some(active_quote) = quote {
+            current.push(ch);
+            if ch == '\\' && active_quote == '"' {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            } else if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+
+        let kind = if ch.is_whitespace() {
+            CommandSegmentKind::Whitespace
+        } else if matches!(ch, '|' | '&' | ';' | '<' | '>') {
+            CommandSegmentKind::Operator
+        } else {
+            CommandSegmentKind::Word
+        };
+
+        if current_kind.is_some_and(|existing| existing != kind) {
+            segments.push((std::mem::take(&mut current), current_kind.unwrap()));
+        }
+        current_kind = Some(kind);
+        current.push(ch);
+        if kind == CommandSegmentKind::Word && matches!(ch, '"' | '\'') {
+            quote = Some(ch);
+        }
+    }
+
+    if let Some(kind) = current_kind {
+        segments.push((current, kind));
+    }
+    segments
 }
 
 fn codex_edit_diff_style(part: &str, fallback: Style) -> Style {
@@ -4321,6 +4473,8 @@ fn codex_edit_diff_style(part: &str, fallback: Style) -> Style {
         || trimmed.starts_with("追加:")
         || trimmed.starts_with("削除:")
         || trimmed.starts_with("移動:")
+        || trimmed.starts_with("変更 ")
+        || trimmed.starts_with("▸ ")
         || trimmed.starts_with("update:")
         || trimmed.starts_with("add:")
         || trimmed.starts_with("delete:")
@@ -4657,12 +4811,18 @@ struct CodeEditChange {
     path: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodeEditSection {
+    change: CodeEditChange,
+    diff_lines: Vec<String>,
+}
+
 fn code_edit_display_text(text: &str) -> Option<String> {
     if !looks_like_code_edit_display_text(text) {
         return None;
     }
-    let changes = code_edit_changes(text);
-    if changes.is_empty() {
+    let sections = code_edit_sections(text);
+    if sections.is_empty() {
         let first_line = text.lines().next().unwrap_or("コード編集").trim();
         let title = first_line.strip_prefix("EDIT ").unwrap_or(first_line);
         let title = if title.is_empty() || title.contains("*** Begin Patch") {
@@ -4673,22 +4833,12 @@ fn code_edit_display_text(text: &str) -> Option<String> {
         return Some(format!("{title}\n  コード編集"));
     }
 
-    let first = changes.first()?;
-    let title = if changes.len() == 1 {
-        format!("{}: {}", first.action, first.path)
+    let title = if sections.len() == 1 {
+        "変更 1 file".to_string()
     } else {
-        format!("{}件のファイル変更", changes.len())
+        format!("変更 {} files", sections.len())
     };
     let mut lines = vec![title];
-    if changes.len() > 1 {
-        for change in changes.iter().take(3) {
-            lines.push(format!("  {}: {}", change.action, change.path));
-        }
-        let omitted = changes.len().saturating_sub(3);
-        if omitted > 0 {
-            lines.push(format!("  ... 他{omitted}件"));
-        }
-    }
     lines.extend(code_edit_diff_preview(text, CODEX_EDIT_DIFF_PREVIEW_LINES));
     Some(lines.join("\n"))
 }
@@ -4704,7 +4854,16 @@ fn looks_like_code_edit_display_text(text: &str) -> bool {
 }
 
 fn code_edit_changes(text: &str) -> Vec<CodeEditChange> {
+    code_edit_sections(text)
+        .into_iter()
+        .map(|section| section.change)
+        .collect()
+}
+
+fn code_edit_sections(text: &str) -> Vec<CodeEditSection> {
     let mut changes = Vec::new();
+    let mut current: Option<CodeEditSection> = None;
+
     for line in text.lines() {
         let trimmed = line.trim();
         let change = [
@@ -4721,42 +4880,117 @@ fn code_edit_changes(text: &str) -> Vec<CodeEditChange> {
             })
         });
 
-        if let Some(change) = change
-            && !changes
-                .iter()
-                .any(|existing: &CodeEditChange| existing == &change)
+        if let Some(change) = change {
+            if let Some(section) = current.take() {
+                changes.push(section);
+            }
+            current = Some(CodeEditSection {
+                change,
+                diff_lines: Vec::new(),
+            });
+            continue;
+        }
+
+        let Some(section) = current.as_mut() else {
+            continue;
+        };
+        let trimmed = line.trim_end();
+        if trimmed.starts_with("***") || !is_code_edit_diff_line(trimmed) {
+            continue;
+        }
+        section.diff_lines.push(trimmed.to_string());
+    }
+
+    if let Some(section) = current {
+        changes.push(section);
+    }
+
+    let mut unique: Vec<CodeEditSection> = Vec::new();
+    for section in changes {
+        if let Some(existing) = unique
+            .iter()
+            .position(|existing| existing.change == section.change)
         {
-            changes.push(change);
+            unique[existing].diff_lines.extend(section.diff_lines);
+        } else {
+            unique.push(section);
         }
     }
-    changes
+    unique
 }
 
 fn code_edit_diff_preview(text: &str, max_lines: usize) -> Vec<String> {
     let mut out = Vec::new();
     let mut omitted = 0usize;
+    let sections = code_edit_sections(text);
 
-    for line in text.lines() {
-        let trimmed = line.trim_end();
-        if trimmed.starts_with("***") {
-            continue;
+    if sections.is_empty() {
+        for line in text.lines() {
+            let trimmed = line.trim_end();
+            if trimmed.starts_with("***") || !is_code_edit_diff_line(trimmed) {
+                continue;
+            }
+            if out.len() >= max_lines {
+                omitted += 1;
+                continue;
+            }
+            out.push(ellipsize_width(trimmed, 140));
         }
-        let is_diff_line =
-            trimmed.starts_with("@@") || trimmed.starts_with('+') || trimmed.starts_with('-');
-        if !is_diff_line {
-            continue;
+
+        if omitted > 0 {
+            out.push(format!("... 差分行を{omitted}行省略"));
         }
+        return out;
+    }
+
+    for section in sections {
+        let (added, deleted) = diff_line_counts(&section.diff_lines);
+        let header = format!(
+            "▸ {} {} (+{} -{})",
+            section.change.action, section.change.path, added, deleted
+        );
         if out.len() >= max_lines {
-            omitted += 1;
+            omitted += 1 + section.diff_lines.len();
             continue;
         }
-        out.push(ellipsize_width(trimmed, 140));
+        out.push(ellipsize_width(&header, 140));
+
+        for line in section.diff_lines {
+            if out.len() >= max_lines {
+                omitted += 1;
+                continue;
+            }
+            out.push(ellipsize_width(&line, 140));
+        }
     }
 
     if omitted > 0 {
         out.push(format!("... 差分行を{omitted}行省略"));
     }
     out
+}
+
+fn is_code_edit_diff_line(line: &str) -> bool {
+    if line.starts_with("+++")
+        || line.starts_with("---")
+        || line.starts_with("diff ")
+        || line.starts_with("index ")
+    {
+        return false;
+    }
+    line.starts_with("@@") || line.starts_with('+') || line.starts_with('-')
+}
+
+fn diff_line_counts(lines: &[String]) -> (usize, usize) {
+    let added = lines
+        .iter()
+        .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
+        .count();
+    let deleted = lines
+        .iter()
+        .filter(|line| line.starts_with('-') && !line.starts_with("---"))
+        .count();
+    (added, deleted)
 }
 
 fn special_tool_summary(head: &str, output: &str) -> Option<String> {
@@ -5164,6 +5398,7 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane, scro
         &format!("{} / {}", pane.settings_label(), pane.diff_label()),
         value_width,
     );
+    let settings_help = ellipsize_width(pane.settings_shortcuts_label(), prompt_width);
     let assistant = pane
         .last_assistant_text()
         .map(|p| prompt_preview(p, prompt_width))
@@ -5212,6 +5447,10 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane, scro
         Line::from(vec![
             Span::styled("設定 ", Style::default().fg(COLOR_MUTED)),
             Span::styled(settings, Style::default().fg(COLOR_TEXT)),
+        ]),
+        Line::from(vec![
+            Span::styled("キー ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(settings_help, Style::default().fg(COLOR_MUTED)),
         ]),
     ];
     if let Some(active) = pane.active_work_package_label() {
@@ -5286,7 +5525,7 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane, scro
         lines.push(Line::from(vec![
             Span::styled("サブエージェント ", Style::default().fg(COLOR_MUTED)),
             Span::styled(
-                format!("{subagent_running}体稼働中"),
+                subagent_summary_label(subagent_running, subagent_lines.len()),
                 if subagent_running > 0 {
                     Style::default().fg(COLOR_WARN)
                 } else {
@@ -5411,6 +5650,14 @@ fn codex_subagent_visible_count(height: u16) -> usize {
     }
 }
 
+fn subagent_summary_label(running: usize, shown: usize) -> String {
+    if shown == 0 {
+        format!("実行中{running}")
+    } else {
+        format!("実行中{running} / 表示{shown}")
+    }
+}
+
 fn codex_dashboard_shortcut_lines(max_width: usize) -> Vec<Line<'static>> {
     vec![
         Line::from(Span::styled(
@@ -5530,16 +5777,17 @@ fn ellipsize_width(text: &str, max_width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivePane, App, CODEX_EDIT_DIFF_PREVIEW_LINES, COLOR_DANGER, COLOR_EVENT, COLOR_SUCCESS,
-        COLOR_WARN, RUN_SPINNER_FRAMES, cached_assistant_markdown_count,
-        cached_assistant_markdown_lines, code_edit_diff_preview, codex_activity_lines,
-        codex_child_goal_lines, codex_current_activity_label, codex_dashboard_shortcut_lines,
-        codex_decision_choice_line, codex_decision_input_lines, codex_decision_title_hint,
-        codex_diff_lines, codex_header_line, codex_header_lines, codex_input_prompt_render,
-        codex_log_entry_lines, codex_log_lines, codex_markdown_styles,
+        ActivePane, App, CODEX_EDIT_DIFF_PREVIEW_LINES, COLOR_ADDNESS, COLOR_CODEX, COLOR_DANGER,
+        COLOR_EVENT, COLOR_MUTED, COLOR_SUCCESS, COLOR_WARN, RUN_SPINNER_FRAMES,
+        cached_assistant_markdown_count, cached_assistant_markdown_lines, code_edit_diff_preview,
+        codex_activity_lines, codex_child_goal_lines, codex_current_activity_label,
+        codex_dashboard_shortcut_lines, codex_decision_choice_line, codex_decision_input_lines,
+        codex_decision_title_hint, codex_diff_lines, codex_header_line, codex_header_lines,
+        codex_input_prompt_render, codex_log_entry_lines, codex_log_lines, codex_markdown_styles,
         codex_recent_action_visible_count, codex_runtime_status, codex_subagent_visible_count,
         codex_visible_log_lines, codex_work_label, draw, draw_status_bar, ellipsize_width,
-        markdown, prompt_preview, run_spinner_glyph, summarize_tool_display_text,
+        markdown, prompt_preview, run_spinner_glyph, subagent_summary_label,
+        summarize_tool_display_text,
     };
     use crate::api::ApiClient;
     use crate::tui::agent::{
@@ -5648,6 +5896,77 @@ mod tests {
     }
 
     #[test]
+    fn codex_log_entry_lines_colors_command_tokens() {
+        let entry = CodexLogLine {
+            kind: CodexLogKind::Tool,
+            text: "RUNNING cargo test --workspace src/main.rs".to_string(),
+        };
+
+        let lines = codex_log_entry_lines(&entry, 120, None);
+        let spans = &lines[0].line.spans;
+
+        assert_eq!(
+            line_text(&lines[0].line),
+            "実行 | • 実行中: cargo test --workspace src/main.rs"
+        );
+        let cargo = spans
+            .iter()
+            .find(|span| span.content.as_ref() == "cargo")
+            .expect("cargo span");
+        let flag = spans
+            .iter()
+            .find(|span| span.content.as_ref() == "--workspace")
+            .expect("flag span");
+        let path = spans
+            .iter()
+            .find(|span| span.content.as_ref() == "src/main.rs")
+            .expect("path span");
+
+        assert_eq!(cargo.style.fg, Some(COLOR_CODEX));
+        assert!(cargo.style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(flag.style.fg, Some(COLOR_WARN));
+        assert_eq!(path.style.fg, Some(COLOR_ADDNESS));
+    }
+
+    #[test]
+    fn codex_log_entry_lines_colors_claude_bash_command_tokens() {
+        let entry = CodexLogLine {
+            kind: CodexLogKind::Tool,
+            text: "Bash cargo test --workspace src/main.rs".to_string(),
+        };
+
+        let lines = codex_log_entry_lines(&entry, 120, None);
+        let spans = &lines[0].line.spans;
+
+        assert_eq!(
+            line_text(&lines[0].line),
+            "作業 | • 実行: Bash cargo test --workspace src/main.rs"
+        );
+        let bash = spans
+            .iter()
+            .find(|span| span.content.as_ref() == "Bash")
+            .expect("Bash span");
+        let cargo = spans
+            .iter()
+            .find(|span| span.content.as_ref() == "cargo")
+            .expect("cargo span");
+        let flag = spans
+            .iter()
+            .find(|span| span.content.as_ref() == "--workspace")
+            .expect("flag span");
+        let path = spans
+            .iter()
+            .find(|span| span.content.as_ref() == "src/main.rs")
+            .expect("path span");
+
+        assert_eq!(bash.style.fg, Some(COLOR_MUTED));
+        assert_eq!(cargo.style.fg, Some(COLOR_CODEX));
+        assert!(cargo.style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(flag.style.fg, Some(COLOR_WARN));
+        assert_eq!(path.style.fg, Some(COLOR_ADDNESS));
+    }
+
+    #[test]
     fn codex_log_entry_lines_omits_large_tool_output_preview() {
         let entry = CodexLogLine {
             kind: CodexLogKind::Tool,
@@ -5682,14 +6001,18 @@ mod tests {
 
         let lines = codex_log_entry_lines(&entry, 80, None);
 
-        assert_eq!(line_text(&lines[0].line), "編集 | 更新: src/tui/ui.rs");
-        assert_eq!(line_text(&lines[1].line), "     | @@");
-        assert_eq!(line_text(&lines[2].line), "     | -old line");
-        assert_eq!(line_text(&lines[3].line), "     | +new line");
-        assert_eq!(lines[2].line.spans[1].style.fg, Some(COLOR_DANGER));
-        assert_eq!(lines[3].line.spans[1].style.fg, Some(COLOR_SUCCESS));
+        assert_eq!(line_text(&lines[0].line), "編集 | 変更 1 file");
+        assert_eq!(
+            line_text(&lines[1].line),
+            "     | ▸ 更新 src/tui/ui.rs (+1 -1)"
+        );
+        assert_eq!(line_text(&lines[2].line), "     | @@");
+        assert_eq!(line_text(&lines[3].line), "     | -old line");
+        assert_eq!(line_text(&lines[4].line), "     | +new line");
+        assert_eq!(lines[3].line.spans[1].style.fg, Some(COLOR_DANGER));
+        assert_eq!(lines[4].line.spans[1].style.fg, Some(COLOR_SUCCESS));
         assert!(
-            !lines[2].line.spans[1]
+            !lines[3].line.spans[1]
                 .style
                 .add_modifier
                 .contains(Modifier::DIM)
@@ -5703,13 +6026,33 @@ mod tests {
             text.push_str(&format!("+line{i}\n"));
         }
         let preview = code_edit_diff_preview(&text, CODEX_EDIT_DIFF_PREVIEW_LINES);
-        // 8 行までのプレビュー + 省略行。
+        // ファイル見出しを含めて上限までのプレビュー + 省略行。
         assert_eq!(preview.len(), CODEX_EDIT_DIFF_PREVIEW_LINES + 1);
-        assert_eq!(preview[0], "+line0");
+        assert_eq!(preview[0], "▸ 更新 big.rs (+20 -0)");
+        assert_eq!(preview[1], "+line0");
         assert_eq!(
             preview[CODEX_EDIT_DIFF_PREVIEW_LINES],
-            format!("... 差分行を{}行省略", 20 - CODEX_EDIT_DIFF_PREVIEW_LINES)
+            format!("... 差分行を{}行省略", 21 - CODEX_EDIT_DIFF_PREVIEW_LINES)
         );
+    }
+
+    #[test]
+    fn summarize_tool_display_text_groups_multiple_code_edit_files() {
+        let text = summarize_tool_display_text(
+            "EDIT *** Begin Patch\n\
+             *** Update File: a.rs\n\
+             @@\n\
+             -old\n\
+             +new\n\
+             *** Add File: b.rs\n\
+             +added\n\
+             *** End Patch",
+        );
+
+        assert!(text.contains("変更 2 files"));
+        assert!(text.contains("▸ 更新 a.rs (+1 -1)"));
+        assert!(text.contains("▸ 追加 b.rs (+1 -0)"));
+        assert!(text.contains("+added"));
     }
 
     #[test]
@@ -6287,6 +6630,13 @@ mod tests {
         assert_eq!(codex_subagent_visible_count(17), 3);
         assert_eq!(codex_subagent_visible_count(18), 5);
         assert_eq!(codex_subagent_visible_count(u16::MAX), 5);
+    }
+
+    #[test]
+    fn subagent_summary_label_shows_running_and_visible_counts() {
+        assert_eq!(subagent_summary_label(2, 3), "実行中2 / 表示3");
+        assert_eq!(subagent_summary_label(0, 1), "実行中0 / 表示1");
+        assert_eq!(subagent_summary_label(0, 0), "実行中0");
     }
 
     #[test]

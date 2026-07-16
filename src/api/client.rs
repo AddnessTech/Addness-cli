@@ -27,6 +27,7 @@ mod search;
 mod sharetree;
 mod skill;
 mod streak;
+mod todo_chat;
 mod tool;
 mod user;
 

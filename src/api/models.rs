@@ -27,6 +27,7 @@ mod search;
 mod sharetree;
 mod skill;
 mod streak;
+mod todo_chat;
 mod tool;
 mod user;
 
@@ -59,6 +60,7 @@ pub use search::*;
 pub use sharetree::*;
 pub use skill::*;
 pub use streak::*;
+pub use todo_chat::*;
 pub use tool::*;
 pub use user::*;
 

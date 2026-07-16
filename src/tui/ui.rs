@@ -4491,6 +4491,7 @@ fn codex_edit_diff_style(part: &str, fallback: Style) -> Style {
 }
 
 fn codex_log_prefix(line: &CodexLogLine) -> (&'static str, Style, Style) {
+    const BLANK_PREFIX: &str = "     | ";
     match line.kind {
         CodexLogKind::User => (
             "依頼 | ",
@@ -4500,10 +4501,8 @@ fn codex_log_prefix(line: &CodexLogLine) -> (&'static str, Style, Style) {
             Style::default().fg(COLOR_TEXT),
         ),
         CodexLogKind::Assistant => (
-            "返答 | ",
-            Style::default()
-                .fg(COLOR_TEXT_STRONG)
-                .add_modifier(Modifier::BOLD),
+            BLANK_PREFIX,
+            Style::default().fg(COLOR_PANEL),
             Style::default().fg(COLOR_TEXT),
         ),
         CodexLogKind::Tool => codex_tool_prefix(&line.text),
@@ -4515,19 +4514,17 @@ fn codex_log_prefix(line: &CodexLogLine) -> (&'static str, Style, Style) {
             Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD),
         ),
         CodexLogKind::System => (
-            "     | ",
+            BLANK_PREFIX,
             Style::default().fg(COLOR_MUTED),
             Style::default().fg(COLOR_MUTED),
         ),
         CodexLogKind::Error => (
-            "失敗 | ",
-            Style::default()
-                .fg(COLOR_DANGER)
-                .add_modifier(Modifier::BOLD),
+            BLANK_PREFIX,
+            Style::default().fg(COLOR_DANGER),
             Style::default().fg(COLOR_DANGER),
         ),
         CodexLogKind::Event => (
-            "     | ",
+            BLANK_PREFIX,
             Style::default().fg(COLOR_EVENT),
             Style::default().fg(COLOR_EVENT),
         ),
@@ -4535,9 +4532,10 @@ fn codex_log_prefix(line: &CodexLogLine) -> (&'static str, Style, Style) {
 }
 
 fn codex_tool_prefix(text: &str) -> (&'static str, Style, Style) {
+    const BLANK_PREFIX: &str = "     | ";
     if text.starts_with("EDIT ") {
         (
-            "編集 | ",
+            BLANK_PREFIX,
             Style::default()
                 .fg(COLOR_CODEX)
                 .add_modifier(Modifier::BOLD),
@@ -4545,7 +4543,7 @@ fn codex_tool_prefix(text: &str) -> (&'static str, Style, Style) {
         )
     } else if text.starts_with("DIFF ") {
         (
-            "差分 | ",
+            BLANK_PREFIX,
             Style::default()
                 .fg(COLOR_MUTED)
                 .add_modifier(Modifier::BOLD),
@@ -4553,7 +4551,7 @@ fn codex_tool_prefix(text: &str) -> (&'static str, Style, Style) {
         )
     } else if text.starts_with("FAIL ") || text.contains("exit ") && !text.contains("exit 0") {
         (
-            "失敗 | ",
+            BLANK_PREFIX,
             Style::default()
                 .fg(COLOR_DANGER)
                 .add_modifier(Modifier::BOLD),
@@ -4561,7 +4559,7 @@ fn codex_tool_prefix(text: &str) -> (&'static str, Style, Style) {
         )
     } else if text.starts_with("OK ") || text.contains("exit 0") {
         (
-            "完了 | ",
+            BLANK_PREFIX,
             Style::default()
                 .fg(COLOR_SUCCESS)
                 .add_modifier(Modifier::BOLD),
@@ -4569,19 +4567,19 @@ fn codex_tool_prefix(text: &str) -> (&'static str, Style, Style) {
         )
     } else if text.contains("output_delta") || text.contains('\n') {
         (
-            "出力 | ",
+            BLANK_PREFIX,
             Style::default().fg(COLOR_MUTED),
             Style::default().fg(COLOR_TEXT),
         )
     } else if text.starts_with("RUNNING ") {
         (
-            "実行 | ",
+            BLANK_PREFIX,
             Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD),
             Style::default().fg(COLOR_TEXT),
         )
     } else {
         (
-            "作業 | ",
+            BLANK_PREFIX,
             Style::default().fg(COLOR_MUTED),
             Style::default().fg(COLOR_TEXT),
         )
@@ -5857,7 +5855,7 @@ mod tests {
         let lines = codex_log_entry_lines(&entry, CODEX_LOG_PREFIX_WIDTH + 3, None);
 
         assert_eq!(lines.len(), 2);
-        assert_eq!(line_text(&lines[0].line), "返答 | abc");
+        assert_eq!(line_text(&lines[0].line), "     | abc");
         assert_eq!(line_text(&lines[1].line), "     | def");
     }
 
@@ -5870,7 +5868,7 @@ mod tests {
 
         let lines = codex_log_entry_lines(&entry, 80, None);
 
-        assert_eq!(line_text(&lines[0].line), "失敗 | • 実行: cargo test");
+        assert_eq!(line_text(&lines[0].line), "     | • 実行: cargo test");
         assert_eq!(line_text(&lines[1].line), "     |   └ テスト: 失敗");
         assert_eq!(lines[0].line.spans[1].content.as_ref(), "•");
         assert_eq!(lines[0].line.spans[1].style.fg, Some(COLOR_DANGER));
@@ -5907,7 +5905,7 @@ mod tests {
 
         assert_eq!(
             line_text(&lines[0].line),
-            "実行 | • 実行中: cargo test --workspace src/main.rs"
+            "     | • 実行中: cargo test --workspace src/main.rs"
         );
         let cargo = spans
             .iter()
@@ -5940,7 +5938,7 @@ mod tests {
 
         assert_eq!(
             line_text(&lines[0].line),
-            "作業 | • 実行: Bash cargo test --workspace src/main.rs"
+            "     | • 実行: Bash cargo test --workspace src/main.rs"
         );
         let bash = spans
             .iter()
@@ -5983,7 +5981,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(rendered.contains("完了 | • 実行: curl https://example.test"));
+        assert!(rendered.contains("     | • 実行: curl https://example.test"));
         assert!(rendered.contains("└ 出力1行"));
         assert!(!rendered.contains("└ 0123456789"));
         assert!(!rendered.contains(&"0123456789 ".repeat(25)));
@@ -6001,7 +5999,7 @@ mod tests {
 
         let lines = codex_log_entry_lines(&entry, 80, None);
 
-        assert_eq!(line_text(&lines[0].line), "編集 | 変更 1 file");
+        assert_eq!(line_text(&lines[0].line), "     | 変更 1 file");
         assert_eq!(
             line_text(&lines[1].line),
             "     | ▸ 更新 src/tui/ui.rs (+1 -1)"
@@ -6440,7 +6438,8 @@ mod tests {
 
         assert!(lines.iter().any(|line| line.starts_with("-----+ ")));
         assert!(!lines.iter().any(|line| line.starts_with(".....+ ")));
-        assert!(lines.iter().any(|line| line.starts_with("作業 | ")));
+        assert!(lines.iter().any(|line| line.starts_with("     | ")));
+        assert!(!lines.iter().any(|line| line.starts_with("作業 | ")));
     }
 
     #[test]

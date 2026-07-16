@@ -1295,6 +1295,18 @@ fn subagent_status_lines_for<'a>(
         .collect()
 }
 
+fn finish_subagent_entry(entry: &mut SubagentEntry, is_error: bool) {
+    if entry.state != SubagentState::Running {
+        return;
+    }
+    entry.state = if is_error {
+        SubagentState::Failed
+    } else {
+        SubagentState::Completed
+    };
+    entry.finished_at = Some(Instant::now());
+}
+
 /// アクション種別（状態パネルのパンくずで先頭に付けるアイコンを決める）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecentActionKind {
@@ -2170,6 +2182,13 @@ impl CodexPane {
         agent_type: Option<String>,
         is_background: bool,
     ) {
+        if let Some(id) = tool_use_id.as_deref()
+            && self.subagents.iter().any(|entry| {
+                entry.state == SubagentState::Running && entry.tool_use_id.as_deref() == Some(id)
+            })
+        {
+            return;
+        }
         self.subagents.push_back(SubagentEntry {
             tool_use_id,
             label,
@@ -2223,12 +2242,50 @@ impl CodexPane {
                 entry.bg_id = Some(id);
                 return; // バックグラウンドで実行中と確認できただけで、まだ未完了。
             }
-            entry.state = if is_error {
-                SubagentState::Failed
+            finish_subagent_entry(entry, is_error);
+        }
+    }
+
+    /// tool id が無い Codex 汎用イベント用。ラベルが一致する直近の実行中エントリを完了/失敗にする。
+    fn resolve_subagent_by_label(&mut self, label: &str, is_error: bool) {
+        let Some(entry) = self
+            .subagents
+            .iter_mut()
+            .rev()
+            .find(|entry| entry.state == SubagentState::Running && entry.label == label)
+        else {
+            return;
+        };
+        finish_subagent_entry(entry, is_error);
+    }
+
+    fn subagent_running_with_label(&self, label: &str) -> bool {
+        self.subagents
+            .iter()
+            .any(|entry| entry.state == SubagentState::Running && entry.label == label)
+    }
+
+    fn record_codex_subagent_from_tool(&mut self, event_type: &str, display: &ToolDisplay) {
+        let Some(label) = codex_subagent_label(display) else {
+            return;
+        };
+        let is_done = is_tool_completion_event(event_type);
+        let is_error = event_type.to_ascii_lowercase().contains("error")
+            || event_type.to_ascii_lowercase().contains("failed")
+            || display.label.starts_with("FAIL ");
+        if is_done {
+            if display.tool_id.is_some() {
+                self.resolve_subagent_result(display.tool_id.as_deref(), "", is_error);
             } else {
-                SubagentState::Completed
-            };
-            entry.finished_at = Some(Instant::now());
+                self.resolve_subagent_by_label(&label, is_error);
+            }
+        } else if !self.subagent_running_with_label(&label) {
+            self.record_subagent_launch(
+                display.tool_id.clone(),
+                label,
+                Some(display.tool_name.clone()),
+                false,
+            );
         }
     }
 
@@ -3527,6 +3584,17 @@ impl CodexPane {
         match self.kind {
             AgentKind::Codex => self.exec_settings.label(),
             AgentKind::ClaudeCode => self.claude_settings.label(),
+        }
+    }
+
+    pub fn settings_shortcuts_label(&self) -> &'static str {
+        match self.kind {
+            AgentKind::Codex => {
+                "F2 model: config/gpt-5.5/gpt-5/o3 | F3 effort: config/low/medium/high/xhigh | F4 approval: config/untrusted/on-request/on-failure/never | F5 sandbox: read-only/workspace-write/danger-full-access"
+            }
+            AgentKind::ClaudeCode => {
+                "F2 model: config/fable/opus/sonnet/haiku | F3 effort: config/low/medium/high/xhigh/max | F4 permission: config/plan/acceptEdits/dontAsk/bypassPermissions/skip-permissions | F5 unused"
+            }
         }
     }
 
@@ -5297,7 +5365,7 @@ impl CodexPane {
 
         // グレースフル終了中の常駐は使わず、確実に終了させてから作り直す。
         if let Some(resident) = self.claude_resident.as_mut()
-            && resident.closing
+            && resident.closing.is_some()
         {
             resident.kill();
             self.claude_resident = None;
@@ -5370,19 +5438,24 @@ impl CodexPane {
         };
         match waited {
             Ok(Some(_status)) => {
-                let closing = self
-                    .claude_resident
-                    .as_ref()
-                    .map(|r| r.closing)
-                    .unwrap_or(false);
+                let closing = self.claude_resident.as_ref().and_then(|r| r.closing);
                 self.claude_resident = None;
-                if closing {
-                    self.push_log(
-                        CodexLogKind::System,
-                        "アイドルのため Claude Code 常駐プロセスを終了しました（次のターンで再接続）",
-                    );
-                } else {
-                    self.handle_claude_resident_death();
+                match closing {
+                    Some(claude_resident::CloseReason::Idle) => {
+                        self.push_log(
+                            CodexLogKind::System,
+                            "アイドルのため Claude Code 常駐プロセスを終了しました（次のターンで再接続）",
+                        );
+                    }
+                    Some(claude_resident::CloseReason::SettingsRestart) => {
+                        self.push_log(
+                            CodexLogKind::System,
+                            "設定変更を反映するため Claude Code 常駐プロセスを終了しました（次のターンで再接続）",
+                        );
+                    }
+                    None => {
+                        self.handle_claude_resident_death();
+                    }
                 }
                 return true;
             }
@@ -5447,7 +5520,7 @@ impl CodexPane {
         {
             self.claude_resident_restart_pending = false;
             if let Some(resident) = self.claude_resident.as_mut() {
-                resident.begin_close();
+                resident.begin_close(claude_resident::CloseReason::SettingsRestart);
             }
             self.push_log(
                 CodexLogKind::System,
@@ -5465,7 +5538,7 @@ impl CodexPane {
         {
             self.claude_resident_last_activity = None;
             if let Some(resident) = self.claude_resident.as_mut() {
-                resident.begin_close();
+                resident.begin_close(claude_resident::CloseReason::Idle);
             }
             return true;
         }
@@ -5814,7 +5887,7 @@ impl CodexPane {
         }
         // グレースフル終了中の常駐は使わず、確実に終了させてから作り直す。
         if let Some(client) = self.codex_appserver.as_mut()
-            && client.closing
+            && client.closing.is_some()
         {
             client.kill();
             self.codex_appserver = None;
@@ -6537,20 +6610,25 @@ impl CodexPane {
         };
         match waited {
             Ok(Some(_status)) => {
-                let closing = self
-                    .codex_appserver
-                    .as_ref()
-                    .map(|c| c.closing)
-                    .unwrap_or(false);
+                let closing = self.codex_appserver.as_ref().and_then(|c| c.closing);
                 self.codex_appserver = None;
                 self.codex_appserver_phase = CodexAppServerPhase::Idle;
-                if closing {
-                    self.push_log(
-                        CodexLogKind::System,
-                        "アイドルのため Codex app-server 常駐プロセスを終了しました（次のターンで再接続）",
-                    );
-                } else {
-                    self.handle_codex_appserver_death();
+                match closing {
+                    Some(codex_appserver::CloseReason::Idle) => {
+                        self.push_log(
+                            CodexLogKind::System,
+                            "アイドルのため Codex app-server 常駐プロセスを終了しました（次のターンで再接続）",
+                        );
+                    }
+                    Some(codex_appserver::CloseReason::SettingsRestart) => {
+                        self.push_log(
+                            CodexLogKind::System,
+                            "設定変更を反映するため Codex app-server 常駐プロセスを終了しました（次のターンで再接続）",
+                        );
+                    }
+                    None => {
+                        self.handle_codex_appserver_death();
+                    }
                 }
                 return true;
             }
@@ -6632,7 +6710,7 @@ impl CodexPane {
         {
             self.codex_appserver_restart_pending = false;
             if let Some(client) = self.codex_appserver.as_mut() {
-                client.begin_close();
+                client.begin_close(codex_appserver::CloseReason::SettingsRestart);
             }
             self.push_log(
                 CodexLogKind::System,
@@ -6650,7 +6728,7 @@ impl CodexPane {
         {
             self.codex_appserver_last_activity = None;
             if let Some(client) = self.codex_appserver.as_mut() {
-                client.begin_close();
+                client.begin_close(codex_appserver::CloseReason::Idle);
             }
             return true;
         }
@@ -6861,6 +6939,7 @@ impl CodexPane {
         }
 
         if let Some(display) = tool_display(event_type, value) {
+            self.record_codex_subagent_from_tool(event_type, &display);
             if let Some(command) = display.command_text.as_deref() {
                 if is_tool_completion_event(event_type) {
                     self.current_command = None;
@@ -11194,7 +11273,7 @@ fn codex_appserver_change_paths(changes: &[codex_appserver::FileChangeDetail]) -
 }
 
 /// apply_patch テキスト 1 セクションに含める差分本文行の上限。
-/// 表示側（code_edit_diff_preview）でさらに 8 行へ切り詰めるが、
+/// 表示側（code_edit_diff_preview）でさらに表示上限へ切り詰めるが、
 /// ログ・セッション記録の肥大化を防ぐためにここでも上限を設ける。
 const CODEX_PATCH_SECTION_MAX_LINES: usize = 40;
 
@@ -12426,6 +12505,8 @@ fn decision_banner(event_type: &str, text: Option<&str>) -> Option<CodexDecision
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ToolDisplay {
+    tool_name: String,
+    tool_id: Option<String>,
     label: String,
     action_text: Option<String>,
     command_text: Option<String>,
@@ -12438,6 +12519,7 @@ fn tool_display(event_type: &str, value: &Value) -> Option<ToolDisplay> {
     }
 
     let name = tool_name(value).unwrap_or_else(|| event_type.to_string());
+    let tool_id = tool_id(value);
     let command = command_text(value)
         .map(|text| visible_command_display(&text))
         .map(|text| compact_tool_text(&text));
@@ -12456,11 +12538,45 @@ fn tool_display(event_type: &str, value: &Value) -> Option<ToolDisplay> {
     let label = format!("{state} {primary}");
 
     Some(ToolDisplay {
+        tool_name: name,
+        tool_id,
         label,
         action_text: command.clone(),
         command_text: command,
         output_text: output,
     })
+}
+
+fn codex_subagent_label(display: &ToolDisplay) -> Option<String> {
+    if !is_codex_subagent_tool_name(&display.tool_name) {
+        return None;
+    }
+    let raw = display
+        .action_text
+        .as_deref()
+        .or(display.output_text.as_deref())
+        .unwrap_or(&display.tool_name);
+    let target = compact_one_line(strip_turn_tool_state(raw), 80);
+    if target.is_empty() || target == display.tool_name {
+        Some(display.tool_name.clone())
+    } else if matches!(
+        display.tool_name.to_ascii_lowercase().as_str(),
+        "task" | "agent"
+    ) {
+        Some(target)
+    } else {
+        Some(format!("{}: {target}", display.tool_name))
+    }
+}
+
+fn is_codex_subagent_tool_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == "task"
+        || lower == "agent"
+        || lower.contains("subagent")
+        || lower.contains("sub_agent")
+        || lower.contains("multi_agent")
+        || lower.contains("multi-agent")
 }
 
 fn tool_state_label(
@@ -13049,6 +13165,12 @@ fn is_tool_like_name(name: &str) -> bool {
         || name == "run_command"
         || name == "terminal"
         || name == "bash"
+        || name == "task"
+        || name == "agent"
+        || name.contains("subagent")
+        || name.contains("sub_agent")
+        || name.contains("multi_agent")
+        || name.contains("multi-agent")
 }
 
 fn tool_name(value: &Value) -> Option<String> {
@@ -13060,6 +13182,21 @@ fn tool_name(value: &Value) -> Option<String> {
             "toolName",
             "function_name",
             "functionName",
+        ],
+    )
+}
+
+fn tool_id(value: &Value) -> Option<String> {
+    recursive_scalar_field_text(
+        value,
+        &[
+            "tool_use_id",
+            "toolUseId",
+            "item_id",
+            "itemId",
+            "call_id",
+            "callId",
+            "id",
         ],
     )
 }
@@ -13149,6 +13286,11 @@ fn command_text(value: &Value) -> Option<String> {
                 "parsed_cmd",
                 "codex_parsed_cmd",
                 "interaction_input",
+                "description",
+                "prompt",
+                "task",
+                "title",
+                "subagent_type",
                 "argv",
                 "args",
                 "arguments",
@@ -13205,6 +13347,11 @@ fn tool_output_text(value: &Value) -> Option<String> {
                 "stderr",
                 "output",
                 "delta",
+                "description",
+                "prompt",
+                "task",
+                "title",
+                "subagent_type",
             ] {
                 if let Some(found) = map.get(key).and_then(tool_output_text)
                     && !found.is_empty()
@@ -13837,6 +13984,53 @@ mod tests {
             ]}
         }));
         assert_eq!(pane.subagents_len(), 0);
+    }
+
+    #[test]
+    fn codex_task_tool_event_is_detected_as_subagent() {
+        let mut pane = live_pane();
+        pane.handle_json_event(serde_json::json!({
+            "type": "tool_call_started",
+            "name": "Task",
+            "id": "task-1",
+            "input": {
+                "description": "実装調査",
+                "subagent_type": "general-purpose"
+            }
+        }));
+
+        assert_eq!(pane.subagents_len(), 1);
+        assert_eq!(pane.subagent_running_count(), 1);
+        let lines = pane.subagent_status_lines(5);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("● 実装調査"));
+
+        pane.handle_json_event(serde_json::json!({
+            "type": "tool_call_completed",
+            "name": "Task",
+            "id": "task-1",
+            "output": "done"
+        }));
+
+        assert_eq!(pane.subagent_running_count(), 0);
+        let lines = pane.subagent_status_lines(5);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("✔ 実装調査"));
+    }
+
+    #[test]
+    fn codex_subagent_tool_name_is_included_for_non_task_tools() {
+        let mut pane = live_pane();
+        pane.handle_json_event(serde_json::json!({
+            "type": "tool_call_started",
+            "name": "multi_agent.spawn",
+            "id": "multi-1",
+            "input": {"prompt": "差分レンダラ確認"}
+        }));
+
+        let lines = pane.subagent_status_lines(5);
+        assert_eq!(pane.subagent_running_count(), 1);
+        assert!(lines[0].starts_with("● multi_agent.spawn: 差分レンダラ確認"));
     }
 
     #[test]
@@ -14594,7 +14788,7 @@ mod tests {
         pane.handle_json_event(serde_json::json!({
             "jsonrpc": "2.0", "method": "item/completed",
             "params": {"item": {"id": "fc_1", "type": "fileChange", "status": "completed", "changes": [
-                {"path": "src/tui/ui.rs", "kind": {"type": "update"}}
+                {"path": "src/tui/ui.rs", "kind": {"type": "update"}, "diff": "@@\n-old\n+new\n"}
             ]}}
         }));
         assert!(pane.current_command.is_none());
@@ -14604,6 +14798,13 @@ mod tests {
                 .iter()
                 .any(|l| l.kind == CodexLogKind::Tool && l.text.contains("completed"))
         );
+        assert!(pane.log.iter().any(|l| {
+            l.kind == CodexLogKind::Tool
+                && l.text.starts_with("EDIT ")
+                && l.text.contains("*** Update File: src/tui/ui.rs")
+                && l.text.contains("-old")
+                && l.text.contains("+new")
+        }));
     }
 
     #[test]
@@ -15008,6 +15209,21 @@ mod tests {
                 .iter()
                 .any(|line| line.text.contains("F4") && line.text.contains("permission-mode"))
         );
+    }
+
+    #[test]
+    fn settings_shortcuts_label_explains_f_keys_per_backend() {
+        let codex = live_pane();
+        let codex_label = codex.settings_shortcuts_label();
+        assert!(codex_label.contains("F2 model"));
+        assert!(codex_label.contains("F4 approval"));
+        assert!(codex_label.contains("F5 sandbox"));
+
+        let claude = claude_pane();
+        let claude_label = claude.settings_shortcuts_label();
+        assert!(claude_label.contains("F2 model"));
+        assert!(claude_label.contains("F4 permission"));
+        assert!(claude_label.contains("F5 unused"));
     }
 
     #[test]

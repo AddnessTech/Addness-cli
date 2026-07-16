@@ -327,6 +327,14 @@ impl GoalTree {
     pub fn from_tree_items(items: Vec<GoalTreeItem>) -> Self {
         use std::collections::{HashMap, HashSet};
 
+        // The default TUI tree is the active-goal view. The API normally excludes
+        // completed goals, but defensively drop leaked completed rows here so an
+        // orphaned completed child is not promoted to the top level.
+        let items = items
+            .into_iter()
+            .filter(|item| !item.is_completed)
+            .collect::<Vec<_>>();
+
         // Build a set of all item IDs in this response
         let id_set: HashSet<String> = items.iter().map(|item| item.id.clone()).collect();
 
@@ -452,8 +460,26 @@ impl GoalTree {
             });
         }
 
-        // Build root nodes (nodes with no parent)
-        let root_ids = children_map.get(&None).cloned().unwrap_or_default();
+        // Build root nodes for this response. A today's-goals payload can contain
+        // a scoped slice whose real parent is outside the response, so treat those
+        // orphans as roots of the visible tree instead of dropping them.
+        let mut root_ids = children_map.get(&None).cloned().unwrap_or_default();
+        for (id, node) in &node_map {
+            if node
+                .parent_id
+                .as_ref()
+                .is_some_and(|parent_id| !node_map.contains_key(parent_id))
+            {
+                root_ids.push(id.clone());
+            }
+        }
+        root_ids.sort_by(|a, b| {
+            let order_a = node_map.get(a).map(|n| n.order_no).unwrap_or(0.0);
+            let order_b = node_map.get(b).map(|n| n.order_no).unwrap_or(0.0);
+            order_a
+                .partial_cmp(&order_b)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         dbg_log!("Found {} root nodes", root_ids.len());
 
@@ -1123,7 +1149,7 @@ fn build_child_node_from_todays(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::CommentAuthor;
+    use crate::api::{CommentAuthor, TodaysGoalNode};
 
     fn mk_comment(id: &str, resolved: bool) -> Comment {
         Comment {
@@ -1168,6 +1194,39 @@ mod tests {
             scroll_offset: 0,
             is_required_to_fetch: true,
             comment_view: view,
+        }
+    }
+
+    fn mk_tree_item(id: &str, parent_id: Option<&str>, is_completed: bool) -> GoalTreeItem {
+        GoalTreeItem {
+            id: id.to_string(),
+            parent_id: parent_id.map(ToString::to_string),
+            title: format!("Goal {id}"),
+            status: None,
+            order_no: 0.0,
+            is_completed,
+            has_children: false,
+            owner: None,
+        }
+    }
+
+    fn mk_today_node(id: &str, parent_id: Option<&str>, order_no: f64) -> TodaysGoalNode {
+        TodaysGoalNode {
+            id: id.to_string(),
+            parent_id: parent_id.map(ToString::to_string),
+            depth: 0,
+            title: format!("Goal {id}"),
+            status: "NONE".to_string(),
+            completed_at: None,
+            order_no,
+            is_leaf: false,
+            has_recurring: false,
+            is_recurring: false,
+            kind: "goal".to_string(),
+            execution: None,
+            owner: None,
+            is_direct_assignment: true,
+            is_ai_running: None,
         }
     }
 
@@ -1254,5 +1313,48 @@ mod tests {
             tree.cursor < tree.flatten().len(),
             "cursor must stay in range after view change"
         );
+    }
+
+    #[test]
+    fn todays_tree_treats_nodes_with_missing_parent_as_visible_roots() {
+        let nodes = vec![
+            mk_today_node("child", Some("parent-outside-response"), 2.0),
+            mk_today_node("grandchild", Some("child"), 1.0),
+        ];
+
+        let tree = GoalTree::from_todays_goal_nodes(nodes);
+
+        assert_eq!(tree.roots.len(), 1);
+        assert_eq!(tree.roots[0].node.id, "child");
+        let goal_rows = tree
+            .flatten()
+            .into_iter()
+            .filter_map(|row| match row {
+                TreeRow::Goal { goal_id, depth, .. } => Some((goal_id.to_string(), depth)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            goal_rows,
+            vec![("child".to_string(), 0), ("grandchild".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn active_goal_tree_drops_completed_items_even_if_api_leaks_them() {
+        let tree = GoalTree::from_tree_items(vec![
+            mk_tree_item("done-child", Some("missing-parent"), true),
+            mk_tree_item("active-root", None, false),
+        ]);
+
+        let goal_ids = tree
+            .flatten()
+            .into_iter()
+            .filter_map(|row| match row {
+                TreeRow::Goal { goal_id, .. } => Some(goal_id.to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(goal_ids, vec!["active-root".to_string()]);
     }
 }

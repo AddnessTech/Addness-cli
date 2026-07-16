@@ -200,14 +200,23 @@ enum WriterMsg {
     Close,
 }
 
+/// グレースフルクローズを始めた理由（終了検知時のログ文言の出し分けに使う）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CloseReason {
+    /// 無操作が続いたためのアイドル回収。
+    Idle,
+    /// 設定変更（config へ戻すなど）を反映するための再起動。
+    SettingsRestart,
+}
+
 /// 常駐 claude プロセスのクライアント。`Child` を所有し、stdin は writer スレッドへ委譲する。
 /// stdout/stderr は呼び出し側（`CodexPane`）が `spawn_line_reader` で読む。
 pub(super) struct ResidentClient {
     child: Child,
     writer_tx: Sender<WriterMsg>,
     next_request_id: u64,
-    /// アイドル回収などで stdin クローズ済み（終了待ち）か。
-    pub(super) closing: bool,
+    /// stdin クローズ済み（終了待ち）なら、その理由。
+    pub(super) closing: Option<CloseReason>,
 }
 
 impl ResidentClient {
@@ -239,7 +248,7 @@ impl ResidentClient {
             child,
             writer_tx,
             next_request_id: 1,
-            closing: false,
+            closing: None,
         })
     }
 
@@ -293,8 +302,8 @@ impl ResidentClient {
     }
 
     /// stdin をクローズしてグレースフル終了を開始する（アイドル回収・設定変更フォールバック用）。
-    pub(super) fn begin_close(&mut self) {
-        self.closing = true;
+    pub(super) fn begin_close(&mut self, reason: CloseReason) {
+        self.closing = Some(reason);
         let _ = self.writer_tx.send(WriterMsg::Close);
     }
 

@@ -4295,20 +4295,64 @@ fn codex_log_content_spans(
     marker_style: Style,
 ) -> Vec<Span<'static>> {
     if kind == CodexLogKind::Tool
-        && let Some(rest) = part.strip_prefix("• ")
+        && let Some(rest) = part.strip_prefix("● ")
     {
         if let Some((label, command)) = tool_command_label(rest) {
-            let mut spans = vec![Span::styled("•", marker_style)];
+            let mut spans = vec![Span::styled("●", marker_style)];
             spans.push(Span::styled(format!(" {label}: "), text_style));
             spans.extend(command_syntax_spans(command, text_style));
             return spans;
         }
         return vec![
-            Span::styled("•", marker_style),
+            Span::styled("●", marker_style),
             Span::styled(format!(" {rest}"), text_style),
         ];
     }
-    vec![Span::styled(part, text_style)]
+    diff_count_badge_spans(part, text_style)
+}
+
+/// `(+N -M)` という増減件数を GitHub の diff stat のように、+ は緑・- は赤で
+/// 個別に色分けする。パターンに一致しなければ元のテキストをそのまま 1 span で返す。
+fn diff_count_badge_spans(text: String, base_style: Style) -> Vec<Span<'static>> {
+    match split_diff_count_badge(&text, base_style) {
+        Some(spans) => spans,
+        None => vec![Span::styled(text, base_style)],
+    }
+}
+
+fn split_diff_count_badge(text: &str, base_style: Style) -> Option<Vec<Span<'static>>> {
+    let open = text.rfind("(+")?;
+    let after_plus = &text[open + 2..];
+    let plus_end = after_plus.find(' ')?;
+    let added = &after_plus[..plus_end];
+    if added.is_empty() || !added.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let after_added = &after_plus[plus_end + 1..];
+    let after_minus = after_added.strip_prefix('-')?;
+    let close = after_minus.find(')')?;
+    let deleted = &after_minus[..close];
+    if deleted.is_empty() || !deleted.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+
+    let head = text[..open].to_string();
+    let tail = after_minus[close..].to_string();
+    let added_style = Style::default()
+        .fg(COLOR_SUCCESS)
+        .add_modifier(Modifier::BOLD);
+    let deleted_style = Style::default()
+        .fg(COLOR_DANGER)
+        .add_modifier(Modifier::BOLD);
+
+    Some(vec![
+        Span::styled(head, base_style),
+        Span::styled("(+", base_style),
+        Span::styled(added.to_string(), added_style),
+        Span::styled(" -", base_style),
+        Span::styled(deleted.to_string(), deleted_style),
+        Span::styled(tail, base_style),
+    ])
 }
 
 fn tool_command_label(rest: &str) -> Option<(&str, &str)> {
@@ -4473,8 +4517,8 @@ fn codex_edit_diff_style(part: &str, fallback: Style) -> Style {
         || trimmed.starts_with("追加:")
         || trimmed.starts_with("削除:")
         || trimmed.starts_with("移動:")
-        || trimmed.starts_with("変更 ")
-        || trimmed.starts_with("▸ ")
+        || trimmed.starts_with("● ")
+        || trimmed.starts_with("⎿ ")
         || trimmed.starts_with("update:")
         || trimmed.starts_with("add:")
         || trimmed.starts_with("delete:")
@@ -4683,11 +4727,11 @@ fn summarize_tool_display_text(text: &str) -> String {
     }
 
     if let Some(summary) = special_tool_summary(head, output) {
-        return format!("{head_line}\n  └ {summary}");
+        return format!("{head_line}\n  ⎿ {summary}");
     }
 
     let preview = tool_output_tree_preview(output);
-    format!("{head_line}\n  └ {preview}")
+    format!("{head_line}\n  ⎿ {preview}")
 }
 
 fn split_tool_state_prefix(text: &str) -> (Option<&str>, &str) {
@@ -4708,7 +4752,7 @@ fn tool_command_tree_head(state: Option<&str>, command: &str) -> String {
         "実行"
     };
     let command = compact_tool_command_name(command);
-    format!("• {verb}: {command}")
+    format!("● {verb}: {command}")
 }
 
 fn compact_tool_command_name(command: &str) -> String {
@@ -4774,12 +4818,34 @@ fn addness_command_rest_from_line(line: &str) -> Option<&str> {
     None
 }
 
+const TOOL_OUTPUT_PREVIEW_LINES: usize = 12;
+const TOOL_OUTPUT_PREVIEW_LINE_WIDTH: usize = 140;
+
+/// ツール出力の内容そのものをプレビューする（「出力N行」という件数表示ではなく
+/// 実際に何が出力されたかを見せる）。長すぎる場合のみ行数・幅を絞る。
 fn tool_output_tree_preview(output: &str) -> String {
-    match non_empty_line_count(output) {
-        0 => "出力なし".to_string(),
-        1 => "出力1行".to_string(),
-        n => format!("出力{n}行"),
+    let lines: Vec<&str> = output
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    if lines.is_empty() {
+        return "出力なし".to_string();
     }
+
+    let shown: Vec<String> = lines
+        .iter()
+        .take(TOOL_OUTPUT_PREVIEW_LINES)
+        .map(|line| ellipsize_width(line, TOOL_OUTPUT_PREVIEW_LINE_WIDTH))
+        .collect();
+    let mut preview = shown.join("\n     ");
+    if lines.len() > TOOL_OUTPUT_PREVIEW_LINES {
+        preview.push_str(&format!(
+            "\n     ... 出力を{}行省略",
+            lines.len() - TOOL_OUTPUT_PREVIEW_LINES
+        ));
+    }
+    preview
 }
 
 fn non_empty_line_count(text: &str) -> usize {
@@ -4832,9 +4898,9 @@ fn code_edit_display_text(text: &str) -> Option<String> {
     }
 
     let title = if sections.len() == 1 {
-        "変更 1 file".to_string()
+        "● 変更 1 file".to_string()
     } else {
-        format!("変更 {} files", sections.len())
+        format!("● 変更 {} files", sections.len())
     };
     let mut lines = vec![title];
     lines.extend(code_edit_diff_preview(text, CODEX_EDIT_DIFF_PREVIEW_LINES));
@@ -4944,7 +5010,7 @@ fn code_edit_diff_preview(text: &str, max_lines: usize) -> Vec<String> {
     for section in sections {
         let (added, deleted) = diff_line_counts(&section.diff_lines);
         let header = format!(
-            "▸ {} {} (+{} -{})",
+            "  ⎿ {} {} (+{} -{})",
             section.change.action, section.change.path, added, deleted
         );
         if out.len() >= max_lines {
@@ -4958,7 +5024,7 @@ fn code_edit_diff_preview(text: &str, max_lines: usize) -> Vec<String> {
                 omitted += 1;
                 continue;
             }
-            out.push(ellipsize_width(&line, 140));
+            out.push(ellipsize_width(&format!("     {line}"), 140));
         }
     }
 
@@ -5777,15 +5843,16 @@ mod tests {
     use super::{
         ActivePane, App, CODEX_EDIT_DIFF_PREVIEW_LINES, COLOR_ADDNESS, COLOR_CODEX, COLOR_DANGER,
         COLOR_EVENT, COLOR_MUTED, COLOR_SUCCESS, COLOR_WARN, RUN_SPINNER_FRAMES,
-        cached_assistant_markdown_count, cached_assistant_markdown_lines, code_edit_diff_preview,
-        codex_activity_lines, codex_child_goal_lines, codex_current_activity_label,
-        codex_dashboard_shortcut_lines, codex_decision_choice_line, codex_decision_input_lines,
-        codex_decision_title_hint, codex_diff_lines, codex_header_line, codex_header_lines,
-        codex_input_prompt_render, codex_log_entry_lines, codex_log_lines, codex_markdown_styles,
+        TOOL_OUTPUT_PREVIEW_LINES, cached_assistant_markdown_count,
+        cached_assistant_markdown_lines, code_edit_diff_preview, codex_activity_lines,
+        codex_child_goal_lines, codex_current_activity_label, codex_dashboard_shortcut_lines,
+        codex_decision_choice_line, codex_decision_input_lines, codex_decision_title_hint,
+        codex_diff_lines, codex_header_line, codex_header_lines, codex_input_prompt_render,
+        codex_log_entry_lines, codex_log_lines, codex_markdown_styles,
         codex_recent_action_visible_count, codex_runtime_status, codex_subagent_visible_count,
         codex_visible_log_lines, codex_work_label, draw, draw_status_bar, ellipsize_width,
-        markdown, prompt_preview, run_spinner_glyph, subagent_summary_label,
-        summarize_tool_display_text,
+        markdown, prompt_preview, run_spinner_glyph, split_diff_count_badge,
+        subagent_summary_label, summarize_tool_display_text,
     };
     use crate::api::ApiClient;
     use crate::tui::agent::{
@@ -5794,6 +5861,7 @@ mod tests {
     };
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::style::Modifier;
+    use ratatui::style::Style;
     use ratatui::text::{Line, Span};
     use ratatui::{Terminal, backend::TestBackend};
     use std::time::Instant;
@@ -5868,9 +5936,9 @@ mod tests {
 
         let lines = codex_log_entry_lines(&entry, 80, None);
 
-        assert_eq!(line_text(&lines[0].line), "     | • 実行: cargo test");
-        assert_eq!(line_text(&lines[1].line), "     |   └ テスト: 失敗");
-        assert_eq!(lines[0].line.spans[1].content.as_ref(), "•");
+        assert_eq!(line_text(&lines[0].line), "     | ● 実行: cargo test");
+        assert_eq!(line_text(&lines[1].line), "     |   ⎿ テスト: 失敗");
+        assert_eq!(lines[0].line.spans[1].content.as_ref(), "●");
         assert_eq!(lines[0].line.spans[1].style.fg, Some(COLOR_DANGER));
     }
 
@@ -5881,7 +5949,7 @@ mod tests {
             text: "RUNNING cargo test".to_string(),
         };
         let running_lines = codex_log_entry_lines(&running, 80, None);
-        assert_eq!(running_lines[0].line.spans[1].content.as_ref(), "•");
+        assert_eq!(running_lines[0].line.spans[1].content.as_ref(), "●");
         assert_eq!(running_lines[0].line.spans[1].style.fg, Some(COLOR_WARN));
 
         let ok = CodexLogLine {
@@ -5889,7 +5957,7 @@ mod tests {
             text: "exec_command_end (exit 0): cargo test\nok".to_string(),
         };
         let ok_lines = codex_log_entry_lines(&ok, 80, None);
-        assert_eq!(ok_lines[0].line.spans[1].content.as_ref(), "•");
+        assert_eq!(ok_lines[0].line.spans[1].content.as_ref(), "●");
         assert_eq!(ok_lines[0].line.spans[1].style.fg, Some(COLOR_SUCCESS));
     }
 
@@ -5905,7 +5973,7 @@ mod tests {
 
         assert_eq!(
             line_text(&lines[0].line),
-            "     | • 実行中: cargo test --workspace src/main.rs"
+            "     | ● 実行中: cargo test --workspace src/main.rs"
         );
         let cargo = spans
             .iter()
@@ -5938,7 +6006,7 @@ mod tests {
 
         assert_eq!(
             line_text(&lines[0].line),
-            "     | • 実行: Bash cargo test --workspace src/main.rs"
+            "     | ● 実行: Bash cargo test --workspace src/main.rs"
         );
         let bash = spans
             .iter()
@@ -5981,9 +6049,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(rendered.contains("     | • 実行: curl https://example.test"));
-        assert!(rendered.contains("└ 出力1行"));
-        assert!(!rendered.contains("└ 0123456789"));
+        assert!(rendered.contains("     | ● 実行: curl https://example.test"));
+        // 「出力N行」という件数表示ではなく、実際の出力内容がプレビューされる。
+        assert!(rendered.contains("⎿ 0123456789 0123456789"));
+        assert!(rendered.contains("..."));
         assert!(!rendered.contains(&"0123456789 ".repeat(25)));
         assert!(!rendered.contains("RUNNING"));
         assert!(!rendered.contains("OK"));
@@ -5999,14 +6068,14 @@ mod tests {
 
         let lines = codex_log_entry_lines(&entry, 80, None);
 
-        assert_eq!(line_text(&lines[0].line), "     | 変更 1 file");
+        assert_eq!(line_text(&lines[0].line), "     | ● 変更 1 file");
         assert_eq!(
             line_text(&lines[1].line),
-            "     | ▸ 更新 src/tui/ui.rs (+1 -1)"
+            "     |   ⎿ 更新 src/tui/ui.rs (+1 -1)"
         );
-        assert_eq!(line_text(&lines[2].line), "     | @@");
-        assert_eq!(line_text(&lines[3].line), "     | -old line");
-        assert_eq!(line_text(&lines[4].line), "     | +new line");
+        assert_eq!(line_text(&lines[2].line), "     |      @@");
+        assert_eq!(line_text(&lines[3].line), "     |      -old line");
+        assert_eq!(line_text(&lines[4].line), "     |      +new line");
         assert_eq!(lines[3].line.spans[1].style.fg, Some(COLOR_DANGER));
         assert_eq!(lines[4].line.spans[1].style.fg, Some(COLOR_SUCCESS));
         assert!(
@@ -6015,6 +6084,39 @@ mod tests {
                 .add_modifier
                 .contains(Modifier::DIM)
         );
+    }
+
+    /// GitHub の diff stat のように、見出し行の `(+N -M)` の増減件数を
+    /// + は緑・- は赤で個別に色分けする。
+    #[test]
+    fn codex_log_entry_lines_colors_edit_count_badge_like_github() {
+        let entry = CodexLogLine {
+            kind: CodexLogKind::Tool,
+            text: "EDIT *** Begin Patch\n*** Update File: src/tui/ui.rs\n@@\n-old line\n+new line 1\n+new line 2\n*** End Patch".to_string(),
+        };
+
+        let lines = codex_log_entry_lines(&entry, 80, None);
+        let header = &lines[1].line;
+        assert_eq!(line_text(header), "     |   ⎿ 更新 src/tui/ui.rs (+2 -1)");
+
+        let added = header
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "2")
+            .expect("added count span");
+        let deleted = header
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "1")
+            .expect("deleted count span");
+        assert_eq!(added.style.fg, Some(COLOR_SUCCESS));
+        assert_eq!(deleted.style.fg, Some(COLOR_DANGER));
+    }
+
+    #[test]
+    fn split_diff_count_badge_ignores_non_matching_text() {
+        assert!(split_diff_count_badge("no counts here", Style::default()).is_none());
+        assert!(split_diff_count_badge("(+a -b)", Style::default()).is_none());
     }
 
     #[test]
@@ -6026,8 +6128,8 @@ mod tests {
         let preview = code_edit_diff_preview(&text, CODEX_EDIT_DIFF_PREVIEW_LINES);
         // ファイル見出しを含めて上限までのプレビュー + 省略行。
         assert_eq!(preview.len(), CODEX_EDIT_DIFF_PREVIEW_LINES + 1);
-        assert_eq!(preview[0], "▸ 更新 big.rs (+20 -0)");
-        assert_eq!(preview[1], "+line0");
+        assert_eq!(preview[0], "  ⎿ 更新 big.rs (+20 -0)");
+        assert_eq!(preview[1], "     +line0");
         assert_eq!(
             preview[CODEX_EDIT_DIFF_PREVIEW_LINES],
             format!("... 差分行を{}行省略", 21 - CODEX_EDIT_DIFF_PREVIEW_LINES)
@@ -6047,9 +6149,9 @@ mod tests {
              *** End Patch",
         );
 
-        assert!(text.contains("変更 2 files"));
-        assert!(text.contains("▸ 更新 a.rs (+1 -1)"));
-        assert!(text.contains("▸ 追加 b.rs (+1 -0)"));
+        assert!(text.contains("● 変更 2 files"));
+        assert!(text.contains("⎿ 更新 a.rs (+1 -1)"));
+        assert!(text.contains("⎿ 追加 b.rs (+1 -0)"));
         assert!(text.contains("+added"));
     }
 
@@ -6057,7 +6159,7 @@ mod tests {
     fn summarize_tool_display_text_highlights_cargo_test_result() {
         let text = summarize_tool_display_text("cargo test\ntest result: ok. 86 passed; 0 failed;");
 
-        assert_eq!(text, "• 実行: cargo test\n  └ テスト: 成功");
+        assert_eq!(text, "● 実行: cargo test\n  ⎿ テスト: 成功");
     }
 
     #[test]
@@ -6066,7 +6168,38 @@ mod tests {
             "cargo fmt -- --check\nDiff in /repo/src/tui/ui.rs:3163:\n-old\n+new",
         );
 
-        assert_eq!(text, "• 実行: cargo fmt -- --check\n  └ 出力3行");
+        assert_eq!(
+            text,
+            "● 実行: cargo fmt -- --check\n  ⎿ Diff in /repo/src/tui/ui.rs:3163:\n     -old\n     +new"
+        );
+    }
+
+    #[test]
+    fn tool_output_tree_preview_shows_content_not_just_line_count() {
+        let text =
+            summarize_tool_display_text("cat src/main.rs\nfn main() {\n    println!(\"hi\");\n}");
+
+        assert_eq!(
+            text,
+            "● 実行: cat src/main.rs\n  ⎿ fn main() {\n         println!(\"hi\");\n     }"
+        );
+    }
+
+    #[test]
+    fn tool_output_tree_preview_caps_lines_and_reports_omitted() {
+        let mut output = String::from("cat big.rs\n");
+        for i in 0..20 {
+            output.push_str(&format!("line{i}\n"));
+        }
+        let text = summarize_tool_display_text(&output);
+
+        assert!(text.contains("line0"));
+        assert!(text.contains(&format!("line{}", TOOL_OUTPUT_PREVIEW_LINES - 1)));
+        assert!(!text.contains("line19"));
+        assert!(text.contains(&format!(
+            "... 出力を{}行省略",
+            20 - TOOL_OUTPUT_PREVIEW_LINES
+        )));
     }
 
     #[test]
@@ -6078,7 +6211,7 @@ mod tests {
 
         assert_eq!(
             text,
-            "• 実行: addness goal get goal-1 --json\n  └ addness: ゴール"
+            "● 実行: addness goal get goal-1 --json\n  ⎿ addness: ゴール"
         );
     }
 
@@ -6091,8 +6224,8 @@ mod tests {
 
         assert_eq!(
             text,
-            r#"• 実行: "$ADDNESS_BIN" goal get goal-1 --json
-  └ addness: ゴール"#
+            r#"● 実行: "$ADDNESS_BIN" goal get goal-1 --json
+  ⎿ addness: ゴール"#
         );
     }
 
@@ -6105,7 +6238,7 @@ mod tests {
 
         assert_eq!(
             text,
-            "• 実行: $ addness link progress --goal goal-1 --message ok --json\n  └ addness: 1項目"
+            "● 実行: $ addness link progress --goal goal-1 --message ok --json\n  ⎿ addness: 1項目"
         );
     }
 
@@ -6113,7 +6246,7 @@ mod tests {
     fn summarize_tool_display_text_highlights_codex_management_output() {
         let text = summarize_tool_display_text("OK codex mcp list\nserver-a\nserver-b");
 
-        assert_eq!(text, "• 実行: codex mcp list\n  └ mcp: 2行");
+        assert_eq!(text, "● 実行: codex mcp list\n  ⎿ mcp: 2行");
     }
 
     #[test]
@@ -6123,7 +6256,7 @@ mod tests {
 [{"id":"task-1"},{"id":"task-2"}]"#,
         );
 
-        assert_eq!(text, "• 実行: codex cloud list\n  └ cloud: 一覧2件");
+        assert_eq!(text, "● 実行: codex cloud list\n  ⎿ cloud: 一覧2件");
     }
 
     #[test]

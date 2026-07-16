@@ -18,6 +18,14 @@ pub fn run(client: ApiClient) -> Result<()> {
             std::io::stdout(),
             ratatui::crossterm::event::EnableBracketedPaste
         );
+        // フォーカス復帰イベントを受け取れるようにする。画面切り替え後に戻ってきた際、
+        // ratatui は前回描画したバッファとの差分しか送らないため、離れている間に端末側の
+        // 表示が乱れても検知できず黒画面のまま固まることがある。FocusGained を
+        // needs_full_clear のトリガに使い、復帰時に必ず全消去→再描画させる。
+        let _ = ratatui::crossterm::execute!(
+            std::io::stdout(),
+            ratatui::crossterm::event::EnableFocusChange
+        );
         let _ = ratatui::crossterm::execute!(
             std::io::stdout(),
             ratatui::crossterm::event::PushKeyboardEnhancementFlags(
@@ -36,6 +44,7 @@ pub fn run(client: ApiClient) -> Result<()> {
         );
         let _ = ratatui::crossterm::execute!(
             std::io::stdout(),
+            ratatui::crossterm::event::DisableFocusChange,
             ratatui::crossterm::event::DisableBracketedPaste,
             ratatui::crossterm::event::DisableMouseCapture
         );

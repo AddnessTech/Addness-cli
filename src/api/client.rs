@@ -9,6 +9,7 @@ mod deliverable;
 mod desktop_auth;
 mod diagnosis;
 mod goal;
+mod goal_chat;
 mod goal_execution;
 mod goalreport;
 mod inlinemedia;
@@ -35,6 +36,7 @@ pub use activity::{
 };
 pub use chat::{ChatMessageListParams, ChatRoomListParams, ChatSearchParams};
 pub use comment::{ListAllCommentsParams, ListCommentsParams};
+pub use goal_chat::GoalChatThreadListParams;
 pub use invoice::InvoiceListParams;
 pub use issue::{GoalSectionListParams, IssueListParams};
 pub use meeting::{HuddleInviteableMembersParams, MinuteListParams};
@@ -560,6 +562,18 @@ impl ApiClient {
     pub(super) async fn get_stream(&self, path: &str) -> Result<Response> {
         let (url, req) = self.request(Method::GET, path, true)?;
         let req = req.timeout(Duration::from_secs(EVENT_STREAM_TIMEOUT_SECS));
+        self.send(req, &url).await
+    }
+
+    /// POST a JSON body to a server-sent-events endpoint, returning the raw
+    /// `Response` for the caller to consume as a byte stream. Mirrors
+    /// `get_stream`, but for endpoints (e.g. AI goal chat) whose SSE stream
+    /// is initiated with a POST + JSON payload rather than a GET.
+    pub(super) async fn post_stream<B: Serialize>(&self, path: &str, body: &B) -> Result<Response> {
+        let (url, req) = self.request(Method::POST, path, true)?;
+        let req = req
+            .json(body)
+            .timeout(Duration::from_secs(EVENT_STREAM_TIMEOUT_SECS));
         self.send(req, &url).await
     }
 }

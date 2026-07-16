@@ -12,6 +12,7 @@ pub mod detect;
 pub mod diagnosis;
 pub mod execution;
 pub mod goal;
+pub mod goal_chat;
 pub mod invitation;
 pub mod invoice;
 pub mod issue;

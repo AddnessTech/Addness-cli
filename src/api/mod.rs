@@ -14,8 +14,8 @@ pub use client::{
     GoalActivitySummaryParams,
 };
 pub use client::{
-    ChatMessageListParams, ChatRoomListParams, ChatSearchParams, GoalSectionListParams,
-    IssueListParams, ListAllCommentsParams,
+    ChatMessageListParams, ChatRoomListParams, ChatSearchParams, GoalChatThreadListParams,
+    GoalSectionListParams, IssueListParams, ListAllCommentsParams,
 };
 pub use client::{
     HuddleInviteableMembersParams, InvoiceListParams, MinuteListParams, SearchQueryParams,

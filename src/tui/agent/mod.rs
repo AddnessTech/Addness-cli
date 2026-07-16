@@ -1201,6 +1201,11 @@ const RECENT_ACTIONS_CAP: usize = 5;
 /// 保持件数上限。ターン跨ぎでも保持するため `RECENT_ACTIONS_CAP` より大きめに取る。
 const SUBAGENTS_CAP: usize = 20;
 
+/// バックグラウンドタスクが実行中のまま生き残れる最大ターン数（安全弁）。
+/// これを超えて実行中のままだと、完了通知の取りこぼしとみなして強制的に完了扱いへ倒す
+/// （`CodexPane::prune_stale_background_tasks` 参照）。
+const BACKGROUND_TASK_STALE_TURN_LIMIT: u32 = 3;
+
 /// サブエージェント 1 件の状態。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SubagentState {
@@ -1223,6 +1228,10 @@ impl SubagentState {
 }
 
 /// 状態パネルに表示する 1 件のサブエージェント起動情報。
+///
+/// `run_in_background: true` で起動された Bash コマンド / Task・Agent サブエージェントも、
+/// 同じ「起動して裏で走らせ、いつか完了する何か」という性質を共有するため、この構造体を
+/// 再利用して追跡する（`is_background` で区別する）。
 #[derive(Debug, Clone)]
 struct SubagentEntry {
     /// 起動元 tool_use の `id`。対応する tool_result とのマッチングに使う。
@@ -1236,6 +1245,54 @@ struct SubagentEntry {
     started_at: Instant,
     /// 完了/失敗した時刻（経過時間表示の固定に使う）。実行中は None。
     finished_at: Option<Instant>,
+    /// `run_in_background: true` で起動されたか（Bash のバックグラウンド実行、または
+    /// Task/Agent のバックグラウンド起動）。false は通常の（同期的な）サブエージェント。
+    is_background: bool,
+    /// バックグラウンド起動の確認応答（「running in background with ID: ...」）を
+    /// 受信済みか。`is_background == false` では常に false のまま無視される。
+    bg_confirmed: bool,
+    /// バックグラウンド起動の確認応答から取り出した ID（例: "bash_1"）。
+    /// task-notification 系の完了通知とこの ID で突き合わせる。
+    bg_id: Option<String>,
+    /// 安全弁: `is_background` エントリが実行中のまま新しいユーザーターンをまたいだ回数。
+    /// 一定回数を超えたら完了通知を取りこぼしたとみなし、強制的に完了扱いへ倒す
+    /// （`prune_stale_background_tasks` 参照）。
+    turns_survived_while_running: u32,
+}
+
+/// `subagent_status_lines` の整形ロジック本体。バックグラウンドタスク一覧
+/// （`background_task_status_lines`）とは表示アイコンの決め方が異なるため独立させている。
+/// 実行中を優先しつつ、完了/失敗は新しい順にして `limit` 件までに絞る。
+fn subagent_status_lines_for<'a>(
+    entries: impl Iterator<Item = &'a SubagentEntry>,
+    limit: usize,
+) -> Vec<String> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut running: Vec<&SubagentEntry> = Vec::new();
+    let mut finished: Vec<&SubagentEntry> = Vec::new();
+    for entry in entries {
+        if entry.state == SubagentState::Running {
+            running.push(entry);
+        } else {
+            finished.push(entry);
+        }
+    }
+    // 完了/失敗は新しい順（直近ほど関心が高い）、実行中はそのまま起動順で先頭にまとめる。
+    finished.reverse();
+    running
+        .into_iter()
+        .chain(finished)
+        .take(limit)
+        .map(|entry| {
+            let elapsed = match entry.finished_at {
+                Some(finished_at) => finished_at.duration_since(entry.started_at).as_secs(),
+                None => entry.started_at.elapsed().as_secs(),
+            };
+            format!("{} {} ({}秒)", entry.state.icon(), entry.label, elapsed)
+        })
+        .collect()
 }
 
 /// アクション種別（状態パネルのパンくずで先頭に付けるアイコンを決める）。
@@ -1952,7 +2009,13 @@ impl CodexPane {
     /// テスト用: 実行中サブエージェントを直接積む（ui 側のヘッダ/状態パネル表示テストから使う）。
     #[cfg(test)]
     pub(crate) fn test_add_running_subagent(&mut self, label: &str) {
-        self.record_subagent_launch(None, label.to_string(), None);
+        self.record_subagent_launch(None, label.to_string(), None, false);
+    }
+
+    /// テスト用: 実行中バックグラウンドタスクを直接積む（ui 側の表示テストから使う）。
+    #[cfg(test)]
+    pub(crate) fn test_add_running_background_task(&mut self, label: &str) {
+        self.record_background_bash_launch(None, label.to_string());
     }
 
     /// このペインのエージェントバックエンド種別。
@@ -2097,11 +2160,15 @@ impl CodexPane {
 
     /// サブエージェント起動（`Task`/`Agent` ツール）を「実行中」として記録する。
     /// ターンをまたいでも保持するため `clear_recent_actions` の対象にはしない。
+    /// `is_background` は `input.run_in_background == true` で起動されたか
+    /// （バックグラウンド起動は tool_result を「確認応答」として扱う点が異なる。
+    /// `resolve_subagent_result` 参照）。
     fn record_subagent_launch(
         &mut self,
         tool_use_id: Option<String>,
         label: String,
         agent_type: Option<String>,
+        is_background: bool,
     ) {
         self.subagents.push_back(SubagentEntry {
             tool_use_id,
@@ -2110,16 +2177,32 @@ impl CodexPane {
             state: SubagentState::Running,
             started_at: Instant::now(),
             finished_at: None,
+            is_background,
+            bg_confirmed: false,
+            bg_id: None,
+            turns_survived_while_running: 0,
         });
         while self.subagents.len() > SUBAGENTS_CAP {
             self.subagents.pop_front();
         }
     }
 
-    /// tool_result を受けて、対応するサブエージェントの状態を完了/失敗へ遷移させる。
-    /// `tool_use_id` が一致する実行中エントリのみ更新する（Claude Code の tool_result は
-    /// 常に `tool_use_id` を持つため、id 不一致=サブエージェント以外の tool_result として無視する）。
-    fn resolve_subagent_result(&mut self, tool_use_id: Option<&str>, is_error: bool) {
+    /// Bash を `run_in_background: true` で起動した際の「実行中」記録。
+    /// サブエージェントと同じ `SubagentEntry`/`subagents` を再利用する（`is_background = true`）。
+    fn record_background_bash_launch(&mut self, tool_use_id: Option<String>, label: String) {
+        self.record_subagent_launch(tool_use_id, label, None, true);
+    }
+
+    /// tool_result を受けて、対応するサブエージェント/バックグラウンドタスクの状態を
+    /// 完了/失敗へ遷移させる。`tool_use_id` が一致する実行中エントリのみ更新する
+    /// （Claude Code の tool_result は常に `tool_use_id` を持つため、id 不一致は
+    /// サブエージェント/バックグラウンドタスク以外の tool_result として無視する）。
+    ///
+    /// `is_background` なエントリは特別扱いする: まだバックグラウンド確認応答
+    /// （「running in background with ID: ...」）を受け取っていなければ、この tool_result は
+    /// 「バックグラウンドで走り始めた」ことの確認に過ぎず、まだ完了していない。
+    /// 確認応答が取れなければ（即時エラー・即時完了など）通常どおり解決する。
+    fn resolve_subagent_result(&mut self, tool_use_id: Option<&str>, text: &str, is_error: bool) {
         let idx = tool_use_id.and_then(|id| {
             self.subagents
                 .iter()
@@ -2132,6 +2215,14 @@ impl CodexPane {
             if entry.state != SubagentState::Running {
                 return;
             }
+            if entry.is_background
+                && !entry.bg_confirmed
+                && let Some(id) = claude::background_confirmation_id(text)
+            {
+                entry.bg_confirmed = true;
+                entry.bg_id = Some(id);
+                return; // バックグラウンドで実行中と確認できただけで、まだ未完了。
+            }
             entry.state = if is_error {
                 SubagentState::Failed
             } else {
@@ -2141,30 +2232,118 @@ impl CodexPane {
         }
     }
 
-    /// 実行中のサブエージェント数。ヘッダ行・状態パネルの集計表示に使う。
+    /// task-notification 系の完了通知テキストを解析し、該当するバックグラウンドタスクを完了へ倒す。
+    /// ID を特定できた場合はそのエントリのみ、特定できない「完了通知らしきテキスト」の場合は
+    /// 取りこぼし防止のため最も古い実行中エントリを 1 件だけ解決する（安全弁）。
+    fn resolve_background_notification(&mut self, text: &str) {
+        if !self
+            .subagents
+            .iter()
+            .any(|entry| entry.is_background && entry.state == SubagentState::Running)
+        {
+            return; // 追跡中のバックグラウンドタスクが無ければ判定コストをかけない。
+        }
+        match claude::background_completion_signal(text) {
+            claude::BackgroundCompletionSignal::None => {}
+            claude::BackgroundCompletionSignal::ForId(id) => {
+                if let Some(entry) = self.subagents.iter_mut().find(|entry| {
+                    entry.is_background
+                        && entry.state == SubagentState::Running
+                        && entry.bg_id.as_deref() == Some(id.as_str())
+                }) {
+                    entry.state = SubagentState::Completed;
+                    entry.finished_at = Some(Instant::now());
+                }
+            }
+            claude::BackgroundCompletionSignal::Unmatched => {
+                if let Some(entry) = self
+                    .subagents
+                    .iter_mut()
+                    .filter(|entry| entry.is_background && entry.state == SubagentState::Running)
+                    .min_by_key(|entry| entry.started_at)
+                {
+                    entry.state = SubagentState::Completed;
+                    entry.finished_at = Some(Instant::now());
+                }
+            }
+        }
+    }
+
+    /// 安全弁: 完了通知を取りこぼしたまま新しいユーザーターンを重ねても表示が
+    /// 「バックグラウンド処理中」に張り付き続けないよう、一定ターン数実行中のまま
+    /// 生き残ったバックグラウンドタスクを強制的に完了扱いへ倒す。
+    /// 実際にまだ動いている可能性はあるが、通知を検知できない以上いつまでも
+    /// 待ち続けるより「打ち切って通常表示へ戻す」方を安全側とみなす。
+    fn prune_stale_background_tasks(&mut self) {
+        for entry in self.subagents.iter_mut() {
+            if !entry.is_background || entry.state != SubagentState::Running {
+                continue;
+            }
+            entry.turns_survived_while_running =
+                entry.turns_survived_while_running.saturating_add(1);
+            if entry.turns_survived_while_running > BACKGROUND_TASK_STALE_TURN_LIMIT {
+                entry.state = SubagentState::Completed;
+                entry.finished_at = Some(Instant::now());
+                entry.label = format!("{} (通知未検知のため打ち切り)", entry.label);
+            }
+        }
+    }
+
+    /// 実行中のサブエージェント数（バックグラウンドタスクは含まない）。
+    /// ヘッダ行・状態パネルの集計表示に使う。
     pub fn subagent_running_count(&self) -> usize {
         self.subagents
             .iter()
-            .filter(|entry| entry.state == SubagentState::Running)
+            .filter(|entry| entry.state == SubagentState::Running && !entry.is_background)
             .count()
     }
 
-    /// 状態パネルに表示するサブエージェント一覧を、実行中を優先しつつ新しい順に整形して返す。
+    /// 実行中のバックグラウンドタスク数（Bash の `run_in_background` および
+    /// バックグラウンド起動の Task/Agent）。「入力待ち」表示の誤り修正に使う集計値。
+    pub fn background_task_running_count(&self) -> usize {
+        self.subagents
+            .iter()
+            .filter(|entry| entry.state == SubagentState::Running && entry.is_background)
+            .count()
+    }
+
+    /// 未完了のバックグラウンドタスクがある間だけ、入力待ち表示の代わりに出すラベル。
+    /// 入力欄自体はブロックしない（呼び出し側は表示のみに使う）。
+    pub fn background_status_label(&self) -> Option<String> {
+        let n = self.background_task_running_count();
+        if n == 0 {
+            None
+        } else {
+            Some(format!("⏳ バックグラウンド処理中({n}件)・通知待ち"))
+        }
+    }
+
+    /// 状態パネルに表示するサブエージェント一覧（バックグラウンドタスクは含まない）を、
+    /// 実行中を優先しつつ新しい順に整形して返す。
     /// `limit` は呼び出し側（パネル高さに応じた表示件数トリム）で決める。
     pub fn subagent_status_lines(&self, limit: usize) -> Vec<String> {
-        if limit == 0 || self.subagents.is_empty() {
+        subagent_status_lines_for(
+            self.subagents.iter().filter(|entry| !entry.is_background),
+            limit,
+        )
+    }
+
+    /// 状態パネルに表示するバックグラウンドタスク一覧を、実行中を優先しつつ新しい順に整形して返す。
+    /// バックグラウンド確認応答（`bg_confirmed`）がまだ来ていない実行中エントリは、
+    /// 確定した状態アイコンではなく `…`（起動リクエスト送信済み・確認待ち）を使う。
+    pub fn background_task_status_lines(&self, limit: usize) -> Vec<String> {
+        if limit == 0 {
             return Vec::new();
         }
         let mut running: Vec<&SubagentEntry> = Vec::new();
         let mut finished: Vec<&SubagentEntry> = Vec::new();
-        for entry in &self.subagents {
+        for entry in self.subagents.iter().filter(|entry| entry.is_background) {
             if entry.state == SubagentState::Running {
                 running.push(entry);
             } else {
                 finished.push(entry);
             }
         }
-        // 完了/失敗は新しい順（直近ほど関心が高い）、実行中はそのまま起動順で先頭にまとめる。
         finished.reverse();
         running
             .into_iter()
@@ -2175,7 +2354,12 @@ impl CodexPane {
                     Some(finished_at) => finished_at.duration_since(entry.started_at).as_secs(),
                     None => entry.started_at.elapsed().as_secs(),
                 };
-                format!("{} {} ({}秒)", entry.state.icon(), entry.label, elapsed)
+                let icon = if entry.state == SubagentState::Running && !entry.bg_confirmed {
+                    "…"
+                } else {
+                    entry.state.icon()
+                };
+                format!("{icon} {} ({}秒)", entry.label, elapsed)
             })
             .collect()
     }
@@ -2208,11 +2392,23 @@ impl CodexPane {
 
     /// 状態ラベルに経過時間を添えた表示（例: 「考え中 1:23」）。
     pub fn run_state_elapsed_label(&self) -> String {
-        let label = self.run_state().label();
+        let label = self.run_state_display_label();
         match self.current_display_elapsed_secs() {
             Some(secs) => format!("{label} {}", format_elapsed(secs)),
-            None => label.to_string(),
+            None => label,
         }
+    }
+
+    /// `run_state()` のラベルを、未完了のバックグラウンドタスクがある間だけ
+    /// 「入力待ち」から「バックグラウンド処理中」表示へ差し替えたもの。
+    /// `run_state()` 自体（入力可否等の判定に使う）は変更しない。入力欄はブロックしない。
+    pub fn run_state_display_label(&self) -> String {
+        if self.run_state() == CodexRunState::InputWaiting
+            && let Some(label) = self.background_status_label()
+        {
+            return label;
+        }
+        self.run_state().label().to_string()
     }
 
     /// ターン開始/終了に応じて経過タイマーを管理し、表示秒が変わったら true を返す。
@@ -4757,6 +4953,7 @@ impl CodexPane {
                     edit_patch,
                     id,
                     subagent,
+                    background,
                 } => {
                     if let Some(summary) = &summary {
                         self.record_current_command(
@@ -4766,7 +4963,24 @@ impl CodexPane {
                     }
                     self.set_work_action(format!("ツール実行: {name}"));
                     if let Some(subagent) = subagent {
-                        self.record_subagent_launch(id, subagent.label, subagent.agent_type);
+                        // Task/Agent は `run_in_background: true` でも通常どおりサブエージェントとして
+                        // 記録する。背後で走らせているだけで種別は変わらないため、同じ subagents に
+                        // is_background フラグ付きで積む（`resolve_subagent_result` が確認応答を特別扱いする）。
+                        self.record_subagent_launch(
+                            id,
+                            subagent.label,
+                            subagent.agent_type,
+                            background,
+                        );
+                    } else if background && name == "Bash" {
+                        // Bash の `run_in_background: true` はバックグラウンドタスクとして追跡する
+                        // （tool_result の「running in background with ID: ...」で確認が取れるまでは
+                        // 「起動リクエスト送信済み」段階として扱う）。
+                        let label = summary
+                            .as_deref()
+                            .map(compact_tool_text)
+                            .unwrap_or_else(|| name.clone());
+                        self.record_background_bash_launch(id, label);
                     }
                     // Edit/Write は変更内容を色付き差分プレビュー行（見出し + diff）として残す。
                     // ラベル行と重複しないよう、パッチがあればそれをツール実行行にする。
@@ -4813,7 +5027,14 @@ impl CodexPane {
         for result in claude::tool_results(value) {
             self.current_command = None;
             self.current_command_started_at = None;
-            self.resolve_subagent_result(result.tool_use_id.as_deref(), result.is_error);
+            self.resolve_subagent_result(
+                result.tool_use_id.as_deref(),
+                &result.text,
+                result.is_error,
+            );
+            // BashOutput 等でバックグラウンドタスクの状況を確認した結果や、
+            // tool_result に相乗りした完了通知（task-notification 相当）を拾う。
+            self.resolve_background_notification(&result.text);
             if result.is_error {
                 let text = if result.text.is_empty() {
                     "(エラー詳細なし)".to_string()
@@ -4825,6 +5046,10 @@ impl CodexPane {
                 let summary = child_process_output_summary(&result.text);
                 self.push_log(CodexLogKind::Tool, format!("OUT {summary}"));
             }
+        }
+        // tool_result 以外のプレーンテキスト（task-notification の差し込みメッセージ等）。
+        for text in claude::user_event_plain_texts(value) {
+            self.resolve_background_notification(&text);
         }
     }
 
@@ -7286,6 +7511,11 @@ impl CodexPane {
     }
 
     fn start_turn_with_display_prompt(&mut self, prompt: &str, display_prompt: &str) {
+        // 安全弁: ユーザーが明示的に新しいターンを開始するタイミングで、完了通知を
+        // 取りこぼしたまま生き残っているバックグラウンドタスクを整理する
+        // （`is_turn_running` を跨いだ自動継続では呼ばれないため、通常のバックグラウンド
+        // タスク追跡はここでは消えない）。
+        self.prune_stale_background_tasks();
         // ClaudeCode の常駐モードは 1 プロセスで多ターンを回す（別経路）。
         if self.claude_resident_active() {
             self.start_claude_resident_turn(prompt, display_prompt);
@@ -13710,6 +13940,265 @@ mod tests {
     }
 
     #[test]
+    fn claude_bash_run_in_background_is_tracked_as_background_task() {
+        // run_in_background: true の Bash 起動は「入力待ち」誤表示解消の対象となる
+        // バックグラウンドタスクとして記録される（通常の Bash はサブエージェント扱いにならない）。
+        let mut pane = claude_pane();
+        assert_eq!(pane.background_task_running_count(), 0);
+
+        pane.handle_json_event(serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_bg1",
+                    "name": "Bash",
+                    "input": {"command": "./merge.sh", "run_in_background": true}
+                }
+            ]}
+        }));
+
+        assert_eq!(pane.background_task_running_count(), 1);
+        assert_eq!(
+            pane.subagent_running_count(),
+            0,
+            "通常のサブエージェント集計には含めない"
+        );
+        let lines = pane.background_task_status_lines(5);
+        assert_eq!(lines.len(), 1);
+        // 「running in background with ID」の確認応答がまだなので、確定アイコンではなく「…」。
+        assert!(lines[0].starts_with("… "), "line={}", lines[0]);
+    }
+
+    #[test]
+    fn claude_bash_background_confirmation_keeps_task_running_not_completed() {
+        // バックグラウンド化直後の tool_result は「実行中の確認」であって完了ではない。
+        let mut pane = claude_pane();
+        pane.handle_json_event(serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_bg2",
+                    "name": "Bash",
+                    "input": {"command": "./merge.sh", "run_in_background": true}
+                }
+            ]}
+        }));
+        pane.handle_json_event(serde_json::json!({
+            "type": "user",
+            "message": {"content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_bg2",
+                    "content": "Command running in background with ID: bash_1",
+                    "is_error": false
+                }
+            ]}
+        }));
+
+        assert_eq!(
+            pane.background_task_running_count(),
+            1,
+            "確認応答だけでは完了にならない"
+        );
+        let lines = pane.background_task_status_lines(5);
+        assert!(
+            lines[0].starts_with("● "),
+            "確認後は実行中アイコンに変わる: {}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn claude_background_task_immediate_error_resolves_without_confirmation() {
+        // 確認メッセージが来ずにいきなりエラーになった場合は、通常どおり失敗として解決する。
+        let mut pane = claude_pane();
+        pane.handle_json_event(serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_bg3",
+                    "name": "Bash",
+                    "input": {"command": "./boom.sh", "run_in_background": true}
+                }
+            ]}
+        }));
+        pane.handle_json_event(serde_json::json!({
+            "type": "user",
+            "message": {"content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_bg3",
+                    "content": "command not found",
+                    "is_error": true
+                }
+            ]}
+        }));
+
+        assert_eq!(pane.background_task_running_count(), 0);
+    }
+
+    #[test]
+    fn claude_background_task_completes_on_task_notification_with_id() {
+        // task-notification 相当のテキストに ID が含まれる場合はそのタスクだけを解決する。
+        let mut pane = claude_pane();
+        pane.handle_json_event(serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_bg4",
+                    "name": "Bash",
+                    "input": {"command": "./merge.sh", "run_in_background": true}
+                }
+            ]}
+        }));
+        pane.handle_json_event(serde_json::json!({
+            "type": "user",
+            "message": {"content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_bg4",
+                    "content": "Command running in background with ID: bash_9",
+                    "is_error": false
+                }
+            ]}
+        }));
+        assert_eq!(pane.background_task_running_count(), 1);
+
+        // task-notification は tool_result ではなくプレーンテキストとして差し込まれる想定。
+        pane.handle_json_event(serde_json::json!({
+            "type": "user",
+            "message": {"content": [
+                {"type": "text", "text": "task-id: bash_9 completed"}
+            ]}
+        }));
+
+        assert_eq!(pane.background_task_running_count(), 0);
+        let lines = pane.background_task_status_lines(5);
+        assert!(lines[0].starts_with('✔'));
+    }
+
+    #[test]
+    fn claude_background_task_notification_without_id_resolves_oldest_as_fallback() {
+        // ID を抽出できない完了通知らしきテキストは、取りこぼし防止の安全弁として
+        // 最も古い実行中エントリを解決する。
+        let mut pane = claude_pane();
+        pane.handle_json_event(serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_bg5",
+                    "name": "Bash",
+                    "input": {"command": "./merge.sh", "run_in_background": true}
+                }
+            ]}
+        }));
+        assert_eq!(pane.background_task_running_count(), 1);
+
+        pane.handle_json_event(serde_json::json!({
+            "type": "user",
+            "message": {"content": [
+                {"type": "text", "text": "Background job completed successfully"}
+            ]}
+        }));
+
+        assert_eq!(pane.background_task_running_count(), 0);
+    }
+
+    #[test]
+    fn claude_background_task_running_count_hides_input_waiting_label() {
+        // DoD: 未完了のバックグラウンドタスクが残っている間は「入力待ち」の代わりに
+        // バックグラウンド処理中であることを示すラベルを出す。ターン自体は終了済みでよい。
+        let mut pane = claude_pane();
+        pane.test_set_turn_running(false);
+        assert_eq!(pane.run_state(), CodexRunState::InputWaiting);
+        assert_eq!(pane.run_state_display_label(), "入力待ち");
+
+        pane.test_add_running_background_task("マージ処理");
+        assert_eq!(
+            pane.run_state(),
+            CodexRunState::InputWaiting,
+            "入力可否の判定は変えない"
+        );
+        let label = pane.run_state_display_label();
+        assert!(label.contains("バックグラウンド処理中"), "label={label}");
+        assert!(label.contains('1'), "label={label}");
+    }
+
+    #[test]
+    fn claude_background_task_completion_restores_input_waiting_label() {
+        let mut pane = claude_pane();
+        pane.test_set_turn_running(false);
+        pane.test_add_running_background_task("マージ処理");
+        assert!(
+            pane.run_state_display_label()
+                .contains("バックグラウンド処理中")
+        );
+
+        pane.resolve_background_notification("Background command completed");
+
+        assert_eq!(pane.background_task_running_count(), 0);
+        assert_eq!(pane.run_state_display_label(), "入力待ち");
+    }
+
+    #[test]
+    fn claude_background_task_stale_entry_is_pruned_after_turn_limit() {
+        // 安全弁: 完了通知を取りこぼしたまま新しいターンを重ねても、一定回数を超えたら
+        // 強制的に完了扱いへ倒し、表示が張り付き続けないようにする。
+        let mut pane = claude_pane();
+        pane.test_add_running_background_task("放置タスク");
+        assert_eq!(pane.background_task_running_count(), 1);
+
+        for _ in 0..BACKGROUND_TASK_STALE_TURN_LIMIT {
+            pane.prune_stale_background_tasks();
+            assert_eq!(
+                pane.background_task_running_count(),
+                1,
+                "上限に達するまでは実行中のまま"
+            );
+        }
+        pane.prune_stale_background_tasks();
+        assert_eq!(
+            pane.background_task_running_count(),
+            0,
+            "上限超過で強制的に完了扱いへ倒す"
+        );
+    }
+
+    #[test]
+    fn claude_task_tool_run_in_background_is_tracked_via_subagent_entry() {
+        // Task/Agent の run_in_background は既存のサブエージェント追跡へ is_background として乗る。
+        let mut pane = claude_pane();
+        pane.handle_json_event(serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_bgtask",
+                    "name": "Task",
+                    "input": {
+                        "description": "長期リサーチ",
+                        "subagent_type": "general-purpose",
+                        "run_in_background": true
+                    }
+                }
+            ]}
+        }));
+
+        assert_eq!(pane.subagents_len(), 1);
+        assert_eq!(
+            pane.subagent_running_count(),
+            0,
+            "バックグラウンド起動は通常のサブエージェント集計から外れる"
+        );
+        assert_eq!(pane.background_task_running_count(), 1);
+    }
+
+    #[test]
     fn claude_subagent_entries_are_capped_at_subagents_cap() {
         let mut pane = claude_pane();
         for i in 0..(SUBAGENTS_CAP + 3) {
@@ -13717,6 +14206,7 @@ mod tests {
                 Some(format!("id-{i}")),
                 format!("task-{i}"),
                 Some("Explore".to_string()),
+                false,
             );
         }
         assert_eq!(pane.subagents_len(), SUBAGENTS_CAP);
@@ -13729,15 +14219,22 @@ mod tests {
             Some("id-1".to_string()),
             "完了済みタスクA".to_string(),
             None,
+            false,
         );
-        pane.resolve_subagent_result(Some("id-1"), false);
-        pane.record_subagent_launch(Some("id-2".to_string()), "実行中タスクB".to_string(), None);
+        pane.resolve_subagent_result(Some("id-1"), "", false);
+        pane.record_subagent_launch(
+            Some("id-2".to_string()),
+            "実行中タスクB".to_string(),
+            None,
+            false,
+        );
         pane.record_subagent_launch(
             Some("id-3".to_string()),
             "完了済みタスクC".to_string(),
             None,
+            false,
         );
-        pane.resolve_subagent_result(Some("id-3"), false);
+        pane.resolve_subagent_result(Some("id-3"), "", false);
 
         // limit=0 は空。
         assert!(pane.subagent_status_lines(0).is_empty());

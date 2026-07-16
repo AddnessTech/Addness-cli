@@ -12,9 +12,9 @@ use crate::config::{Credentials, DEFAULT_API_URL, Settings};
 use api::ApiClient;
 use cli::commands::{
     activity, api_key, assignment, chat, codex_job, comment, configure, consent, deliverable,
-    desktop_auth, detect, diagnosis, execution, goal, invitation, invoice, issue, kpi, link, login,
-    media, meeting, member, notification, org, personal, referral, search, sharetree, skill,
-    skills, streak, summary, today, tool, update, user,
+    desktop_auth, detect, diagnosis, execution, goal, goal_chat, invitation, invoice, issue, kpi,
+    link, login, media, meeting, member, notification, org, personal, referral, search,
+    sharetree, skill, skills, streak, summary, today, tool, update, user,
 };
 
 #[derive(Parser)]
@@ -58,6 +58,12 @@ enum Commands {
     Goal {
         #[command(subcommand)]
         command: goal::GoalCommands,
+    },
+    /// AI agent chat scoped to a goal: send a message and stream the reply
+    /// (SSE), get an encouragement message, and browse threads/messages
+    GoalChat {
+        #[command(subcommand)]
+        command: goal_chat::GoalChatCommands,
     },
     /// Manage comments on goals
     Comment {
@@ -290,6 +296,7 @@ fn command_outputs_json(command: &Commands) -> bool {
         Commands::Consent { command } => consent_outputs_json(command),
         Commands::Org { command } => org_outputs_json(command),
         Commands::Goal { command } => goal_outputs_json(command),
+        Commands::GoalChat { command } => goal_chat_outputs_json(command),
         Commands::Comment { command } => comment_outputs_json(command),
         Commands::Issue { command } => issue_outputs_json(command),
         Commands::Chat { command } => chat_outputs_json(command),
@@ -565,6 +572,15 @@ fn codex_job_outputs_json(command: &codex_job::CodexJobCommands) -> bool {
         | codex_job::CodexJobCommands::Events { json, .. } => *json,
         codex_job::CodexJobCommands::Close { json, force, .. }
         | codex_job::CodexJobCommands::Delete { json, force, .. } => *json && *force,
+    }
+}
+
+fn goal_chat_outputs_json(command: &goal_chat::GoalChatCommands) -> bool {
+    match command {
+        goal_chat::GoalChatCommands::Send { json, .. }
+        | goal_chat::GoalChatCommands::Encouragement { json, .. }
+        | goal_chat::GoalChatCommands::Threads { json, .. }
+        | goal_chat::GoalChatCommands::Messages { json, .. } => *json,
     }
 }
 
@@ -1006,6 +1022,10 @@ async fn main() -> Result<()> {
         Some(Commands::Goal { command }) => {
             let client = build_client()?;
             goal::handle_goals(command, &client).await
+        }
+        Some(Commands::GoalChat { command }) => {
+            let client = build_client()?;
+            goal_chat::handle_goal_chat(command, &client).await
         }
         Some(Commands::Comment { command }) => {
             let client = build_client()?;

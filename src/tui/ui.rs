@@ -1370,7 +1370,7 @@ fn draw_codex_help_overlay(frame: &mut Frame, app: &mut App) {
                 "Vim composer / raw output設定を次ターンへ適用",
             ),
             kv("/keymap", "通常Codex keymap overrideを次ターンへ適用"),
-            kv("/memories", "Addness DB固定。作業メモは/rememberで保存"),
+            kv("/memories", "Addness DB固定。明示メモは/rememberで保存"),
             kv("/color", "Codex実行の色設定を never / auto / always に変更"),
             kv("/search / /oss", "web search / OSS provider modeを切替"),
             kv("/remote", "remote app server接続先を指定 / clear"),

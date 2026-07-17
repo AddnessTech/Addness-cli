@@ -4155,7 +4155,7 @@ impl CodexPane {
         self.restore_addness_memory_defaults();
         self.push_log(
             CodexLogKind::Error,
-            "Addness TUIでは通常Codexのglobal memoryを有効化しません。プロジェクト固有メモは /remember <内容> でAddnessへ保存してください",
+            "Addness TUIでは通常Codexのglobal memoryを有効化しません。プロジェクト固有メモは必要時にAddnessへ残し、明示保存は /remember <内容> を使ってください",
         );
     }
 
@@ -9493,7 +9493,7 @@ impl CodexPane {
                 self.push_log(
                     CodexLogKind::System,
                     format!(
-                        "記憶先: Addness DB。通常Codex memory: use={use_memories}, generate={generate}. プロジェクト固有の記憶は /remember で保存してください"
+                        "記憶先: Addness DB。通常Codex memory: use={use_memories}, generate={generate}. 実装・調査で必要な記憶はAddnessへ残し、明示保存は /remember を使ってください"
                     ),
                 );
             }
@@ -9527,7 +9527,7 @@ impl CodexPane {
             }
             _ => self.push_log(
                 CodexLogKind::Error,
-                "memories は Addness DB 固定です。status / off / clear を指定してください。プロジェクト固有メモは /remember <内容>",
+                "memories は Addness DB 固定です。status / off / clear を指定してください。明示保存は /remember <内容>",
             ),
         }
     }
@@ -10348,7 +10348,7 @@ Keep working toward the persistent goal across turns. If the user_request confli
             r#"{user_request}
 
 <addness_tui_context role="supporting_project_memory">
-Use this Addness snapshot as project-specific memory/source of truth. It prevents cross-project memory contamination, but it must not replace the user request above. Work like normal Codex: inspect the repo, implement or investigate, and verify.
+Use this Addness snapshot as initial project-specific memory/source of truth. It prevents cross-project memory contamination, but it must not replace the user request above. Work like normal Codex: inspect the repo, implement or investigate, verify, and keep durable project state in Addness.
 
 Current Addness goal:
 - id: {goal_id}
@@ -10368,11 +10368,11 @@ Body excerpt from TUI snapshot:
 
 Operating rule:
 1. Make concrete progress on the user request; do not replace implementation with memory bookkeeping.
-2. Treat this TUI snapshot as the first Addness recall. If it is enough for the current request, start from it immediately and inspect the repository like normal Codex. Read Addness via CLI only when more precise body/comments/deliverables/history could change the implementation decision.
+2. Treat this TUI snapshot as the first Addness hint. For implementation, investigation, goal management, PR/release, or handoff work, read the current goal early with `"$ADDNESS_BIN" goal get "$ADDNESS_GOAL_ID" --json --with-deliverable --with-comment` unless the request is only a trivial greeting or display check.
 3. For implementation or investigation requests, make a reasonable assumption from repo evidence and proceed unless the missing detail would make the result unsafe or likely wrong.
-4. The TUI automatically records current branch/folder, turn completion, and session progress into `## Codex自動メモ(機械)`. Do not manually update Addness just to mirror routine progress.
-5. Manually update Addness only when it improves future work: durable decisions, non-obvious constraints, DoD changes, useful child-goal decomposition, deliverables, or explicit handoff/memory requests.
-6. Do not put this project's durable facts into Codex global memory; use Addness body/DoD/child goals/deliverables instead.
+4. Before the final response after code changes, substantial investigation, PR/release/tag work, goal decomposition, or a durable decision, write the necessary state back to Addness even if the user did not explicitly ask. Use body/DoD/child goals/deliverables/progress as appropriate, and record only facts needed for restart.
+5. The TUI automatically records current branch/folder, turn completion, and session progress into `## Codex自動メモ(機械)` as a safety net. Do not rely on it as the only record for implemented work.
+6. Do not read or write Codex/Claude Code native memory or global DB for project facts unless the user explicitly asks or session resume mechanics require it; use Addness body/DoD/child goals/deliverables instead.
 {organization_hint}
 </addness_tui_context>
 
@@ -10407,11 +10407,11 @@ Current Addness goal:
 
 Rules:
 1. Act on the user request first; do not spend the turn re-summarizing Addness.
-2. Read Addness via CLI only if missing details could change the implementation decision.
+2. For implementation, investigation, goal management, PR/release, or handoff work, read the current goal early with `"$ADDNESS_BIN" goal get "$ADDNESS_GOAL_ID" --json --with-deliverable --with-comment` unless the request is only a trivial greeting or display check.
 3. For implementation or investigation requests, make a reasonable assumption from repo evidence and proceed unless the missing detail would make the result unsafe or likely wrong.
-4. The TUI automatically records current branch/folder, turn completion, and session progress into `## Codex自動メモ(機械)`. Do not manually update Addness just to mirror routine progress.
-5. Manually update Addness only for durable decisions, non-obvious constraints, DoD changes, useful child-goal decomposition, deliverables, or explicit handoff/memory requests.
-6. Do not use Codex global memory for project-specific facts.
+4. Before the final response after code changes, substantial investigation, PR/release/tag work, goal decomposition, or a durable decision, write the necessary state back to Addness even if the user did not explicitly ask.
+5. The TUI automatically records current branch/folder, turn completion, and session progress into `## Codex自動メモ(機械)` as a safety net. Do not rely on it as the only record for implemented work.
+6. Do not read or write Codex/Claude Code native memory or global DB for project facts unless the user explicitly asks or session resume mechanics require it.
 {organization_hint}
 </addness_tui_context>
 
@@ -12926,7 +12926,7 @@ fn dual_agent_prompt(pane: &CodexPane, mode: DualAgentMode, task: &str) -> Strin
 1. {instructions}
 2. 相手バックエンドが後続ターンで使えるように、結論だけでなく根拠・変更ファイル・検証結果を明示する。
 3. 同じ作業ツリーで相手も動く前提なので、未コミット差分や危険な操作は必ず明示する。
-4. Addnessへの通常進捗保存はTUIの自動記録に任せ、長期的な決定・PR・リリースだけ構造化して残す。
+4. 実装・調査・レビュー判断・PR/releaseを進めたら、相手バックエンドと次回再開に必要な状態をAddnessへ構造化して残す。TUIの自動記録だけに任せない。
 5. ユーザーへの報告、レビュー指摘、相手への依頼文は日本語で書く。
 "#,
         current = current,
@@ -13470,7 +13470,7 @@ fn user_request_prompt_block(prompt: &str) -> String {
 }
 
 pub fn resume_prompt() -> &'static str {
-    "Addnessの対象ゴールを読み、前回の続きから再開してください。bodyの `## Codex作業メモ` / `## Codex決定ログ` / `## PR/Release Traceability`、DoD、子ゴール、コメント、成果物を確認し、前回の続き・未完了・次の一手を3行以内で整理したら、そのまま必要なリポジトリ確認・実装・検証へ進んでください。Addnessを読んだだけでターンを終えないでください。通常進捗保存はTUIの `## Codex自動メモ(機械)` に任せ、必要な決定/成果物/子ゴールだけ手動更新してください。"
+    "Addnessの対象ゴールを読み、前回の続きから再開してください。bodyの `## Codex作業メモ` / `## Codex決定ログ` / `## PR/Release Traceability`、DoD、子ゴール、コメント、成果物を確認し、前回の続き・未完了・次の一手を3行以内で整理したら、そのまま必要なリポジトリ確認・実装・検証へ進んでください。Addnessを読んだだけでターンを終えないでください。実装・調査・PR/release・重要判断を進めたら、最終応答前に必要な再開情報をAddnessへ残してください。Codex/Claude Code本体のmemory/DBにはプロジェクト固有情報を保存しないでください。"
 }
 
 fn addness_organize_prompt(task: &str) -> String {
@@ -13488,7 +13488,7 @@ Addness TUI は誰でも `addness` と打てば起動できる通常の入口で
 {target}
 
 進め方:
-1. 既存のTUI snapshot（body/DoD/子ゴール/ブランチ）とリポジトリを確認し、実装判断に必要な不足だけAddness CLIで追加確認する。
+1. `"$ADDNESS_BIN" goal get "$ADDNESS_GOAL_ID" --json --with-deliverable --with-comment` で現在のbody/DoD/子ゴール/成果物を確認し、リポジトリ確認へ進む。
 2. 2つ以上の独立した作業単位、未完了の引き継ぎ、またはサブエージェントに渡せる単位がある場合だけ、Addness子ゴールを作成または更新する。
 3. 子ゴールを作る場合は title=作業名、description=完了状態、body=入力情報・対象ファイル・実装方針・検証方法・次の手 に分ける。作成後に `goal update <CHILD_GOAL_ID> --body-file <file> --json` でbodyを入れる。
 4. サブエージェント/並列作業ツールが利用でき、独立性が高い作業だけ委任する。委任できない場合は、子ゴールを作った上でメインエージェントが最優先の子ゴールから実装する。
@@ -13587,7 +13587,7 @@ fn addness_tui_developer_instructions() -> &'static str {
 目的:
 通常Codexと同じ速度で調査・実装・検証しながら、プロジェクト固有の長期状態だけをAddnessへ残してください。
 Addnessはmemory.mdの代替となるプロジェクト別DBです。通常memoryは複数プロジェクトの状態が混ざりやすいため、
-このプロジェクト固有の現在地・判断・決定・次の手はAddnessを真実源として扱います。
+このプロジェクト固有の現在地・判断・決定・次の手はAddnessを真実源として扱い、Codex/Claude Code本体のmemory/DBへは極力置きません。
 Addness TUIは誰でも `addness` と打てば起動できる通常の入口です。CodexはAddness CLIでgoal body/DoD/子ゴールを書き込めます。
 
 起動直後:
@@ -13600,17 +13600,17 @@ TUIから渡される軽量コンテキスト:
 - ADDNESS_WORKTREE_BRANCH: 起動した作業ツリーのgitブランチ
 
 実行ループ:
-1. TUIから渡されたbody/DoD/子ゴール/ブランチのsnapshotを最初の想起として扱ってください。
-2. snapshotで足りるなら、追加のAddness読込に1ターンを費やさず、通常Codexと同じように進めます。
-3. デフォルトの進み方は「TUI snapshotを見る → リポジトリを読む → 実装/調査する → 検証する」です。
+1. TUIから渡されたbody/DoD/子ゴール/ブランチのsnapshotを最初のヒントとして扱ってください。
+2. 実装・調査・ゴール整理・PR/release・引き継ぎに入る場合は、最初の作業段階で必ずAddness CLIで現在のゴールを読みます。挨拶・単純な表示確認だけならsnapshotだけで即応してよいです。
+3. デフォルトの進み方は「TUI snapshotを見る → Addness CLIで現在地を読む → リポジトリを読む → 実装/調査する → 検証する → 必要な状態をAddnessへ残す」です。
 4. Addnessを読んだだけで作業完了にしない。読んだ内容を使って、コード変更・検証・具体提案へ進みます。
 5. 実装や調査の依頼では、repoから合理的に判断できるなら確認質問やAddness整理を挟まず手を動かします。
 6. ユーザーへの返答では、Addness運用の説明より実装・判断・検証結果を先に出します。
 
-追加読込が必要な時:
-- body全文、コメント、成果物、過去決定などの不足が実装判断を変え得る場合だけ、Addness CLIで追加想起します。
-- body、DoD(description/definitionOfDone)、コメント、成果物、子ゴール、作業フォルダ/ブランチのうち、実装判断に必要な不足分だけを確認する。
-- 追加読込したら、読んだ内容を長く説明せず、その情報を使って実装・調査・提案へ戻ります。
+Addness読込ルール:
+- 実装・調査・ゴール整理・PR/release・引き継ぎでは、`"$ADDNESS_BIN" goal get "$ADDNESS_GOAL_ID" --json --with-deliverable --with-comment` を早い段階で実行します。
+- 必要な範囲はbody、DoD(description/definitionOfDone)、コメント、成果物、子ゴール、作業フォルダ/ブランチです。
+- 読んだ内容を長く説明せず、その情報を使って実装・調査・提案へ戻ります。
 
 Addness DBの置き場所:
 - DoD/完了基準: goal description
@@ -13628,17 +13628,19 @@ CLI最小操作:
 - 子ゴール作成: `"$ADDNESS_BIN" goal create --title "..." --parent "$ADDNESS_GOAL_ID" --description "..." --json`
 - 子ゴールbody: 作成結果のidへ `"$ADDNESS_BIN" goal update <CHILD_GOAL_ID> --body-file <file> --json`
 - PR紐づけ: `"$ADDNESS_BIN" link pr --goal "$ADDNESS_GOAL_ID" --url "<PR_URL>" --name "<name>" --json`
+- 短い進捗記録: `"$ADDNESS_BIN" link progress --goal "$ADDNESS_GOAL_ID" --message "..." --json`
 
 書き込みルール:
 - 起動しただけでは Addness に書き込まない。
-- TUIが作業フォルダ・ブランチ・turn完了・セッション終了サマリを `## Codex自動メモ(機械)` に自動記録します。
-  この自動記録で足りる通常の進捗は、Codexが手動でbody更新しなくて構いません。
-- メインエージェントは実装・調査・検証を止めない。TUIの自動記録に任せられる進捗保存のために、手を止めてAddness更新ターンへ寄せない。
-- 手動でAddnessに書き込むのは、自動メモでは足りない長期的判断・決定・重要制約、DoD変更、成果物/PR、独立した作業単位として残すべき子ゴール、明示的な `/remember`・`/handoff` 相当の内容がある時だけ。
+- TUIが作業フォルダ・ブランチ・turn完了・セッション終了サマリを `## Codex自動メモ(機械)` に自動記録しますが、これは保険です。
+- 実装・調査・PR/release・重要判断・未完了の引き継ぎが発生したら、ユーザーが明示しなくても最終応答前に必要な情報をAddnessへ残します。
+- 自動記録だけで済ませてよいのは、挨拶・単純な表示確認・コードや判断を伴わない短い応答だけです。
+- メインエージェントは実装・調査・検証を止めない。逐語ログや全コマンド出力ではなく、次回再開に必要な事実だけを短く残す。
 - 手動更新する時は現bodyを読み、手書きメモと `## Codex自動メモ(機械)` を壊さず、自分の専用ブロックだけを更新する。長文は `goal update --body-file` を使う。
 - 子ゴールは毎ターン機械的に作らない。作業分解・並列化・サブエージェント化・引き継ぎに役立つ時だけCodex自身が作成/更新する。
 - tag/releaseを作成したら deliverable/link に紐づけ、`## PR/Release Traceability` にPR・tag・release URL・CI結果を残す。
 - DoDが不十分なら、足りない観点を短く整理してユーザーに確認し、合意後に更新する。
+- Codex/Claude Code本体のmemory/DBはプロジェクト固有情報の保存先にしない。読む必要があるのはresume等の実行制御に限ります。
 
 再開時:
 body の `## Codex作業メモ`、`## Codex決定ログ`、`## PR/Release Traceability`、DoD、子ゴール、コメント、成果物を必要な範囲で読み、
@@ -16069,15 +16071,14 @@ mod tests {
         assert!(prompt.contains("Body excerpt from TUI snapshot"));
         assert!(prompt.contains("現在地: 設計済み"));
         assert!(prompt.contains("Make concrete progress"));
-        assert!(prompt.contains("Treat this TUI snapshot as the first Addness recall"));
-        assert!(prompt.contains("inspect the repository like normal Codex"));
+        assert!(prompt.contains("Treat this TUI snapshot as the first Addness hint"));
+        assert!(prompt.contains("read the current goal early"));
+        assert!(prompt.contains("inspect the repo"));
         assert!(prompt.contains("make a reasonable assumption from repo evidence"));
-        assert!(prompt.contains("The TUI automatically records current branch/folder"));
-        assert!(prompt.contains("Do not manually update Addness just to mirror routine progress"));
-        assert!(prompt.contains("Manually update Addness only when it improves future work"));
-        assert!(
-            prompt.contains("Do not put this project's durable facts into Codex global memory")
-        );
+        assert!(prompt.contains("Before the final response after code changes"));
+        assert!(prompt.contains("as a safety net"));
+        assert!(prompt.contains("Do not rely on it as the only record for implemented work"));
+        assert!(prompt.contains("Codex/Claude Code native memory or global DB"));
         assert!(prompt.contains("<user_request>\n実装して\n</user_request>"));
         assert!(prompt.contains("Act on the user_request first"));
     }
@@ -16161,9 +16162,9 @@ mod tests {
         assert!(prompt.contains("The user request above is primary"));
         assert!(prompt.contains("Act on the user request first"));
         assert!(prompt.contains("make a reasonable assumption from repo evidence"));
-        assert!(prompt.contains("The TUI automatically records current branch/folder"));
-        assert!(prompt.contains("Do not manually update Addness just to mirror routine progress"));
-        assert!(prompt.contains("Manually update Addness only for durable decisions"));
+        assert!(prompt.contains("read the current goal early"));
+        assert!(prompt.contains("Before the final response after code changes"));
+        assert!(prompt.contains("Do not rely on it as the only record for implemented work"));
         assert!(prompt.contains("- branch:"));
         assert!(!prompt.contains("Body excerpt from TUI snapshot"));
         assert!(!prompt.contains("Known child goals from TUI snapshot"));
@@ -16181,7 +16182,8 @@ mod tests {
         assert!(prompt.contains("3行以内で整理"));
         assert!(prompt.contains("リポジトリ確認・実装・検証へ進んでください"));
         assert!(prompt.contains("Addnessを読んだだけでターンを終えない"));
-        assert!(prompt.contains("通常進捗保存はTUI"));
+        assert!(prompt.contains("最終応答前に必要な再開情報をAddnessへ残してください"));
+        assert!(prompt.contains("Codex/Claude Code本体のmemory/DB"));
         assert!(!prompt.contains("短く整理してから進めてください"));
     }
 
@@ -17207,15 +17209,17 @@ mod tests {
     fn addness_developer_instructions_keep_codex_execution_primary() {
         let instructions = addness_tui_developer_instructions();
 
-        assert!(instructions.chars().count() < 3_000);
+        assert!(instructions.chars().count() < 3_600);
         assert!(instructions.contains("通常Codexと同じ速度で調査・実装・検証"));
         assert!(instructions.contains("Addnessはmemory.mdの代替となるプロジェクト別DB"));
         assert!(instructions.contains("Addness TUIは誰でも `addness` と打てば起動"));
         assert!(instructions.contains("Addness CLIでgoal body/DoD/子ゴールを書き込めます"));
         assert!(
             instructions
-                .contains("TUI snapshotを見る → リポジトリを読む → 実装/調査する → 検証する")
+                .contains("TUI snapshotを見る → Addness CLIで現在地を読む → リポジトリを読む")
         );
+        assert!(instructions.contains("必ずAddness CLIで現在のゴールを読みます"));
+        assert!(instructions.contains("必要な状態をAddnessへ残す"));
         assert!(instructions.contains("Addnessを読んだだけで作業完了にしない"));
         assert!(
             instructions.contains("repoから合理的に判断できるなら確認質問やAddness整理を挟まず")
@@ -17225,9 +17229,12 @@ mod tests {
         assert!(instructions.contains("goal update \"$ADDNESS_GOAL_ID\" --body-file"));
         assert!(instructions.contains("goal update \"$ADDNESS_GOAL_ID\" --description-file"));
         assert!(instructions.contains("goal create --title \"...\" --parent \"$ADDNESS_GOAL_ID\""));
+        assert!(instructions.contains("link progress --goal \"$ADDNESS_GOAL_ID\""));
         assert!(instructions.contains("body=入力情報/ブランチ/次の手"));
         assert!(instructions.contains("goal update <CHILD_GOAL_ID> --body-file"));
         assert!(instructions.contains("子ゴールは毎ターン機械的に作らない"));
+        assert!(instructions.contains("自動記録だけで済ませてよいのは"));
+        assert!(instructions.contains("Codex/Claude Code本体のmemory/DB"));
     }
 
     #[test]

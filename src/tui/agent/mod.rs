@@ -3151,6 +3151,7 @@ impl CodexPane {
             };
             let items = [
                 CodexModelChoice::Config,
+                CodexModelChoice::Gpt56,
                 CodexModelChoice::Gpt55,
                 CodexModelChoice::Gpt5,
                 CodexModelChoice::O3,
@@ -3590,7 +3591,7 @@ impl CodexPane {
     pub fn settings_shortcuts_label(&self) -> &'static str {
         match self.kind {
             AgentKind::Codex => {
-                "F2 model: config/gpt-5.5/gpt-5/o3 | F3 effort: config/low/medium/high/xhigh | F4 approval: config/untrusted/on-request/on-failure/never | F5 sandbox: read-only/workspace-write/danger-full-access"
+                "F2 model: config/gpt-5.6/gpt-5.5/gpt-5/o3 | F3 effort: config/low/medium/high/xhigh | F4 approval: config/untrusted/on-request/on-failure/never | F5 sandbox: read-only/workspace-write/danger-full-access"
             }
             AgentKind::ClaudeCode => {
                 "F2 model: config/fable/opus/sonnet/haiku | F3 effort: config/low/medium/high/xhigh/max | F4 permission: config/plan/acceptEdits/dontAsk/bypassPermissions/skip-permissions | F5 unused"
@@ -15212,6 +15213,15 @@ mod tests {
     }
 
     #[test]
+    fn codex_f2_cycles_through_gpt56() {
+        let mut pane = live_pane();
+        pane.cycle_model();
+        assert!(pane.settings_label().contains("model:gpt-5.6"));
+        pane.cycle_model();
+        assert!(pane.settings_label().contains("model:gpt-5.5"));
+    }
+
+    #[test]
     fn settings_shortcuts_label_explains_f_keys_per_backend() {
         let codex = live_pane();
         let codex_label = codex.settings_shortcuts_label();
@@ -18939,13 +18949,22 @@ mod tests {
             .iter()
             .map(|item| item.label.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(labels, ["config", "gpt-5.5", "gpt-5", "o3"]);
-        assert!(picker.items[2].current, "現在値 gpt-5 にマーカー");
-        assert_eq!(picker.selected, 2, "初期選択は現在値");
+        assert_eq!(labels, ["config", "gpt-5.6", "gpt-5.5", "gpt-5", "o3"]);
+        assert!(picker.items[3].current, "現在値 gpt-5 にマーカー");
+        assert_eq!(picker.selected, 3, "初期選択は現在値");
         pane.move_list_picker_selection(-1); // gpt-5 -> gpt-5.5
         pane.accept_list_picker(false);
         assert_eq!(pane.exec_settings.model, CodexModelChoice::Gpt55);
         assert!(pane.exec_settings.model_override.is_none());
+    }
+
+    #[test]
+    fn model_command_accepts_gpt56_alias() {
+        let mut pane = live_pane();
+        submit_line(&mut pane, "/model gpt5.6");
+        assert_eq!(pane.exec_settings.model, CodexModelChoice::Gpt56);
+        assert!(pane.exec_settings.model_override.is_none());
+        assert!(pane.settings_label().contains("model:gpt-5.6"));
     }
 
     #[test]

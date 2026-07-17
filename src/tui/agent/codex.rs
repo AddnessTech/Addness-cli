@@ -21,6 +21,7 @@ use super::{CodexSessionCandidate, config_override_value, split_codex_command_ar
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodexModelChoice {
     Config,
+    Gpt56,
     Gpt55,
     Gpt5,
     O3,
@@ -29,7 +30,8 @@ pub enum CodexModelChoice {
 impl CodexModelChoice {
     fn next(self) -> Self {
         match self {
-            Self::Config => Self::Gpt55,
+            Self::Config => Self::Gpt56,
+            Self::Gpt56 => Self::Gpt55,
             Self::Gpt55 => Self::Gpt5,
             Self::Gpt5 => Self::O3,
             Self::O3 => Self::Config,
@@ -39,6 +41,7 @@ impl CodexModelChoice {
     pub(super) fn label(self) -> &'static str {
         match self {
             Self::Config => "config",
+            Self::Gpt56 => "gpt-5.6",
             Self::Gpt55 => "gpt-5.5",
             Self::Gpt5 => "gpt-5",
             Self::O3 => "o3",
@@ -48,6 +51,7 @@ impl CodexModelChoice {
     fn cli_arg(self) -> Option<&'static str> {
         match self {
             Self::Config => None,
+            Self::Gpt56 => Some("gpt-5.6"),
             Self::Gpt55 => Some("gpt-5.5"),
             Self::Gpt5 => Some("gpt-5"),
             Self::O3 => Some("o3"),
@@ -58,6 +62,7 @@ impl CodexModelChoice {
 pub(super) fn parse_builtin_model_choice(value: &str) -> Option<CodexModelChoice> {
     match value.to_ascii_lowercase().as_str() {
         "config" | "default" | "clear" => Some(CodexModelChoice::Config),
+        "gpt-5.6" | "gpt5.6" | "gpt56" => Some(CodexModelChoice::Gpt56),
         "gpt-5.5" | "gpt5.5" | "gpt55" => Some(CodexModelChoice::Gpt55),
         "gpt-5" | "gpt5" => Some(CodexModelChoice::Gpt5),
         "o3" => Some(CodexModelChoice::O3),

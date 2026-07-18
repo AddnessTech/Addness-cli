@@ -6407,7 +6407,7 @@ mod dod_tests {
         assert_eq!(second.matches("## Codex作業メモ").count(), 1);
         assert_eq!(second.matches("## Codex決定ログ").count(), 1);
         assert_eq!(second.matches("## PR/Release Traceability").count(), 1);
-        assert!(second.contains("Codexの通常memoryへ混ぜない"));
+        assert!(second.contains("Codex/Claude Code本体のmemory/DBへ混ぜない"));
     }
 
     #[test]

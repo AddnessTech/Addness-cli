@@ -191,7 +191,7 @@ pub(super) fn ensure_codex_memory_sections(body: String) -> String {
     let work_memo = "## Codex作業メモ\n\
         - 現在地: 未記録\n\
         - 次の手: 未記録\n\
-        - メモリ運用: このゴール固有の前提・判断・未完了点はここに集約し、Codexの通常memoryへ混ぜない。"
+        - メモリ運用: このゴール固有の前提・判断・未完了点・実装結果はAddnessへ集約し、Codex/Claude Code本体のmemory/DBへ混ぜない。"
         .replace("\n        ", "\n");
     let decision_log = "## Codex決定ログ\n\
         - （決定が出たら `YYYY-MM-DD HH:MM - 決定: ... / 理由: ... / 影響: ...` の形で追記）"

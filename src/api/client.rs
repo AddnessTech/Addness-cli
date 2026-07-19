@@ -141,6 +141,25 @@ fn parse_dns_override_addr(raw: &str, port: u16) -> Result<SocketAddr> {
     Ok(SocketAddr::new(ip, port))
 }
 
+/// パース失敗時の診断用に、レスポンスボディの先頭を短く整形して返す。
+/// 文字境界を壊さないよう chars 単位で切り、改行は潰す。
+fn body_snippet(bytes: &[u8]) -> String {
+    const MAX_CHARS: usize = 160;
+    let text = String::from_utf8_lossy(bytes);
+    let mut snippet: String = text
+        .chars()
+        .filter(|c| *c != '\n' && *c != '\r')
+        .take(MAX_CHARS)
+        .collect();
+    if text.chars().count() > MAX_CHARS {
+        snippet.push('…');
+    }
+    if snippet.is_empty() {
+        snippet.push_str("<empty>");
+    }
+    snippet
+}
+
 fn send_failure_context(url: &str, attempts: usize) -> String {
     format!(
         "Failed to send request to {url} after {attempts} attempt(s). \
@@ -400,12 +419,72 @@ impl ApiClient {
             && (err.is_connect() || err.is_timeout())
     }
 
+    /// JSONレスポンスを期待するリクエストを送る。
+    ///
+    /// `retry_on_body_error` はステータス受信後にボディ読み取りが失敗した場合
+    /// （ローリングデプロイ中のコネクション切断等で 2xx でもボディが途中で
+    /// 切れることがある）にリクエスト全体を再送するか。サーバー側で処理が
+    /// 完了している可能性があるため、冪等な GET でのみ有効にすること。
+    async fn send_json_with_retry<T: DeserializeOwned>(
+        &self,
+        req: RequestBuilder,
+        url: &str,
+        retry_on_body_error: bool,
+    ) -> Result<T> {
+        let retryable_req = if retry_on_body_error {
+            req.try_clone()
+        } else {
+            None
+        };
+        let mut first_req = Some(req);
+
+        for attempt in 1..=REQUEST_SEND_ATTEMPTS {
+            let current_req = if attempt == 1 {
+                first_req
+                    .take()
+                    .expect("request builder should be available for first send")
+            } else if let Some(retryable_req) = &retryable_req {
+                retryable_req
+                    .try_clone()
+                    .expect("request builder clone should remain cloneable")
+            } else {
+                unreachable!("retry loop only continues when a cloneable request exists")
+            };
+
+            let response = self.send(current_req, url).await?;
+            let bytes = match response.bytes().await {
+                Ok(bytes) => bytes,
+                Err(_) if retryable_req.is_some() && attempt < REQUEST_SEND_ATTEMPTS => {
+                    tokio::time::sleep(Duration::from_millis(150 * attempt as u64)).await;
+                    continue;
+                }
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("Failed to read response body from {url}"));
+                }
+            };
+            return Self::parse_json_bytes(&bytes, url);
+        }
+
+        anyhow::bail!(
+            "Failed to read response body from {url} after {REQUEST_SEND_ATTEMPTS} attempts"
+        )
+    }
+
     async fn send_json<T: DeserializeOwned>(&self, req: RequestBuilder, url: &str) -> Result<T> {
-        self.send(req, url)
-            .await?
-            .json::<T>()
-            .await
-            .with_context(|| format!("Failed to parse response from {url}"))
+        self.send_json_with_retry(req, url, false).await
+    }
+
+    /// 2xxレスポンスのボディをJSONとしてパースする。失敗時はボディ先頭の
+    /// スニペットをエラーメッセージに含め、切断による欠損かスキーマ不一致かを
+    /// 切り分けられるようにする。
+    fn parse_json_bytes<T: DeserializeOwned>(bytes: &[u8], url: &str) -> Result<T> {
+        serde_json::from_slice(bytes).with_context(|| {
+            format!(
+                "Failed to parse response from {url} (body: {})",
+                body_snippet(bytes)
+            )
+        })
     }
 
     async fn send_no_content(&self, req: RequestBuilder, url: &str) -> Result<()> {
@@ -417,7 +496,7 @@ impl ApiClient {
     /// 組織に依存しないエンドポイント（org list等）で使用。
     pub(super) async fn get_without_org<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
         let (url, req) = self.request(Method::GET, path, false)?;
-        self.send_json(req, &url).await
+        self.send_json_with_retry(req, &url, true).await
     }
 
     /// ApiClient::get() は与えられた path をURLパスとして
@@ -427,7 +506,7 @@ impl ApiClient {
     /// このラッパをApiClientのメソッドとして実装する
     pub(super) async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
         let (url, req) = self.request(Method::GET, path, true)?;
-        self.send_json(req, &url).await
+        self.send_json_with_retry(req, &url, true).await
     }
 
     pub(super) async fn post<B: Serialize, T: DeserializeOwned>(
@@ -600,8 +679,8 @@ impl ApiClient {
 #[cfg(test)]
 mod tests {
     use super::{
-        API_RESOLVE_ENV, ApiClient, DEFAULT_HTTP_TIMEOUT_SECS, http_timeout_from_env_value,
-        parse_dns_override_addrs, send_failure_context,
+        API_RESOLVE_ENV, ApiClient, DEFAULT_HTTP_TIMEOUT_SECS, body_snippet,
+        http_timeout_from_env_value, parse_dns_override_addrs, send_failure_context,
     };
     use reqwest::StatusCode;
     use std::net::SocketAddr;
@@ -633,6 +712,43 @@ mod tests {
             http_timeout_from_env_value(Some("15")),
             Duration::from_secs(15)
         );
+    }
+
+    #[test]
+    fn body_snippet_truncates_and_flattens_newlines() {
+        let long = "a".repeat(200);
+        let snippet = body_snippet(long.as_bytes());
+        assert_eq!(snippet.chars().count(), 161); // 160 chars + ellipsis
+        assert!(snippet.ends_with('…'));
+
+        assert_eq!(body_snippet(b"line1\nline2\r\n"), "line1line2");
+        assert_eq!(body_snippet(b""), "<empty>");
+    }
+
+    #[test]
+    fn parse_json_bytes_reports_body_snippet_on_mismatch() {
+        let err = ApiClient::parse_json_bytes::<serde_json::Value>(
+            b"<html>WAF challenge</html>",
+            "https://example.com/api",
+        )
+        .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("Failed to parse response from https://example.com/api"));
+        assert!(message.contains("<html>WAF challenge</html>"));
+    }
+
+    #[test]
+    fn parse_json_bytes_reports_truncated_body() {
+        // ローリングデプロイ中の切断で途中までしか届かなかったボディを想定
+        let err = ApiClient::parse_json_bytes::<serde_json::Value>(
+            br#"{"data":{"members":[{"id":"x"#,
+            "https://example.com/api",
+        )
+        .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains(r#"{"data":{"members":[{"id":"x"#));
+        // 根本原因(serde)がチェーンに残ること
+        assert!(message.contains("EOF") || message.contains("eof"));
     }
 
     #[test]

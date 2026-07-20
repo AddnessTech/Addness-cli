@@ -193,7 +193,7 @@ jobs:
       # 使用中 CLI フラグの存在）を実測検証する。チェンジログに現れない挙動変更
       # （例: codex 0.142.5 の JSON-RPC `jsonrpc` フィールド欠落）を捕まえるための保険。
       - name: Node セットアップ（プローブ用 CLI インストール）
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
 

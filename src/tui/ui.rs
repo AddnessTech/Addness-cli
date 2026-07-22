@@ -5430,6 +5430,7 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane, scro
     } else {
         Style::default().fg(COLOR_TEXT_STRONG)
     };
+    let model_status = pane.model_status_label();
     let memory_mode = ellipsize_width(&pane.memory_mode_label(), value_width);
     let memory_mode_style = if pane.memory_mode_is_addness_safe() {
         Style::default().fg(COLOR_ADDNESS)
@@ -5494,6 +5495,13 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane, scro
             Span::styled(
                 format!("  Turn {}", pane.turn_count()),
                 Style::default().fg(COLOR_MUTED),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("モデル ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(
+                ellipsize_width(&model_status, value_width),
+                Style::default().fg(COLOR_TEXT),
             ),
         ]),
         Line::from(vec![

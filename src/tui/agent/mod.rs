@@ -3588,6 +3588,31 @@ impl CodexPane {
         }
     }
 
+    /// ダッシュボードの「モデル」行に出す現在モデルのラベル。
+    /// Claude はランタイム報告値（system/init の model）を優先し、設定値が config 以外なら併記する。
+    /// Codex は appserver が実効モデルを報告しないため設定値（override 優先）を表示する。
+    pub fn model_status_label(&self) -> String {
+        match self.kind {
+            AgentKind::ClaudeCode => {
+                let selected = self
+                    .claude_settings
+                    .model_override()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| self.claude_settings.model_choice().label().to_string());
+                match self.claude_active_model.as_deref() {
+                    Some(active) if selected == "config" => active.to_string(),
+                    Some(active) => format!("{active} (設定:{selected})"),
+                    None => selected,
+                }
+            }
+            AgentKind::Codex => self
+                .exec_settings
+                .model_override
+                .clone()
+                .unwrap_or_else(|| self.exec_settings.model.label().to_string()),
+        }
+    }
+
     pub fn settings_shortcuts_label(&self) -> &'static str {
         match self.kind {
             AgentKind::Codex => {
@@ -18683,6 +18708,36 @@ mod tests {
             pane.usage_header_label().as_deref(),
             Some("$0.0123 | ctx 45%")
         );
+    }
+
+    #[test]
+    fn model_status_label_claude_prefers_runtime_model() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.kind = AgentKind::ClaudeCode;
+
+        // ランタイム報告なし・設定 config → 設定値のラベルをそのまま表示。
+        assert_eq!(pane.model_status_label(), "config");
+
+        // ランタイム報告あり・設定 config → ランタイム値をそのまま表示（併記なし）。
+        pane.claude_active_model = Some("claude-fable-5".to_string());
+        assert_eq!(pane.model_status_label(), "claude-fable-5");
+
+        // ランタイム報告あり・設定が config 以外 → ランタイム値 + 設定値を併記。
+        pane.claude_settings.set_model("sonnet");
+        assert_eq!(pane.model_status_label(), "claude-fable-5 (設定:sonnet)");
+    }
+
+    #[test]
+    fn model_status_label_codex_uses_configured_value() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        assert_eq!(pane.kind, AgentKind::Codex);
+
+        // 既定（Config）→ "config"。
+        assert_eq!(pane.model_status_label(), "config");
+
+        // override 設定時はそちらを優先。
+        pane.exec_settings.model_override = Some("gpt-5.6-codex".to_string());
+        assert_eq!(pane.model_status_label(), "gpt-5.6-codex");
     }
 
     #[test]

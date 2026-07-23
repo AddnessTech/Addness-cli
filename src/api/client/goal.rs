@@ -212,10 +212,11 @@ impl ApiClient {
             let body = response.text().await.unwrap_or_default();
             return Err(Self::api_error(status, &body));
         }
-        response
-            .json::<ApiResponse<RecurringGoal>>()
+        let bytes = response
+            .bytes()
             .await
-            .with_context(|| format!("Failed to parse response from {url}"))
+            .with_context(|| format!("Failed to read response body from {url}"))?;
+        Self::parse_json_bytes(&bytes, &url)
     }
 
     pub async fn remove_recurring_goal(&self, goal_id: &str) -> Result<()> {

@@ -432,7 +432,7 @@ async fn fetch_initial_data(mut client: ApiClient) -> InitialData {
             return InitialData {
                 orgs: Vec::new(),
                 goal_tree: GoalTree::empty(),
-                error: Some(format!("Failed to load organizations: {e}")),
+                error: Some(format!("Failed to load organizations: {e:#}")),
             };
         }
     };
@@ -450,7 +450,7 @@ async fn fetch_initial_data(mut client: ApiClient) -> InitialData {
         Ok(resp) => (GoalTree::from_tree_items(resp.data.items), None),
         Err(e) => (
             GoalTree::empty(),
-            Some(format!("Failed to load goals: {e}")),
+            Some(format!("Failed to load goals: {e:#}")),
         ),
     };
 
@@ -473,7 +473,7 @@ async fn fetch_deferred_initial_data(
     );
     let (members_list, error) = match members_res {
         Ok(resp) => (resp.data.members, None),
-        Err(e) => (Vec::new(), Some(format!("Failed to load members: {e}"))),
+        Err(e) => (Vec::new(), Some(format!("Failed to load members: {e:#}"))),
     };
     DeferredInitialData {
         members_list,
@@ -1339,7 +1339,7 @@ impl App {
                 self.goal_tree = GoalTree::empty();
                 self.members = HashMap::new();
                 self.members_list = vec![];
-                self.set_error_message(format!("Failed to load goals: {e}"));
+                self.set_error_message(format!("Failed to load goals: {e:#}"));
             }
         }
     }
@@ -1359,7 +1359,7 @@ impl App {
             }
             Err(e) => {
                 self.goal_tree = GoalTree::empty();
-                self.set_error_message(format!("Failed to load goals: {e}"));
+                self.set_error_message(format!("Failed to load goals: {e:#}"));
             }
         }
     }
@@ -1403,7 +1403,7 @@ impl App {
             }
             Err(e) => {
                 self.todays_goals_tree = GoalTree::empty();
-                self.set_error_message(format!("Failed to load today's goals: {e}"));
+                self.set_error_message(format!("Failed to load today's goals: {e:#}"));
             }
         }
     }

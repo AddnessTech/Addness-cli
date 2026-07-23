@@ -154,10 +154,11 @@ impl ApiClient {
             let body = response.text().await.unwrap_or_default();
             return Err(Self::api_error(status, &body));
         }
-        let resp: ApiResponse<HuddleActive> = response
-            .json()
+        let bytes = response
+            .bytes()
             .await
-            .with_context(|| format!("Failed to parse response from {url}"))?;
+            .with_context(|| format!("Failed to read response body from {url}"))?;
+        let resp: ApiResponse<HuddleActive> = Self::parse_json_bytes(&bytes, &url)?;
         Ok(Some(resp.data))
     }
 

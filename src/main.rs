@@ -1021,6 +1021,54 @@ fn client_from_env() -> Option<Result<ApiClient>> {
     Some(ApiClient::new(&cfg.token, &cfg.api_url).map(|client| client.with_org_id(cfg.org_id)))
 }
 
+/// Return the API URL to use for browser login when the interactive TUI has no
+/// usable authentication source. Environment-token authentication takes
+/// precedence over stored credentials, matching [`build_client`].
+fn browser_login_api_url(
+    env_token: Option<&str>,
+    credentials: Option<&Credentials>,
+    current_org_id: Option<&str>,
+) -> Option<String> {
+    if env_token.is_some_and(|token| !token.trim().is_empty()) {
+        return None;
+    }
+
+    let has_stored_token = credentials.is_some_and(|creds| match current_org_id {
+        Some(org_id) => creds.token_for_org(org_id).is_some(),
+        None => creds.any_token().is_some(),
+    });
+    if has_stored_token {
+        return None;
+    }
+
+    Some(
+        credentials
+            .map(|creds| creds.api_url())
+            .unwrap_or(DEFAULT_API_URL)
+            .to_string(),
+    )
+}
+
+fn pending_browser_login_api_url() -> Result<Option<String>> {
+    let credentials = Credentials::load()?;
+    let settings = Settings::load()?;
+    Ok(browser_login_api_url(
+        std::env::var("ADDNESS_API_TOKEN").ok().as_deref(),
+        credentials.as_ref(),
+        settings.current_organization_id(),
+    ))
+}
+
+async fn build_tui_client() -> Result<ApiClient> {
+    if let Some(api_url) = pending_browser_login_api_url()? {
+        println!("Authentication is required. Starting browser login...");
+        println!();
+        login::handle_login(&api_url, None).await?;
+    }
+
+    build_client()
+}
+
 fn build_client() -> Result<ApiClient> {
     if let Some(client) = client_from_env() {
         return client;
@@ -1088,7 +1136,7 @@ async fn main() -> Result<()> {
 
     match &cli.command {
         None => {
-            let client = build_client()?;
+            let client = build_tui_client().await?;
             tui::run(client)
         }
         Some(Commands::Login {
@@ -1307,6 +1355,46 @@ mod tests {
         let cfg = env_client_config(Some("token"), Some("   "), Some("   ")).expect("some");
         assert_eq!(cfg.api_url, DEFAULT_API_URL);
         assert_eq!(cfg.org_id, None);
+    }
+
+    #[test]
+    fn browser_login_uses_default_api_without_authentication() {
+        assert_eq!(
+            browser_login_api_url(None, None, None).as_deref(),
+            Some(DEFAULT_API_URL)
+        );
+        assert_eq!(
+            browser_login_api_url(Some("   "), None, None).as_deref(),
+            Some(DEFAULT_API_URL)
+        );
+    }
+
+    #[test]
+    fn browser_login_is_skipped_for_environment_token() {
+        assert_eq!(browser_login_api_url(Some(" token "), None, None), None);
+    }
+
+    #[test]
+    fn browser_login_is_skipped_for_current_organization_token() {
+        let mut credentials = Credentials::new("https://api.example.test".to_string());
+        credentials.set_token("org-1".to_string(), "token".to_string());
+
+        assert_eq!(
+            browser_login_api_url(None, Some(&credentials), Some("org-1")),
+            None
+        );
+        assert_eq!(browser_login_api_url(None, Some(&credentials), None), None);
+    }
+
+    #[test]
+    fn browser_login_uses_stored_api_for_missing_organization_token() {
+        let mut credentials = Credentials::new("https://api.example.test".to_string());
+        credentials.set_token("org-1".to_string(), "token".to_string());
+
+        assert_eq!(
+            browser_login_api_url(None, Some(&credentials), Some("org-2")).as_deref(),
+            Some("https://api.example.test")
+        );
     }
 
     #[test]

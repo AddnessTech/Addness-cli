@@ -76,8 +76,8 @@ fn timestamp() -> i64 {
         .as_secs() as i64
 }
 
-fn is_callback_path(path: &str) -> bool {
-    path == "/callback"
+fn is_callback_path(path: &str, expected_state: &str) -> bool {
+    path == "/callback" || path == format!("/callback/{expected_state}")
 }
 
 pub async fn handle_login(api_url: &str, frontend_url: Option<&str>) -> Result<()> {
@@ -194,10 +194,12 @@ timestamp={ts}"#,
     println!("Waiting for login...");
 
     // 8. localhostでコールバックを待機（hyperでHTTPリクエストを処理）
-    let (handoff_id, callback_state) =
-        tokio::time::timeout(Duration::from_secs(300), wait_for_callback(listener))
-            .await
-            .map_err(|_| anyhow::anyhow!("Login timed out (5 minutes). Please try again."))??;
+    let (handoff_id, callback_state) = tokio::time::timeout(
+        Duration::from_secs(300),
+        wait_for_callback(listener, &state),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Login timed out (5 minutes). Please try again."))??;
 
     if callback_state != state {
         bail!("State mismatch: expected {}, got {}", state, callback_state);
@@ -315,11 +317,15 @@ timestamp={ts}"#
     Ok(())
 }
 
-async fn wait_for_callback(listener: tokio::net::TcpListener) -> Result<(String, String)> {
+async fn wait_for_callback(
+    listener: tokio::net::TcpListener,
+    expected_state: &str,
+) -> Result<(String, String)> {
     use tokio::sync::oneshot;
 
     let (tx, rx) = oneshot::channel::<(String, String)>();
     let tx = std::sync::Mutex::new(Some(tx));
+    let expected_state = expected_state.to_string();
 
     let (stream, _) = listener
         .accept()
@@ -328,9 +334,14 @@ async fn wait_for_callback(listener: tokio::net::TcpListener) -> Result<(String,
     let io = hyper_util::rt::TokioIo::new(stream);
 
     let service = service_fn(move |req: Request<Incoming>| {
-        let tx = tx.lock().unwrap().take();
+        let is_callback = is_callback_path(req.uri().path(), &expected_state);
+        let tx = if is_callback {
+            tx.lock().unwrap().take()
+        } else {
+            None
+        };
         async move {
-            if !is_callback_path(req.uri().path()) {
+            if !is_callback {
                 return Ok::<_, Infallible>(
                     Response::builder()
                         .status(StatusCode::NOT_FOUND)
@@ -381,12 +392,38 @@ async fn wait_for_callback(listener: tokio::net::TcpListener) -> Result<(String,
 
 #[cfg(test)]
 mod tests {
-    use super::is_callback_path;
+    use super::{is_callback_path, wait_for_callback};
+    use reqwest::StatusCode;
 
     #[test]
-    fn callback_path_must_match_exactly() {
-        assert!(is_callback_path("/callback"));
-        assert!(!is_callback_path("/callback-extra"));
-        assert!(!is_callback_path("/callback/extra"));
+    fn callback_path_accepts_current_and_legacy_contracts_exactly() {
+        let state = "session-1";
+
+        assert!(is_callback_path("/callback", state));
+        assert!(is_callback_path("/callback/session-1", state));
+        assert!(!is_callback_path("/callback/session-2", state));
+        assert!(!is_callback_path("/callback/session-1/extra", state));
+        assert!(!is_callback_path("/callback-extra", state));
+    }
+
+    #[tokio::test]
+    async fn callback_listener_accepts_state_scoped_path() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let callback =
+            tokio::spawn(async move { wait_for_callback(listener, "session-1").await.unwrap() });
+
+        let response = reqwest::get(format!(
+            "http://{address}/callback/session-1?state=session-1&handoff_id=handoff-1"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(response);
+
+        assert_eq!(
+            callback.await.unwrap(),
+            ("handoff-1".to_string(), "session-1".to_string())
+        );
     }
 }

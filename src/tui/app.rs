@@ -20,6 +20,8 @@ use crate::api::{
     ApiClient, Comment, CreateGoalRequest, Deliverable, DeliverableType, GoalChildItem, GoalStatus,
     Member, MemberId, Organization, UpdateGoalRequest,
 };
+#[cfg(not(test))]
+use crate::config::Settings;
 use crate::dbg_log;
 
 use super::agent::{
@@ -33,6 +35,37 @@ use super::file_picker::{
 };
 use super::goal_tree::{GoalTree, TreeRow};
 use super::ui;
+
+fn load_codex_left_panel_collapsed() -> bool {
+    #[cfg(test)]
+    {
+        false
+    }
+    #[cfg(not(test))]
+    {
+        Settings::load()
+            .map(|settings| settings.codex_left_panel_collapsed())
+            .unwrap_or(true)
+    }
+}
+
+fn save_codex_left_panel_collapsed(collapsed: bool) -> Result<()> {
+    #[cfg(test)]
+    {
+        let _ = collapsed;
+        Ok(())
+    }
+    #[cfg(not(test))]
+    {
+        Settings::load().and_then(|mut settings| settings.set_codex_left_panel_collapsed(collapsed))
+    }
+}
+
+fn is_codex_layout_toggle_key(key: KeyEvent) -> bool {
+    key.code == KeyCode::F(10)
+        || (key.code == KeyCode::Char('m')
+            && key.modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+}
 
 #[derive(PartialEq, Eq)]
 pub enum ActivePane {
@@ -960,7 +993,7 @@ pub struct App {
     pub(super) codex_contract_area: Option<Rect>,
     pub(super) codex_activity_area: Option<Rect>,
     /// 左の Addness ペイン（ゴールツリー/状態パネル）を折りたたんでいるか。
-    /// セッション内のみ保持（設定ファイルへの永続化はしない）。F10 でトグルする。
+    /// F10 でトグルし、設定ファイルへ永続化する。
     pub(super) codex_left_panel_collapsed: bool,
     pub(super) codex_status_scroll: usize,
     pub(super) codex_contract_scroll: usize,
@@ -1036,7 +1069,7 @@ impl App {
             codex_status_area: None,
             codex_contract_area: None,
             codex_activity_area: None,
-            codex_left_panel_collapsed: false,
+            codex_left_panel_collapsed: load_codex_left_panel_collapsed(),
             codex_status_scroll: 0,
             codex_contract_scroll: 0,
             codex_activity_scroll: 0,
@@ -2590,9 +2623,13 @@ impl App {
             return;
         }
         // 左の Addness ペイン（ゴールツリー/状態パネル）の開閉。検索入力中やピッカー表示中
-        // でも常に効くよう、他のキー処理より先に横取りする（F10はどのモードでも未使用）。
-        if key.modifiers.is_empty() && key.code == KeyCode::F(10) {
+        // でも常に効くよう、他のキー処理より先に横取りする。macOSでF10が特殊キーに
+        // 割り当てられている端末向けに Ctrl+Shift+M も用意する。
+        if is_codex_layout_toggle_key(key) {
             self.codex_left_panel_collapsed = !self.codex_left_panel_collapsed;
+            if let Err(err) = save_codex_left_panel_collapsed(self.codex_left_panel_collapsed) {
+                self.set_error_message(format!("表示モードの保存に失敗しました: {err}"));
+            }
             return;
         }
         if let Some(pane) = self.codex.as_mut() {
@@ -5805,7 +5842,7 @@ mod codex_turn_key_tests {
     }
 
     #[test]
-    fn f10_toggles_left_panel_even_during_search_editing() {
+    fn layout_toggle_key_toggles_left_panel_even_during_search_editing() {
         // 検索入力中は他のキーがほぼ入力欄に吸われるが、F10 は例外的に常に効く必要がある。
         let (_rt, mut app) = app_with_codex_live_input();
         app.codex.as_mut().unwrap().begin_search();
@@ -5816,6 +5853,19 @@ mod codex_turn_key_tests {
         assert!(app.codex_left_panel_collapsed);
         // 検索編集状態自体は F10 で崩れない。
         assert!(app.codex.as_ref().unwrap().is_search_editing());
+    }
+
+    #[test]
+    fn ctrl_shift_m_toggles_left_panel() {
+        let (_rt, mut app) = app_with_codex_live_input();
+        let key = KeyEvent::new(
+            KeyCode::Char('m'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+
+        app.handle_codex_key(key);
+
+        assert!(app.codex_left_panel_collapsed);
     }
 
     #[test]

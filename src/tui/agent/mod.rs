@@ -3151,7 +3151,9 @@ impl CodexPane {
             };
             let items = [
                 CodexModelChoice::Config,
-                CodexModelChoice::Gpt56,
+                CodexModelChoice::Gpt56Sol,
+                CodexModelChoice::Gpt56Terra,
+                CodexModelChoice::Gpt56Luna,
                 CodexModelChoice::Gpt55,
                 CodexModelChoice::Gpt5,
                 CodexModelChoice::O3,
@@ -3616,7 +3618,7 @@ impl CodexPane {
     pub fn settings_shortcuts_label(&self) -> &'static str {
         match self.kind {
             AgentKind::Codex => {
-                "F2 model: config/gpt-5.6/gpt-5.5/gpt-5/o3 | F3 effort: config/low/medium/high/xhigh | F4 approval: config/untrusted/on-request/on-failure/never | F5 sandbox: read-only/workspace-write/danger-full-access"
+                "F2 model: config/gpt-5.6-sol/gpt-5.6-terra/gpt-5.6-luna/gpt-5.5/gpt-5/o3 | F3 effort: config/low/medium/high/xhigh | F4 approval: config/untrusted/on-request/on-failure/never | F5 sandbox: read-only/workspace-write/danger-full-access"
             }
             AgentKind::ClaudeCode => {
                 "F2 model: config/fable/opus/sonnet/haiku | F3 effort: config/low/medium/high/xhigh/max | F4 permission: config/plan/acceptEdits/dontAsk/bypassPermissions/skip-permissions | F5 unused"
@@ -15240,10 +15242,14 @@ mod tests {
     }
 
     #[test]
-    fn codex_f2_cycles_through_gpt56() {
+    fn codex_f2_cycles_through_gpt56_variants() {
         let mut pane = live_pane();
         pane.cycle_model();
-        assert!(pane.settings_label().contains("model:gpt-5.6"));
+        assert!(pane.settings_label().contains("model:gpt-5.6-sol"));
+        pane.cycle_model();
+        assert!(pane.settings_label().contains("model:gpt-5.6-terra"));
+        pane.cycle_model();
+        assert!(pane.settings_label().contains("model:gpt-5.6-luna"));
         pane.cycle_model();
         assert!(pane.settings_label().contains("model:gpt-5.5"));
     }
@@ -19011,9 +19017,20 @@ mod tests {
             .iter()
             .map(|item| item.label.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(labels, ["config", "gpt-5.6", "gpt-5.5", "gpt-5", "o3"]);
-        assert!(picker.items[3].current, "現在値 gpt-5 にマーカー");
-        assert_eq!(picker.selected, 3, "初期選択は現在値");
+        assert_eq!(
+            labels,
+            [
+                "config",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-5.5",
+                "gpt-5",
+                "o3"
+            ]
+        );
+        assert!(picker.items[5].current, "現在値 gpt-5 にマーカー");
+        assert_eq!(picker.selected, 5, "初期選択は現在値");
         pane.move_list_picker_selection(-1); // gpt-5 -> gpt-5.5
         pane.accept_list_picker(false);
         assert_eq!(pane.exec_settings.model, CodexModelChoice::Gpt55);
@@ -19024,9 +19041,9 @@ mod tests {
     fn model_command_accepts_gpt56_alias() {
         let mut pane = live_pane();
         submit_line(&mut pane, "/model gpt5.6");
-        assert_eq!(pane.exec_settings.model, CodexModelChoice::Gpt56);
+        assert_eq!(pane.exec_settings.model, CodexModelChoice::Gpt56Sol);
         assert!(pane.exec_settings.model_override.is_none());
-        assert!(pane.settings_label().contains("model:gpt-5.6"));
+        assert!(pane.settings_label().contains("model:gpt-5.6-sol"));
     }
 
     #[test]

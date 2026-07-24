@@ -61,6 +61,13 @@ pub struct Settings {
     /// 既存configとの後方互換のため serde default（未設定は `Auto`）。
     #[serde(default)]
     agent_language: AgentLanguage,
+    /// Codex TUIでAddnessの左ペインを表示するか。未設定の旧configはCodex風にする。
+    #[serde(default = "default_codex_left_panel_collapsed")]
+    codex_left_panel_collapsed: bool,
+}
+
+fn default_codex_left_panel_collapsed() -> bool {
+    true
 }
 
 fn settings_path() -> Result<PathBuf> {
@@ -133,6 +140,16 @@ impl Settings {
         self.save()
     }
 
+    pub fn codex_left_panel_collapsed(&self) -> bool {
+        self.codex_left_panel_collapsed
+    }
+
+    #[cfg_attr(test, allow(dead_code))]
+    pub fn set_codex_left_panel_collapsed(&mut self, collapsed: bool) -> Result<()> {
+        self.codex_left_panel_collapsed = collapsed;
+        self.save()
+    }
+
     pub fn delete() -> Result<()> {
         let path = settings_path()?;
         if path.exists() {
@@ -174,5 +191,18 @@ mod tests {
         // agent_language を持たない旧 config.json でも読み込めること。
         let settings: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(settings.agent_language(), AgentLanguage::Auto);
+    }
+
+    #[test]
+    fn settings_defaults_codex_left_panel_to_collapsed_for_legacy_config() {
+        let settings: Settings = serde_json::from_str("{}").unwrap();
+        assert!(settings.codex_left_panel_collapsed());
+    }
+
+    #[test]
+    fn settings_round_trip_codex_left_panel_preference() {
+        let settings: Settings =
+            serde_json::from_str(r#"{"codex_left_panel_collapsed":true}"#).unwrap();
+        assert!(settings.codex_left_panel_collapsed());
     }
 }

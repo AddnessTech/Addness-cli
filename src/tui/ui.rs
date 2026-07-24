@@ -86,6 +86,7 @@ fn replace_member_mentions(text: &str, members: &HashMap<MemberId, Member>) -> S
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    let compact_codex = app.codex.is_some() && app.codex_left_panel_collapsed;
     let main_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -95,27 +96,32 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ])
         .split(frame.area());
 
-    draw_title_bar(frame, main_layout[0], app);
-
-    if app.codex.is_some() {
-        // codex 使用中は org/navigation を出さず（切り替えないため）、
-        // 全幅を「Addnessの進行が見えるペイン + codex本体」に使う。
-        draw_codex(frame, main_layout[1], app);
+    if compact_codex {
+        // Codex風モードは画面全体を枠なしの会話ペインとして使う。
+        draw_codex(frame, frame.area(), app);
     } else {
-        app.codex_terminal_area = None;
-        app.codex_status_area = None;
-        app.codex_contract_area = None;
-        app.codex_activity_area = None;
-        app.codex_status_scroll = 0;
-        let content_layout = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(24), Constraint::Min(0)])
-            .split(main_layout[1]);
+        draw_title_bar(frame, main_layout[0], app);
 
-        draw_left_panel(frame, content_layout[0], app);
-        draw_content(frame, content_layout[1], app);
+        if app.codex.is_some() {
+            // codex 使用中は org/navigation を出さず（切り替えないため）、
+            // 全幅を「Addnessの進行が見えるペイン + codex本体」に使う。
+            draw_codex(frame, main_layout[1], app);
+        } else {
+            app.codex_terminal_area = None;
+            app.codex_status_area = None;
+            app.codex_contract_area = None;
+            app.codex_activity_area = None;
+            app.codex_status_scroll = 0;
+            let content_layout = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(24), Constraint::Min(0)])
+                .split(main_layout[1]);
+
+            draw_left_panel(frame, content_layout[0], app);
+            draw_content(frame, content_layout[1], app);
+        }
+        draw_status_bar(frame, main_layout[2], app);
     }
-    draw_status_bar(frame, main_layout[2], app);
 
     if app.show_org_popup {
         draw_org_popup(frame, app);
@@ -822,16 +828,16 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
             .map(|c| c.is_turn_running())
             .unwrap_or(false);
         let hint = if finished {
-            " [c]コメント  [s]状態  [d]成果物(PR/Release)  [v]DoD判定  F10:Addness  ?/Ctrl+Q:操作一覧  Esc/q:閉じる ".to_string()
+            " [c]コメント  [s]状態  [d]成果物(PR/Release)  [v]DoD判定  F10/Ctrl+Shift+M:表示切替  ?/Ctrl+Q:操作一覧  Esc/q:閉じる ".to_string()
         } else if running {
             format!(
-                " {name} 実行中  |  Ctrl-T:表示切替  |  F7:turn一覧  |  入力+Enter:次ターン予約  |  F10:Addness  |  Ctrl-C:中断 "
+                " {name} 実行中  |  Ctrl-T:表示切替  |  F7:turn一覧  |  入力+Enter:次ターン予約  |  F10/Ctrl+Shift+M:表示切替  |  Ctrl-C:中断 "
             )
         } else {
             let fkeys = if kind == AgentKind::ClaudeCode {
-                "F2:model  |  F3:effort  |  F4:permission  |  F6:差分  |  F8:bypass  |  F10:Addness"
+                "F2:model  |  F3:effort  |  F4:permission  |  F6:差分  |  F8:bypass  |  F10/Ctrl+Shift+M:表示切替"
             } else {
-                "F2:model  |  F3:effort  |  F4:approval  |  F5:sandbox  |  F6:差分  |  F8:bypass  |  F10:Addness"
+                "F2:model  |  F3:effort  |  F4:approval  |  F5:sandbox  |  F6:差分  |  F8:bypass  |  F10/Ctrl+Shift+M:表示切替"
             };
             format!(
                 " 入力してEnterで{name}へ送信  |  Ctrl-T:表示切替  |  F7:turn一覧  |  {fkeys}  |  ?/Ctrl+Q:操作一覧 "
@@ -1125,7 +1131,7 @@ fn draw_codex_help_overlay(frame: &mut Frame, app: &mut App) {
         kv("F9", "Addnessの作業メモ・決定ログから再開"),
         kv(
             "F10",
-            "左のAddnessペイン（ゴールツリー/状態）を開閉（会話ペインが全幅に）",
+            "Addnessペイン表示 / Codex風の全幅表示を切替（F10 または Ctrl+Shift+M、設定を保存）",
         ),
         kv("F12", &format!("{name}ペインを終了して戻る")),
         blank(),
@@ -2852,8 +2858,17 @@ fn draw_codex_addness_pane(frame: &mut Frame, area: Rect, app: &mut App) {
 fn draw_codex_terminal_pane(frame: &mut Frame, area: Rect, app: &mut App) {
     let term_area = area;
     app.codex_terminal_area = Some(term_area);
-    let rows = term_area.height.saturating_sub(2);
-    let cols = term_area.width.saturating_sub(2);
+    let unframed = app.codex_left_panel_collapsed;
+    let rows = if unframed {
+        term_area.height
+    } else {
+        term_area.height.saturating_sub(2)
+    };
+    let cols = if unframed {
+        term_area.width
+    } else {
+        term_area.width.saturating_sub(2)
+    };
     if let Some(pane) = app.codex.as_mut() {
         pane.resize(rows, cols);
         let name = pane.kind().display_name();
@@ -2884,9 +2899,9 @@ fn draw_codex_terminal_pane(frame: &mut Frame, area: Rect, app: &mut App) {
             (format!(" {name} 履歴表示 — Esc: 最新へ戻る "), COLOR_PANEL)
         } else {
             let fkeys = if pane.kind() == AgentKind::ClaudeCode {
-                "F2:model F3:effort F4:permission F6:差分 F8:bypass F10:Addness"
+                "F2:model F3:effort F4:permission F6:差分 F8:bypass F10/Ctrl+Shift+M:表示切替"
             } else {
-                "F2:model F3:effort F4:approval F5:sandbox F6:差分 F8:bypass F10:Addness"
+                "F2:model F3:effort F4:approval F5:sandbox F6:差分 F8:bypass F10/Ctrl+Shift+M:表示切替"
             };
             (
                 format!(
@@ -2895,18 +2910,15 @@ fn draw_codex_terminal_pane(frame: &mut Frame, area: Rect, app: &mut App) {
                 COLOR_PANEL,
             )
         };
-        // Addness ペインが折りたたまれている間は、タイトルの先頭に小さく印を出して
-        // 「隠れているだけで消えたわけではない」ことが分かるようにする。
-        let title = if app.codex_left_panel_collapsed {
-            format!("◀{title}")
+        if unframed {
+            draw_codex_exec_panel_unframed(frame, term_area, pane);
         } else {
-            title
-        };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(color))
-            .title(title);
-        draw_codex_exec_panel(frame, term_area, block, pane);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(color))
+                .title(title);
+            draw_codex_exec_panel(frame, term_area, block, pane);
+        }
         if pane.turn_picker_open() {
             draw_codex_turn_picker(frame, term_area, pane);
         }
@@ -3035,6 +3047,14 @@ fn draw_codex_turn_picker(frame: &mut Frame, area: Rect, pane: &CodexPane) {
 fn draw_codex_exec_panel(frame: &mut Frame, area: Rect, block: Block<'_>, pane: &mut CodexPane) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    draw_codex_exec_panel_contents(frame, inner, pane);
+}
+
+fn draw_codex_exec_panel_unframed(frame: &mut Frame, area: Rect, pane: &mut CodexPane) {
+    draw_codex_exec_panel_contents(frame, area, pane);
+}
+
+fn draw_codex_exec_panel_contents(frame: &mut Frame, inner: Rect, pane: &mut CodexPane) {
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -6992,6 +7012,16 @@ mod tests {
         assert_eq!(
             collapsed_width, 100,
             "collapsed terminal pane should take the full width"
+        );
+        assert_eq!(
+            app.codex_terminal_area.unwrap().y,
+            0,
+            "Codex風モード should start at the top of the terminal"
+        );
+        assert_eq!(
+            app.codex_terminal_area.unwrap().height,
+            30,
+            "Codex風モード should use the full terminal height"
         );
         assert!(
             app.codex_status_area.is_none(),

@@ -10369,6 +10369,7 @@ Keep working toward the persistent goal across turns. If the user_request confli
             .as_deref()
             .unwrap_or("未取得または空");
         let child_goals = addness_child_goal_context(&self.children);
+        let child_goal_policy = addness_child_goal_policy();
         let organization_hint = addness_organization_hint(prompt);
 
         format!(
@@ -10400,6 +10401,7 @@ Operating rule:
 4. Before the final response after code changes, substantial investigation, PR/release/tag work, goal decomposition, or a durable decision, write the necessary state back to Addness even if the user did not explicitly ask. Use body/DoD/child goals/deliverables/progress as appropriate, and record only facts needed for restart.
 5. The TUI automatically records current branch/folder, turn completion, and session progress into `## Codex自動メモ(機械)` as a safety net. Do not rely on it as the only record for implemented work.
 6. Do not read or write Codex/Claude Code native memory or global DB for project facts unless the user explicitly asks or session resume mechanics require it; use Addness body/DoD/child goals/deliverables instead.
+{child_goal_policy}
 {organization_hint}
 </addness_tui_context>
 
@@ -10411,11 +10413,13 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
             status = compact_one_line(&self.status_label, 80),
             cwd = self.cwd,
             branch = compact_one_line(branch, 160),
+            child_goal_policy = child_goal_policy,
         )
     }
 
     fn compact_addness_context_prompt(&self, prompt: &str, branch: &str) -> String {
         let user_request = user_request_prompt_block(prompt);
+        let child_goal_policy = addness_child_goal_policy();
         let organization_hint = addness_organization_hint(prompt);
         format!(
             r#"{user_request}
@@ -10439,6 +10443,7 @@ Rules:
 4. Before the final response after code changes, substantial investigation, PR/release/tag work, goal decomposition, or a durable decision, write the necessary state back to Addness even if the user did not explicitly ask.
 5. The TUI automatically records current branch/folder, turn completion, and session progress into `## Codex自動メモ(機械)` as a safety net. Do not rely on it as the only record for implemented work.
 6. Do not read or write Codex/Claude Code native memory or global DB for project facts unless the user explicitly asks or session resume mechanics require it.
+{child_goal_policy}
 {organization_hint}
 </addness_tui_context>
 
@@ -10452,6 +10457,7 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
             branch = compact_one_line(branch, 160),
             dod = self.addness_context_dod(360),
             goal_mode = self.addness_context_goal_mode(),
+            child_goal_policy = child_goal_policy,
         )
     }
 
@@ -13008,6 +13014,16 @@ Addness整理だけで終わらず、このターンで実装または検証に�
     )
 }
 
+fn addness_child_goal_policy() -> &'static str {
+    r#"
+Mandatory small-goal gate for implementation:
+- If the user request includes implementation, a bug fix, refactoring, documentation/code changes, or adding tests, create or select exactly one small Addness child goal before editing any repository file.
+- For a new request, first read the current goal, then run `"$ADDNESS_BIN" goal create --title "..." --parent "$ADDNESS_GOAL_ID" --description "..." --json`; put the task-specific DoD, branch, files, and verification plan in the child body with `goal update <CHILD_GOAL_ID> --body-file <file> --json`.
+- Do not start implementation while child-goal creation or its DoD/body update is pending or failed. Report the blocker instead of editing the repository.
+- On later turns for the same request, continue the existing in-progress child goal rather than creating duplicates. Do not finish only the Addness bookkeeping: implement and verify the child goal in the same turn.
+"#
+}
+
 fn addness_organization_hint(prompt: &str) -> &'static str {
     let prompt = prompt.trim();
     if prompt.is_empty() || prompt.contains("Addnessを作業DBとして使い、この依頼を組織的に分解")
@@ -13032,6 +13048,22 @@ fn addness_organization_hint(prompt: &str) -> &'static str {
     ]
     .iter()
     .any(|signal| prompt.contains(signal) || lower.contains(signal));
+    let implementation_request = [
+        "実装",
+        "修正",
+        "変更",
+        "追加",
+        "リファクタ",
+        "テストを書く",
+        "implement",
+        "fix",
+        "change",
+        "add",
+        "refactor",
+        "write tests",
+    ]
+    .iter()
+    .any(|signal| prompt.contains(signal) || lower.contains(signal));
     let broad_signal_count = [
         "改善",
         "改良",
@@ -13052,13 +13084,17 @@ fn addness_organization_hint(prompt: &str) -> &'static str {
     .iter()
     .filter(|signal| prompt.contains(**signal) || lower.contains(**signal))
     .count();
-    if !(strong || prompt.chars().count() > 240 || broad_signal_count >= 3) {
+    if !(strong
+        || implementation_request
+        || prompt.chars().count() > 240
+        || broad_signal_count >= 3)
+    {
         return "";
     }
     r#"
 
 Organization hint:
-This request looks broad or multi-part. If repo evidence confirms independent work packages, create/update Addness child goals with clear DoD/body, optionally delegate independent slices to subagents/parallel tools, then implement the highest-priority slice in this turn."#
+For implementation requests, the mandatory small-goal gate applies even when the request is small: create/select one child goal with a clear DoD/body before editing, then implement and verify it in this turn. For broad requests, split independent work into additional child goals only when useful."#
 }
 
 fn compact_multiline_excerpt(text: &str, max_chars: usize) -> String {
@@ -13516,10 +13552,10 @@ Addness TUI は誰でも `addness` と打てば起動できる通常の入口で
 
 進め方:
 1. `"$ADDNESS_BIN" goal get "$ADDNESS_GOAL_ID" --json --with-deliverable --with-comment` で現在のbody/DoD/子ゴール/成果物を確認し、リポジトリ確認へ進む。
-2. 2つ以上の独立した作業単位、未完了の引き継ぎ、またはサブエージェントに渡せる単位がある場合だけ、Addness子ゴールを作成または更新する。
-3. 子ゴールを作る場合は title=作業名、description=完了状態、body=入力情報・対象ファイル・実装方針・検証方法・次の手 に分ける。作成後に `goal update <CHILD_GOAL_ID> --body-file <file> --json` でbodyを入れる。
-4. サブエージェント/並列作業ツールが利用でき、独立性が高い作業だけ委任する。委任できない場合は、子ゴールを作った上でメインエージェントが最優先の子ゴールから実装する。
-5. 分解だけで終わらず、最初の実装単位に着手し、可能な範囲で検証する。
+2. 実装・修正・変更・テスト追加を行う場合は、必ず選択中ゴール直下に今回の小作業用子ゴールを1件作成する。新規依頼では `goal create --title "..." --parent "$ADDNESS_GOAL_ID" --description "..." --json` を先に実行する。
+3. 子ゴールのdescriptionには検証可能なDoDを、bodyには入力情報・対象ファイル・実装方針・検証方法・次の手を入れ、作成後に `goal update <CHILD_GOAL_ID> --body-file <file> --json` で更新する。
+4. 子ゴールの作成またはDoD/body更新に失敗した場合は、リポジトリを編集せず、失敗を報告する。同じ依頼の継続ターンでは既存の作業中子ゴールを使い、重複作成しない。
+5. 子ゴールを作っただけで終わらず、そのDoDに向けた実装または検証にこのターンで着手する。独立した大きな作業がある場合だけ追加の子ゴールや委任を使う。
 6. ユーザーへの最終報告は「作った/使った子ゴール」「実装したこと」「検証」「残り」を短く出す。"#
     )
 }
@@ -13634,6 +13670,12 @@ TUIから渡される軽量コンテキスト:
 5. 実装や調査の依頼では、repoから合理的に判断できるなら確認質問やAddness整理を挟まず手を動かします。
 6. ユーザーへの返答では、Addness運用の説明より実装・判断・検証結果を先に出します。
 
+実装の必須小ゴールゲート:
+- 実装、バグ修正、リファクタ、ドキュメント/設定変更、テスト追加を含む依頼では、リポジトリのファイルを編集する前に、選択中ゴール直下へ今回の小作業用子ゴールを必ず1件作成してください。
+- 新規依頼では `"$ADDNESS_BIN" goal create --title "..." --parent "$ADDNESS_GOAL_ID" --description "..." --json` を実行し、作成された子ゴールへDoD、対象ファイル、実装方針、ブランチ、検証方法をbodyとして `goal update <CHILD_GOAL_ID> --body-file <file> --json` で記録してください。
+- 子ゴールの作成またはDoD/bodyの記録が失敗したら実装を開始しないでください。失敗内容をユーザーへ報告し、コード変更なしで止めてください。
+- 同じ依頼の継続ターンでは既存の作業中子ゴールを使って重複作成を避けてください。子ゴールの整理だけで終わらず、作成/選択後はそのDoDの実装と検証へ進んでください。
+
 Addness読込ルール:
 - 実装・調査・ゴール整理・PR/release・引き継ぎでは、`"$ADDNESS_BIN" goal get "$ADDNESS_GOAL_ID" --json --with-deliverable --with-comment` を早い段階で実行します。
 - 必要な範囲はbody、DoD(description/definitionOfDone)、コメント、成果物、子ゴール、作業フォルダ/ブランチです。
@@ -13664,7 +13706,7 @@ CLI最小操作:
 - 自動記録だけで済ませてよいのは、挨拶・単純な表示確認・コードや判断を伴わない短い応答だけです。
 - メインエージェントは実装・調査・検証を止めない。逐語ログや全コマンド出力ではなく、次回再開に必要な事実だけを短く残す。
 - 手動更新する時は現bodyを読み、手書きメモと `## Codex自動メモ(機械)` を壊さず、自分の専用ブロックだけを更新する。長文は `goal update --body-file` を使う。
-- 子ゴールは毎ターン機械的に作らない。作業分解・並列化・サブエージェント化・引き継ぎに役立つ時だけCodex自身が作成/更新する。
+- 実装依頼では必須小ゴールゲートに従い、新規依頼ごとに小ゴールを1件作成し、継続ターンでは対応する作業中子ゴールを更新する。挨拶・表示確認・単なる読み取り・相談だけでは作成しない。
 - tag/releaseを作成したら deliverable/link に紐づけ、`## PR/Release Traceability` にPR・tag・release URL・CI結果を残す。
 - DoDが不十分なら、足りない観点を短く整理してユーザーに確認し、合意後に更新する。
 - Codex/Claude Code本体のmemory/DBはプロジェクト固有情報の保存先にしない。読む必要があるのはresume等の実行制御に限ります。
@@ -16126,8 +16168,12 @@ mod tests {
         );
         assert!(broad.starts_with("<user_request>\nTUIをCodexより見やすく改善"));
         assert!(broad.contains("Organization hint"));
-        assert!(broad.contains("Addness child goals with clear DoD/body"));
-        assert!(broad.contains("highest-priority slice"));
+        assert!(broad.contains("mandatory small-goal gate"));
+        assert!(broad.contains("create/select one child goal"));
+
+        let implementation = pane.prompt_with_addness_context("このバグを修正して");
+        assert!(implementation.contains("Organization hint"));
+        assert!(implementation.contains("before editing"));
 
         pane.thread_id = Some("thread-1".to_string());
         let compact = pane.prompt_with_addness_context("子ゴールごとにサブエージェントへ委任して");
@@ -17240,7 +17286,7 @@ mod tests {
     fn addness_developer_instructions_keep_codex_execution_primary() {
         let instructions = addness_tui_developer_instructions();
 
-        assert!(instructions.chars().count() < 3_600);
+        assert!(instructions.chars().count() < 4_200);
         assert!(instructions.contains("通常Codexと同じ速度で調査・実装・検証"));
         assert!(instructions.contains("Addnessはmemory.mdの代替となるプロジェクト別DB"));
         assert!(instructions.contains("Addness TUIは誰でも `addness` と打てば起動"));
@@ -17263,7 +17309,10 @@ mod tests {
         assert!(instructions.contains("link progress --goal \"$ADDNESS_GOAL_ID\""));
         assert!(instructions.contains("body=入力情報/ブランチ/次の手"));
         assert!(instructions.contains("goal update <CHILD_GOAL_ID> --body-file"));
-        assert!(instructions.contains("子ゴールは毎ターン機械的に作らない"));
+        assert!(instructions.contains("実装の必須小ゴールゲート"));
+        assert!(instructions.contains("リポジトリのファイルを編集する前に"));
+        assert!(instructions.contains("実装を開始しないでください"));
+        assert!(instructions.contains("継続ターンでは対応する作業中子ゴール"));
         assert!(instructions.contains("自動記録だけで済ませてよいのは"));
         assert!(instructions.contains("Codex/Claude Code本体のmemory/DB"));
     }
@@ -17839,10 +17888,14 @@ mod tests {
         assert!(
             queued
                 .submitted
-                .contains("title=作業名、description=完了状態、body=入力情報")
+                .contains("descriptionには検証可能なDoDを、bodyには入力情報")
         );
-        assert!(queued.submitted.contains("サブエージェント/並列作業ツール"));
-        assert!(queued.submitted.contains("分解だけで終わらず"));
+        assert!(
+            queued
+                .submitted
+                .contains("同じ依頼の継続ターンでは既存の作業中子ゴール")
+        );
+        assert!(queued.submitted.contains("子ゴールを作っただけで終わらず"));
     }
 
     #[test]

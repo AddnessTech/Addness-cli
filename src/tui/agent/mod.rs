@@ -57,8 +57,8 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/plan", "実装前の計画を依頼"),
     ("/compact", "会話を圧縮する"),
     ("/skills", "ローカル skill 一覧 / 使用依頼"),
-    ("/new", "新しいセッションを開始"),
-    ("/clear", "表示ログをクリア"),
+    ("/new", "新しいセッションを開始（名前指定可）"),
+    ("/clear", "表示ログをクリアし新規開始（名前指定可）"),
     ("/undo", "直近ターンのチェックポイントへ戻す"),
     ("/stop", "実行中のターンを中断"),
     ("/sessions", "セッション候補を一覧から選択"),
@@ -1453,6 +1453,8 @@ pub struct CodexPane {
     queued_prompts: VecDeque<QueuedPrompt>,
     /// `codex exec --json` が返した Codex thread id。2ターン目以降の resume に使う。
     thread_id: Option<String>,
+    /// `/new <name>` / `/clear <name>` の後、新規 thread id 確定時に適用する名前。
+    pending_new_thread_name: Option<String>,
     /// 表示ログから復元した thread_id を保持中で、まだライブイベントで裏取りできていない状態。
     /// resume が失敗したら 1 回だけ新規セッションへフォールバックするために使う。
     thread_id_restored: bool,
@@ -1772,6 +1774,7 @@ impl CodexPane {
             esc_interrupt_armed: false,
             queued_prompts: VecDeque::new(),
             thread_id: restored_thread_id.clone(),
+            pending_new_thread_name: None,
             thread_id_restored: restored_thread_id.is_some(),
             current_turn_prompt: None,
             current_turn_retry_prompt: None,
@@ -4588,6 +4591,32 @@ impl CodexPane {
         }
         self.thread_id = id.clone();
         self.persist_session_record(CodexSessionRecord::ThreadId { id });
+        if self.kind == AgentKind::Codex
+            && let (Some(thread_id), Some(title)) =
+                (self.thread_id.clone(), self.pending_new_thread_name.take())
+        {
+            if let Some(client) = self.codex_appserver.as_mut() {
+                let request_id = client.next_id();
+                let request =
+                    codex_appserver::thread_name_set_request(request_id, &thread_id, &title);
+                if !client.send_value(&request) {
+                    self.push_log(
+                        CodexLogKind::Error,
+                        "app-server への Codex セッション名設定に失敗しました",
+                    );
+                }
+            }
+            match append_codex_session_rename(&thread_id, &title) {
+                Ok(()) => self.push_log(
+                    CodexLogKind::System,
+                    format!("Codex セッション名を設定しました: {title}"),
+                ),
+                Err(e) => self.push_log(
+                    CodexLogKind::Error,
+                    format!("新しい Codex セッションの命名に失敗しました: {e}"),
+                ),
+            }
+        }
     }
 
     /// 復元した thread_id での resume が失敗したとき、次ターンを新規セッションで開始する。
@@ -7942,11 +7971,11 @@ impl CodexPane {
                 true
             }
             "new" | "new-thread" | "new-chat" => {
-                self.handle_new_thread_slash_command();
+                self.handle_new_thread_slash_command(args);
                 true
             }
             "clear" | "clear-log" | "clear-terminal" => {
-                self.handle_clear_log_slash_command();
+                self.handle_clear_log_slash_command(args);
                 true
             }
             "stop" | "interrupt" => {
@@ -8249,7 +8278,7 @@ impl CodexPane {
         self.record_and_run_user_line(prompt);
     }
 
-    fn handle_new_thread_slash_command(&mut self) {
+    fn handle_new_thread_slash_command(&mut self, requested_name: &str) {
         let name = self.kind.display_name();
         if self.is_turn_running() {
             self.push_log(
@@ -8263,6 +8292,9 @@ impl CodexPane {
         self.teardown_claude_resident();
         self.teardown_codex_appserver();
         self.set_thread_id(None);
+        self.pending_new_thread_name = (self.kind == AgentKind::Codex)
+            .then(|| normalize_submitted_line(requested_name))
+            .filter(|name| !name.is_empty());
         self.current_turn_prompt = None;
         self.current_turn_retry_prompt = None;
         self.current_command = None;
@@ -8282,7 +8314,10 @@ impl CodexPane {
         );
     }
 
-    fn handle_clear_log_slash_command(&mut self) {
+    fn handle_clear_log_slash_command(&mut self, requested_name: &str) {
+        if self.kind == AgentKind::Codex {
+            self.handle_new_thread_slash_command(requested_name);
+        }
         self.log.clear();
         self.collapsed_turns.clear();
         self.scrollback = 0;
@@ -10756,8 +10791,8 @@ Codex CLI commands:
   /codex <args> - arbitrary codex subcommand
   /codex-help [command] - codex help
   /codex-version|/version - codex --version
-  /new - start the next prompt in a new Codex session
-  /clear - clear the visible Codex log
+  /new [name] - start the next prompt in a new optionally named Codex session
+  /clear [name] - clear the visible log and start a new optionally named Codex session
   /init [notes] - create or update AGENTS.md for future Codex sessions
   /ide - show IDE context availability in this TUI
   /exec|/e <prompt> - send directly to Codex without Goal mode wrapping
@@ -15615,7 +15650,7 @@ mod tests {
         pane.queued_prompts
             .push_back(QueuedPrompt::user("queued".to_string()));
 
-        pane.handle_new_thread_slash_command();
+        pane.handle_new_thread_slash_command("");
 
         assert!(pane.checkpoints.is_empty());
         assert_eq!(pane.checkpoint_seq, 0);
@@ -17501,8 +17536,8 @@ mod tests {
 
         assert!(text.contains("Codex CLI commands:"));
         assert!(text.contains("/codex-help [command]"));
-        assert!(text.contains("/new - start the next prompt"));
-        assert!(text.contains("/clear - clear the visible Codex log"));
+        assert!(text.contains("/new [name] - start the next prompt"));
+        assert!(text.contains("/clear [name] - clear the visible log"));
         assert!(text.contains("/init [notes]"));
         assert!(text.contains("/ide - show IDE context"));
         assert!(text.contains("/compact [notes]"));
@@ -18364,6 +18399,17 @@ mod tests {
     }
 
     #[test]
+    fn named_new_slash_keeps_name_until_thread_starts() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.finished = false;
+
+        submit_line(&mut pane, "/new   Add User  ");
+
+        assert_eq!(pane.pending_new_thread_name.as_deref(), Some("Add User"));
+        assert!(pane.thread_id.is_none());
+    }
+
+    #[test]
     fn clear_slash_clears_visible_log_without_starting_turn() {
         let mut pane = CodexPane::test_with_output(8, 80, 0, "");
         pane.finished = false;
@@ -18378,6 +18424,19 @@ mod tests {
         assert!(pane.log.iter().any(|line| {
             line.kind == CodexLogKind::System && line.text.contains("表示ログをクリア")
         }));
+        assert!(pane.thread_id.is_none());
+    }
+
+    #[test]
+    fn named_clear_slash_keeps_name_for_fresh_thread() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.finished = false;
+        pane.thread_id = Some("old-thread".to_string());
+
+        submit_line(&mut pane, "/clear   Fix Login  ");
+
+        assert!(pane.thread_id.is_none());
+        assert_eq!(pane.pending_new_thread_name.as_deref(), Some("Fix Login"));
     }
 
     #[test]

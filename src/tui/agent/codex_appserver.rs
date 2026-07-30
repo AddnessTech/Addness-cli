@@ -136,6 +136,16 @@ pub(super) fn thread_resume_request(id: u64, thread_id: &str, config: &ThreadCon
     })
 }
 
+/// thread/name/set リクエスト（Codex 0.146.0 以降）。
+pub(super) fn thread_name_set_request(id: u64, thread_id: &str, name: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "thread/name/set",
+        "params": {"threadId": thread_id, "name": name}
+    })
+}
+
 /// turn/start リクエスト。effort はここでオーバーライドする（thread/start には effort が無い）。
 /// `image_paths` は LocalImageUserInput（`{"type":"localImage","path":...}`）として input に追加する。
 pub(super) fn turn_start_request(

@@ -96,6 +96,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/config", "codex config override を追加"),
     ("/mcp", "MCP の一覧・管理"),
     ("/review", "codex review を実行"),
+    ("/code-review", "Claude Code で diff / PR をレビュー"),
     ("/apply", "codex apply <task_id> を実行"),
     ("/cloud", "Codex Cloud task を操作"),
     ("/apps", "Desktop / app-server / remote 入口"),
@@ -143,9 +144,15 @@ const CODEX_ONLY_SLASH_COMMANDS: &[&str] = &[
     "/rename",
 ];
 
+/// Claude Code の組み込みコマンドとして、そのままターンへ渡すコマンド名。
+const CLAUDE_ONLY_SLASH_COMMANDS: &[&str] = &["/code-review"];
+
 /// パレット候補・`/help` の一覧に `name` を出してよいかどうか。
 fn slash_command_visible_for_kind(name: &str, kind: AgentKind) -> bool {
-    kind != AgentKind::ClaudeCode || !CODEX_ONLY_SLASH_COMMANDS.contains(&name)
+    match kind {
+        AgentKind::Codex => !CLAUDE_ONLY_SLASH_COMMANDS.contains(&name),
+        AgentKind::ClaudeCode => !CODEX_ONLY_SLASH_COMMANDS.contains(&name),
+    }
 }
 
 const CODEX_SESSION_HISTORY_DIR: &str = "codex-sessions";
@@ -7688,12 +7695,16 @@ impl CodexPane {
         let mut parts = command_line.trim().splitn(2, char::is_whitespace);
         let command = parts.next().unwrap_or_default().to_ascii_lowercase();
         let args = parts.next().unwrap_or_default().trim();
-        // パレット非表示の codex 専用コマンドは、手入力でも実行させない
-        // （ClaudeCode のターンに反映されない設定を黙って変更しないため）。
+        // パレット非表示のバックエンド専用コマンドは、手入力でも実行させない。
+        // 別バックエンドへ通常プロンプトとして誤送信されるのを防ぐ。
         if !slash_command_visible_for_kind(&format!("/{command}"), self.kind) {
+            let backend = match self.kind {
+                AgentKind::Codex => "Claude Code",
+                AgentKind::ClaudeCode => "codex",
+            };
             self.push_log(
                 CodexLogKind::System,
-                format!("/{command} は codex 専用コマンドです。Claude Code では利用できません"),
+                format!("/{command} は {backend} 専用コマンドです"),
             );
             return true;
         }
@@ -10721,6 +10732,7 @@ fn slash_help_text(kind: AgentKind) -> &'static str {
 fn claude_slash_help_text() -> &'static str {
     r#"Slash commands:
 Claude Code CLI commands:
+  /code-review [level] [pr#] - review the current diff or a PR
   /new - start the next prompt in a new Claude Code session
   /clear - clear the visible log
   /init [notes] - create or update AGENTS.md for future sessions
@@ -17557,6 +17569,7 @@ mod tests {
         assert!(text.contains("/fork-last [prompt]"));
         assert!(text.contains("/fork-session <N|id> [prompt]"));
         assert!(text.contains("/add-dir <path|list|clear>"));
+        assert!(text.contains("/code-review [level] [pr#]"));
         assert!(text.contains("/organize|/team [task]"));
         assert!(text.contains("/remember|/memo <内容>"));
         assert!(!text.contains("/review"));
@@ -17586,6 +17599,7 @@ mod tests {
         assert!(names.contains(&"/sessions"));
         assert!(names.contains(&"/resume-last"));
         assert!(names.contains(&"/add-dir"));
+        assert!(names.contains(&"/code-review"));
         for excluded in CODEX_ONLY_SLASH_COMMANDS {
             assert!(
                 !names.contains(excluded),
@@ -17612,6 +17626,16 @@ mod tests {
                 .iter()
                 .any(|line| line.text.contains("次回ターンの model: opus"))
         );
+    }
+
+    #[test]
+    fn claude_only_slash_commands_are_rejected_at_runtime_for_codex() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        assert!(pane.handle_local_slash_command("/code-review high"));
+        assert!(pane.log.iter().any(|line| {
+            line.text
+                .contains("/code-review は Claude Code 専用コマンドです")
+        }));
     }
 
     #[test]

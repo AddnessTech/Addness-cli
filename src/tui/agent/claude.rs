@@ -1096,15 +1096,39 @@ pub(super) fn config_dir() -> Option<PathBuf> {
 }
 
 /// cwd 絶対パスを projects ディレクトリのスラッグへ変換する。
-/// 実ファイルで検証済み: `/`, `.`, `_` を `-` に置換する（例:
-/// `/Users/x/dev/foo` → `-Users-x-dev-foo`）。
+/// `/`, `.`, `_` を `-` に置換する。200 文字を超える場合は先頭 200 文字に、
+/// 元の cwd の Java 互換ハッシュ（絶対値・base36）を付ける。
 pub(super) fn cwd_slug(cwd: &str) -> String {
-    cwd.chars()
+    let slug: String = cwd
+        .chars()
         .map(|c| match c {
             '/' | '.' | '_' => '-',
             other => other,
         })
-        .collect()
+        .collect();
+    if slug.chars().count() <= 200 {
+        return slug;
+    }
+
+    let prefix: String = slug.chars().take(200).collect();
+    let hash = cwd.encode_utf16().fold(0_i32, |hash, code_unit| {
+        hash.wrapping_mul(31).wrapping_add(i32::from(code_unit))
+    });
+    format!("{prefix}-{}", base36(hash.unsigned_abs()))
+}
+
+fn base36(mut value: u32) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut reversed = Vec::new();
+    loop {
+        reversed.push(DIGITS[(value % 36) as usize]);
+        value /= 36;
+        if value == 0 {
+            break;
+        }
+    }
+    reversed.reverse();
+    String::from_utf8(reversed).expect("base36 digits are valid UTF-8")
 }
 
 /// 指定 config ディレクトリ配下から、cwd に対応するセッション候補を mtime 降順で返す。
@@ -1885,6 +1909,17 @@ mod tests {
         assert_eq!(cwd_slug("/Users/x/dev/foo"), "-Users-x-dev-foo");
         assert_eq!(cwd_slug("/a/.claude-worktrees/b"), "-a--claude-worktrees-b");
         assert_eq!(cwd_slug("/a/my_dir"), "-a-my-dir");
+    }
+
+    #[test]
+    fn cwd_slug_truncates_long_paths_with_java_hash() {
+        let cwd = format!("/tmp/{}", "long_project/".repeat(20));
+        let slug = cwd_slug(&cwd);
+
+        assert!(cwd.len() > 200);
+        assert_eq!(slug.chars().count(), 207);
+        assert_eq!(&slug[..200], &cwd.replace(['/', '.', '_'], "-")[..200]);
+        assert_eq!(slug, format!("{}-4igp5z", &slug[..200]));
     }
 
     #[test]

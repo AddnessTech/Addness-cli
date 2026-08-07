@@ -78,7 +78,8 @@
 
 - ルート: `CLAUDE_CONFIG_DIR` または `~/.claude`（`config_dir`）
 - パス: `~/.claude/projects/<cwd スラッグ>/*.jsonl`
-  （スラッグは `/`, `.`, `_` → `-` 置換。`cwd_slug`）
+  （スラッグは `/`, `.`, `_` → `-` 置換。200 文字超は先頭 200 文字と元 cwd の
+  Java 互換ハッシュ絶対値（base36）を `-` で連結。`cwd_slug`）
 - 各 jsonl から `type == "user"` 行の `message.content` と `timestamp` を読む
   （`load_session_candidates_from` / `session_candidate_from_file` / `first_user_text`）
 

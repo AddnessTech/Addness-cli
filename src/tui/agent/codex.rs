@@ -321,6 +321,7 @@ pub struct CodexExecSettings {
     pub(super) ignore_rules: bool,
     pub(super) skip_git_repo_check: bool,
     pub(super) ephemeral: bool,
+    pub(super) approve_for_me: bool,
     pub(super) bypass_approvals_and_sandbox: bool,
     pub(super) bypass_hook_trust: bool,
     pub(super) color: CodexColorChoice,
@@ -365,6 +366,7 @@ impl Default for CodexExecSettings {
             ignore_rules: false,
             skip_git_repo_check: false,
             ephemeral: false,
+            approve_for_me: false,
             bypass_approvals_and_sandbox: false,
             bypass_hook_trust: false,
             color: CodexColorChoice::Never,
@@ -433,6 +435,9 @@ impl CodexExecSettings {
         }
         if self.bypass_hook_trust {
             parts.push("bypass-hook-trust".to_string());
+        }
+        if self.approve_for_me {
+            parts.push("approve-for-me".to_string());
         }
         if self.color != CodexColorChoice::Never {
             parts.push(format!("color:{}", self.color.label()));
@@ -967,6 +972,8 @@ fn push_global_exec_settings(
     }
     if settings.bypass_approvals_and_sandbox {
         args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+    } else if settings.approve_for_me {
+        args.push("--approve-for-me".to_string());
     } else if let Some(approval) = settings.approval.cli_arg() {
         // `-a` is a global Codex option. `codex exec -a ...` is rejected, so keep it before `exec`.
         args.push("-a".to_string());

@@ -81,6 +81,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/approval", "承認モードを切替"),
     ("/sandbox", "sandbox を切替 / 指定"),
     ("/permissions", "承認 / sandbox 権限を設定"),
+    ("/approve-for-me", "承認リクエストを自動レビュー"),
     ("/bypass", "権限チェックをスキップ（危険）: ON/OFF トグル"),
     ("/personality", "通信スタイルを切替"),
     ("/settings", "モデル・推論・承認・sandbox 設定を表示"),
@@ -138,6 +139,7 @@ const CODEX_ONLY_SLASH_COMMANDS: &[&str] = &[
     "/vim",
     "/personality",
     "/search",
+    "/approve-for-me",
     "/config",
     "/archive",
     "/rename",
@@ -4287,6 +4289,16 @@ impl CodexPane {
         );
     }
 
+    fn toggle_approve_for_me(&mut self) {
+        self.exec_settings.approve_for_me = !self.exec_settings.approve_for_me;
+        let value = on_off(self.exec_settings.approve_for_me);
+        self.set_status_note(format!("approve-for-me: {value}"));
+        self.push_log(
+            CodexLogKind::System,
+            format!("次回ターンの approve-for-me: {value}"),
+        );
+    }
+
     fn toggle_bypass_approvals_and_sandbox(&mut self) {
         self.exec_settings.bypass_approvals_and_sandbox =
             !self.exec_settings.bypass_approvals_and_sandbox;
@@ -5848,7 +5860,9 @@ impl CodexPane {
     // -----------------------------------------------------------------------
 
     fn codex_appserver_active(&self) -> bool {
-        self.kind == AgentKind::Codex && self.codex_appserver_enabled
+        self.kind == AgentKind::Codex
+            && self.codex_appserver_enabled
+            && !self.exec_settings.approve_for_me
     }
 
     /// 常駐 codex app-server を spawn する（stdout/stderr は既存の line reader で読む）。
@@ -8127,6 +8141,10 @@ impl CodexPane {
             }
             "ephemeral" => {
                 self.toggle_ephemeral();
+                true
+            }
+            "approve-for-me" => {
+                self.toggle_approve_for_me();
                 true
             }
             "bypass" | "dangerously-bypass" => {
@@ -10793,7 +10811,7 @@ Codex options for next turn:
   /add-dir <path|list|clear>
   /config <key=value|list|clear>, /enable <feature>, /disable <feature>
   /strict-config, /ignore-user-config, /ignore-rules, /skip-git-check, /ephemeral
-  /bypass [status], /bypass-hook-trust, /output-schema <path|clear>, /output-last-message <path|clear>
+  /approve-for-me, /bypass [status], /bypass-hook-trust, /output-schema <path|clear>, /output-last-message <path|clear>
 TUI helpers:
   /goal <目標>, /goal pause, /goal resume, /goal clear
   /organize|/team [task] - Addness子ゴールへ分解し、最初の実装単位へ進む
@@ -14747,6 +14765,17 @@ mod tests {
     }
 
     #[test]
+    fn approve_for_me_uses_one_shot_instead_of_appserver() {
+        let mut pane = CodexPane::test_with_output(10, 80, 0, "");
+        pane.kind = AgentKind::Codex;
+        pane.codex_appserver_enabled = true;
+        assert!(pane.codex_appserver_active());
+
+        pane.exec_settings.approve_for_me = true;
+        assert!(!pane.codex_appserver_active());
+    }
+
+    #[test]
     fn codex_appserver_routes_jsonrpc_to_resident_handler() {
         let Some(mut pane) = codex_appserver_pane() else {
             return;
@@ -18490,6 +18519,7 @@ mod tests {
         submit_line(&mut pane, "/ignore-rules");
         submit_line(&mut pane, "/skip-git-check");
         submit_line(&mut pane, "/ephemeral");
+        submit_line(&mut pane, "/approve-for-me");
         submit_line(&mut pane, "/bypass-hook-trust");
         submit_line(&mut pane, "/color auto");
         submit_line(&mut pane, "/output-schema /tmp/schema.json");
@@ -18514,10 +18544,14 @@ mod tests {
         assert!(label.contains("ignore-rules"));
         assert!(label.contains("skip-git-check"));
         assert!(label.contains("ephemeral"));
+        assert!(label.contains("approve-for-me"));
         assert!(label.contains("bypass-hook-trust"));
         assert!(label.contains("color:auto"));
         assert!(label.contains("output-schema"));
         assert!(label.contains("output-last-message"));
+
+        let args = codex_exec_args(None, "/repo", &pane.exec_settings, "DEV");
+        assert!(args.contains(&"--approve-for-me".to_string()));
     }
 
     #[test]

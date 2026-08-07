@@ -1480,6 +1480,7 @@ mod tests {
             "--add-dir",                                  // 書込許可ディレクトリ追加
             "--config",              // -c key=value（developer_instructions 等）
             "--ask-for-approval",    // -a 承認ポリシー
+            "--approve-for-me",      // 承認リクエストの自動レビュー
             "--search",              // Web 検索
             "--skip-git-repo-check", // git リポジトリ外での実行
             "--ignore-user-config",  // ユーザ設定を無視

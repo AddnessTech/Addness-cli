@@ -122,6 +122,7 @@ mod.rs 1009〜1158 行付近と 9381〜9649 行付近。これらが組むサブ
 - 共通: `push_global_exec_settings` / `push_optional_exec_settings`
 
 使用フラグ一覧: `--json`, `-a/--ask-for-approval`, `-s/--sandbox`,
+`--approve-for-me`,
 `--dangerously-bypass-approvals-and-sandbox`, `--dangerously-bypass-hook-trust`,
 `--strict-config`, `--search`, `--oss`, `--local-provider`, `-p <profile>`,
 `--add-dir`, `-c key=value`（`developer_instructions`, `model_reasoning_effort`,

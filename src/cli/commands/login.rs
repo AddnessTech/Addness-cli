@@ -69,6 +69,52 @@ fn sign_message(signing_key: &SigningKey, message: &str) -> String {
     URL_SAFE_NO_PAD.encode(signature.to_bytes())
 }
 
+fn build_privileged_exchange_signature_message(
+    installation_id: &str,
+    handoff_id: &str,
+    code_verifier: &str,
+    organization_id: Option<&str>,
+    timestamp: i64,
+) -> String {
+    let organization_id = organization_id.unwrap_or_default();
+
+    format!(
+        r#"visiontodo-desktop-auth-exchange-privileged-v1
+installation_id={installation_id}
+handoff_id={handoff_id}
+code_verifier={code_verifier}
+source=cli
+organization_id={organization_id}
+timestamp={timestamp}"#
+    )
+}
+
+fn build_exchange_body(
+    installation_id: &str,
+    handoff_id: &str,
+    code_verifier: &str,
+    timestamp: i64,
+    signatures: (&str, &str),
+    organization_id: Option<&str>,
+) -> serde_json::Value {
+    let (signature, privileged_signature) = signatures;
+    let mut body = serde_json::json!({
+        "handoffId": handoff_id,
+        "codeVerifier": code_verifier,
+        "installationId": installation_id,
+        "timestamp": timestamp,
+        "signature": signature,
+        "privilegedSignature": privileged_signature,
+        "source": "cli",
+    });
+
+    if let Some(org_id) = organization_id {
+        body["organizationId"] = serde_json::Value::String(org_id.to_string());
+    }
+
+    body
+}
+
 fn timestamp() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -215,27 +261,22 @@ code_verifier={code_verifier}
 timestamp={ts}"#
     );
     let exchange_signature = sign_message(&signing_key, &exchange_message);
-
-    let exchange_body = if let Some(org_id) = &current_org_id {
-        serde_json::json!({
-            "handoffId": handoff_id,
-            "codeVerifier": code_verifier,
-            "installationId": installation_id,
-            "timestamp": ts,
-            "signature": exchange_signature,
-            "source": "cli",
-            "organizationId": org_id,
-        })
-    } else {
-        serde_json::json!({
-            "handoffId": handoff_id,
-            "codeVerifier": code_verifier,
-            "installationId": installation_id,
-            "timestamp": ts,
-            "signature": exchange_signature,
-            "source": "cli",
-        })
-    };
+    let privileged_exchange_message = build_privileged_exchange_signature_message(
+        &installation_id,
+        &handoff_id,
+        &code_verifier,
+        current_org_id.as_deref(),
+        ts,
+    );
+    let privileged_exchange_signature = sign_message(&signing_key, &privileged_exchange_message);
+    let exchange_body = build_exchange_body(
+        &installation_id,
+        &handoff_id,
+        &code_verifier,
+        ts,
+        (&exchange_signature, &privileged_exchange_signature),
+        current_org_id.as_deref(),
+    );
 
     let exchange_resp = client
         .post(format!(
@@ -392,7 +433,10 @@ async fn wait_for_callback(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_callback_path, wait_for_callback};
+    use super::{
+        build_exchange_body, build_privileged_exchange_signature_message, is_callback_path,
+        wait_for_callback,
+    };
     use reqwest::StatusCode;
 
     #[test]
@@ -404,6 +448,78 @@ mod tests {
         assert!(!is_callback_path("/callback/session-2", state));
         assert!(!is_callback_path("/callback/session-1/extra", state));
         assert!(!is_callback_path("/callback-extra", state));
+    }
+
+    #[test]
+    fn privileged_exchange_signature_binds_cli_capability_and_organization() {
+        assert_eq!(
+            build_privileged_exchange_signature_message(
+                "installation-1",
+                "handoff-1",
+                "verifier-1",
+                Some("org-1"),
+                1_775_000_000,
+            ),
+            r#"visiontodo-desktop-auth-exchange-privileged-v1
+installation_id=installation-1
+handoff_id=handoff-1
+code_verifier=verifier-1
+source=cli
+organization_id=org-1
+timestamp=1775000000"#
+        );
+    }
+
+    #[test]
+    fn privileged_exchange_signature_binds_empty_organization() {
+        assert_eq!(
+            build_privileged_exchange_signature_message(
+                "installation-1",
+                "handoff-1",
+                "verifier-1",
+                None,
+                1_775_000_000,
+            ),
+            r#"visiontodo-desktop-auth-exchange-privileged-v1
+installation_id=installation-1
+handoff_id=handoff-1
+code_verifier=verifier-1
+source=cli
+organization_id=
+timestamp=1775000000"#
+        );
+    }
+
+    #[test]
+    fn exchange_body_sends_privileged_signature() {
+        let body = build_exchange_body(
+            "installation-1",
+            "handoff-1",
+            "verifier-1",
+            1_775_000_000,
+            ("legacy-signature", "privileged-signature"),
+            Some("org-1"),
+        );
+
+        assert_eq!(body["source"], "cli");
+        assert_eq!(body["organizationId"], "org-1");
+        assert_eq!(body["signature"], "legacy-signature");
+        assert_eq!(body["privilegedSignature"], "privileged-signature");
+    }
+
+    #[test]
+    fn exchange_body_omits_unselected_organization() {
+        let body = build_exchange_body(
+            "installation-1",
+            "handoff-1",
+            "verifier-1",
+            1_775_000_000,
+            ("legacy-signature", "privileged-signature"),
+            None,
+        );
+
+        assert!(body.get("organizationId").is_none());
+        assert_eq!(body["privilegedSignature"], "privileged-signature");
     }
 
     #[tokio::test]

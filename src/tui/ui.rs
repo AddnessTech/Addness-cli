@@ -14,7 +14,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::agent::{
     AgentKind, CODEX_LOG_PREFIX_WIDTH, ChildGoal, CodexDecisionKind, CodexListPickerAction,
-    CodexLogKind, CodexLogLine, CodexPane,
+    CodexLogKind, CodexLogLine, CodexPane, SubagentState, SubagentStatusLine,
 };
 use super::app::{ActivePane, App, DeliverableFormField, FormField, ModalState};
 use super::goal_tree::{CommentView, TreeRow};
@@ -1301,7 +1301,9 @@ fn draw_codex_help_overlay(frame: &mut Frame, app: &mut App) {
 
     lines.extend([
         section("goal helpers"),
-        kv("/goal <目標>", "Goal modeを開始 / 更新"),
+        kv("/goal <目標>", "継続ゴールを設定し、そのまま着手する"),
+        kv("/goal set <目標>", "継続ゴールを登録するだけで送信しない"),
+        kv("/goal show", "現在の継続ゴールを表示"),
         kv("/goal pause/resume", "Goal modeを一時停止 / 再開"),
         kv("/goal clear", "Goal modeを解除"),
         kv(
@@ -4592,6 +4594,28 @@ fn codex_log_prefix(line: &CodexLogLine) -> (&'static str, Style, Style) {
             Style::default().fg(COLOR_EVENT),
             Style::default().fg(COLOR_EVENT),
         ),
+        // サブエージェント / バックグラウンドタスクの起動・完了。他のツール行に埋もれず
+        // 追えるよう専用のプレフィックスを立て、完了/失敗/実行中で本文色を変える。
+        CodexLogKind::Subagent => (
+            "sub  | ",
+            Style::default()
+                .fg(COLOR_ADDNESS)
+                .add_modifier(Modifier::BOLD),
+            subagent_log_text_style(&line.text),
+        ),
+    }
+}
+
+/// サブエージェントログ行の本文スタイル。先頭アイコンで完了/失敗/実行中を判別する。
+fn subagent_log_text_style(text: &str) -> Style {
+    if text.starts_with('✖') {
+        Style::default()
+            .fg(COLOR_DANGER)
+            .add_modifier(Modifier::BOLD)
+    } else if text.starts_with('✔') {
+        Style::default().fg(COLOR_SUCCESS)
+    } else {
+        Style::default().fg(COLOR_WARN)
     }
 }
 
@@ -5235,6 +5259,19 @@ fn codex_current_activity_label(pane: &CodexPane, max_width: usize) -> String {
         } else {
             " / Enterで次ターン予約".to_string()
         };
+        // サブエージェントに委譲している間は、メイン側の「考えています」表示だけだと
+        // 裏で何が動いているのか分からない。実行中があれば最新の 1 件を「今」欄に添える。
+        let subagent_running = pane.subagent_running_count();
+        let subagent_hint = if subagent_running > 0 {
+            let latest = pane
+                .latest_running_subagent_label()
+                .map(|label| format!(": {label}"))
+                .unwrap_or_default();
+            format!(" / サブ{subagent_running}件{latest}")
+        } else {
+            String::new()
+        };
+        let input_hint = format!("{subagent_hint}{input_hint}");
         if let Some(decision) = pane.decision_banner() {
             // 承認待ちは他の実行中状態より目に留まりやすいラベルにする（色は呼び出し側で強調）。
             format!("⏸ 承認待ち: {}", decision.message)
@@ -5610,25 +5647,31 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane, scro
     }
     // サブエージェント稼働状況（Claude Code の Task/Agent ツール起動）。
     // 実行中件数の集計行 + 実行中を優先した各エージェントの行を、パネル高さに応じて表示する。
+    // 全行を同じ薄色で並べると実行中と完了済みが見分けられないため、状態ごとに色を変える。
     let subagent_running = pane.subagent_running_count();
     let subagent_visible = codex_subagent_visible_count(area.height);
     let subagent_lines = pane.subagent_status_lines(subagent_visible);
     if !subagent_lines.is_empty() {
         lines.push(Line::from(vec![
-            Span::styled("サブエージェント ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(
+                "サブエージェント ",
+                Style::default()
+                    .fg(COLOR_TEXT_STRONG)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(
                 subagent_summary_label(subagent_running, subagent_lines.len()),
                 if subagent_running > 0 {
-                    Style::default().fg(COLOR_WARN)
+                    Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(COLOR_MUTED)
                 },
             ),
         ]));
-        for label in &subagent_lines {
+        for status in &subagent_lines {
             lines.push(Line::from(Span::styled(
-                ellipsize_width(&format!("  {label}"), prompt_width),
-                Style::default().fg(COLOR_MUTED),
+                ellipsize_width(&format!("  {}", status.text), prompt_width),
+                subagent_status_style(status),
             )));
         }
     }
@@ -5639,20 +5682,25 @@ fn draw_codex_status_panel(frame: &mut Frame, area: Rect, pane: &CodexPane, scro
     let bg_lines = pane.background_task_status_lines(bg_visible);
     if !bg_lines.is_empty() {
         lines.push(Line::from(vec![
-            Span::styled("バックグラウンド ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(
+                "バックグラウンド ",
+                Style::default()
+                    .fg(COLOR_TEXT_STRONG)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(
                 format!("{bg_running}件・通知待ち"),
                 if bg_running > 0 {
-                    Style::default().fg(COLOR_WARN)
+                    Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(COLOR_MUTED)
                 },
             ),
         ]));
-        for label in &bg_lines {
+        for status in &bg_lines {
             lines.push(Line::from(Span::styled(
-                ellipsize_width(&format!("  {label}"), prompt_width),
-                Style::default().fg(COLOR_MUTED),
+                ellipsize_width(&format!("  {}", status.text), prompt_width),
+                subagent_status_style(status),
             )));
         }
     }
@@ -5732,13 +5780,30 @@ fn codex_recent_action_visible_count(height: u16) -> usize {
 /// パネル高さに応じて、状態パネルに表示するサブエージェント一覧の件数を決める。
 /// `codex_recent_action_visible_count` と同じ段階を踏むが、直近アクションの後に追加される
 /// セクションのため、低い高さではより控えめ（1 件から）に出す。
+/// ただし 0 件にすると「サブエージェントが動いていること自体」が状態パネルから消えるため、
+/// 見出し + 1 行を出せる最低限の高さ（7 行）からは必ず 1 件は見せる。
 fn codex_subagent_visible_count(height: u16) -> usize {
     match height {
-        0..=8 => 0,
-        9..=10 => 1,
+        0..=6 => 0,
+        7..=10 => 1,
         11..=13 => 2,
         14..=17 => 3,
         _ => 5,
+    }
+}
+
+/// 状態パネルのサブエージェント / バックグラウンド 1 行のスタイル。
+/// 実行中・確認待ち・完了・失敗を色で区別し、一覧を眺めただけで動きが分かるようにする。
+fn subagent_status_style(status: &SubagentStatusLine) -> Style {
+    if status.pending {
+        return Style::default().fg(COLOR_MUTED);
+    }
+    match status.state {
+        SubagentState::Running => Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD),
+        SubagentState::Completed => Style::default().fg(COLOR_SUCCESS),
+        SubagentState::Failed => Style::default()
+            .fg(COLOR_DANGER)
+            .add_modifier(Modifier::BOLD),
     }
 }
 
@@ -5870,16 +5935,16 @@ fn ellipsize_width(text: &str, max_width: usize) -> String {
 mod tests {
     use super::{
         ActivePane, App, CODEX_EDIT_DIFF_PREVIEW_LINES, COLOR_ADDNESS, COLOR_CODEX, COLOR_DANGER,
-        COLOR_EVENT, COLOR_MUTED, COLOR_SUCCESS, COLOR_WARN, RUN_SPINNER_FRAMES,
-        TOOL_OUTPUT_PREVIEW_LINES, cached_assistant_markdown_count,
+        COLOR_EVENT, COLOR_MUTED, COLOR_SUCCESS, COLOR_WARN, RUN_SPINNER_FRAMES, SubagentState,
+        SubagentStatusLine, TOOL_OUTPUT_PREVIEW_LINES, cached_assistant_markdown_count,
         cached_assistant_markdown_lines, code_edit_diff_preview, codex_activity_lines,
         codex_child_goal_lines, codex_current_activity_label, codex_dashboard_shortcut_lines,
         codex_decision_choice_line, codex_decision_input_lines, codex_decision_title_hint,
         codex_diff_lines, codex_header_line, codex_header_lines, codex_input_prompt_render,
-        codex_log_entry_lines, codex_log_lines, codex_markdown_styles,
+        codex_log_entry_lines, codex_log_lines, codex_log_prefix, codex_markdown_styles,
         codex_recent_action_visible_count, codex_runtime_status, codex_subagent_visible_count,
         codex_visible_log_lines, codex_work_label, draw, draw_status_bar, ellipsize_width,
-        markdown, prompt_preview, run_spinner_glyph, split_diff_count_badge,
+        markdown, prompt_preview, run_spinner_glyph, split_diff_count_badge, subagent_status_style,
         subagent_summary_label, summarize_tool_display_text,
     };
     use crate::api::ApiClient;
@@ -6781,7 +6846,10 @@ mod tests {
     #[test]
     fn codex_subagent_visible_count_scales_with_panel_height() {
         assert_eq!(codex_subagent_visible_count(0), 0);
-        assert_eq!(codex_subagent_visible_count(8), 0);
+        assert_eq!(codex_subagent_visible_count(6), 0);
+        // 低いパネルでも「動いていること」が消えないよう、7 行から必ず 1 件は見せる。
+        assert_eq!(codex_subagent_visible_count(7), 1);
+        assert_eq!(codex_subagent_visible_count(8), 1);
         assert_eq!(codex_subagent_visible_count(9), 1);
         assert_eq!(codex_subagent_visible_count(10), 1);
         assert_eq!(codex_subagent_visible_count(11), 2);
@@ -6790,6 +6858,75 @@ mod tests {
         assert_eq!(codex_subagent_visible_count(17), 3);
         assert_eq!(codex_subagent_visible_count(18), 5);
         assert_eq!(codex_subagent_visible_count(u16::MAX), 5);
+    }
+
+    #[test]
+    fn codex_current_activity_label_shows_running_subagents() {
+        let mut pane = CodexPane::test_with_output(8, 20, 0, "");
+        pane.finished = false;
+        pane.test_set_turn_running(true);
+
+        let without = codex_current_activity_label(&pane, 200);
+        assert!(!without.contains("サブ"), "label={without}");
+
+        pane.test_add_running_subagent("差分レンダラ調査");
+        let with = codex_current_activity_label(&pane, 200);
+        assert!(with.contains("サブ1件"), "label={with}");
+        assert!(with.contains("差分レンダラ調査"), "label={with}");
+    }
+
+    #[test]
+    fn subagent_log_lines_use_a_dedicated_prefix_and_state_colors() {
+        let running = codex_log_prefix(&CodexLogLine {
+            kind: CodexLogKind::Subagent,
+            text: "▶ サブエージェント起動: 調査タスク [Explore]".to_string(),
+        });
+        assert_eq!(running.0, "sub  | ");
+        assert_eq!(
+            UnicodeWidthStr::width(running.0),
+            CODEX_LOG_PREFIX_WIDTH,
+            "プレフィックス幅は他の種別と揃える"
+        );
+        assert_eq!(running.2.fg, Some(COLOR_WARN));
+
+        let done = codex_log_prefix(&CodexLogLine {
+            kind: CodexLogKind::Subagent,
+            text: "✔ サブエージェント完了: 調査タスク (12秒)".to_string(),
+        });
+        assert_eq!(done.2.fg, Some(COLOR_SUCCESS));
+
+        let failed = codex_log_prefix(&CodexLogLine {
+            kind: CodexLogKind::Subagent,
+            text: "✖ サブエージェント失敗: 調査タスク (3秒)".to_string(),
+        });
+        assert_eq!(failed.2.fg, Some(COLOR_DANGER));
+    }
+
+    #[test]
+    fn subagent_status_style_separates_running_from_finished() {
+        let line = |state, pending| SubagentStatusLine {
+            text: "x".to_string(),
+            state,
+            pending,
+        };
+
+        assert_eq!(
+            subagent_status_style(&line(SubagentState::Running, false)).fg,
+            Some(COLOR_WARN)
+        );
+        assert_eq!(
+            subagent_status_style(&line(SubagentState::Completed, false)).fg,
+            Some(COLOR_SUCCESS)
+        );
+        assert_eq!(
+            subagent_status_style(&line(SubagentState::Failed, false)).fg,
+            Some(COLOR_DANGER)
+        );
+        // バックグラウンド起動の確認待ちは、まだ動いていると断定できないので控えめに出す。
+        assert_eq!(
+            subagent_status_style(&line(SubagentState::Running, true)).fg,
+            Some(COLOR_MUTED)
+        );
     }
 
     #[test]

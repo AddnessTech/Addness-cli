@@ -177,7 +177,6 @@ addness link --help
 ### AI・自動化
 
 - `skill` — AIスキルのCRUD・検索・パフォーマンス・リソース・改善提案の承認/却下。
-- `tool` — AIツールのCRUD・検索・実行。例: `addness tool list`
 - `codex-job` — クラウドCodexジョブの作成・入力送信・resume・cancel/close・イベント購読。
   例: `addness codex-job list`
 

@@ -152,9 +152,8 @@ Addness フロントエンド (`vision-todo-frontend`) からユーザーが実�
 - test / sync / oauth start
 - toggle tool
 
-### Skill / Tool（組織レベル）
+### Skill（組織レベル）
 - skill: CRUD
-- tool: CRUD
 
 ### API Key
 - create / revoke
@@ -302,13 +301,12 @@ Addness フロントエンド (`vision-todo-frontend`) からユーザーが実�
 
 ---
 
-## Phase 5: 連携 (Integration / MCP / Skill / Tool / Binding)
+## Phase 5: 連携 (Integration / MCP / Skill / Binding)
 
 - `slack-binding add/rm`
 - `sheet-binding add/rm`（既存サービスアカウント対応含む。MEMORY.md `sheets_service_account_setup.md` 参照）
 - `mcp connection add/update/rm/test/sync/oauth-start/toggle` (Organization レベル)
 - `skill create/update/rm` (既存 `skills.rs` 拡張)
-- `tool create/update/rm`
 - `integration credential save/rm`（Slack/Google/GitHub/LINE）
 
 規模見積もり: 約 800〜1000 行

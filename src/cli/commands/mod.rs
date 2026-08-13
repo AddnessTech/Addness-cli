@@ -39,7 +39,6 @@ pub mod summary;
 pub mod thread;
 pub mod today;
 pub mod todo_chat;
-pub mod tool;
 pub mod update;
 pub mod user;
 

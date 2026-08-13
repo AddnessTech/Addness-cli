@@ -14,8 +14,8 @@ use cli::commands::{
     activity, api_key, assignment, chat, codex_job, comment, configure, consent, core_values,
     deliverable, desktop_auth, detect, diagnosis, execution, goal, goal_chat, invitation, invoice,
     issue, kpi, link, login, master_plan, media, meeting, member, notification, org, personal,
-    referral, search, sharetree, skill, skills, streak, summary, thread, today, todo_chat, tool,
-    update, user,
+    referral, search, sharetree, skill, skills, streak, summary, thread, today, todo_chat, update,
+    user,
 };
 
 #[derive(Parser)]
@@ -244,11 +244,6 @@ enum Commands {
         #[command(subcommand)]
         command: skill::SkillCommands,
     },
-    /// Manage tools (executable actions an AI skill can invoke): CRUD, search, and execution
-    Tool {
-        #[command(subcommand)]
-        command: tool::ToolCommands,
-    },
     /// Manage cloud Codex jobs (agent sessions): create, list, follow-up input,
     /// resume, cancel/close, delete, and the live event stream
     CodexJob {
@@ -319,7 +314,6 @@ fn command_outputs_json(command: &Commands) -> bool {
         Commands::Execution { command } => execution_outputs_json(command),
         Commands::Meeting { command } => meeting_outputs_json(command),
         Commands::Skill { command } => skill_outputs_json(command),
-        Commands::Tool { command } => tool_outputs_json(command),
         Commands::CodexJob { command } => codex_job_outputs_json(command),
         Commands::ApiKey { command } => api_key_outputs_json(command),
         Commands::DesktopAuth { command } => desktop_auth_outputs_json(command),
@@ -685,18 +679,6 @@ fn desktop_auth_outputs_json(command: &desktop_auth::DesktopAuthCommands) -> boo
 fn consent_outputs_json(command: &consent::ConsentCommands) -> bool {
     match command {
         consent::ConsentCommands::Get { json, .. } => *json,
-    }
-}
-
-fn tool_outputs_json(command: &tool::ToolCommands) -> bool {
-    match command {
-        tool::ToolCommands::Create { json, .. }
-        | tool::ToolCommands::List { json, .. }
-        | tool::ToolCommands::Search { json, .. }
-        | tool::ToolCommands::Get { json, .. }
-        | tool::ToolCommands::Update { json, .. }
-        | tool::ToolCommands::Delete { json, .. }
-        | tool::ToolCommands::Execute { json, .. } => *json,
     }
 }
 
@@ -1280,10 +1262,6 @@ async fn main() -> Result<()> {
             let client = build_client()?;
             skill::handle_skill(command, &client).await
         }
-        Some(Commands::Tool { command }) => {
-            let client = build_client()?;
-            tool::handle_tool(command, &client).await
-        }
         Some(Commands::CodexJob { command }) => {
             let client = build_client()?;
             codex_job::handle_codex_job(command, &client).await
@@ -1318,6 +1296,16 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::error::ErrorKind;
+
+    #[test]
+    fn retired_tool_command_is_not_exposed() {
+        let error = Cli::try_parse_from(["addness", "tool", "list"])
+            .err()
+            .expect("tool command must be retired");
+
+        assert_eq!(error.kind(), ErrorKind::InvalidSubcommand);
+    }
 
     #[test]
     fn env_client_config_none_without_token() {

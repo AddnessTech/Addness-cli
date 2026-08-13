@@ -46,8 +46,8 @@ pub const CODEX_LOG_PREFIX_WIDTH: usize = 7;
 /// Addness 連携・セッション操作を上に、codex 委譲・設定系を下に並べる。
 /// 表示はコマンド名の先頭一致で絞り込む。
 const SLASH_COMMANDS: &[(&str, &str)] = &[
-    ("/goal", "Goal モードを開始 / 更新"),
-    ("/work", "子ゴールの作業単位へ進む"),
+    ("/goal", "継続ゴールを設定してそのまま着手"),
+    ("/work", "子ゴールへ着手（next / all / N、引数なしは一覧）"),
     ("/dual", "Codex + Claude Code の実装/レビュー分担"),
     ("/organize", "子ゴールに分解する"),
     ("/remember", "メモを Addness の body へ保存"),
@@ -81,7 +81,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/approval", "承認モードを切替"),
     ("/sandbox", "sandbox を切替 / 指定"),
     ("/permissions", "承認 / sandbox 権限を設定"),
-    ("/bypass", "権限チェックをスキップ（危険）: ON/OFF トグル"),
+    ("/bypass", "権限チェックをスキップ（危険）: on/off/status"),
     ("/personality", "通信スタイルを切替"),
     ("/settings", "モデル・推論・承認・sandbox 設定を表示"),
     ("/lang", "エージェントの応答言語を設定"),
@@ -410,6 +410,10 @@ pub enum CodexLogKind {
     System,
     Error,
     Event,
+    /// サブエージェント / バックグラウンドタスクの起動・完了。
+    /// 状態パネルは高さ次第で数行しか出せず見落とすため、本文ログにも専用種別で残す。
+    /// どの表示フィルタでも隠れないよう `matches_log_filter` で会話・実行の両方に含める。
+    Subagent,
 }
 
 /// Addness 独自 UI に表示する Codex ログ行。
@@ -466,10 +470,14 @@ fn matches_log_filter(kind: CodexLogKind, filter: CodexLogFilter) -> bool {
                     | CodexLogKind::Turn
                     | CodexLogKind::System
                     | CodexLogKind::Error
+                    | CodexLogKind::Subagent
             )
         }
         CodexLogFilter::Tools => {
-            matches!(kind, CodexLogKind::Tool | CodexLogKind::Event)
+            matches!(
+                kind,
+                CodexLogKind::Tool | CodexLogKind::Event | CodexLogKind::Subagent
+            )
         }
         CodexLogFilter::Errors => matches!(kind, CodexLogKind::Error),
         CodexLogFilter::All => true,
@@ -1208,7 +1216,7 @@ const BACKGROUND_TASK_STALE_TURN_LIMIT: u32 = 3;
 
 /// サブエージェント 1 件の状態。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SubagentState {
+pub enum SubagentState {
     /// 起動済みで、対応する tool_result 未受信（実行中）。
     Running,
     /// tool_result を正常受信（完了）。
@@ -1225,6 +1233,25 @@ impl SubagentState {
             SubagentState::Failed => "✖",
         }
     }
+}
+
+/// 状態パネルへ渡す 1 行分の表示情報。すべて同じ薄色で並べると実行中と完了の区別が
+/// つかず「サブエージェントの動きが見えない」ため、状態を添えて色分けできるようにする。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentStatusLine {
+    /// アイコン付きの表示文字列（例: `● 調査タスク (12秒)`）。
+    pub text: String,
+    pub state: SubagentState,
+    /// バックグラウンド起動の確認応答待ち（アイコンは `…`）。実行中扱いだが未確定。
+    pub pending: bool,
+}
+
+/// 完了したサブエージェント/バックグラウンドタスクを本文ログへ 1 行残すための情報。
+struct SubagentFinishLog {
+    label: String,
+    elapsed_secs: u64,
+    is_error: bool,
+    is_background: bool,
 }
 
 /// 状態パネルに表示する 1 件のサブエージェント起動情報。
@@ -1260,13 +1287,37 @@ struct SubagentEntry {
     turns_survived_while_running: u32,
 }
 
-/// `subagent_status_lines` の整形ロジック本体。バックグラウンドタスク一覧
-/// （`background_task_status_lines`）とは表示アイコンの決め方が異なるため独立させている。
+impl SubagentEntry {
+    /// 実行中なら起動からの経過秒、完了済みなら所要秒。
+    fn elapsed_secs(&self) -> u64 {
+        match self.finished_at {
+            Some(finished_at) => finished_at.duration_since(self.started_at).as_secs(),
+            None => self.started_at.elapsed().as_secs(),
+        }
+    }
+
+    /// 状態パネル 1 行分の表示。バックグラウンド起動の確認応答（「running in background
+    /// with ID: ...」）がまだ来ていない実行中エントリだけは、確定アイコンではなく
+    /// `…`（起動リクエスト送信済み・確認待ち）を使う。
+    fn status_line(&self) -> SubagentStatusLine {
+        let pending =
+            self.state == SubagentState::Running && self.is_background && !self.bg_confirmed;
+        let icon = if pending { "…" } else { self.state.icon() };
+        SubagentStatusLine {
+            text: format!("{icon} {} ({}秒)", self.label, self.elapsed_secs()),
+            state: self.state,
+            pending,
+        }
+    }
+}
+
+/// `subagent_status_lines` / `background_task_status_lines` 共通の整形ロジック。
 /// 実行中を優先しつつ、完了/失敗は新しい順にして `limit` 件までに絞る。
+/// アイコンの決め方（バックグラウンドの確認待ちだけ `…`）は `SubagentEntry::status_line` 側。
 fn subagent_status_lines_for<'a>(
     entries: impl Iterator<Item = &'a SubagentEntry>,
     limit: usize,
-) -> Vec<String> {
+) -> Vec<SubagentStatusLine> {
     if limit == 0 {
         return Vec::new();
     }
@@ -1285,26 +1336,37 @@ fn subagent_status_lines_for<'a>(
         .into_iter()
         .chain(finished)
         .take(limit)
-        .map(|entry| {
-            let elapsed = match entry.finished_at {
-                Some(finished_at) => finished_at.duration_since(entry.started_at).as_secs(),
-                None => entry.started_at.elapsed().as_secs(),
-            };
-            format!("{} {} ({}秒)", entry.state.icon(), entry.label, elapsed)
-        })
+        .map(SubagentEntry::status_line)
         .collect()
 }
 
-fn finish_subagent_entry(entry: &mut SubagentEntry, is_error: bool) {
+/// ログ行の主語。バックグラウンド起動（Bash の `run_in_background` 等）は
+/// サブエージェントと同じ構造体で追跡しているが、ユーザーから見ると別物なので言い分ける。
+fn subagent_log_noun(is_background: bool) -> &'static str {
+    if is_background {
+        "バックグラウンド"
+    } else {
+        "サブエージェント"
+    }
+}
+
+fn finish_subagent_entry(entry: &mut SubagentEntry, is_error: bool) -> Option<SubagentFinishLog> {
     if entry.state != SubagentState::Running {
-        return;
+        return None;
     }
     entry.state = if is_error {
         SubagentState::Failed
     } else {
         SubagentState::Completed
     };
-    entry.finished_at = Some(Instant::now());
+    let finished_at = Instant::now();
+    entry.finished_at = Some(finished_at);
+    Some(SubagentFinishLog {
+        label: entry.label.clone(),
+        elapsed_secs: finished_at.duration_since(entry.started_at).as_secs(),
+        is_error,
+        is_background: entry.is_background,
+    })
 }
 
 /// アクション種別（状態パネルのパンくずで先頭に付けるアイコンを決める）。
@@ -2189,6 +2251,14 @@ impl CodexPane {
         {
             return;
         }
+        self.push_subagent_log(format!(
+            "▶ {}起動: {label}{}",
+            subagent_log_noun(is_background),
+            agent_type
+                .as_deref()
+                .map(|kind| format!(" [{kind}]"))
+                .unwrap_or_default(),
+        ));
         self.subagents.push_back(SubagentEntry {
             tool_use_id,
             label,
@@ -2204,6 +2274,26 @@ impl CodexPane {
         while self.subagents.len() > SUBAGENTS_CAP {
             self.subagents.pop_front();
         }
+    }
+
+    /// サブエージェント / バックグラウンドタスクの起動・完了を本文ログへ 1 行残す。
+    /// 状態パネルは高さ次第で 0〜5 行しか出せず、完了は一瞬でアイコンが変わるだけなので、
+    /// 流れて残るログ側にも必ず痕跡を残して「動きが見えない」状態を避ける。
+    fn push_subagent_log(&mut self, text: impl Into<String>) {
+        self.push_log(CodexLogKind::Subagent, text);
+    }
+
+    fn push_subagent_finish_log(&mut self, finish: SubagentFinishLog) {
+        let noun = subagent_log_noun(finish.is_background);
+        let (icon, verb) = if finish.is_error {
+            ("✖", "失敗")
+        } else {
+            ("✔", "完了")
+        };
+        self.push_subagent_log(format!(
+            "{icon} {noun}{verb}: {} ({}秒)",
+            finish.label, finish.elapsed_secs
+        ));
     }
 
     /// Bash を `run_in_background: true` で起動した際の「実行中」記録。
@@ -2230,33 +2320,44 @@ impl CodexPane {
         let Some(idx) = idx else {
             return;
         };
-        if let Some(entry) = self.subagents.get_mut(idx) {
-            if entry.state != SubagentState::Running {
-                return;
+        // ログ出力のために可変借用をここで閉じてから push_log する。
+        let mut confirmed_background: Option<(String, String)> = None;
+        let finished = match self.subagents.get_mut(idx) {
+            Some(entry) if entry.state == SubagentState::Running => {
+                if entry.is_background
+                    && !entry.bg_confirmed
+                    && let Some(id) = claude::background_confirmation_id(text)
+                {
+                    entry.bg_confirmed = true;
+                    entry.bg_id = Some(id.clone());
+                    confirmed_background = Some((entry.label.clone(), id));
+                    None // バックグラウンドで実行中と確認できただけで、まだ未完了。
+                } else {
+                    finish_subagent_entry(entry, is_error)
+                }
             }
-            if entry.is_background
-                && !entry.bg_confirmed
-                && let Some(id) = claude::background_confirmation_id(text)
-            {
-                entry.bg_confirmed = true;
-                entry.bg_id = Some(id);
-                return; // バックグラウンドで実行中と確認できただけで、まだ未完了。
-            }
-            finish_subagent_entry(entry, is_error);
+            _ => return,
+        };
+        if let Some((label, id)) = confirmed_background {
+            self.push_subagent_log(format!("… バックグラウンド実行中: {label} (ID: {id})"));
+            return;
+        }
+        if let Some(finish) = finished {
+            self.push_subagent_finish_log(finish);
         }
     }
 
     /// tool id が無い Codex 汎用イベント用。ラベルが一致する直近の実行中エントリを完了/失敗にする。
     fn resolve_subagent_by_label(&mut self, label: &str, is_error: bool) {
-        let Some(entry) = self
+        let finished = self
             .subagents
             .iter_mut()
             .rev()
             .find(|entry| entry.state == SubagentState::Running && entry.label == label)
-        else {
-            return;
-        };
-        finish_subagent_entry(entry, is_error);
+            .and_then(|entry| finish_subagent_entry(entry, is_error));
+        if let Some(finish) = finished {
+            self.push_subagent_finish_log(finish);
+        }
     }
 
     fn subagent_running_with_label(&self, label: &str) -> bool {
@@ -2300,29 +2401,26 @@ impl CodexPane {
         {
             return; // 追跡中のバックグラウンドタスクが無ければ判定コストをかけない。
         }
-        match claude::background_completion_signal(text) {
-            claude::BackgroundCompletionSignal::None => {}
-            claude::BackgroundCompletionSignal::ForId(id) => {
-                if let Some(entry) = self.subagents.iter_mut().find(|entry| {
+        let finished = match claude::background_completion_signal(text) {
+            claude::BackgroundCompletionSignal::None => None,
+            claude::BackgroundCompletionSignal::ForId(id) => self
+                .subagents
+                .iter_mut()
+                .find(|entry| {
                     entry.is_background
                         && entry.state == SubagentState::Running
                         && entry.bg_id.as_deref() == Some(id.as_str())
-                }) {
-                    entry.state = SubagentState::Completed;
-                    entry.finished_at = Some(Instant::now());
-                }
-            }
-            claude::BackgroundCompletionSignal::Unmatched => {
-                if let Some(entry) = self
-                    .subagents
-                    .iter_mut()
-                    .filter(|entry| entry.is_background && entry.state == SubagentState::Running)
-                    .min_by_key(|entry| entry.started_at)
-                {
-                    entry.state = SubagentState::Completed;
-                    entry.finished_at = Some(Instant::now());
-                }
-            }
+                })
+                .and_then(|entry| finish_subagent_entry(entry, false)),
+            claude::BackgroundCompletionSignal::Unmatched => self
+                .subagents
+                .iter_mut()
+                .filter(|entry| entry.is_background && entry.state == SubagentState::Running)
+                .min_by_key(|entry| entry.started_at)
+                .and_then(|entry| finish_subagent_entry(entry, false)),
+        };
+        if let Some(finish) = finished {
+            self.push_subagent_finish_log(finish);
         }
     }
 
@@ -2332,6 +2430,7 @@ impl CodexPane {
     /// 実際にまだ動いている可能性はあるが、通知を検知できない以上いつまでも
     /// 待ち続けるより「打ち切って通常表示へ戻す」方を安全側とみなす。
     fn prune_stale_background_tasks(&mut self) {
+        let mut finished = Vec::new();
         for entry in self.subagents.iter_mut() {
             if !entry.is_background || entry.state != SubagentState::Running {
                 continue;
@@ -2339,10 +2438,12 @@ impl CodexPane {
             entry.turns_survived_while_running =
                 entry.turns_survived_while_running.saturating_add(1);
             if entry.turns_survived_while_running > BACKGROUND_TASK_STALE_TURN_LIMIT {
-                entry.state = SubagentState::Completed;
-                entry.finished_at = Some(Instant::now());
                 entry.label = format!("{} (通知未検知のため打ち切り)", entry.label);
+                finished.extend(finish_subagent_entry(entry, false));
             }
+        }
+        for finish in finished {
+            self.push_subagent_finish_log(finish);
         }
     }
 
@@ -2378,47 +2479,31 @@ impl CodexPane {
     /// 状態パネルに表示するサブエージェント一覧（バックグラウンドタスクは含まない）を、
     /// 実行中を優先しつつ新しい順に整形して返す。
     /// `limit` は呼び出し側（パネル高さに応じた表示件数トリム）で決める。
-    pub fn subagent_status_lines(&self, limit: usize) -> Vec<String> {
+    pub fn subagent_status_lines(&self, limit: usize) -> Vec<SubagentStatusLine> {
         subagent_status_lines_for(
             self.subagents.iter().filter(|entry| !entry.is_background),
             limit,
         )
     }
 
+    /// 実行中サブエージェントのうち、最も新しく起動したものの表示ラベル。
+    /// ヘッダの「今」欄に添えて、状態パネルを見ていなくても動きが分かるようにする。
+    pub fn latest_running_subagent_label(&self) -> Option<String> {
+        self.subagents
+            .iter()
+            .rev()
+            .find(|entry| entry.state == SubagentState::Running && !entry.is_background)
+            .map(|entry| format!("{} ({}秒)", entry.label, entry.elapsed_secs()))
+    }
+
     /// 状態パネルに表示するバックグラウンドタスク一覧を、実行中を優先しつつ新しい順に整形して返す。
     /// バックグラウンド確認応答（`bg_confirmed`）がまだ来ていない実行中エントリは、
     /// 確定した状態アイコンではなく `…`（起動リクエスト送信済み・確認待ち）を使う。
-    pub fn background_task_status_lines(&self, limit: usize) -> Vec<String> {
-        if limit == 0 {
-            return Vec::new();
-        }
-        let mut running: Vec<&SubagentEntry> = Vec::new();
-        let mut finished: Vec<&SubagentEntry> = Vec::new();
-        for entry in self.subagents.iter().filter(|entry| entry.is_background) {
-            if entry.state == SubagentState::Running {
-                running.push(entry);
-            } else {
-                finished.push(entry);
-            }
-        }
-        finished.reverse();
-        running
-            .into_iter()
-            .chain(finished)
-            .take(limit)
-            .map(|entry| {
-                let elapsed = match entry.finished_at {
-                    Some(finished_at) => finished_at.duration_since(entry.started_at).as_secs(),
-                    None => entry.started_at.elapsed().as_secs(),
-                };
-                let icon = if entry.state == SubagentState::Running && !entry.bg_confirmed {
-                    "…"
-                } else {
-                    entry.state.icon()
-                };
-                format!("{icon} {} ({}秒)", entry.label, elapsed)
-            })
-            .collect()
+    pub fn background_task_status_lines(&self, limit: usize) -> Vec<SubagentStatusLine> {
+        subagent_status_lines_for(
+            self.subagents.iter().filter(|entry| entry.is_background),
+            limit,
+        )
     }
 
     #[cfg(test)]
@@ -3976,6 +4061,43 @@ impl CodexPane {
         }
     }
 
+    /// `on` / `off` 指定を受け付けるトグル系スラッシュコマンドの共通処理。
+    ///
+    /// 引数を読まずに反転すると `/search on` が「既に ON なので OFF」になり、
+    /// ユーザーの指示と逆の結果になる。ここを必ず通して指定値へ寄せる。
+    /// - 引数なし / `toggle` … 従来どおり反転
+    /// - `status` / `show` … 現在値の表示のみ
+    /// - `on|off|true|false|yes|no|1|0` … その値へ寄せる（既に同値なら何もしない）
+    /// - それ以外 … 使い方をエラーで返す（黙って反転しない）
+    fn handle_toggle_slash_command(
+        &mut self,
+        name: &str,
+        args: &str,
+        current: bool,
+        apply: fn(&mut Self),
+    ) {
+        let arg = args.trim().to_ascii_lowercase();
+        match arg.as_str() {
+            "" | "toggle" => apply(self),
+            "status" | "show" => {
+                self.push_log(CodexLogKind::System, format!("{name}: {}", on_off(current)));
+            }
+            _ => match parse_bool_choice(&arg) {
+                Some(desired) if desired == current => {
+                    self.push_log(
+                        CodexLogKind::System,
+                        format!("{name}: {}（変更なし）", on_off(current)),
+                    );
+                }
+                Some(_) => apply(self),
+                None => self.push_log(
+                    CodexLogKind::Error,
+                    format!("/{name} には on / off / status を指定してください"),
+                ),
+            },
+        }
+    }
+
     pub fn toggle_web_search(&mut self) {
         let enabled = self.exec_settings.toggle_web_search();
         let value = on_off(enabled);
@@ -4306,7 +4428,16 @@ impl CodexPane {
     /// 経由の既存処理（`push_claude_resident_permission_mode`）に乗る。
     /// ON にする瞬間は危険性の警告ログを出す。
     fn handle_bypass_slash_command(&mut self, args: &str) {
-        if matches!(args.trim().to_ascii_lowercase().as_str(), "status" | "show") {
+        let arg = args.trim().to_ascii_lowercase();
+        if matches!(arg.as_str(), "status" | "show") {
+            self.push_bypass_status();
+            return;
+        }
+        // `on` / `off` を明示された場合は反転ではなくその値へ寄せる（`/bypass off` が
+        // 既に OFF の状態で ON になる事故を防ぐ）。
+        if let Some(desired) = parse_bool_choice(&arg)
+            && desired == self.bypass_enabled()
+        {
             self.push_bypass_status();
             return;
         }
@@ -8046,11 +8177,21 @@ impl CodexPane {
                 true
             }
             "search" | "web-search" => {
-                self.toggle_web_search();
+                self.handle_toggle_slash_command(
+                    "search",
+                    args,
+                    self.exec_settings.web_search,
+                    Self::toggle_web_search,
+                );
                 true
             }
             "oss" => {
-                self.toggle_oss();
+                self.handle_toggle_slash_command(
+                    "oss",
+                    args,
+                    self.exec_settings.oss,
+                    Self::toggle_oss,
+                );
                 true
             }
             "remote" => {
@@ -8062,7 +8203,12 @@ impl CodexPane {
                 true
             }
             "no-alt-screen" => {
-                self.toggle_no_alt_screen();
+                self.handle_toggle_slash_command(
+                    "no-alt-screen",
+                    args,
+                    self.exec_settings.no_alt_screen,
+                    Self::toggle_no_alt_screen,
+                );
                 true
             }
             "color" | "colour" => {
@@ -8110,23 +8256,48 @@ impl CodexPane {
                 true
             }
             "strict-config" => {
-                self.toggle_strict_config();
+                self.handle_toggle_slash_command(
+                    "strict-config",
+                    args,
+                    self.exec_settings.strict_config,
+                    Self::toggle_strict_config,
+                );
                 true
             }
             "ignore-user-config" => {
-                self.toggle_ignore_user_config();
+                self.handle_toggle_slash_command(
+                    "ignore-user-config",
+                    args,
+                    self.exec_settings.ignore_user_config,
+                    Self::toggle_ignore_user_config,
+                );
                 true
             }
             "ignore-rules" => {
-                self.toggle_ignore_rules();
+                self.handle_toggle_slash_command(
+                    "ignore-rules",
+                    args,
+                    self.exec_settings.ignore_rules,
+                    Self::toggle_ignore_rules,
+                );
                 true
             }
             "skip-git-check" | "skip-git-repo-check" => {
-                self.toggle_skip_git_repo_check();
+                self.handle_toggle_slash_command(
+                    "skip-git-check",
+                    args,
+                    self.exec_settings.skip_git_repo_check,
+                    Self::toggle_skip_git_repo_check,
+                );
                 true
             }
             "ephemeral" => {
-                self.toggle_ephemeral();
+                self.handle_toggle_slash_command(
+                    "ephemeral",
+                    args,
+                    self.exec_settings.ephemeral,
+                    Self::toggle_ephemeral,
+                );
                 true
             }
             "bypass" | "dangerously-bypass" => {
@@ -8134,7 +8305,12 @@ impl CodexPane {
                 true
             }
             "bypass-hook-trust" | "dangerously-bypass-hook-trust" | "hook-trust-bypass" => {
-                self.toggle_bypass_hook_trust();
+                self.handle_toggle_slash_command(
+                    "bypass-hook-trust",
+                    args,
+                    self.exec_settings.bypass_hook_trust,
+                    Self::toggle_bypass_hook_trust,
+                );
                 true
             }
             "output-schema" => {
@@ -9906,30 +10082,61 @@ impl CodexPane {
                 self.push_activity("Goal mode を再開しました".to_string());
                 self.push_log(CodexLogKind::System, "Goal mode を再開しました");
             }
-            "clear" => {
+            "clear" | "off" => {
                 self.goal_mode = CodexGoalMode::default();
                 self.persist_goal_mode();
                 self.set_status_note("継続ゴール: 解除".to_string());
                 self.push_activity("Goal mode を解除しました".to_string());
                 self.push_log(CodexLogKind::System, "Goal mode を解除しました");
             }
-            "set" if !rest.is_empty() => self.set_goal_mode_objective(rest),
-            _ => self.set_goal_mode_objective(args),
+            "show" | "status" => self.push_goal_mode_status(),
+            // `set` は「登録だけして今は動かさない」明示の入口。`/goal <目標>` の着手が
+            // 邪魔になるケース（先に別作業を流したい等）のために残す。
+            "set" => {
+                if rest.is_empty() {
+                    self.push_log(
+                        CodexLogKind::Error,
+                        "/goal set には目標を指定してください。例: /goal set 認証周りのバグを直す",
+                    );
+                } else if self.set_goal_mode_objective(rest) {
+                    self.push_log(
+                        CodexLogKind::System,
+                        "継続ゴールを登録しました（このターンでは送信しません）。着手するには /goal <目標> を使ってください",
+                    );
+                }
+            }
+            _ => self.start_goal_mode_objective(args),
         }
     }
 
-    fn set_goal_mode_objective(&mut self, objective: &str) {
+    /// `/goal <目標>`: 継続ゴールを設定し、そのまま今ターンから着手する。
+    ///
+    /// 設定だけして何も送らないと「コマンドを打っても実行されない」ように見えるため、
+    /// `/organize`・`/plan`・`/dual` と同じく、設定に続けてターン開始（実行中なら次ターン予約）
+    /// まで行う。ターンには `prompt_with_goal_mode` で永続ゴールが付与される。
+    fn start_goal_mode_objective(&mut self, objective: &str) {
+        if !self.set_goal_mode_objective(objective) {
+            return;
+        }
+        let Some(objective) = self.goal_mode.objective.clone() else {
+            return;
+        };
+        self.record_and_run_user_line(objective);
+    }
+
+    /// 継続ゴールを設定する。設定できたら true（空・長すぎる目標は false）。
+    fn set_goal_mode_objective(&mut self, objective: &str) -> bool {
         let objective = normalize_submitted_line(objective);
         if objective.is_empty() {
             self.push_log(CodexLogKind::Error, "Goal mode の目標が空です");
-            return;
+            return false;
         }
         if objective.chars().count() > 4_000 {
             self.push_log(
                 CodexLogKind::Error,
                 "Goal mode の目標は 4,000 文字以内にしてください",
             );
-            return;
+            return false;
         }
 
         self.goal_mode = CodexGoalMode {
@@ -9940,6 +10147,7 @@ impl CodexPane {
         self.set_status_note("継続ゴール: 有効".to_string());
         self.push_activity("Goal mode を設定しました".to_string());
         self.push_log(CodexLogKind::System, format!("Goal mode: {objective}"));
+        true
     }
 
     fn push_goal_mode_status(&mut self) {
@@ -10741,10 +10949,12 @@ Claude Code options for next turn:
   /settings, /cd <dir>, /model [name|config], /reasoning|/effort [level]
   /lang|/language [auto|ja|en|off] - エージェントの応答言語（既定 auto は LANG/LC_ALL から判定）
   /permissions|/approval [mode] - permission-mode: config/plan/acceptEdits/dontAsk/bypassPermissions/skip-permissions
-  /bypass [status] - dangerously-skip-permissions を ON/OFF トグル（危険: 全権限チェックをスキップ）
+  /bypass [on|off|status] - dangerously-skip-permissions を ON/OFF（危険: 全権限チェックをスキップ）
   /add-dir <path|list|clear>
 TUI helpers:
-  /goal <目標>, /goal pause, /goal resume, /goal clear
+  /goal <目標> - 継続ゴールを設定し、そのターンから着手する（実行中なら次ターンへ予約）
+  /goal set <目標> - 継続ゴールを登録するだけで送信しない
+  /goal show|pause|resume|clear - 現在の継続ゴールを表示 / 一時停止 / 再開 / 解除
   /organize|/team [task] - Addness子ゴールへ分解し、最初の実装単位へ進む
   /work [next|all|N|id|title] - 子ゴールを実装ワークパッケージとして着手/キュー化
   /dual|/pair [review|fix] [task] - Codex/Claude Codeの実装・レビュー分担プロンプトを開始
@@ -10793,15 +11003,19 @@ Codex options for next turn:
   /theme [name|clear], /pets [name|hide|anchor <pos>|clear], /vim [on|off|clear], /raw [on|off|clear]
   /keymap [key=value|clear], /memories [status|off|clear] - Addness DB fixed memory
   /approval|/approvals [policy], /sandbox [mode], /sandbox-add-read-dir <path>, /setup-default-sandbox
-  /color [never|auto|always], /search, /oss, /local-provider
+  /color [never|auto|always], /search [on|off|status], /oss [on|off|status], /local-provider
   /remote <addr|clear>, /remote-auth-token-env <env|clear>, /no-alt-screen
   /profile <name|clear>, /image <path|list|clear|remove N>, /attachments [list|clear|image <path>|add-dir <path>]
   /add-dir <path|list|clear>
   /config <key=value|list|clear>, /enable <feature>, /disable <feature>
   /strict-config, /ignore-user-config, /ignore-rules, /skip-git-check, /ephemeral
-  /bypass [status], /bypass-hook-trust, /output-schema <path|clear>, /output-last-message <path|clear>
+    …いずれも引数なしでトグル、[on|off] で明示指定、[status] で現在値表示
+  /bypass [on|off|status], /bypass-hook-trust [on|off|status]
+  /output-schema <path|clear>, /output-last-message <path|clear>
 TUI helpers:
-  /goal <目標>, /goal pause, /goal resume, /goal clear
+  /goal <目標> - 継続ゴールを設定し、そのターンから着手する（実行中なら次ターンへ予約）
+  /goal set <目標> - 継続ゴールを登録するだけで送信しない
+  /goal show|pause|resume|clear - 現在の継続ゴールを表示 / 一時停止 / 再開 / 解除
   /organize|/team [task] - Addness子ゴールへ分解し、最初の実装単位へ進む
   /work [next|all|N|id|title] - 子ゴールを実装ワークパッケージとして着手/キュー化
   /dual|/pair [review|fix] [task] - Codex/Claude Codeの実装・レビュー分担プロンプトを開始
@@ -14042,7 +14256,7 @@ mod tests {
         assert_eq!(pane.subagent_running_count(), 1);
         let lines = pane.subagent_status_lines(5);
         assert_eq!(lines.len(), 1);
-        assert!(lines[0].starts_with("● stream-json調査"));
+        assert!(lines[0].text.starts_with("● stream-json調査"));
     }
 
     #[test]
@@ -14075,7 +14289,7 @@ mod tests {
         assert_eq!(pane.subagent_running_count(), 1);
         let lines = pane.subagent_status_lines(5);
         assert_eq!(lines.len(), 1);
-        assert!(lines[0].starts_with("● 実装調査"));
+        assert!(lines[0].text.starts_with("● 実装調査"));
 
         pane.handle_json_event(serde_json::json!({
             "type": "tool_call_completed",
@@ -14087,7 +14301,7 @@ mod tests {
         assert_eq!(pane.subagent_running_count(), 0);
         let lines = pane.subagent_status_lines(5);
         assert_eq!(lines.len(), 1);
-        assert!(lines[0].starts_with("✔ 実装調査"));
+        assert!(lines[0].text.starts_with("✔ 実装調査"));
     }
 
     #[test]
@@ -14102,7 +14316,11 @@ mod tests {
 
         let lines = pane.subagent_status_lines(5);
         assert_eq!(pane.subagent_running_count(), 1);
-        assert!(lines[0].starts_with("● multi_agent.spawn: 差分レンダラ確認"));
+        assert!(
+            lines[0]
+                .text
+                .starts_with("● multi_agent.spawn: 差分レンダラ確認")
+        );
     }
 
     #[test]
@@ -14131,7 +14349,74 @@ mod tests {
         assert_eq!(pane.subagent_running_count(), 0);
         let lines = pane.subagent_status_lines(5);
         assert_eq!(lines.len(), 1);
-        assert!(lines[0].starts_with("✔ 調査タスク"));
+        assert!(lines[0].text.starts_with("✔ 調査タスク"));
+    }
+
+    #[test]
+    fn subagent_launch_and_finish_are_left_in_the_visible_log() {
+        // 状態パネルは高さ次第で 0〜5 行しか出せないため、起動と完了は本文ログにも残す。
+        let mut pane = claude_pane();
+        pane.handle_json_event(serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_log1",
+                    "name": "Task",
+                    "input": {"description": "ログ確認タスク", "subagent_type": "Explore"}
+                }
+            ]}
+        }));
+
+        let launch = pane
+            .log
+            .iter()
+            .find(|line| line.kind == CodexLogKind::Subagent)
+            .expect("起動ログが必要");
+        assert_eq!(
+            launch.text,
+            "▶ サブエージェント起動: ログ確認タスク [Explore]"
+        );
+
+        pane.handle_json_event(serde_json::json!({
+            "type": "user",
+            "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu_log1", "content": "done", "is_error": false}
+            ]}
+        }));
+
+        let finish = pane
+            .log
+            .iter()
+            .rev()
+            .find(|line| line.kind == CodexLogKind::Subagent)
+            .expect("完了ログが必要");
+        assert!(
+            finish
+                .text
+                .starts_with("✔ サブエージェント完了: ログ確認タスク ("),
+            "finish={}",
+            finish.text
+        );
+    }
+
+    #[test]
+    fn subagent_log_lines_survive_every_display_filter() {
+        // 「会話」表示のままでもサブエージェントの動きが消えないことを担保する。
+        for filter in [
+            CodexLogFilter::Conversation,
+            CodexLogFilter::Tools,
+            CodexLogFilter::All,
+        ] {
+            assert!(
+                matches_log_filter(CodexLogKind::Subagent, filter),
+                "filter={filter:?} should keep subagent lines"
+            );
+        }
+        assert!(!matches_log_filter(
+            CodexLogKind::Subagent,
+            CodexLogFilter::Errors
+        ));
     }
 
     #[test]
@@ -14157,7 +14442,7 @@ mod tests {
 
         assert_eq!(pane.subagent_running_count(), 0);
         let lines = pane.subagent_status_lines(5);
-        assert!(lines[0].starts_with("✖ 失敗するタスク"));
+        assert!(lines[0].text.starts_with("✖ 失敗するタスク"));
     }
 
     #[test]
@@ -14233,7 +14518,7 @@ mod tests {
         let lines = pane.background_task_status_lines(5);
         assert_eq!(lines.len(), 1);
         // 「running in background with ID」の確認応答がまだなので、確定アイコンではなく「…」。
-        assert!(lines[0].starts_with("… "), "line={}", lines[0]);
+        assert!(lines[0].text.starts_with("… "), "line={}", lines[0].text);
     }
 
     #[test]
@@ -14270,9 +14555,9 @@ mod tests {
         );
         let lines = pane.background_task_status_lines(5);
         assert!(
-            lines[0].starts_with("● "),
+            lines[0].text.starts_with("● "),
             "確認後は実行中アイコンに変わる: {}",
-            lines[0]
+            lines[0].text
         );
     }
 
@@ -14344,7 +14629,7 @@ mod tests {
 
         assert_eq!(pane.background_task_running_count(), 0);
         let lines = pane.background_task_status_lines(5);
-        assert!(lines[0].starts_with('✔'));
+        assert!(lines[0].text.starts_with('✔'));
     }
 
     #[test]
@@ -14508,13 +14793,13 @@ mod tests {
         // limit=1 では実行中を優先。
         let lines = pane.subagent_status_lines(1);
         assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("実行中タスクB"));
+        assert!(lines[0].text.contains("実行中タスクB"));
 
         // limit=2 では実行中 + 直近の完了（新しい方=タスクC）。
         let lines = pane.subagent_status_lines(2);
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains("実行中タスクB"));
-        assert!(lines[1].contains("完了済みタスクC"));
+        assert!(lines[0].text.contains("実行中タスクB"));
+        assert!(lines[1].text.contains("完了済みタスクC"));
     }
 
     #[test]
@@ -16029,9 +16314,11 @@ mod tests {
     }
 
     #[test]
-    fn goal_slash_command_sets_goal_without_starting_turn() {
+    fn goal_slash_command_sets_goal_and_starts_working_on_it() {
         let mut pane = CodexPane::test_with_output(8, 80, 0, "");
         pane.finished = false;
+        // 実行中にして予約経路で確認する（テスト環境で codex を spawn しないため）。
+        pane.turn_running = true;
 
         submit_line(&mut pane, "/goal Finish the migration");
 
@@ -16040,16 +16327,115 @@ mod tests {
             Some("Finish the migration")
         );
         assert!(pane.goal_mode.is_active());
-        assert_eq!(pane.turn_count(), 0);
         assert!(pane.log.iter().any(|line| {
             line.kind == CodexLogKind::System && line.text.contains("Finish the migration")
         }));
+        // 設定だけで終わらず、目標がそのままターンとして送られる（実行中なので次ターンへ予約）。
+        let queued = pane.queued_prompts.front().expect("goal should be queued");
+        assert_eq!(queued.submitted, "Finish the migration");
+        assert!(queued.apply_goal_mode);
+        assert!(
+            pane.log
+                .iter()
+                .any(|line| line.kind == CodexLogKind::User && line.text == "Finish the migration")
+        );
+    }
+
+    #[test]
+    fn toggle_slash_commands_honor_explicit_on_off() {
+        // 引数を無視して反転すると `/search on` が OFF になり、指示と逆の結果になる。
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.finished = false;
+        assert!(!pane.exec_settings.web_search);
+
+        submit_line(&mut pane, "/search on");
+        assert!(pane.exec_settings.web_search);
+
+        // 既に ON なので `on` は据え置き（従来は反転して OFF になっていた）。
+        submit_line(&mut pane, "/search on");
+        assert!(pane.exec_settings.web_search);
+
+        submit_line(&mut pane, "/search off");
+        assert!(!pane.exec_settings.web_search);
+
+        // 引数なしは従来どおりトグル。
+        submit_line(&mut pane, "/search");
+        assert!(pane.exec_settings.web_search);
+
+        // status は現在値の表示だけで変更しない。
+        submit_line(&mut pane, "/search status");
+        assert!(pane.exec_settings.web_search);
+
+        // 未知の引数は黙って反転せずエラーにする。
+        submit_line(&mut pane, "/search yesplease");
+        assert!(pane.exec_settings.web_search);
+        assert!(
+            pane.log
+                .iter()
+                .any(|line| line.kind == CodexLogKind::Error && line.text.contains("/search には"))
+        );
+    }
+
+    #[test]
+    fn bypass_slash_command_honors_explicit_on_off() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.finished = false;
+        assert!(!pane.bypass_enabled());
+
+        submit_line(&mut pane, "/bypass off");
+        assert!(!pane.bypass_enabled(), "既に OFF なら OFF のまま");
+
+        submit_line(&mut pane, "/bypass on");
+        assert!(pane.bypass_enabled());
+
+        submit_line(&mut pane, "/bypass on");
+        assert!(pane.bypass_enabled(), "既に ON なら ON のまま");
+
+        submit_line(&mut pane, "/bypass");
+        assert!(!pane.bypass_enabled(), "引数なしは従来どおりトグル");
+    }
+
+    #[test]
+    fn goal_slash_command_set_registers_without_sending() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.finished = false;
+        pane.turn_running = true;
+
+        submit_line(&mut pane, "/goal set Finish the migration");
+
+        assert_eq!(
+            pane.goal_mode.objective.as_deref(),
+            Some("Finish the migration")
+        );
+        assert!(
+            pane.queued_prompts.is_empty(),
+            "/goal set は登録のみでターンを起こさない"
+        );
+    }
+
+    #[test]
+    fn goal_slash_command_status_actions_do_not_start_a_turn() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.finished = false;
+        pane.turn_running = true;
+
+        for line in ["/goal", "/goal show", "/goal status"] {
+            submit_line(&mut pane, line);
+        }
+
+        assert!(pane.goal_mode.objective.is_none());
+        assert!(
+            pane.queued_prompts.is_empty(),
+            "状態表示だけのサブコマンドはターンを起こさない"
+        );
     }
 
     #[test]
     fn goal_slash_command_pauses_resumes_and_clears_goal() {
         let mut pane = CodexPane::test_with_output(8, 80, 0, "");
         pane.finished = false;
+        // `/goal <目標>` は着手まで行うので、実プロセスを起動しないよう実行中にしておく。
+        pane.turn_running = true;
 
         submit_line(&mut pane, "/goal Finish the migration");
         submit_line(&mut pane, "/goal pause");

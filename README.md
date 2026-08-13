@@ -241,9 +241,13 @@ Codex が実行したコマンドやツール実行の開始・終了・出力�
 履歴保存状態を固定表示します。
 Codex 起動中は左上の「Codex 作業ダッシュボード」に短い操作一覧が常時表示され、
 詳細な一覧は `Ctrl-?` で開けます。
-`/goal <目標>` で Addness 側の Goal mode を開始でき、以後の `codex exec` ターンには
-その永続目標が注入されます。`/goal` は表示、`/goal pause` / `/goal resume` は一時停止/再開、
-`/goal clear` は解除です。`/status` と `/help` で現在状態と slash 一覧を確認できます。
+`/goal <目標>` で Addness 側の Goal mode を開始できます。目標を永続化するだけでなく、
+その場でエージェントへ送信して着手させます（ターン実行中なら次ターンへ予約されます）。
+以後の `codex exec` ターンにもその永続目標が注入されます。
+登録だけして送信したくない場合は `/goal set <目標>` を使います。
+引数なしの `/goal` と `/goal show` は現在の目標を表示、`/goal pause` / `/goal resume` は
+一時停止/再開、`/goal clear` は解除です。
+`/status` と `/help` で現在状態と slash 一覧を確認できます。
 `/bypass`（または `F8`）で承認・サンドボックスを完全スキップする危険モードを ON/OFF できます
 （codex は `--dangerously-bypass-approvals-and-sandbox`、Claude Code は
 `--dangerously-skip-permissions` 相当。両バックエンド共通の入口で、`/bypass status` で現在値を確認できます）。
@@ -262,7 +266,11 @@ Addness 側に差し戻す経路がないため、追加承認が必要な操作
   管理されるため、「直前に何をしたか」と「今何をしているか」が混ざりません。
 - 現在の作業対象はゴール階層のパンくずとして表示されます。
 - エージェントがサブエージェントを起動した場合は、稼働状況パネルに各サブエージェントの
-  状態が一覧表示されます。
+  状態が一覧表示されます。実行中は黄、完了は緑、失敗は赤で色分けされ、パネルが低いときでも
+  最低 1 件は表示されます。
+- サブエージェントとバックグラウンドタスクの起動・完了は `sub |` 行として履歴本文にも
+  残ります。この行は表示フィルタ（`Ctrl-T`）が「会話」でも「実行」でも消えません。
+- 実行中サブエージェントがある間は、ヘッダの「今」欄に件数と最新の 1 件が添えられます。
 
 codex 終了後は還流バーのキーで成果を Addness に反映できます:
 
@@ -281,8 +289,9 @@ codex 終了後は還流バーのキーで成果を Addness に反映できま�
 - `1`〜`9` / `Ctrl-1`〜`Ctrl-9` … 履歴を見ている時は数字、いつでも `Ctrl-数字` で指定番号の turn を直接開閉
 - `e` … 履歴を見ている時または codex 終了後、表示中の turn を開閉
 - `E` / `Ctrl-E` … 古い turn の一括開閉
-- `/goal <目標>` … Goal mode を開始し、以後の Codex ターンへ永続目標を注入
-- `/goal pause` / `/goal resume` / `/goal clear` … Goal mode の一時停止 / 再開 / 解除
+- `/goal <目標>` … Goal mode を開始してそのまま着手し、以後の Codex ターンへ永続目標を注入
+- `/goal set <目標>` … Goal mode の目標を登録するだけで送信しない
+- `/goal show` / `/goal pause` / `/goal resume` / `/goal clear` … 表示 / 一時停止 / 再開 / 解除
 - `/status` / `/help` … Addness側Codexセッション状態 / slash コマンド一覧
 - `F12` … 実行中の codex を終了して戻る / `Esc`・`q` … ペインを閉じる
 

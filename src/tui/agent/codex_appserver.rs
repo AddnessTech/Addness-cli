@@ -1458,18 +1458,20 @@ mod tests {
 
     /// 実 `codex exec --help` / `codex --help` に、本リポジトリがワンショット/常駐で
     /// 渡すサブコマンド・フラグが存在することを確認する（`codex.rs` の引数ビルダー由来）。
+    ///
+    /// 重要: root help と exec help を連結して検索すると、「root にはあるが exec では
+    /// 受け付けない」フラグ（実際に `-a` / `--search` がこれに該当し、`codex exec -a ...` は
+    /// `unexpected argument` で失敗する）を見逃す。`push_global_exec_settings` は
+    /// これらを `exec` の前に置いて回避しているので、テストも同じ位置で検証する。
     #[test]
     #[ignore = "実 codex バイナリが必要（CI の upstream-sync が --ignored で実行）"]
     fn upstream_probe_codex_cli_flags() {
         let bin = probe_codex_bin();
         let exec_help = probe_help(&bin, &["exec", "--help"]);
         let root_help = probe_help(&bin, &["--help"]);
-        let combined = format!("{exec_help}\n{root_help}");
 
-        // codex_exec_args / codex_exec_resume_args / push_global_exec_settings /
-        // push_optional_exec_settings が組み立てるサブコマンド・フラグ。
-        const REQUIRED: &[&str] = &[
-            "exec",                                       // exec サブコマンド
+        // `codex exec` の位置で渡すフラグ（push_optional_exec_settings / codex_exec_args）。
+        const EXEC_REQUIRED: &[&str] = &[
             "resume",                                     // exec resume サブコマンド
             "--json",                                     // イベントを JSON Lines で受信
             "--model",                                    // -m モデル指定
@@ -1479,16 +1481,27 @@ mod tests {
             "--cd",                                       // -C 作業ディレクトリ
             "--add-dir",                                  // 書込許可ディレクトリ追加
             "--config",              // -c key=value（developer_instructions 等）
-            "--ask-for-approval",    // -a 承認ポリシー
-            "--search",              // Web 検索
             "--skip-git-repo-check", // git リポジトリ外での実行
             "--ignore-user-config",  // ユーザ設定を無視
             "--dangerously-bypass-approvals-and-sandbox", // 承認/サンドボックス全バイパス
         ];
-        let missing: Vec<&str> = REQUIRED
+        // `exec` より前（グローバル位置）で渡すフラグ（push_global_exec_settings）。
+        const ROOT_REQUIRED: &[&str] = &[
+            "exec",               // exec サブコマンド
+            "--ask-for-approval", // -a 承認ポリシー
+            "--search",           // Web 検索
+        ];
+
+        let missing: Vec<String> = EXEC_REQUIRED
             .iter()
-            .copied()
-            .filter(|flag| !combined.contains(flag))
+            .filter(|flag| !exec_help.contains(**flag))
+            .map(|flag| format!("codex exec: {flag}"))
+            .chain(
+                ROOT_REQUIRED
+                    .iter()
+                    .filter(|flag| !root_help.contains(**flag))
+                    .map(|flag| format!("codex(root): {flag}")),
+            )
             .collect();
         assert!(
             missing.is_empty(),

@@ -31,7 +31,6 @@ mod skill;
 mod streak;
 mod thread;
 mod todo_chat;
-mod tool;
 mod user;
 
 pub use activity::*;
@@ -67,7 +66,6 @@ pub use skill::*;
 pub use streak::*;
 pub use thread::*;
 pub use todo_chat::*;
-pub use tool::*;
 pub use user::*;
 
 use serde::{Deserialize, Serialize};

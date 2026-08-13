@@ -32,7 +32,6 @@ mod skill;
 mod streak;
 mod thread;
 mod todo_chat;
-mod tool;
 mod user;
 
 pub use activity::{
@@ -683,8 +682,46 @@ mod tests {
         http_timeout_from_env_value, parse_dns_override_addrs, send_failure_context,
     };
     use reqwest::StatusCode;
+    use std::fs;
     use std::net::SocketAddr;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
+
+    fn collect_rust_sources(directory: &Path, files: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect_rust_sources(&path, files);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                files.push(path);
+            }
+        }
+    }
+
+    #[test]
+    fn retired_legacy_tools_api_path_is_absent_from_source() {
+        const LEGACY_ORGANIZATION_PREFIX: &str = "/api/v1/team/organizations/";
+        const LEGACY_TOOLS_SEGMENT: &str = "/tools";
+        let mut files = Vec::new();
+        collect_rust_sources(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+
+        let offenders: Vec<_> = files
+            .into_iter()
+            .filter(|path| {
+                fs::read_to_string(path).unwrap().lines().any(|line| {
+                    line.contains(LEGACY_ORGANIZATION_PREFIX) && line.contains(LEGACY_TOOLS_SEGMENT)
+                })
+            })
+            .collect();
+
+        assert!(
+            offenders.is_empty(),
+            "legacy Tools API paths: {offenders:?}"
+        );
+    }
 
     #[test]
     fn http_timeout_uses_default_without_valid_override() {

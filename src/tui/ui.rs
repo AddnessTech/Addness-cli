@@ -1276,7 +1276,11 @@ fn draw_codex_help_overlay(frame: &mut Frame, app: &mut App) {
                 "/doctor / /features",
                 "codex doctor / features list等を実行",
             ),
-            kv("/mcp / /plugin", "MCP / plugin の一覧・管理コマンドを実行"),
+            kv(
+                "/mcp [status|reconnect]",
+                "MCP接続状態の確認・再接続（その他はCodex CLIへ委譲）",
+            ),
+            kv("/plugin", "plugin の一覧・管理コマンドを実行"),
             kv(
                 "/apps",
                 "Codex Desktop/app-server/remote controlの入口を表示",

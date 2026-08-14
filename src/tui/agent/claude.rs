@@ -428,7 +428,7 @@ pub(super) fn exec_args(
             .iter()
             .chain(one_shot_allowed_tools.iter()),
     );
-    // Addness 操作は CLI に一本化するため addness MCP を拒否する。
+    // Addness 操作は filesystem Code API（内部runtimeはCLI）に一本化するためMCPを拒否する。
     push_disallowed_addness_mcp_args(&mut args);
     push_add_dir_args(&mut args, settings);
     push_system_prompt_args(&mut args, developer_instructions);
@@ -467,7 +467,7 @@ pub(super) fn resident_args(
     push_permission_mode_args(&mut args, settings.permission_mode);
     // 常駐では sticky 許可リストのみを付与する（今回だけの許可は can_use_tool 応答で処理）。
     push_allowed_tools_args(&mut args, settings.sticky_allowed_tools.iter());
-    // Addness 操作は CLI に一本化するため addness MCP を拒否する。
+    // Addness 操作は filesystem Code API（内部runtimeはCLI）に一本化するためMCPを拒否する。
     push_disallowed_addness_mcp_args(&mut args);
     push_add_dir_args(&mut args, settings);
     push_system_prompt_args(&mut args, developer_instructions);
@@ -514,8 +514,9 @@ fn push_model_and_effort_args(args: &mut Vec<OsString>, settings: &ClaudeExecSet
     }
 }
 
-/// Addness 操作は Addness CLI（`"$ADDNESS_BIN"`）に一本化するため、エージェントに
-/// addness MCP サーバのツールを一切使わせない拒否ルール。`mcp__addness` はサーバレベルの
+/// Addness 操作は filesystem Code API（内部runtimeは `"$ADDNESS_BIN"`）に一本化するため、
+/// エージェントに addness MCP サーバのツールを一切使わせない拒否ルール。
+/// `mcp__addness` はサーバレベルの
 /// 権限ルールで、そのサーバの全ツール（`mcp__addness__get_goal` 等）にマッチする。
 /// ユーザー環境の `.mcp.json` に addness MCP が登録されていても、認証・接続先が TUI と
 /// 一致する保証がないため、リポジトリ側で強制的に拒否してエラー事故を防ぐ。
@@ -1327,7 +1328,7 @@ mod tests {
         assert!(!args.iter().any(|a| a == "--allowedTools"));
     }
 
-    /// Addness 操作は CLI 一本化のため、exec 経路で必ず addness MCP を拒否する。
+    /// Addness 操作は filesystem Code API 一本化のため、exec 経路で必ず addness MCP を拒否する。
     #[test]
     fn exec_args_disallows_addness_mcp() {
         let settings = ClaudeExecSettings::default();
@@ -1960,7 +1961,7 @@ mod tests {
             "--effort",                       // effort 指定
             "--add-dir",                      // 書込許可ディレクトリ追加
             "--append-system-prompt",         // Addness 手順注入
-            "--disallowedTools",              // addness MCP 拒否（Addness 操作は CLI 一本化）
+            "--disallowedTools",              // addness MCP 拒否（filesystem Code APIへ一本化）
         ];
         let missing: Vec<&str> = REQUIRED
             .iter()

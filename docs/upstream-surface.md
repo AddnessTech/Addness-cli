@@ -182,6 +182,7 @@ JSON-RPC 2.0 / stdio）を常駐プロセスとして起動し 1 プロセスで
   `developerInstructions`）
 - `turn/start`（`input`: text / localImage、`effort`）/ `turn/interrupt`
 - `thread/settings/update`（`model` / `effort` / `approvalPolicy` / `sandboxPolicy`）
+- `config/mcpServer/reload`（MCP 接続の手動・自動再試行）
 
 **サーバ発リクエスト（承認）**: `item/commandExecution/requestApproval` /
 `item/fileChange/requestApproval` / `item/permissions/requestApproval`
@@ -189,6 +190,7 @@ JSON-RPC 2.0 / stdio）を常駐プロセスとして起動し 1 プロセスで
 
 **消費している通知**: `turn/started` / `turn/completed`（`turn.status`）/
 `item/agentMessage/delta` / `item/commandExecution/outputDelta` /
+`item/commandExecution/terminalInteraction` / `mcpServer/startupStatus/updated` /
 `item/reasoning/summaryTextDelta` / `item/reasoning/textDelta` / `item/started` /
 `item/completed`（`item.type`: commandExecution / agentMessage / reasoning /
 fileChange / mcpToolCall）/ `thread/tokenUsage/updated` / `error`。
@@ -202,6 +204,20 @@ fileChange / mcpToolCall）/ `thread/tokenUsage/updated` / `error`。
 **メソッド名・params 形状・通知種別・`jsonrpc` 省略などプロトコルの変更は関係あり**
 （ハンドシェイクが壊れると常駐がワンショットへフォールバックする）。
 
+### 2.7 Filesystem Code API
+
+TUI 起動時に Addness CLI の Clap schema から、JSON 対応の leaf command を
+`~/.addness/code-api/generated/addness/**/*.mjs` へ1操作1ファイルで生成する。
+Codex / Claude Code には全操作schemaをpromptやMCP tool listとして渡さず、
+`ADDNESS_CODE_API_ROOT` だけを渡す。モデルは `find` / `rg` で必要な定義だけを読み、
+Node.js 内で複数の `run()` を合成する。runtimeは `ADDNESS_BIN ... --json` を
+shellなしで起動し、JSON/JSONLの中間値をプロセス内に保持する。
+
+正本は `src/code_api/`、生成と環境変数注入は `CodexPane::spawn` /
+`apply_agent_env`。Clap の command/argument schema、JSON出力形式、Node.jsの
+subprocess API、Codex/Claude Codeのfilesystem・command sandboxに互換性変更があれば
+この統合面に関係する。詳細は [code-execution.md](code-execution.md) を参照。
+
 ---
 
 ## 3. 関連性の判定ガイドライン
@@ -214,6 +230,7 @@ fileChange / mcpToolCall）/ `thread/tokenUsage/updated` / `error`。
   usage・cost・permission_denials 形式の変更）
 - **セッションファイル**の形式・置き場所・スラッグ規則・index 形式の変更
 - **設定ディレクトリ環境変数**（`CLAUDE_CONFIG_DIR` / `CODEX_HOME`）まわりの変更
+- **filesystem / command sandbox** の変更（`ADDNESS_CODE_API_ROOT` の探索・Node.js実行に影響するもの）
 - 上流 CLI の**スラッシュコマンド / サブコマンド追加**（TUI パレットへの追加候補）
 - exit code・stdin/stdout プロトコルなど**サブプロセス制御に影響する挙動変更**
 

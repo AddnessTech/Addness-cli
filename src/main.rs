@@ -1,5 +1,6 @@
 mod api;
 mod cli;
+mod code_api;
 mod config;
 mod debug_log;
 mod tui;

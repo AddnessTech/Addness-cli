@@ -207,7 +207,11 @@ addness
 [codex](https://github.com/openai/codex) を `codex exec --json` で起動し、
 Addness 側の独自会話ペインに JSONL イベントを表示します。
 起動直後は軽量コンテキストだけで即入力でき、実依頼を受けた時に必要に応じて
-`addness goal get --json --with-deliverable --with-comment` で対象ゴールを読みます。
+filesystem Code API から対象ゴールを読みます。TUI は JSON 対応の Addness 操作を
+`~/.addness/code-api/generated/addness/` に1操作1ファイルで生成し、エージェントは
+`find` / `rg` で必要な定義だけを選びます。複数操作は1つの Node.js プロセスで合成され、
+中間 JSON はモデルのコンテキストへ戻さず、最終結果だけを stdout に出します。
+詳細は [Filesystem Code Execution](docs/code-execution.md) を参照してください。
 実装・バグ修正・リファクタ・ドキュメント/設定変更・テスト追加の依頼では、TUI が
 「必須小ゴールゲート」を Codex に渡します。Codex は最初のファイル変更より前に、
 選択中ゴールの直下へ今回の作業用子ゴールを1件作成し、DoD・対象ファイル・方針・検証方法を
@@ -218,8 +222,9 @@ codex は Addness をその組織/プロジェクト専用の
 作業DBとして読み、DoD や子ゴール分解の不足を確認します。Addness への書き込みは、
 追加の子ゴール作成やコンテキスト書き込みが必要な時は、軽量/低コストの記録専用
 サブエージェントへ委任するよう `developer_instructions` で指示します。
-codex は Addness を「タスク DB」として扱い、`addness` CLI 経由で DoD の具体化・
-子ゴール作成・進捗コメントを書き戻します。
+codex は Addness を「タスク DB」として扱い、filesystem Code API（runtime は
+`addness ... --json` を shell なしで起動）経由で DoD の具体化・子ゴール作成・
+進捗コメントを書き戻します。
 左の Addness ペインには、対象ゴールのステータス、DoD、子ゴール、コメント数、
 Addness への更新ログがライブ表示されます。更新ログは `body`、`DoD`、子ゴール、
 コメント/通知、成果物など、どの領域が動いたか分かる文言で出ます。

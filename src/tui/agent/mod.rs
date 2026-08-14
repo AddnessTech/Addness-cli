@@ -171,10 +171,18 @@ const CODEX_APPSERVER_INTERRUPT_GRACE: Duration = CLAUDE_INTERRUPT_GRACE;
 const CODEX_APPSERVER_SETTING_CHANGE_GRACE: Duration = CLAUDE_SETTING_CHANGE_GRACE;
 /// 常駐 codex app-server をアイドル回収するまでの無操作時間（RSS 約38MB だが Claude 側と揃える）。
 const CODEX_APPSERVER_IDLE_TIMEOUT: Duration = CLAUDE_RESIDENT_IDLE_TIMEOUT;
-/// 常駐 codex app-server のハンドシェイク（initialize / thread/start・resume）および
-/// turn/start 応答を待つ上限。codex 0.142.5 が想定外の応答形を返して固まった場合の保険で、
-/// 超えたらワンショットへフォールバックして「考え中」フリーズを回避する。
+/// 常駐 codex app-server の initialize / turn/start 応答を待つ上限。
+/// thread/start・resume は MCP cold start を含むため別の長い上限を使う。
 const CODEX_APPSERVER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+/// MCP プロセスの cold start（npx / uvx の初回取得を含む）を待てる上限。
+/// startupStatus が starting の間は、この時間だけ thread/start の期限を延長する。
+const CODEX_APPSERVER_MCP_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
+/// 一時障害時に同じ TUI セッション内で MCP reload を自動試行する回数。
+const CODEX_APPSERVER_MCP_RELOAD_MAX_ATTEMPTS: u8 = 2;
+/// 一時的な app-server 障害で常駐モードを即時・永久無効化しないための circuit breaker。
+const CODEX_APPSERVER_MAX_CONSECUTIVE_FAILURES: u8 = 3;
+/// コマンド最終出力を履歴へ残す最大文字数。
+const CODEX_APPSERVER_FINAL_OUTPUT_MAX_CHARS: usize = 20_000;
 /// 実行中コマンドのライブ出力バッファに保持する末尾行数。
 const CODEX_APPSERVER_OUTPUT_TAIL_LINES: usize = 3;
 /// @メンションのファイル候補を一度に表示する最大件数。
@@ -294,6 +302,8 @@ enum CodexAppServerPhase {
     Idle,
     /// initialize 送信済み、応答待ち。id を保持。
     Initializing { request_id: u64 },
+    /// initialize 済みだが thread は未確立。
+    Initialized,
     /// thread/start または thread/resume 送信済み、応答待ち。resume 失敗時のフォールバック判定に使う。
     StartingThread { request_id: u64, resuming: bool },
     /// thread 確立済み。turn/start 可能。
@@ -306,6 +316,14 @@ struct CodexAppServerSettingChange {
     request_id: u64,
     deadline: Instant,
     label: String,
+}
+
+/// config/mcpServer/reload の応答待ち。
+#[derive(Debug, Clone)]
+struct CodexAppServerMcpReload {
+    request_id: u64,
+    automatic: bool,
+    deadline: Instant,
 }
 
 /// codex 実行ファイルのパスを解決する。
@@ -1408,6 +1426,8 @@ pub struct CodexPane {
     kind: AgentKind,
     codex_bin: PathBuf,
     addness_bin: String,
+    /// モデルが必要な Addness 操作だけを遅延読込する filesystem Code API のルート。
+    code_api_root: Option<PathBuf>,
     child: Option<Child>,
     tx: Sender<CodexProcessEvent>,
     rx: Receiver<CodexProcessEvent>,
@@ -1614,8 +1634,10 @@ pub struct CodexPane {
     /// system/init が報告する現在の permissionMode（保存のみ、表示同期用）。
     claude_active_permission_mode: Option<String>,
     /// codex app-server 常駐モードを使うか（Codex 専用）。既定は環境変数で決まり、
-    /// spawn / initialize 失敗時はこのセッションだけ false へ落として `codex exec --json` に退避する。
+    /// 連続失敗が circuit breaker の閾値へ達した場合だけ false へ落とす。
     codex_appserver_enabled: bool,
+    /// 一時障害の連続回数。成功時に 0 へ戻し、単発障害で常駐を永久無効化しない。
+    codex_appserver_consecutive_failures: u8,
     /// 常駐 codex app-server プロセスのクライアント。None=未起動 / 死亡 / アイドル回収済み。
     codex_appserver: Option<codex_appserver::AppServerClient>,
     /// 常駐 app-server のハンドシェイク/ターン進行フェーズ。
@@ -1650,6 +1672,14 @@ pub struct CodexPane {
     codex_appserver_running_item: Option<String>,
     /// 直近の thread/tokenUsage/updated（保存のみ）。
     codex_appserver_token_usage: Option<codex_appserver::TokenUsageInfo>,
+    /// MCP サーバー名 → 直近の startupStatus。`/mcp status` と再接続判定に使う。
+    codex_appserver_mcp_statuses: HashMap<String, codex_appserver::McpStartupStatus>,
+    /// config/mcpServer/reload の応答待ち。
+    codex_appserver_mcp_reload: Option<CodexAppServerMcpReload>,
+    /// app-server の initialize/thread 確立後に手動 reload を送る予約。
+    codex_appserver_mcp_manual_reload_pending: bool,
+    /// 現在の app-server プロセスで行った自動 reload 回数。
+    codex_appserver_mcp_reload_attempts: u8,
     /// ターン単位チェックポイント（git ref）のスタック。末尾が最新。/undo で末尾から遡る。
     checkpoints: Vec<Checkpoint>,
     /// チェックポイント ref 名に使う単調増加シーケンス。
@@ -1688,7 +1718,7 @@ impl CodexPane {
         status_label: String,
         kind: AgentKind,
     ) -> Result<Self> {
-        Self::spawn_inner(CodexPaneSpawnOptions {
+        let mut pane = Self::spawn_inner(CodexPaneSpawnOptions {
             kind,
             codex_bin,
             cwd,
@@ -1700,7 +1730,29 @@ impl CodexPane {
             goal_title,
             dod,
             status_label,
-        })
+        })?;
+        // テストの汎用 pane 生成では実ホームを書き換えない。Code API の生成器自体は
+        // `code_api` モジュールの一時ディレクトリテストで検証する。
+        if !cfg!(test) {
+            match crate::code_api::materialize() {
+                Ok(code_api) => {
+                    pane.push_log(
+                        CodexLogKind::System,
+                        format!(
+                            "Code API: {} operations（必要な定義だけ遅延読込） {}",
+                            code_api.operation_count,
+                            compact_home_path(&code_api.root)
+                        ),
+                    );
+                    pane.code_api_root = Some(code_api.root);
+                }
+                Err(error) => pane.push_log(
+                    CodexLogKind::Error,
+                    format!("Code API の生成に失敗しました（CLI fallback は利用可能）: {error}"),
+                ),
+            }
+        }
+        Ok(pane)
     }
 
     fn spawn_inner(options: CodexPaneSpawnOptions<'_>) -> Result<Self> {
@@ -1777,6 +1829,7 @@ impl CodexPane {
             kind,
             codex_bin: codex_bin.to_path_buf(),
             addness_bin: addness_bin.to_string(),
+            code_api_root: None,
             child: None,
             tx,
             rx,
@@ -1884,6 +1937,7 @@ impl CodexPane {
             claude_active_model: None,
             claude_active_permission_mode: None,
             codex_appserver_enabled: kind == AgentKind::Codex && codex_appserver_default_enabled(),
+            codex_appserver_consecutive_failures: 0,
             codex_appserver: None,
             codex_appserver_phase: CodexAppServerPhase::Idle,
             codex_appserver_pending_turn: None,
@@ -1900,6 +1954,10 @@ impl CodexPane {
             codex_appserver_output: HashMap::new(),
             codex_appserver_running_item: None,
             codex_appserver_token_usage: None,
+            codex_appserver_mcp_statuses: HashMap::new(),
+            codex_appserver_mcp_reload: None,
+            codex_appserver_mcp_manual_reload_pending: false,
+            codex_appserver_mcp_reload_attempts: 0,
             checkpoints: Vec::new(),
             checkpoint_seq: 0,
             pending_checkpoint_requests: VecDeque::new(),
@@ -2010,6 +2068,7 @@ impl CodexPane {
         pane.claude_active_model = None;
         pane.claude_active_permission_mode = None;
         pane.codex_appserver_enabled = false;
+        pane.codex_appserver_consecutive_failures = 0;
         pane.codex_appserver = None;
         pane.codex_appserver_phase = CodexAppServerPhase::Idle;
         pane.codex_appserver_pending_turn = None;
@@ -2025,6 +2084,10 @@ impl CodexPane {
         pane.codex_appserver_output.clear();
         pane.codex_appserver_running_item = None;
         pane.codex_appserver_token_usage = None;
+        pane.codex_appserver_mcp_statuses.clear();
+        pane.codex_appserver_mcp_reload = None;
+        pane.codex_appserver_mcp_manual_reload_pending = false;
+        pane.codex_appserver_mcp_reload_attempts = 0;
         pane.checkpoints.clear();
         pane.checkpoint_seq = 0;
         pane.pending_checkpoint_requests.clear();
@@ -5488,6 +5551,7 @@ impl CodexPane {
         ) {
             cmd.arg(arg);
         }
+        self.apply_code_api_filesystem_access(&mut cmd);
         cmd.current_dir(&self.cwd);
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
@@ -5984,6 +6048,9 @@ impl CodexPane {
 
     /// 常駐 codex app-server を spawn する（stdout/stderr は既存の line reader で読む）。
     fn spawn_codex_appserver(&mut self) -> Result<codex_appserver::AppServerClient> {
+        self.codex_appserver_mcp_statuses.clear();
+        self.codex_appserver_mcp_reload = None;
+        self.codex_appserver_mcp_reload_attempts = 0;
         let mut cmd = Command::new(&self.codex_bin);
         cmd.arg("app-server");
         cmd.current_dir(&self.cwd);
@@ -6064,7 +6131,7 @@ impl CodexPane {
                         // writer が死んでいる → ワンショットへ退避する。
                         self.codex_appserver = None;
                         self.codex_appserver_phase = CodexAppServerPhase::Idle;
-                        self.codex_appserver_enabled = false;
+                        self.record_codex_appserver_failure();
                         self.push_log(
                             CodexLogKind::Error,
                             "常駐プロセスへの initialize 送信に失敗したためワンショットで実行します",
@@ -6083,7 +6150,7 @@ impl CodexPane {
                     );
                 }
                 Err(e) => {
-                    self.codex_appserver_enabled = false;
+                    self.record_codex_appserver_failure();
                     self.push_log(
                         CodexLogKind::System,
                         format!("常駐プロセスの起動に失敗したためワンショットで実行します: {e}"),
@@ -6109,8 +6176,10 @@ impl CodexPane {
         self.scroll_to_live();
 
         // すでに thread 確立済みなら即座に turn/start する。未確立ならハンドシェイク完了時に送る。
-        if self.codex_appserver_phase == CodexAppServerPhase::Ready {
-            self.flush_codex_appserver_pending_turn();
+        match self.codex_appserver_phase {
+            CodexAppServerPhase::Ready => self.flush_codex_appserver_pending_turn(),
+            CodexAppServerPhase::Initialized => self.send_codex_appserver_start_thread(),
+            _ => {}
         }
     }
 
@@ -6163,17 +6232,21 @@ impl CodexPane {
         }
     }
 
-    /// 常駐プロセスへ initialized 通知 → thread/start（or resume）を送る。
+    /// initialize 成功後に initialized 通知を 1 回送る。
+    fn send_codex_appserver_initialized(&mut self) -> bool {
+        let Some(client) = self.codex_appserver.as_ref() else {
+            return false;
+        };
+        client.send_value(&codex_appserver::initialized_notification())
+    }
+
+    /// initialized 済みの常駐プロセスへ thread/start（or resume）を送る。
     fn send_codex_appserver_start_thread(&mut self) {
         let config = self.codex_appserver_thread_config();
         let resume_target = self.thread_id.clone();
         let Some(client) = self.codex_appserver.as_mut() else {
             return;
         };
-        if !client.send_value(&codex_appserver::initialized_notification()) {
-            self.handle_codex_appserver_death();
-            return;
-        }
         let id = client.next_id();
         let (request, resuming) = match resume_target.as_deref() {
             Some(thread_id) => (
@@ -6188,7 +6261,7 @@ impl CodexPane {
                 resuming,
             };
             self.codex_appserver_handshake_deadline =
-                Some(Instant::now() + CODEX_APPSERVER_HANDSHAKE_TIMEOUT);
+                Some(Instant::now() + CODEX_APPSERVER_MCP_STARTUP_TIMEOUT);
         } else {
             self.handle_codex_appserver_death();
         }
@@ -6208,7 +6281,7 @@ impl CodexPane {
                 resuming: false,
             };
             self.codex_appserver_handshake_deadline =
-                Some(Instant::now() + CODEX_APPSERVER_HANDSHAKE_TIMEOUT);
+                Some(Instant::now() + CODEX_APPSERVER_MCP_STARTUP_TIMEOUT);
         } else {
             self.handle_codex_appserver_death();
         }
@@ -6252,7 +6325,39 @@ impl CodexPane {
         result: Option<Value>,
         error: Option<codex_appserver::JsonRpcError>,
     ) {
-        // 1. initialize 応答。
+        // 1. MCP reload 応答。
+        if self
+            .codex_appserver_mcp_reload
+            .as_ref()
+            .is_some_and(|reload| reload.request_id == id)
+        {
+            let reload = self
+                .codex_appserver_mcp_reload
+                .take()
+                .expect("checked above");
+            if let Some(error) = error {
+                let source = if reload.automatic { "自動" } else { "手動" };
+                self.push_log(
+                    CodexLogKind::Error,
+                    format!("MCP {source}再接続に失敗しました（{}）", error.message),
+                );
+                if reload.automatic && self.request_codex_appserver_mcp_reload(true) {
+                    self.push_log(
+                        CodexLogKind::System,
+                        format!(
+                            "MCP 接続を再試行します（{}/{}）",
+                            self.codex_appserver_mcp_reload_attempts,
+                            CODEX_APPSERVER_MCP_RELOAD_MAX_ATTEMPTS
+                        ),
+                    );
+                }
+            } else {
+                self.push_log(CodexLogKind::System, "MCP 接続を再読込しました");
+            }
+            return;
+        }
+
+        // 2. initialize 応答。
         if let CodexAppServerPhase::Initializing { request_id } = self.codex_appserver_phase
             && request_id == id
         {
@@ -6264,11 +6369,17 @@ impl CodexPane {
                 self.fallback_codex_appserver_to_oneshot();
                 return;
             }
+            if !self.send_codex_appserver_initialized() {
+                self.push_log(CodexLogKind::Error, "initialized 通知の送信に失敗しました");
+                self.fallback_codex_appserver_to_oneshot();
+                return;
+            }
+            self.codex_appserver_phase = CodexAppServerPhase::Initialized;
             self.send_codex_appserver_start_thread();
             return;
         }
 
-        // 2. thread/start・thread/resume 応答。
+        // 3. thread/start・thread/resume 応答。
         if let CodexAppServerPhase::StartingThread {
             request_id,
             resuming,
@@ -6301,12 +6412,19 @@ impl CodexPane {
                 self.set_thread_id(Some(thread_id));
             }
             self.codex_appserver_phase = CodexAppServerPhase::Ready;
+            self.codex_appserver_handshake_deadline = None;
+            self.codex_appserver_consecutive_failures = 0;
             self.push_log(CodexLogKind::System, "Codex セッションを開始しました");
-            self.flush_codex_appserver_pending_turn();
+            if self.codex_appserver_pending_turn.is_some() {
+                self.flush_codex_appserver_pending_turn();
+            }
+            if std::mem::take(&mut self.codex_appserver_mcp_manual_reload_pending) {
+                self.request_codex_appserver_mcp_reload(false);
+            }
             return;
         }
 
-        // 3. turn/start 応答（turn.id 確定）。ここでハンドシェイク/ターン開始の待ちが完了する。
+        // 4. turn/start 応答（turn.id 確定）。ここでハンドシェイク/ターン開始の待ちが完了する。
         if self.codex_appserver_turn_req_id == Some(id) {
             self.codex_appserver_turn_req_id = None;
             self.codex_appserver_handshake_deadline = None;
@@ -6327,7 +6445,7 @@ impl CodexPane {
             return;
         }
 
-        // 4. thread/settings/update 応答。
+        // 5. thread/settings/update 応答。
         if let Some(change) = self.codex_appserver_pending_setting.as_ref()
             && change.request_id == id
         {
@@ -6369,6 +6487,21 @@ impl CodexPane {
             N::CommandOutputDelta { item_id, delta } => {
                 self.record_codex_appserver_output(&item_id, &delta);
             }
+            N::TerminalInteraction {
+                item_id,
+                process_id,
+                stdin_bytes,
+            } => {
+                if stdin_bytes > 0 {
+                    self.push_log(
+                        CodexLogKind::Event,
+                        format!(
+                            "コマンド {item_id}（process {process_id}）へ stdin {stdin_bytes} bytes を送信"
+                        ),
+                    );
+                }
+            }
+            N::McpStartupStatus(status) => self.handle_codex_appserver_mcp_status(status),
             N::TokenUsage(usage) => self.record_codex_appserver_token_usage(usage),
             N::Error { message } => {
                 self.push_log(CodexLogKind::Error, message.clone());
@@ -6509,6 +6642,7 @@ impl CodexPane {
         match item.kind {
             K::CommandExecution {
                 command,
+                aggregated_output,
                 exit_code,
                 duration_ms,
                 ..
@@ -6525,6 +6659,13 @@ impl CodexPane {
                     .unwrap_or_else(|| "終了".to_string());
                 let duration = duration_ms.map(|ms| format!(" {ms}ms")).unwrap_or_default();
                 let state = if exit_code == Some(0) { "OK" } else { "FAIL" };
+                if let Some(output) = aggregated_output {
+                    let output =
+                        sanitized_terminal_output(&output, CODEX_APPSERVER_FINAL_OUTPUT_MAX_CHARS);
+                    if !output.is_empty() {
+                        self.push_log(CodexLogKind::Tool, format!("output:\n{output}"));
+                    }
+                }
                 self.push_log(
                     CodexLogKind::Tool,
                     format!(
@@ -6628,6 +6769,266 @@ impl CodexPane {
             self.last_token_usage_label = Some(parts.join(" / "));
         }
         self.codex_appserver_token_usage = Some(usage);
+    }
+
+    /// MCP startupStatus を状態へ反映し、cold start 中は thread handshake の期限を延長する。
+    /// 認証切れ以外の失敗は同一プロセス内で上限付き reload を行う。
+    fn handle_codex_appserver_mcp_status(&mut self, status: codex_appserver::McpStartupStatus) {
+        if status.name.trim().is_empty() {
+            return;
+        }
+        let changed = self.codex_appserver_mcp_statuses.get(&status.name) != Some(&status);
+        let name = status.name.clone();
+        let state = status.status.clone();
+        let reauthentication = status.needs_reauthentication();
+        let error = status.error.clone();
+        self.codex_appserver_mcp_statuses
+            .insert(name.clone(), status);
+
+        match state.as_str() {
+            "starting" => {
+                if changed {
+                    if self.codex_appserver_handshake_deadline.is_some() {
+                        self.codex_appserver_handshake_deadline =
+                            Some(Instant::now() + CODEX_APPSERVER_MCP_STARTUP_TIMEOUT);
+                    }
+                    self.set_work_action(format!("MCP 接続中: {name}"));
+                    self.push_log(CodexLogKind::Event, format!("MCP {name} 接続中"));
+                }
+            }
+            "ready" => {
+                if changed {
+                    self.push_log(CodexLogKind::System, format!("MCP {name} 接続済み"));
+                }
+                if self
+                    .codex_appserver_mcp_statuses
+                    .values()
+                    .all(|status| status.status == "ready")
+                {
+                    self.codex_appserver_mcp_reload_attempts = 0;
+                }
+            }
+            "failed" if reauthentication => {
+                // reload の応答より先に再認証エラーが届く場合がある。すでに送信済みの
+                // 自動 reload は取り消せないが、追跡を外して応答エラー/timeout から
+                // 追加の自動再試行へ進まないようにする。手動 reload は利用者の明示操作
+                // なので、その応答だけは通常どおり表示する。
+                if self
+                    .codex_appserver_mcp_reload
+                    .as_ref()
+                    .is_some_and(|reload| reload.automatic)
+                {
+                    self.codex_appserver_mcp_reload = None;
+                }
+                if changed {
+                    let detail = error
+                        .as_deref()
+                        .map(|error| format!(": {}", compact_one_line(error, 160)))
+                        .unwrap_or_default();
+                    let message = format!(
+                        "MCP {name} は再認証が必要です{detail}。`/mcp login {name}` の後に `/mcp reconnect` を実行してください"
+                    );
+                    self.push_log(CodexLogKind::Error, message.clone());
+                    self.push_terminal_notice("MCP 再認証が必要", message);
+                }
+            }
+            "failed" => {
+                if changed {
+                    let detail = error
+                        .as_deref()
+                        .map(|error| format!(": {}", compact_one_line(error, 160)))
+                        .unwrap_or_default();
+                    self.push_log(
+                        CodexLogKind::Error,
+                        format!("MCP {name} の接続に失敗しました{detail}"),
+                    );
+                    if self.request_codex_appserver_mcp_reload(true) {
+                        self.push_log(
+                            CodexLogKind::System,
+                            format!(
+                                "MCP 接続を自動再試行します（{}/{}）",
+                                self.codex_appserver_mcp_reload_attempts,
+                                CODEX_APPSERVER_MCP_RELOAD_MAX_ATTEMPTS
+                            ),
+                        );
+                    } else if self.codex_appserver_mcp_reload_attempts
+                        >= CODEX_APPSERVER_MCP_RELOAD_MAX_ATTEMPTS
+                    {
+                        self.push_log(
+                            CodexLogKind::Error,
+                            "MCP 自動再接続の上限に達しました。`/mcp reconnect` で再試行できます",
+                        );
+                    }
+                }
+            }
+            "cancelled" => {
+                if changed {
+                    self.push_log(
+                        CodexLogKind::System,
+                        format!("MCP {name} 接続を中止しました"),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// config/mcpServer/reload を送る。重複要求と自動試行上限をここで一元管理する。
+    fn request_codex_appserver_mcp_reload(&mut self, automatic: bool) -> bool {
+        if self.codex_appserver_mcp_reload.is_some()
+            || (automatic
+                && self.codex_appserver_mcp_reload_attempts
+                    >= CODEX_APPSERVER_MCP_RELOAD_MAX_ATTEMPTS)
+        {
+            return false;
+        }
+        let Some(client) = self.codex_appserver.as_mut() else {
+            return false;
+        };
+        let id = client.next_id();
+        if !client.send_value(&codex_appserver::mcp_reload_request(id)) {
+            return false;
+        }
+        if automatic {
+            self.codex_appserver_mcp_reload_attempts =
+                self.codex_appserver_mcp_reload_attempts.saturating_add(1);
+        }
+        self.codex_appserver_mcp_reload = Some(CodexAppServerMcpReload {
+            request_id: id,
+            automatic,
+            deadline: Instant::now() + CODEX_APPSERVER_MCP_STARTUP_TIMEOUT,
+        });
+        self.codex_appserver_last_activity = Some(Instant::now());
+        true
+    }
+
+    fn handle_mcp_slash_command(&mut self, args: &str) {
+        let mut parts = args.splitn(2, char::is_whitespace);
+        let action = parts.next().unwrap_or_default().trim().to_ascii_lowercase();
+        match action.as_str() {
+            "status" => self.push_codex_appserver_mcp_status(),
+            "reconnect" | "reload" => self.reconnect_codex_appserver_mcp(),
+            _ => self.handle_named_codex_subcommand("mcp", args),
+        }
+    }
+
+    fn push_codex_appserver_mcp_status(&mut self) {
+        if self.codex_appserver_mcp_statuses.is_empty() {
+            self.push_log(
+                CodexLogKind::System,
+                "MCP 起動状態はまだありません。設定一覧は `/mcp list`、接続開始は Codex ターンまたは `/mcp reconnect` を利用してください",
+            );
+            return;
+        }
+        let mut statuses = self
+            .codex_appserver_mcp_statuses
+            .values()
+            .map(|status| {
+                let detail = status
+                    .error
+                    .as_deref()
+                    .map(|error| format!(" ({})", compact_one_line(error, 120)))
+                    .unwrap_or_default();
+                format!("{}: {}{detail}", status.name, status.status)
+            })
+            .collect::<Vec<_>>();
+        statuses.sort();
+        self.push_log(
+            CodexLogKind::System,
+            format!("MCP status:\n{}", statuses.join("\n")),
+        );
+    }
+
+    /// `/mcp reconnect`。接続済みなら即 reload、未起動なら app-server を初期化して
+    /// thread/resume 後に reload する。
+    fn reconnect_codex_appserver_mcp(&mut self) {
+        if self.is_turn_running() {
+            self.push_log(
+                CodexLogKind::System,
+                "実行中のターンが完了してから MCP を再接続してください",
+            );
+            return;
+        }
+        self.codex_appserver_enabled = true;
+        self.codex_appserver_consecutive_failures = 0;
+        self.codex_appserver_mcp_reload_attempts = 0;
+
+        if let Some(client) = self.codex_appserver.as_mut()
+            && client.closing.is_some()
+        {
+            client.kill();
+            self.codex_appserver = None;
+            self.codex_appserver_phase = CodexAppServerPhase::Idle;
+        }
+
+        if self.codex_appserver.is_none() {
+            match self.spawn_codex_appserver() {
+                Ok(client) => {
+                    self.codex_appserver = Some(client);
+                    self.codex_appserver_phase = CodexAppServerPhase::Idle;
+                    self.codex_appserver_mcp_statuses.clear();
+                    self.codex_appserver_mcp_manual_reload_pending = true;
+                    if self.send_codex_appserver_initialize() {
+                        self.push_log(
+                            CodexLogKind::System,
+                            "MCP 再接続用の Codex app-server を起動しました",
+                        );
+                    } else {
+                        if let Some(mut client) = self.codex_appserver.take() {
+                            client.kill();
+                        }
+                        self.codex_appserver_phase = CodexAppServerPhase::Idle;
+                        self.record_codex_appserver_failure();
+                        self.codex_appserver_mcp_manual_reload_pending = false;
+                        self.push_log(
+                            CodexLogKind::Error,
+                            "MCP 再接続用 app-server の初期化要求を送信できませんでした",
+                        );
+                    }
+                }
+                Err(error) => {
+                    self.record_codex_appserver_failure();
+                    self.push_log(
+                        CodexLogKind::Error,
+                        format!("MCP 再接続用 app-server を起動できませんでした: {error}"),
+                    );
+                }
+            }
+            return;
+        }
+
+        match self.codex_appserver_phase {
+            CodexAppServerPhase::Initialized | CodexAppServerPhase::Ready => {
+                if self.request_codex_appserver_mcp_reload(false) {
+                    self.push_log(CodexLogKind::System, "MCP 接続を再読込しています");
+                } else {
+                    self.push_log(CodexLogKind::System, "MCP 再接続はすでに進行中です");
+                }
+            }
+            CodexAppServerPhase::Initializing { .. }
+            | CodexAppServerPhase::StartingThread { .. } => {
+                self.codex_appserver_mcp_manual_reload_pending = true;
+                self.push_log(
+                    CodexLogKind::System,
+                    "app-server の接続完了後に MCP を再読込します",
+                );
+            }
+            CodexAppServerPhase::Idle => {
+                self.codex_appserver_mcp_manual_reload_pending = true;
+                if !self.send_codex_appserver_initialize() {
+                    if let Some(mut client) = self.codex_appserver.take() {
+                        client.kill();
+                    }
+                    self.codex_appserver_phase = CodexAppServerPhase::Idle;
+                    self.record_codex_appserver_failure();
+                    self.codex_appserver_mcp_manual_reload_pending = false;
+                    self.push_log(
+                        CodexLogKind::Error,
+                        "MCP 再接続用 app-server の初期化要求を送信できませんでした",
+                    );
+                }
+            }
+        }
     }
 
     /// サーバ発の承認リクエストを到着順に保持し、先頭だけをバナーで提示する。
@@ -6823,6 +7224,8 @@ impl CodexPane {
             self.codex_appserver_pending_approvals.clear();
             self.codex_appserver_turn_id = None;
             self.codex_appserver_pending_turn = None;
+            self.codex_appserver_mcp_reload = None;
+            self.codex_appserver_mcp_manual_reload_pending = false;
             self.current_turn_prompt = None;
             self.current_turn_retry_prompt = None;
             self.push_log(
@@ -6839,15 +7242,56 @@ impl CodexPane {
             && Instant::now() >= deadline
         {
             self.codex_appserver_handshake_deadline = None;
+            let seconds = if matches!(
+                self.codex_appserver_phase,
+                CodexAppServerPhase::StartingThread { .. }
+            ) || self
+                .codex_appserver_mcp_statuses
+                .values()
+                .any(|status| status.status == "starting")
+            {
+                CODEX_APPSERVER_MCP_STARTUP_TIMEOUT.as_secs()
+            } else {
+                CODEX_APPSERVER_HANDSHAKE_TIMEOUT.as_secs()
+            };
             self.push_log(
                 CodexLogKind::Error,
-                "Codex app-server の応答が15秒以内に得られなかったためワンショットで実行します",
+                format!(
+                    "Codex app-server の応答が{seconds}秒以内に得られなかったため接続を再作成します"
+                ),
             );
             self.fallback_codex_appserver_to_oneshot();
             return true;
         }
 
-        // 4. 設定変更応答のタイムアウト → 再起動フォールバック。
+        // 4. MCP reload 応答のタイムアウト。自動要求なら上限内でもう一度だけ送る。
+        if self
+            .codex_appserver_mcp_reload
+            .as_ref()
+            .is_some_and(|reload| Instant::now() >= reload.deadline)
+        {
+            let reload = self
+                .codex_appserver_mcp_reload
+                .take()
+                .expect("checked above");
+            self.push_log(
+                CodexLogKind::Error,
+                "MCP 再接続の応答がタイムアウトしました",
+            );
+            if reload.automatic && self.request_codex_appserver_mcp_reload(true) {
+                self.push_log(
+                    CodexLogKind::System,
+                    format!(
+                        "MCP 接続を再試行します（{}/{}）",
+                        self.codex_appserver_mcp_reload_attempts,
+                        CODEX_APPSERVER_MCP_RELOAD_MAX_ATTEMPTS
+                    ),
+                );
+            }
+            return true;
+        }
+
+        // 5. 設定変更応答のタイムアウト → 再起動フォールバック。
         if let Some(change) = self.codex_appserver_pending_setting.as_ref()
             && Instant::now() >= change.deadline
         {
@@ -6861,7 +7305,7 @@ impl CodexPane {
             return true;
         }
 
-        // 5. アイドル時: 再起動保留があればグレースフルに閉じる（次ターンで再 spawn）。
+        // 6. アイドル時: 再起動保留があればグレースフルに閉じる（次ターンで再 spawn）。
         if self.codex_appserver_restart_pending
             && !self.turn_running
             && self.pending_decision.is_none()
@@ -6878,7 +7322,7 @@ impl CodexPane {
             return true;
         }
 
-        // 6. アイドル回収（無操作が続いたら閉じる）。
+        // 7. アイドル回収（無操作が続いたら閉じる）。
         if !self.turn_running
             && self.pending_decision.is_none()
             && self.codex_appserver_pending_approvals.is_empty()
@@ -6897,6 +7341,7 @@ impl CodexPane {
 
     /// 常駐プロセスが予期せず死んだときの処理。実行中ターンはエラー終了扱い。
     fn handle_codex_appserver_death(&mut self) {
+        self.record_codex_appserver_failure();
         self.codex_appserver = None;
         self.codex_appserver_phase = CodexAppServerPhase::Idle;
         self.codex_appserver_interrupt_deadline = None;
@@ -6911,6 +7356,10 @@ impl CodexPane {
         self.codex_appserver_restart_pending = false;
         self.codex_appserver_output.clear();
         self.codex_appserver_running_item = None;
+        self.codex_appserver_mcp_statuses.clear();
+        self.codex_appserver_mcp_reload = None;
+        self.codex_appserver_mcp_manual_reload_pending = false;
+        self.codex_appserver_mcp_reload_attempts = 0;
         let was_running = self.turn_running;
         if was_running {
             // 実行中の死亡/切断でも Addness へ作業メモを記録する（current_turn_prompt を消す前に）。
@@ -6926,31 +7375,69 @@ impl CodexPane {
         if was_running {
             self.refresh_current_turn_title();
         }
-        let message = "Codex プロセスが終了しました。次のターンで再接続します";
+        let message = if self.codex_appserver_enabled {
+            "Codex プロセスが終了しました。次のターンで再接続します"
+        } else {
+            "Codex プロセスが連続して終了したため、以降はワンショットで実行します"
+        };
         self.push_log(CodexLogKind::Error, message);
         self.push_terminal_notice("Codex 切断", message);
     }
 
-    /// initialize / thread/start に失敗したとき、常駐を諦めてワンショットで同じターンを実行する。
+    /// app-server の一時障害を記録する。単発では常駐を無効化せず、連続失敗時だけ遮断する。
+    fn record_codex_appserver_failure(&mut self) {
+        self.codex_appserver_consecutive_failures =
+            self.codex_appserver_consecutive_failures.saturating_add(1);
+        if self.codex_appserver_consecutive_failures >= CODEX_APPSERVER_MAX_CONSECUTIVE_FAILURES
+            && self.codex_appserver_enabled
+        {
+            self.codex_appserver_enabled = false;
+            self.push_log(
+                CodexLogKind::Error,
+                format!(
+                    "Codex app-server が{}回連続で失敗したため、このセッションではワンショットへ切り替えました。`/mcp reconnect` で再有効化できます",
+                    self.codex_appserver_consecutive_failures
+                ),
+            );
+        }
+    }
+
+    /// initialize / thread/start に失敗したとき、同じ通常ターンだけワンショットで実行する。
+    /// 常駐モードは連続失敗閾値までは維持し、次ターンで再接続する。
     fn fallback_codex_appserver_to_oneshot(&mut self) {
+        let was_manual_mcp = self.codex_appserver_mcp_manual_reload_pending;
+        let retry = self.current_turn_retry_prompt.clone();
+        let display = self.current_turn_prompt.clone();
+        self.record_codex_appserver_failure();
         if let Some(mut client) = self.codex_appserver.take() {
             client.kill();
         }
         self.codex_appserver_phase = CodexAppServerPhase::Idle;
-        self.codex_appserver_enabled = false;
         self.codex_appserver_handshake_deadline = None;
         self.codex_appserver_pending_turn = None;
         self.codex_appserver_turn_id = None;
         self.codex_appserver_turn_req_id = None;
-        let retry = self.current_turn_retry_prompt.clone();
-        let display = self.current_turn_prompt.clone();
+        self.codex_appserver_mcp_reload = None;
+        self.codex_appserver_mcp_manual_reload_pending = false;
+        self.codex_appserver_mcp_statuses.clear();
         // 進行中ターン状態をいったんクリアしてからワンショットへ切り替える。
         self.turn_running = false;
         self.current_turn_prompt = None;
         self.current_turn_retry_prompt = None;
+        if was_manual_mcp && retry.is_none() {
+            self.push_log(
+                CodexLogKind::Error,
+                "MCP 再接続用 app-server の初期化がタイムアウトしました",
+            );
+            return;
+        }
         self.push_log(
             CodexLogKind::System,
-            "常駐初期化に失敗したためワンショットで実行します",
+            if self.codex_appserver_enabled {
+                "このターンはワンショットで実行し、次のターンで app-server へ再接続します"
+            } else {
+                "常駐初期化の連続失敗によりワンショットで実行します"
+            },
         );
         // 常駐 turn/start へ渡せなかった添付画像はワンショットの -i 引数へ戻す。
         if !self.codex_appserver_pending_images.is_empty() {
@@ -6981,6 +7468,10 @@ impl CodexPane {
         self.codex_appserver_restart_pending = false;
         self.codex_appserver_output.clear();
         self.codex_appserver_running_item = None;
+        self.codex_appserver_mcp_statuses.clear();
+        self.codex_appserver_mcp_reload = None;
+        self.codex_appserver_mcp_manual_reload_pending = false;
+        self.codex_appserver_mcp_reload_attempts = 0;
     }
 
     /// F2（model）を thread/settings/update で反映する。具体値が無ければ再起動フォールバック。
@@ -7090,6 +7581,19 @@ impl CodexPane {
             git_branch_label(Path::new(&self.cwd)),
         );
         cmd.env("ADDNESS_BIN", &self.addness_bin);
+        if let Some(root) = &self.code_api_root {
+            cmd.env("ADDNESS_CODE_API_ROOT", root);
+        }
+    }
+
+    /// Claude Code は cwd 外のファイルを tool で読む時に `--add-dir` が必要。
+    /// Codex の `--add-dir` は書込許可も広げるため、全system readが可能なCodexには付けない。
+    fn apply_code_api_filesystem_access(&self, cmd: &mut Command) {
+        if self.kind == AgentKind::ClaudeCode
+            && let Some(root) = &self.code_api_root
+        {
+            cmd.arg("--add-dir").arg(root);
+        }
     }
 
     fn handle_generic_json_event(&mut self, event_type: &str, value: &Value) {
@@ -7901,7 +8405,7 @@ impl CodexPane {
                 true
             }
             "mcp" => {
-                self.handle_named_codex_subcommand("mcp", args);
+                self.handle_mcp_slash_command(args);
                 true
             }
             "apps" => {
@@ -10604,7 +11108,7 @@ Body excerpt from TUI snapshot:
 
 Operating rule:
 1. Make concrete progress on the user request; do not replace implementation with memory bookkeeping.
-2. Treat this TUI snapshot as the first Addness hint. For implementation, investigation, goal management, PR/release, or handoff work, read the current goal early with `"$ADDNESS_BIN" goal get "$ADDNESS_GOAL_ID" --json --with-deliverable --with-comment` unless the request is only a trivial greeting or display check.
+2. Treat this TUI snapshot as the first Addness hint. For implementation, investigation, goal management, PR/release, or handoff work, read `generated/addness/goal/get.mjs` and call its `run()` early through the filesystem Code API unless the request is only a trivial greeting or display check.
 3. For implementation or investigation requests, make a reasonable assumption from repo evidence and proceed unless the missing detail would make the result unsafe or likely wrong.
 4. Before the final response after code changes, substantial investigation, PR/release/tag work, goal decomposition, or a durable decision, write the necessary state back to Addness even if the user did not explicitly ask. Use body/DoD/child goals/deliverables/progress as appropriate, and record only facts needed for restart.
 5. The TUI automatically records current branch/folder, turn completion, and session progress into `## Codex自動メモ(機械)` as a safety net. Do not rely on it as the only record for implemented work.
@@ -10646,7 +11150,7 @@ Current Addness goal:
 
 Rules:
 1. Act on the user request first; do not spend the turn re-summarizing Addness.
-2. For implementation, investigation, goal management, PR/release, or handoff work, read the current goal early with `"$ADDNESS_BIN" goal get "$ADDNESS_GOAL_ID" --json --with-deliverable --with-comment` unless the request is only a trivial greeting or display check.
+2. For implementation, investigation, goal management, PR/release, or handoff work, read `generated/addness/goal/get.mjs` and call its `run()` early through the filesystem Code API unless the request is only a trivial greeting or display check.
 3. For implementation or investigation requests, make a reasonable assumption from repo evidence and proceed unless the missing detail would make the result unsafe or likely wrong.
 4. Before the final response after code changes, substantial investigation, PR/release/tag work, goal decomposition, or a durable decision, write the necessary state back to Addness even if the user did not explicitly ask.
 5. The TUI automatically records current branch/folder, turn completion, and session progress into `## Codex自動メモ(機械)` as a safety net. Do not rely on it as the only record for implemented work.
@@ -10739,6 +11243,7 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
             }
         }
 
+        self.apply_code_api_filesystem_access(&mut cmd);
         cmd.current_dir(&self.cwd);
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
@@ -10982,7 +11487,7 @@ Codex CLI commands:
   /exec-review <args> - run Codex review in direct mode
   /apply|/a <task_id> - codex apply
   /import [status|run], /hooks [key=value|clear], /skills [list|name]
-  /doctor, /features|/experimental, /mcp, /apps, /plugin, /cloud, /login, /logout
+  /doctor, /features|/experimental, /mcp [status|reconnect|...], /apps, /plugin, /cloud, /login, /logout
   /update|/update-codex, /app, /app-server, /remote-control, /debug, /completion
   /mcp-server, /exec-server, /sandbox-run <args>
 Codex sessions:
@@ -11799,6 +12304,18 @@ fn sanitize_terminal_line(text: &str) -> String {
         }
     }
     out
+}
+
+/// 端末出力の改行を保ったまま ANSI / 制御文字を除去し、履歴用上限へ丸める。
+fn sanitized_terminal_output(text: &str, max_chars: usize) -> String {
+    let sanitized = text
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .split('\n')
+        .map(sanitize_terminal_line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    compact_multiline_excerpt(&sanitized, max_chars)
 }
 
 fn spawn_line_reader<R>(reader: R, tx: Sender<CodexProcessEvent>, stderr: bool)
@@ -13213,10 +13730,10 @@ fn addness_child_goal_work_prompt(pane: &CodexPane, ordinal: usize, child: &Chil
 
 進め方:
 1. まずリポジトリを読み、対象ファイル・既存パターン・検証方法を確認する。
-2. TUI snapshotで足りなければ、必要な範囲だけ `"$ADDNESS_BIN" goal get {child_id} --json --with-deliverable --with-comment` で追加確認する。
-3. DoDが空または実装判断に足りない場合は、完了状態として具体化し、必要なら `"$ADDNESS_BIN" goal update {child_id} --description-file <file> --json` で書き込む。
+2. TUI snapshotで足りなければ、filesystem Code APIの `goal/get.mjs` を読み、その `run()` で {child_id} の必要な範囲だけ追加確認する。
+3. DoDが空または実装判断に足りない場合は、完了状態として具体化し、必要なら `goal/update.mjs` の定義を読んで `run()` で書き込む。
 4. 実装・テスト・lintを進める。独立した小作業がさらに見つかった場合だけAddness子ゴールへ分ける。
-5. 完了時は検証結果と残りを短く報告し、長期判断・成果物・引き継ぎがあれば Addness CLI で body/link/子ゴールを更新する。
+5. 完了時は検証結果と残りを短く報告し、長期判断・成果物・引き継ぎがあれば filesystem Code API で body/link/子ゴールを更新する。
 
 Addness整理だけで終わらず、このターンで実装または検証に着手してください。"#,
         child_id = child.id,
@@ -13232,7 +13749,7 @@ fn addness_child_goal_policy() -> &'static str {
     r#"
 Mandatory small-goal gate for implementation:
 - If the user request includes implementation, a bug fix, refactoring, documentation/code changes, or adding tests, create or select exactly one small Addness child goal before editing any repository file.
-- For a new request, first read the current goal, then run `"$ADDNESS_BIN" goal create --title "..." --parent "$ADDNESS_GOAL_ID" --description "..." --json`; put the task-specific DoD, branch, files, and verification plan in the child body with `goal update <CHILD_GOAL_ID> --body-file <file> --json`.
+- For a new request, read only the needed `goal/get.mjs`, `goal/create.mjs`, and `goal/update.mjs` definitions, then call their `run()` functions in one Node.js workflow. Create the child under `ADDNESS_GOAL_ID` and put the task-specific DoD, branch, files, and verification plan in its body.
 - Do not start implementation while child-goal creation or its DoD/body update is pending or failed. Report the blocker instead of editing the repository.
 - On later turns for the same request, continue the existing in-progress child goal rather than creating duplicates. Do not finish only the Addness bookkeeping: implement and verify the child goal in the same turn.
 "#
@@ -13759,15 +14276,15 @@ fn addness_organize_prompt(task: &str) -> String {
     };
     format!(
         r#"Addnessを作業DBとして使い、この依頼を組織的に分解してから実装へ進んでください。
-Addness TUI は誰でも `addness` と打てば起動できる通常の入口です。Codex は Addness CLI で goal body/description/子ゴールを書き込めます。
+Addness TUI は誰でも `addness` と打てば起動できる通常の入口です。Codex は filesystem Code API で goal body/description/子ゴールを書き込めます。
 
 対象:
 {target}
 
 進め方:
-1. `"$ADDNESS_BIN" goal get "$ADDNESS_GOAL_ID" --json --with-deliverable --with-comment` で現在のbody/DoD/子ゴール/成果物を確認し、リポジトリ確認へ進む。
-2. 実装・修正・変更・テスト追加を行う場合は、必ず選択中ゴール直下に今回の小作業用子ゴールを1件作成する。新規依頼では `goal create --title "..." --parent "$ADDNESS_GOAL_ID" --description "..." --json` を先に実行する。
-3. 子ゴールのdescriptionには検証可能なDoDを、bodyには入力情報・対象ファイル・実装方針・検証方法・次の手を入れ、作成後に `goal update <CHILD_GOAL_ID> --body-file <file> --json` で更新する。
+1. filesystem Code APIの `goal/get.mjs` を読み、その `run()` で現在のbody/DoD/子ゴール/成果物を確認し、リポジトリ確認へ進む。
+2. 実装・修正・変更・テスト追加を行う場合は、必ず選択中ゴール直下に今回の小作業用子ゴールを1件作成する。新規依頼では `goal/create.mjs` の定義を読んで `run()` を先に実行する。
+3. 子ゴールのdescriptionには検証可能なDoDを、bodyには入力情報・対象ファイル・実装方針・検証方法・次の手を入れ、`goal/update.mjs` の `run()` で更新する。
 4. 子ゴールの作成またはDoD/body更新に失敗した場合は、リポジトリを編集せず、失敗を報告する。同じ依頼の継続ターンでは既存の作業中子ゴールを使い、重複作成しない。
 5. 子ゴールを作っただけで終わらず、そのDoDに向けた実装または検証にこのターンで着手する。独立した大きな作業がある場合だけ追加の子ゴールや委任を使う。
 6. ユーザーへの最終報告は「作った/使った子ゴール」「実装したこと」「検証」「残り」を短く出す。"#
@@ -13782,10 +14299,10 @@ fn addness_remember_prompt(note: &str) -> String {
 {note}
 
 手順:
-1. `"$ADDNESS_BIN" goal get "$ADDNESS_GOAL_ID" --json --with-deliverable --with-comment` で現在のbody/DoD/子ゴール/成果物を確認する。
+1. filesystem Code APIの `goal/get.mjs` を読み、その `run()` で現在のbody/DoD/子ゴール/成果物を確認する。
 2. body の `## Codex作業メモ` に、重複を避けてこの内容を短く統合する。決定事項なら `## Codex決定ログ` にも追記する。
 3. 独立した作業単位・未完了の引き継ぎ・サブエージェント委任に向く内容なら、子ゴールを作成または更新して分ける。
-4. `## Codex自動メモ(機械)` はTUIの領域なので編集しない。既存bodyを壊さず、長くなる場合は `goal update --body-file` を使う。
+4. `## Codex自動メモ(機械)` はTUIの領域なので編集しない。既存bodyを壊さず、`goal/update.mjs` の `run()` で更新する。
 5. Codex global memory には保存しない。コード変更は不要。
 6. Addnessのどこを更新したかを1-2行で報告する。"#
     )
@@ -13819,12 +14336,12 @@ TUIが抽出した直近サマリー:
 {remaining}
 
 保存手順:
-1. `"$ADDNESS_BIN" goal get "$ADDNESS_GOAL_ID" --json --with-deliverable --with-comment` で現body/DoD/成果物/コメントを読む。
+1. filesystem Code APIの `goal/get.mjs` を読み、その `run()` で現body/DoD/成果物/コメントを読む。
 2. body の `## Codex作業メモ` を、作業フォルダ、ブランチ、現在地、実施内容、検証結果、未完了点、次の手が分かる再開用メモへ短く更新する。
 3. 重要な決定がある場合だけ `## Codex決定ログ` に `YYYY-MM-DD HH:MM - 決定: ... / 理由: ... / 影響: ...` 形式で追記する。
 4. PR/tag/release/CIに関係する情報がある場合だけ `## PR/Release Traceability` を更新する。
 5. 独立した未完了作業やサブエージェントに渡す単位がある場合だけ、子ゴールを作成または更新する。機械的に子ゴールを増やさない。
-6. `## Codex自動メモ(機械)` はTUIの領域なので編集しない。既存bodyを壊さず、長くなる場合は `goal update --body-file` を使う。
+6. `## Codex自動メモ(機械)` はTUIの領域なので編集しない。既存bodyを壊さず、`goal/update.mjs` の `run()` で更新する。
 7. Codex global memory には保存しない。逐語ログを溜めず、次回再開に必要な事実だけを残す。
 
 保存後、body/決定ログ/Traceability/子ゴール/成果物のどれを更新したかだけ短く報告してください。
@@ -13865,33 +14382,34 @@ fn addness_tui_developer_instructions() -> &'static str {
 通常Codexと同じ速度で調査・実装・検証しながら、プロジェクト固有の長期状態だけをAddnessへ残してください。
 Addnessはmemory.mdの代替となるプロジェクト別DBです。通常memoryは複数プロジェクトの状態が混ざりやすいため、
 このプロジェクト固有の現在地・判断・決定・次の手はAddnessを真実源として扱い、Codex/Claude Code本体のmemory/DBへは極力置きません。
-Addness TUIは誰でも `addness` と打てば起動できる通常の入口です。CodexはAddness CLIでgoal body/DoD/子ゴールを書き込めます。
+Addness TUIは誰でも `addness` と打てば起動できる通常の入口です。Codexはfilesystem Code APIでgoal body/DoD/子ゴールを書き込めます。
 
 起動直後:
-- Addness CLI を実行せず、ユーザーの最初の入力を待ってください。
+- Code API / Addness CLI を実行せず、ユーザーの最初の入力を待ってください。
 - 軽い挨拶や単純な表示確認には、TUIから渡された軽量コンテキストだけで即応してください。
 
 TUIから渡される軽量コンテキスト:
 - ADDNESS_GOAL_ID/TITLE/STATUS/DOD: 作業対象ゴール
 - ADDNESS_PARENT_GOAL_ID/TITLE: 起動元の親ゴール（ある場合）
 - ADDNESS_WORKTREE_BRANCH: 起動した作業ツリーのgitブランチ
+- ADDNESS_CODE_API_ROOT: Addness操作を1定義1ファイルで置いたfilesystem Code API
 
 実行ループ:
 1. TUIから渡されたbody/DoD/子ゴール/ブランチのsnapshotを最初のヒントとして扱ってください。
-2. 実装・調査・ゴール整理・PR/release・引き継ぎに入る場合は、最初の作業段階で必ずAddness CLIで現在のゴールを読みます。挨拶・単純な表示確認だけならsnapshotだけで即応してよいです。
-3. デフォルトの進み方は「TUI snapshotを見る → Addness CLIで現在地を読む → リポジトリを読む → 実装/調査する → 検証する → 必要な状態をAddnessへ残す」です。
+2. 実装・調査・ゴール整理・PR/release・引き継ぎに入る場合は、最初の作業段階でfilesystem Code APIから現在のゴールを読みます。挨拶・単純な表示確認だけならsnapshotだけで即応してよいです。
+3. デフォルトの進み方は「TUI snapshotを見る → Code APIで現在地を読む → リポジトリを読む → 実装/調査する → 検証する → 必要な状態をAddnessへ残す」です。
 4. Addnessを読んだだけで作業完了にしない。読んだ内容を使って、コード変更・検証・具体提案へ進みます。
 5. 実装や調査の依頼では、repoから合理的に判断できるなら確認質問やAddness整理を挟まず手を動かします。
 6. ユーザーへの返答では、Addness運用の説明より実装・判断・検証結果を先に出します。
 
 実装の必須小ゴールゲート:
 - 実装、バグ修正、リファクタ、ドキュメント/設定変更、テスト追加を含む依頼では、リポジトリのファイルを編集する前に、選択中ゴール直下へ今回の小作業用子ゴールを必ず1件作成してください。
-- 新規依頼では `"$ADDNESS_BIN" goal create --title "..." --parent "$ADDNESS_GOAL_ID" --description "..." --json` を実行し、作成された子ゴールへDoD、対象ファイル、実装方針、ブランチ、検証方法をbodyとして `goal update <CHILD_GOAL_ID> --body-file <file> --json` で記録してください。
+- 新規依頼では必要な `goal/create.mjs` と `goal/update.mjs` だけを読み、両方の `run()` を1つのNode.js処理で実行してください。子ゴールは `ADDNESS_GOAL_ID` 直下に作り、DoD、対象ファイル、実装方針、ブランチ、検証方法をbodyへ記録してください。
 - 子ゴールの作成またはDoD/bodyの記録が失敗したら実装を開始しないでください。失敗内容をユーザーへ報告し、コード変更なしで止めてください。
 - 同じ依頼の継続ターンでは既存の作業中子ゴールを使って重複作成を避けてください。子ゴールの整理だけで終わらず、作成/選択後はそのDoDの実装と検証へ進んでください。
 
 Addness読込ルール:
-- 実装・調査・ゴール整理・PR/release・引き継ぎでは、`"$ADDNESS_BIN" goal get "$ADDNESS_GOAL_ID" --json --with-deliverable --with-comment` を早い段階で実行します。
+- 実装・調査・ゴール整理・PR/release・引き継ぎでは、必要な `goal/get.mjs` だけを読み、その `run()` を早い段階で実行します。
 - 必要な範囲はbody、DoD(description/definitionOfDone)、コメント、成果物、子ゴール、作業フォルダ/ブランチです。
 - 読んだ内容を長く説明せず、その情報を使って実装・調査・提案へ戻ります。
 
@@ -13903,15 +14421,12 @@ Addness DBの置き場所:
 - 独立した作業単位、サブエージェント委任、未完了の引き継ぎ: 子ゴール（title=作業名、description=DoD、body=入力情報/ブランチ/次の手）
 - 構造化フィールドに置けない短い質問や補足: コメント
 
-CLI最小操作:
-- Addnessの読み書きは必ずAddness CLI（`"$ADDNESS_BIN"`）で行う。`mcp__addness__*` のMCPツールが見えても使わない（認証・接続先がTUIと一致する保証がないため）。
-- 読む: `"$ADDNESS_BIN" goal get "$ADDNESS_GOAL_ID" --json --with-deliverable --with-comment`
-- body更新: `"$ADDNESS_BIN" goal update "$ADDNESS_GOAL_ID" --body-file <file> --json`
-- DoD更新: `"$ADDNESS_BIN" goal update "$ADDNESS_GOAL_ID" --description-file <file> --json`
-- 子ゴール作成: `"$ADDNESS_BIN" goal create --title "..." --parent "$ADDNESS_GOAL_ID" --description "..." --json`
-- 子ゴールbody: 作成結果のidへ `"$ADDNESS_BIN" goal update <CHILD_GOAL_ID> --body-file <file> --json`
-- PR紐づけ: `"$ADDNESS_BIN" link pr --goal "$ADDNESS_GOAL_ID" --url "<PR_URL>" --name "<name>" --json`
-- 短い進捗記録: `"$ADDNESS_BIN" link progress --goal "$ADDNESS_GOAL_ID" --message "..." --json`
+Code Execution / filesystem Code API:
+- Addness操作は直接MCPツールを列挙・連続呼出しせず、`$ADDNESS_CODE_API_ROOT/generated/addness/` のコードAPIを優先します。
+- `find` / `rg -l` でディレクトリを辿り、今回必要な `.mjs` 定義だけを読んでください。manifest全体や全定義をcontextへ読み込まないでください。
+- 各モジュールの `run()` を1つのNode.js `.mjs` へimportして処理を合成し、中間データはプロセス内に保持します。stdoutへはユーザーに必要な最終結果だけを出してください。
+- 生成モジュールはshellを介さず `ADDNESS_BIN` を実行し、JSON/JSONLをプロセス内でparseします。`_json` 引数はobjectを直接渡せます。破壊的操作は `force: true` が必須です。
+- Code APIが生成されていない、Node.jsがない、または該当定義がない時だけ `"$ADDNESS_BIN" ... --json` をfallbackとして使います。`mcp__addness__*` は認証・接続先がTUIと一致する保証がないため使いません。
 
 書き込みルール:
 - 起動しただけでは Addness に書き込まない。
@@ -13919,7 +14434,7 @@ CLI最小操作:
 - 実装・調査・PR/release・重要判断・未完了の引き継ぎが発生したら、ユーザーが明示しなくても最終応答前に必要な情報をAddnessへ残します。
 - 自動記録だけで済ませてよいのは、挨拶・単純な表示確認・コードや判断を伴わない短い応答だけです。
 - メインエージェントは実装・調査・検証を止めない。逐語ログや全コマンド出力ではなく、次回再開に必要な事実だけを短く残す。
-- 手動更新する時は現bodyを読み、手書きメモと `## Codex自動メモ(機械)` を壊さず、自分の専用ブロックだけを更新する。長文は `goal update --body-file` を使う。
+- 手動更新する時は現bodyを読み、手書きメモと `## Codex自動メモ(機械)` を壊さず、自分の専用ブロックだけを `goal/update.mjs` の `run()` で更新する。
 - 実装依頼では必須小ゴールゲートに従い、新規依頼ごとに小ゴールを1件作成し、継続ターンでは対応する作業中子ゴールを更新する。挨拶・表示確認・単なる読み取り・相談だけでは作成しない。
 - tag/releaseを作成したら deliverable/link に紐づけ、`## PR/Release Traceability` にPR・tag・release URL・CI結果を残す。
 - DoDが不十分なら、足りない観点を短く整理してユーザーに確認し、合意後に更新する。
@@ -15443,15 +15958,188 @@ mod tests {
         // deadline を過去にして poll を呼ぶ。
         pane.codex_appserver_handshake_deadline = Some(Instant::now() - Duration::from_secs(1));
         assert!(pane.poll_codex_appserver());
-        // 常駐は破棄され、フォールバックのため deadline も enabled も落ちる。
+        // 常駐は破棄され deadline は落ちるが、単発障害では resident を永久無効化しない。
         assert!(pane.codex_appserver.is_none());
         assert!(pane.codex_appserver_handshake_deadline.is_none());
-        assert!(!pane.codex_appserver_enabled);
+        assert!(pane.codex_appserver_enabled);
+        assert_eq!(pane.codex_appserver_consecutive_failures, 1);
         assert!(
             pane.log
                 .iter()
-                .any(|l| l.kind == CodexLogKind::Error && l.text.contains("15秒以内"))
+                .any(|l| l.kind == CodexLogKind::Error && l.text.contains("応答が"))
         );
+    }
+
+    #[test]
+    fn codex_appserver_circuit_breaker_requires_three_consecutive_failures() {
+        let mut pane = CodexPane::test_with_output(10, 80, 0, "");
+        pane.finished = false;
+        pane.kind = AgentKind::Codex;
+        pane.codex_appserver_enabled = true;
+
+        pane.record_codex_appserver_failure();
+        pane.record_codex_appserver_failure();
+        assert!(pane.codex_appserver_enabled);
+        pane.record_codex_appserver_failure();
+        assert!(!pane.codex_appserver_enabled);
+        assert!(pane.log.iter().any(|line| line.text.contains("3回連続")));
+    }
+
+    #[test]
+    fn codex_appserver_mcp_starting_extends_handshake_deadline() {
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        pane.codex_appserver_phase = CodexAppServerPhase::StartingThread {
+            request_id: 10,
+            resuming: false,
+        };
+        pane.codex_appserver_handshake_deadline = Some(Instant::now() + Duration::from_secs(1));
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "mcpServer/startupStatus/updated",
+            "params": {"threadId": "th-1", "name": "slow", "status": "starting"}
+        }));
+        let remaining = pane
+            .codex_appserver_handshake_deadline
+            .expect("deadline")
+            .saturating_duration_since(Instant::now());
+        assert!(remaining >= Duration::from_secs(55));
+        assert_eq!(
+            pane.codex_appserver_mcp_statuses
+                .get("slow")
+                .map(|status| status.status.as_str()),
+            Some("starting")
+        );
+    }
+
+    #[test]
+    fn codex_appserver_mcp_transient_failure_reloads_with_bound() {
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        for expected_attempt in 1..=CODEX_APPSERVER_MCP_RELOAD_MAX_ATTEMPTS {
+            pane.handle_json_event(serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "mcpServer/startupStatus/updated",
+                "params": {"threadId": "th-1", "name": "flaky", "status": "starting"}
+            }));
+            pane.handle_json_event(serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "mcpServer/startupStatus/updated",
+                "params": {"threadId": "th-1", "name": "flaky", "status": "failed", "error": "temporary"}
+            }));
+            assert_eq!(pane.codex_appserver_mcp_reload_attempts, expected_attempt);
+            let request_id = pane
+                .codex_appserver_mcp_reload
+                .as_ref()
+                .expect("reload request")
+                .request_id;
+            pane.handle_json_event(serde_json::json!({
+                "jsonrpc": "2.0", "id": request_id, "result": {}
+            }));
+            assert!(pane.codex_appserver_mcp_reload.is_none());
+        }
+
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "mcpServer/startupStatus/updated",
+            "params": {"threadId": "th-1", "name": "flaky", "status": "starting"}
+        }));
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "mcpServer/startupStatus/updated",
+            "params": {"threadId": "th-1", "name": "flaky", "status": "failed", "error": "still broken"}
+        }));
+        assert!(pane.codex_appserver_mcp_reload.is_none());
+        assert!(pane.log.iter().any(|line| line.text.contains("上限")));
+    }
+
+    #[test]
+    fn codex_appserver_mcp_reauthentication_does_not_retry() {
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "mcpServer/startupStatus/updated",
+            "params": {
+                "threadId": "th-1",
+                "name": "oauth",
+                "status": "failed",
+                "error": "expired",
+                "failureReason": "reauthenticationRequired"
+            }
+        }));
+        assert!(pane.codex_appserver_mcp_reload.is_none());
+        assert_eq!(pane.codex_appserver_mcp_reload_attempts, 0);
+        assert!(
+            pane.log
+                .iter()
+                .any(|line| line.text.contains("/mcp login oauth"))
+        );
+    }
+
+    #[test]
+    fn codex_appserver_mcp_reauthentication_cancels_pending_auto_retry() {
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        assert!(pane.request_codex_appserver_mcp_reload(true));
+        assert!(
+            pane.codex_appserver_mcp_reload
+                .as_ref()
+                .is_some_and(|reload| reload.automatic)
+        );
+
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "mcpServer/startupStatus/updated",
+            "params": {
+                "threadId": "th-1",
+                "name": "oauth",
+                "status": "failed",
+                "error": "expired",
+                "failureReason": "reauthenticationRequired"
+            }
+        }));
+
+        assert!(pane.codex_appserver_mcp_reload.is_none());
+        assert_eq!(pane.codex_appserver_mcp_reload_attempts, 1);
+    }
+
+    #[test]
+    fn codex_appserver_manual_mcp_reconnect_resets_circuit_breaker() {
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        pane.codex_appserver_enabled = false;
+        pane.codex_appserver_consecutive_failures = CODEX_APPSERVER_MAX_CONSECUTIVE_FAILURES;
+        pane.reconnect_codex_appserver_mcp();
+        assert!(pane.codex_appserver_enabled);
+        assert_eq!(pane.codex_appserver_consecutive_failures, 0);
+        assert!(
+            pane.codex_appserver_mcp_reload
+                .as_ref()
+                .is_some_and(|reload| !reload.automatic)
+        );
+    }
+
+    #[test]
+    fn codex_appserver_command_item_persists_aggregated_output() {
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        pane.turn_running = true;
+        pane.handle_json_event(serde_json::json!({
+            "jsonrpc": "2.0", "method": "item/completed",
+            "params": {"item": {
+                "id": "call-output", "type": "commandExecution", "command": "printf done",
+                "cwd": "/repo", "aggregatedOutput": "done\n", "exitCode": 0,
+                "durationMs": 10, "status": "completed"
+            }}
+        }));
+        assert!(pane.log.iter().any(|line| line.text == "output:\ndone"));
     }
 
     #[test]
@@ -16531,7 +17219,8 @@ mod tests {
         assert!(prompt.contains("現在地: 設計済み"));
         assert!(prompt.contains("Make concrete progress"));
         assert!(prompt.contains("Treat this TUI snapshot as the first Addness hint"));
-        assert!(prompt.contains("read the current goal early"));
+        assert!(prompt.contains("read `generated/addness/goal/get.mjs`"));
+        assert!(prompt.contains("filesystem Code API"));
         assert!(prompt.contains("inspect the repo"));
         assert!(prompt.contains("make a reasonable assumption from repo evidence"));
         assert!(prompt.contains("Before the final response after code changes"));
@@ -16625,7 +17314,8 @@ mod tests {
         assert!(prompt.contains("The user request above is primary"));
         assert!(prompt.contains("Act on the user request first"));
         assert!(prompt.contains("make a reasonable assumption from repo evidence"));
-        assert!(prompt.contains("read the current goal early"));
+        assert!(prompt.contains("read `generated/addness/goal/get.mjs`"));
+        assert!(prompt.contains("filesystem Code API"));
         assert!(prompt.contains("Before the final response after code changes"));
         assert!(prompt.contains("Do not rely on it as the only record for implemented work"));
         assert!(prompt.contains("- branch:"));
@@ -17676,31 +18366,69 @@ mod tests {
         assert!(instructions.contains("通常Codexと同じ速度で調査・実装・検証"));
         assert!(instructions.contains("Addnessはmemory.mdの代替となるプロジェクト別DB"));
         assert!(instructions.contains("Addness TUIは誰でも `addness` と打てば起動"));
-        assert!(instructions.contains("Addness CLIでgoal body/DoD/子ゴールを書き込めます"));
+        assert!(instructions.contains("filesystem Code APIでgoal body/DoD/子ゴールを書き込めます"));
         assert!(
-            instructions
-                .contains("TUI snapshotを見る → Addness CLIで現在地を読む → リポジトリを読む")
+            instructions.contains("TUI snapshotを見る → Code APIで現在地を読む → リポジトリを読む")
         );
-        assert!(instructions.contains("必ずAddness CLIで現在のゴールを読みます"));
+        assert!(instructions.contains("filesystem Code APIから現在のゴールを読みます"));
         assert!(instructions.contains("必要な状態をAddnessへ残す"));
         assert!(instructions.contains("Addnessを読んだだけで作業完了にしない"));
         assert!(
             instructions.contains("repoから合理的に判断できるなら確認質問やAddness整理を挟まず")
         );
         assert!(instructions.contains("Addness DBの置き場所"));
-        assert!(instructions.contains("CLI最小操作"));
-        assert!(instructions.contains("goal update \"$ADDNESS_GOAL_ID\" --body-file"));
-        assert!(instructions.contains("goal update \"$ADDNESS_GOAL_ID\" --description-file"));
-        assert!(instructions.contains("goal create --title \"...\" --parent \"$ADDNESS_GOAL_ID\""));
-        assert!(instructions.contains("link progress --goal \"$ADDNESS_GOAL_ID\""));
+        assert!(instructions.contains("Code Execution / filesystem Code API"));
+        assert!(instructions.contains("$ADDNESS_CODE_API_ROOT/generated/addness/"));
+        assert!(instructions.contains("`find` / `rg -l`"));
+        assert!(instructions.contains("manifest全体や全定義をcontextへ読み込まない"));
+        assert!(instructions.contains("中間データはプロセス内に保持"));
+        assert!(instructions.contains("最終結果だけ"));
+        assert!(instructions.contains("`force: true` が必須"));
+        assert!(instructions.contains("goal/create.mjs"));
+        assert!(instructions.contains("goal/update.mjs"));
+        assert!(!instructions.contains("--with-deliverable"));
+        assert!(!instructions.contains(r#""parameters""#));
         assert!(instructions.contains("body=入力情報/ブランチ/次の手"));
-        assert!(instructions.contains("goal update <CHILD_GOAL_ID> --body-file"));
         assert!(instructions.contains("実装の必須小ゴールゲート"));
         assert!(instructions.contains("リポジトリのファイルを編集する前に"));
         assert!(instructions.contains("実装を開始しないでください"));
         assert!(instructions.contains("継続ターンでは対応する作業中子ゴール"));
         assert!(instructions.contains("自動記録だけで済ませてよいのは"));
         assert!(instructions.contains("Codex/Claude Code本体のmemory/DB"));
+    }
+
+    #[test]
+    fn agent_environment_exposes_materialized_code_api_root() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.code_api_root = Some(PathBuf::from("/tmp/addness-code-api-test"));
+        let mut command = Command::new("agent-placeholder");
+
+        pane.apply_agent_env(&mut command);
+
+        let value = command
+            .get_envs()
+            .find(|(key, _)| key.to_string_lossy() == "ADDNESS_CODE_API_ROOT")
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned());
+        assert_eq!(value.as_deref(), Some("/tmp/addness-code-api-test"));
+    }
+
+    #[test]
+    fn claude_process_gets_code_api_as_an_additional_tool_directory() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.kind = AgentKind::ClaudeCode;
+        pane.code_api_root = Some(PathBuf::from("/tmp/addness-code-api-test"));
+        let mut command = Command::new("claude-placeholder");
+
+        pane.apply_code_api_filesystem_access(&mut command);
+
+        assert_eq!(
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            ["--add-dir", "/tmp/addness-code-api-test"]
+        );
     }
 
     #[test]
@@ -17945,6 +18673,7 @@ mod tests {
         assert!(text.contains("/hooks [key=value|clear]"));
         assert!(text.contains("/skills [list|name]"));
         assert!(text.contains("/exec|/e <prompt>"));
+        assert!(text.contains("/mcp [status|reconnect|...]"));
         assert!(text.contains("/sandbox-run <args>"));
         assert!(text.contains("/features|/experimental"));
         assert!(text.contains("/color [never|auto|always]"));
@@ -18269,7 +18998,7 @@ mod tests {
         assert!(
             queued
                 .submitted
-                .contains("Addness CLI で goal body/description/子ゴール")
+                .contains("filesystem Code API で goal body/description/子ゴール")
         );
         assert!(
             queued
@@ -18354,16 +19083,8 @@ mod tests {
         assert!(queued.submitted.contains("実装ワークパッケージ"));
         assert!(queued.submitted.contains("id: child-work"));
         assert!(queued.submitted.contains("/work next で実装に入れる状態"));
-        assert!(
-            queued
-                .submitted
-                .contains("\"$ADDNESS_BIN\" goal get child-work")
-        );
-        assert!(
-            queued
-                .submitted
-                .contains("goal update child-work --description-file")
-        );
+        assert!(queued.submitted.contains("`goal/get.mjs`"));
+        assert!(queued.submitted.contains("`goal/update.mjs`"));
         assert!(queued.submitted.contains("実装または検証に着手"));
     }
 

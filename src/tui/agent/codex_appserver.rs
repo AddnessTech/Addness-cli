@@ -5,7 +5,7 @@
 //! - stdin へ書き込む専用 writer スレッド + mpsc（不正 JSON でも codex は死なないが、必ず
 //!   `serde_json` でシリアライズしたものだけを書く）
 //! - JSON-RPC リクエスト/通知の生成（initialize / thread.start / turn.start / interrupt /
-//!   settings.update / 承認応答）
+//!   settings.update / MCP 再接続 / 承認応答）
 //! - stdout に来る JSON-RPC メッセージ（レスポンス / サーバ発リクエスト（承認）/ 通知）のパース
 //!
 //! TUI 側の状態更新は `agent/mod.rs`（`CodexPane`）が行う。
@@ -86,7 +86,8 @@ fn sandbox_policy(label: &str) -> Option<Value> {
 // 送信メッセージ生成（純粋関数・serde_json 経由でのみ stdin へ書く）
 // ---------------------------------------------------------------------------
 
-/// initialize リクエスト。experimentalApi を有効化し、雑多な通知を optOut で抑制する。
+/// initialize リクエスト。experimentalApi を有効化し、不要な通知だけを optOut で抑制する。
+/// MCP の起動状態は接続待ちの延長・自動再接続に必要なため購読する。
 pub(super) fn initialize_request(id: u64, name: &str, version: &str) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -98,11 +99,19 @@ pub(super) fn initialize_request(id: u64, name: &str, version: &str) -> Value {
                 "experimentalApi": true,
                 "requestAttestation": false,
                 "optOutNotificationMethods": [
-                    "mcpServer/startupStatus/updated",
                     "account/rateLimits/updated"
                 ]
             }
         }
+    })
+}
+
+/// MCP 設定を再読込し、接続を張り直す。params は現行プロトコルでは省略する。
+pub(super) fn mcp_reload_request(id: u64) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "config/mcpServer/reload"
     })
 }
 
@@ -281,6 +290,9 @@ impl ApprovalRequest {
 pub(super) enum ThreadItemKind {
     CommandExecution {
         command: String,
+        cwd: Option<String>,
+        aggregated_output: Option<String>,
+        process_id: Option<String>,
         exit_code: Option<i64>,
         duration_ms: Option<i64>,
         status: Option<String>,
@@ -331,6 +343,24 @@ pub(super) struct TokenUsageInfo {
     pub(super) model_context_window: Option<u64>,
 }
 
+/// MCP サーバー 1 件の起動状態。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct McpStartupStatus {
+    pub(super) thread_id: Option<String>,
+    pub(super) name: String,
+    /// starting / ready / failed / cancelled（未知値も前方互換のため保持）。
+    pub(super) status: String,
+    pub(super) error: Option<String>,
+    /// 現行仕様では reauthenticationRequired のみ。
+    pub(super) failure_reason: Option<String>,
+}
+
+impl McpStartupStatus {
+    pub(super) fn needs_reauthentication(&self) -> bool {
+        self.failure_reason.as_deref() == Some("reauthenticationRequired")
+    }
+}
+
 /// サーバから届く通知の意味づけ。
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum Notification {
@@ -349,6 +379,14 @@ pub(super) enum Notification {
         item_id: String,
         delta: String,
     },
+    /// item/commandExecution/terminalInteraction（PTY へ stdin が送られたことの通知）。
+    TerminalInteraction {
+        item_id: String,
+        process_id: String,
+        stdin_bytes: usize,
+    },
+    /// mcpServer/startupStatus/updated。
+    McpStartupStatus(McpStartupStatus),
     ReasoningDelta {
         text: String,
     },
@@ -547,6 +585,52 @@ fn parse_notification(method: &str, params: &Value) -> Notification {
                 .to_string();
             Notification::CommandOutputDelta { item_id, delta }
         }
+        "item/commandExecution/terminalInteraction" => {
+            let item_id = params
+                .get("itemId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let process_id = params
+                .get("processId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let stdin_bytes = params
+                .get("stdin")
+                .and_then(Value::as_str)
+                .map(str::len)
+                .unwrap_or_default();
+            Notification::TerminalInteraction {
+                item_id,
+                process_id,
+                stdin_bytes,
+            }
+        }
+        "mcpServer/startupStatus/updated" => Notification::McpStartupStatus(McpStartupStatus {
+            thread_id: params
+                .get("threadId")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            name: params
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            status: params
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            error: params
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            failure_reason: params
+                .get("failureReason")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        }),
         "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
             let text = params
                 .get("delta")
@@ -586,6 +670,15 @@ fn parse_thread_item(item: Option<&Value>) -> Option<ThreadItemInfo> {
     let kind = match item_type {
         "commandExecution" => ThreadItemKind::CommandExecution {
             command: super::command_text(item).unwrap_or_default(),
+            cwd: item.get("cwd").and_then(Value::as_str).map(str::to_string),
+            aggregated_output: item
+                .get("aggregatedOutput")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            process_id: item
+                .get("processId")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             exit_code: item.get("exitCode").and_then(Value::as_i64),
             duration_ms: item.get("durationMs").and_then(Value::as_i64),
             status: item
@@ -851,7 +944,22 @@ mod tests {
         assert_eq!(v["params"]["clientInfo"]["name"], "addness-tui");
         assert_eq!(v["params"]["clientInfo"]["version"], "0.6.0");
         assert_eq!(v["params"]["capabilities"]["experimentalApi"], true);
-        assert!(v["params"]["capabilities"]["optOutNotificationMethods"].is_array());
+        let opt_out = v["params"]["capabilities"]["optOutNotificationMethods"]
+            .as_array()
+            .expect("opt out array");
+        assert!(
+            !opt_out
+                .iter()
+                .any(|method| { method.as_str() == Some("mcpServer/startupStatus/updated") })
+        );
+    }
+
+    #[test]
+    fn mcp_reload_request_shape() {
+        let v = mcp_reload_request(2);
+        assert_eq!(v["method"], "config/mcpServer/reload");
+        assert_eq!(v["id"], 2);
+        assert!(v.get("params").is_none());
     }
 
     #[test]
@@ -1128,6 +1236,56 @@ mod tests {
     }
 
     #[test]
+    fn parse_terminal_interaction_notification_without_exposing_input() {
+        let v = json!({
+            "jsonrpc": "2.0",
+            "method": "item/commandExecution/terminalInteraction",
+            "params": {
+                "threadId": "th-1",
+                "turnId": "turn-1",
+                "itemId": "call_1",
+                "processId": "proc-1",
+                "stdin": "secret\n"
+            }
+        });
+        assert_eq!(
+            parse_message(&v),
+            Some(ServerMessage::Notification(
+                Notification::TerminalInteraction {
+                    item_id: "call_1".to_string(),
+                    process_id: "proc-1".to_string(),
+                    stdin_bytes: 7,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_mcp_startup_status_notifications() {
+        let failed = json!({
+            "jsonrpc": "2.0",
+            "method": "mcpServer/startupStatus/updated",
+            "params": {
+                "threadId": "th-1",
+                "name": "example",
+                "status": "failed",
+                "error": "token expired",
+                "failureReason": "reauthenticationRequired"
+            }
+        });
+        match parse_message(&failed) {
+            Some(ServerMessage::Notification(Notification::McpStartupStatus(status))) => {
+                assert_eq!(status.thread_id.as_deref(), Some("th-1"));
+                assert_eq!(status.name, "example");
+                assert_eq!(status.status, "failed");
+                assert_eq!(status.error.as_deref(), Some("token expired"));
+                assert!(status.needs_reauthentication());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_command_execution_item() {
         let started = json!({
             "jsonrpc": "2.0",
@@ -1171,7 +1329,7 @@ mod tests {
         let completed = json!({
             "jsonrpc": "2.0",
             "method": "item/completed",
-            "params": {"item": {"id": "call_1", "type": "commandExecution", "command": "cargo build", "exitCode": 0, "durationMs": 1200, "status": "completed"}}
+            "params": {"item": {"id": "call_1", "type": "commandExecution", "command": "cargo build", "cwd": "/repo", "aggregatedOutput": "done\n", "processId": "proc-1", "exitCode": 0, "durationMs": 1200, "status": "completed"}}
         });
         match parse_message(&completed) {
             Some(ServerMessage::Notification(Notification::ItemCompleted(item))) => match item.kind
@@ -1180,11 +1338,17 @@ mod tests {
                     exit_code,
                     duration_ms,
                     status,
+                    cwd,
+                    aggregated_output,
+                    process_id,
                     ..
                 } => {
                     assert_eq!(exit_code, Some(0));
                     assert_eq!(duration_ms, Some(1200));
                     assert_eq!(status.as_deref(), Some("completed"));
+                    assert_eq!(cwd.as_deref(), Some("/repo"));
+                    assert_eq!(aggregated_output.as_deref(), Some("done\n"));
+                    assert_eq!(process_id.as_deref(), Some("proc-1"));
                 }
                 other => panic!("unexpected {other:?}"),
             },

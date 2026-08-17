@@ -77,8 +77,9 @@
 ### 1.6 セッションファイル探索
 
 - ルート: `CLAUDE_CONFIG_DIR` または `~/.claude`（`config_dir`）
-- パス: `~/.claude/projects/<cwd スラッグ>/*.jsonl`
-  （スラッグは `/`, `.`, `_` → `-` 置換。`cwd_slug`）
+- パス: `~/.claude/projects/<project dir name>/*.jsonl`
+  （`CLAUDE_CODE_PROJECT_DIR_NAME` があればその値、なければ cwd の `/`, `.`, `_` → `-`
+  置換。`project_dir_name` / `cwd_slug`）
 - 各 jsonl から `type == "user"` 行の `message.content` と `timestamp` を読む
   （`load_session_candidates_from` / `session_candidate_from_file` / `first_user_text`）
 

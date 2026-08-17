@@ -3,7 +3,7 @@
 //! ここには純粋関数だけを置く（TUI 状態を持たない）:
 //! - `claude -p --output-format stream-json` の起動引数ビルダー
 //! - stream-json イベントの防御的パーサ（`serde_json::Value` ベース）
-//! - `~/.claude/projects/<cwd スラッグ>/*.jsonl` のセッション候補探索
+//! - `~/.claude/projects/<project dir name>/*.jsonl` のセッション候補探索
 //! - 次ターン設定 `ClaudeExecSettings`
 //!
 //! `CodexPane`（`agent/mod.rs`）側で状態を更新する。codex 経路のヒューリスティック
@@ -1085,7 +1085,7 @@ pub(super) fn context_tokens(value: &Value) -> Option<u64> {
 }
 
 // ---------------------------------------------------------------------------
-// セッション候補探索（~/.claude/projects/<cwd スラッグ>/*.jsonl）
+// セッション候補探索（~/.claude/projects/<project dir name>/*.jsonl）
 // ---------------------------------------------------------------------------
 
 /// claude 設定ディレクトリ。`CLAUDE_CONFIG_DIR` があればそれ、無ければ `~/.claude`。
@@ -1107,13 +1107,29 @@ pub(super) fn cwd_slug(cwd: &str) -> String {
         .collect()
 }
 
+/// Claude Code が transcript の保存先に使う project ディレクトリ名。
+/// `CLAUDE_CODE_PROJECT_DIR_NAME` が設定されている場合は、cwd スラッグより優先する。
+fn project_dir_name(cwd: &str) -> OsString {
+    project_dir_name_from(
+        cwd,
+        std::env::var_os("CLAUDE_CODE_PROJECT_DIR_NAME").as_deref(),
+    )
+}
+
+fn project_dir_name_from(cwd: &str, configured: Option<&OsStr>) -> OsString {
+    configured
+        .filter(|name| !name.is_empty())
+        .map(OsStr::to_os_string)
+        .unwrap_or_else(|| cwd_slug(cwd).into())
+}
+
 /// 指定 config ディレクトリ配下から、cwd に対応するセッション候補を mtime 降順で返す。
 pub(super) fn load_session_candidates_from(
     config_dir: &Path,
     cwd: &str,
     limit: usize,
 ) -> Vec<CodexSessionCandidate> {
-    let dir = config_dir.join("projects").join(cwd_slug(cwd));
+    let dir = config_dir.join("projects").join(project_dir_name(cwd));
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };
@@ -1142,7 +1158,7 @@ pub(super) fn load_session_candidates_from(
 pub(super) fn session_file_exists_in(config_dir: &Path, cwd: &str, session_id: &str) -> bool {
     config_dir
         .join("projects")
-        .join(cwd_slug(cwd))
+        .join(project_dir_name(cwd))
         .join(format!("{session_id}.jsonl"))
         .is_file()
 }
@@ -1885,6 +1901,22 @@ mod tests {
         assert_eq!(cwd_slug("/Users/x/dev/foo"), "-Users-x-dev-foo");
         assert_eq!(cwd_slug("/a/.claude-worktrees/b"), "-a--claude-worktrees-b");
         assert_eq!(cwd_slug("/a/my_dir"), "-a-my-dir");
+    }
+
+    #[test]
+    fn project_dir_name_prefers_configured_name() {
+        assert_eq!(
+            project_dir_name_from("/Users/x/dev/foo", Some(OsStr::new("foo"))),
+            OsString::from("foo")
+        );
+        assert_eq!(
+            project_dir_name_from("/Users/x/dev/foo", None),
+            OsString::from("-Users-x-dev-foo")
+        );
+        assert_eq!(
+            project_dir_name_from("/Users/x/dev/foo", Some(OsStr::new(""))),
+            OsString::from("-Users-x-dev-foo")
+        );
     }
 
     #[test]

@@ -1170,6 +1170,15 @@ pub(super) fn session_candidate_from_file(path: &Path, cwd: &str) -> Option<Code
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
+        // Claude Code の cwd スラッグは `.`, `_`, `-` を区別できないため、衝突した
+        // ディレクトリのセッションを候補に混ぜないよう永続レコードの cwd を照合する。
+        if value
+            .get("cwd")
+            .and_then(Value::as_str)
+            .is_some_and(|record_cwd| record_cwd != cwd)
+        {
+            return None;
+        }
         // queue-operation 等の非 user 行はスキップ。
         if value.get("type").and_then(Value::as_str) != Some("user") {
             continue;
@@ -1897,7 +1906,7 @@ mod tests {
         let lines = [
             json!({"type":"mode","mode":"normal"}).to_string(),
             json!({"type":"queue-operation","operation":"enqueue","content":"skip me"}).to_string(),
-            json!({"type":"user","message":{"role":"user","content":"最初の依頼です"},"timestamp":"2026-07-06T09:00:00Z"}).to_string(),
+            json!({"type":"user","cwd":cwd,"message":{"role":"user","content":"最初の依頼です"},"timestamp":"2026-07-06T09:00:00Z"}).to_string(),
         ];
         std::fs::write(&file, lines.join("\n")).unwrap();
 
@@ -1907,6 +1916,31 @@ mod tests {
         assert_eq!(candidates[0].id, "11111111-1111-1111-1111-111111111111");
         assert_eq!(candidates[0].title, "最初の依頼です");
         assert_eq!(candidates[0].cwd.as_deref(), Some(cwd));
+    }
+
+    #[test]
+    fn load_session_candidates_rejects_colliding_cwd_slug() {
+        let tmp = std::env::temp_dir().join(format!(
+            "claude-sess-cwd-collision-test-{}",
+            std::process::id()
+        ));
+        let cwd = "/Users/x/my_project";
+        let colliding_cwd = "/Users/x/my-project";
+        assert_eq!(cwd_slug(cwd), cwd_slug(colliding_cwd));
+        let dir = tmp.join("projects").join(cwd_slug(cwd));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("22222222-2222-2222-2222-222222222222.jsonl");
+        let line = json!({
+            "type": "user",
+            "cwd": colliding_cwd,
+            "message": {"role": "user", "content": "別ディレクトリの依頼"},
+            "timestamp": "2026-08-24T00:00:00Z"
+        });
+        std::fs::write(&file, line.to_string()).unwrap();
+
+        let candidates = load_session_candidates_from(&tmp, cwd, 12);
+        std::fs::remove_dir_all(&tmp).ok();
+        assert!(candidates.is_empty());
     }
 
     #[test]

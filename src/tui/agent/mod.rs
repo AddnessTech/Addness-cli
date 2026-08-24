@@ -86,6 +86,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/settings", "モデル・推論・承認・sandbox 設定を表示"),
     ("/lang", "エージェントの応答言語を設定"),
     ("/cd", "次セッションの作業ルートを変更"),
+    ("/pwd", "現在の作業ルートを表示"),
     ("/add-dir", "書込許可ディレクトリを追加"),
     ("/image", "画像を添付する"),
     ("/attachments", "添付の一覧・追加・クリア"),
@@ -98,6 +99,8 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/review", "codex review を実行"),
     ("/apply", "codex apply <task_id> を実行"),
     ("/cloud", "Codex Cloud task を操作"),
+    ("/agents", "codex agents ダッシュボードを起動"),
+    ("/queue", "既存の codex セッションへメッセージを送信"),
     ("/apps", "Desktop / app-server / remote 入口"),
     ("/import", "他ツール設定を検出 / AGENTS 化"),
     ("/hooks", "hook 設定の override を表示 / 設定"),
@@ -126,6 +129,8 @@ const CODEX_ONLY_SLASH_COMMANDS: &[&str] = &[
     "/review",
     "/apply",
     "/cloud",
+    "/agents",
+    "/queue",
     "/apps",
     "/import",
     "/hooks",
@@ -3295,6 +3300,8 @@ impl CodexPane {
                 CodexReasoningChoice::Medium,
                 CodexReasoningChoice::High,
                 CodexReasoningChoice::XHigh,
+                CodexReasoningChoice::Max,
+                CodexReasoningChoice::Ultra,
             ]
             .into_iter()
             .map(|choice| CodexListPickerItem {
@@ -3344,7 +3351,6 @@ impl CodexPane {
             let current = self.exec_settings.approval;
             let items = [
                 CodexApprovalChoice::Config,
-                CodexApprovalChoice::Untrusted,
                 CodexApprovalChoice::OnRequest,
                 CodexApprovalChoice::OnFailure,
                 CodexApprovalChoice::Never,
@@ -3703,7 +3709,7 @@ impl CodexPane {
     pub fn settings_shortcuts_label(&self) -> &'static str {
         match self.kind {
             AgentKind::Codex => {
-                "F2 model: config/gpt-5.6-sol/gpt-5.6-terra/gpt-5.6-luna/gpt-5.5/gpt-5/o3 | F3 effort: config/low/medium/high/xhigh | F4 approval: config/untrusted/on-request/on-failure/never | F5 sandbox: read-only/workspace-write/danger-full-access"
+                "F2 model: config/gpt-5.6-sol/gpt-5.6-terra/gpt-5.6-luna/gpt-5.5/gpt-5/o3 | F3 effort: config/low/medium/high/xhigh/max/ultra | F4 approval: config/on-request/on-failure/never | F5 sandbox: read-only/workspace-write/danger-full-access"
             }
             AgentKind::ClaudeCode => {
                 "F2 model: config/fable/opus/sonnet/haiku | F3 effort: config/low/medium/high/xhigh/max | F4 permission: config/plan/acceptEdits/dontAsk/bypassPermissions/skip-permissions | F5 unused"
@@ -4010,7 +4016,7 @@ impl CodexPane {
         } else {
             self.push_log(
                 CodexLogKind::Error,
-                "reasoning は config / low / medium / high / xhigh を指定してください",
+                "reasoning は config / low / medium / high / xhigh / max / ultra を指定してください",
             );
         }
     }
@@ -4035,7 +4041,7 @@ impl CodexPane {
         } else {
             self.push_log(
                 CodexLogKind::Error,
-                "approval は config / untrusted / on-request / on-failure / never を指定してください",
+                "approval は config / on-request / on-failure / never を指定してください",
             );
         }
     }
@@ -7848,6 +7854,10 @@ impl CodexPane {
                 self.handle_cwd_slash_command(args);
                 true
             }
+            "pwd" => {
+                self.push_log(CodexLogKind::System, format!("cwd: {}", self.cwd));
+                true
+            }
             "codex" => {
                 self.handle_codex_subcommand_slash_command(args);
                 true
@@ -7914,6 +7924,14 @@ impl CodexPane {
             }
             "cloud" => {
                 self.handle_named_codex_subcommand("cloud", args);
+                true
+            }
+            "agents" => {
+                self.handle_named_codex_subcommand("agents", args);
+                true
+            }
+            "queue" => {
+                self.handle_named_codex_subcommand("queue", args);
                 true
             }
             "login" => {
@@ -9393,7 +9411,7 @@ impl CodexPane {
                 } else {
                     self.push_log(
                         CodexLogKind::Error,
-                        "permissions approval は config / untrusted / on-request / on-failure / never を指定してください",
+                        "permissions approval は config / on-request / on-failure / never を指定してください",
                     );
                 }
             }
@@ -17900,14 +17918,14 @@ mod tests {
         // 引数ありは従来どおり直接指定で反映される。
         submit_line(&mut pane, "/model gpt-5.5");
         submit_line(&mut pane, "/reasoning low");
-        submit_line(&mut pane, "/approval untrusted");
+        submit_line(&mut pane, "/approval on-request");
         submit_line(&mut pane, "/sandbox danger-full-access");
         submit_line(&mut pane, "/settings");
 
         assert_eq!(pane.turn_count(), 0);
         assert_eq!(
             pane.settings_label(),
-            "model:gpt-5.5 effort:low approval:untrusted sandbox:danger-full-access config:2"
+            "model:gpt-5.5 effort:low approval:on-request sandbox:danger-full-access config:2"
         );
         assert!(
             pane.log
@@ -19284,6 +19302,19 @@ mod tests {
         assert!(SLASH_COMMANDS.iter().any(|(name, _)| *name == "/undo"));
         // /undo は codex 専用ではない（両バックエンドで使える）。
         assert!(!CODEX_ONLY_SLASH_COMMANDS.contains(&"/undo"));
+    }
+
+    #[test]
+    fn upstream_codex_commands_appear_only_for_codex() {
+        for command in ["/agents", "/queue"] {
+            assert!(SLASH_COMMANDS.iter().any(|(name, _)| *name == command));
+            assert!(CODEX_ONLY_SLASH_COMMANDS.contains(&command));
+            assert!(slash_command_visible_for_kind(command, AgentKind::Codex));
+            assert!(!slash_command_visible_for_kind(
+                command,
+                AgentKind::ClaudeCode
+            ));
+        }
     }
 
     #[test]

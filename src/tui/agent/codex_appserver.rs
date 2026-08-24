@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 pub(super) struct ThreadConfig {
     pub(super) cwd: Option<String>,
     pub(super) model: Option<String>,
-    /// approvalPolicy（untrusted / on-request / on-failure / never）。
+    /// approvalPolicy（on-request / on-failure / never）。
     pub(super) approval_policy: Option<String>,
     /// sandbox（read-only / workspace-write / danger-full-access）。
     pub(super) sandbox: Option<String>,
@@ -866,7 +866,7 @@ mod tests {
         let config = ThreadConfig {
             cwd: Some("/repo".to_string()),
             model: Some("gpt-5".to_string()),
-            approval_policy: Some("untrusted".to_string()),
+            approval_policy: Some("on-request".to_string()),
             sandbox: Some("workspace-write".to_string()),
             developer_instructions: Some("do the thing".to_string()),
         };
@@ -874,7 +874,7 @@ mod tests {
         assert_eq!(start["method"], "thread/start");
         assert_eq!(start["params"]["cwd"], "/repo");
         assert_eq!(start["params"]["model"], "gpt-5");
-        assert_eq!(start["params"]["approvalPolicy"], "untrusted");
+        assert_eq!(start["params"]["approvalPolicy"], "on-request");
         assert_eq!(start["params"]["sandbox"], "workspace-write");
         assert_eq!(start["params"]["developerInstructions"], "do the thing");
 

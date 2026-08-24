@@ -91,6 +91,8 @@ pub enum CodexReasoningChoice {
     Medium,
     High,
     XHigh,
+    Max,
+    Ultra,
 }
 
 impl CodexReasoningChoice {
@@ -100,7 +102,9 @@ impl CodexReasoningChoice {
             Self::Low => Self::Medium,
             Self::Medium => Self::High,
             Self::High => Self::XHigh,
-            Self::XHigh => Self::Config,
+            Self::XHigh => Self::Max,
+            Self::Max => Self::Ultra,
+            Self::Ultra => Self::Config,
         }
     }
 
@@ -111,6 +115,8 @@ impl CodexReasoningChoice {
             Self::Medium => "medium",
             Self::High => "high",
             Self::XHigh => "xhigh",
+            Self::Max => "max",
+            Self::Ultra => "ultra",
         }
     }
 
@@ -121,6 +127,8 @@ impl CodexReasoningChoice {
             Self::Medium => Some("medium"),
             Self::High => Some("high"),
             Self::XHigh => Some("xhigh"),
+            Self::Max => Some("max"),
+            Self::Ultra => Some("ultra"),
         }
     }
 }
@@ -132,6 +140,8 @@ pub(super) fn parse_reasoning_choice(value: &str) -> Option<CodexReasoningChoice
         "medium" | "med" => Some(CodexReasoningChoice::Medium),
         "high" => Some(CodexReasoningChoice::High),
         "xhigh" | "extra-high" | "extra_high" => Some(CodexReasoningChoice::XHigh),
+        "max" => Some(CodexReasoningChoice::Max),
+        "ultra" => Some(CodexReasoningChoice::Ultra),
         _ => None,
     }
 }
@@ -139,7 +149,6 @@ pub(super) fn parse_reasoning_choice(value: &str) -> Option<CodexReasoningChoice
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodexApprovalChoice {
     Config,
-    Untrusted,
     OnRequest,
     OnFailure,
     Never,
@@ -148,8 +157,7 @@ pub enum CodexApprovalChoice {
 impl CodexApprovalChoice {
     fn next(self) -> Self {
         match self {
-            Self::Config => Self::Untrusted,
-            Self::Untrusted => Self::OnRequest,
+            Self::Config => Self::OnRequest,
             Self::OnRequest => Self::OnFailure,
             Self::OnFailure => Self::Never,
             Self::Never => Self::Config,
@@ -159,7 +167,6 @@ impl CodexApprovalChoice {
     pub(super) fn label(self) -> &'static str {
         match self {
             Self::Config => "config",
-            Self::Untrusted => "untrusted",
             Self::OnRequest => "on-request",
             Self::OnFailure => "on-failure",
             Self::Never => "never",
@@ -169,7 +176,6 @@ impl CodexApprovalChoice {
     pub(super) fn cli_arg(self) -> Option<&'static str> {
         match self {
             Self::Config => None,
-            Self::Untrusted => Some("untrusted"),
             Self::OnRequest => Some("on-request"),
             Self::OnFailure => Some("on-failure"),
             Self::Never => Some("never"),
@@ -180,7 +186,6 @@ impl CodexApprovalChoice {
 pub(super) fn parse_approval_choice(value: &str) -> Option<CodexApprovalChoice> {
     match value.to_ascii_lowercase().as_str() {
         "config" | "default" | "clear" => Some(CodexApprovalChoice::Config),
-        "untrusted" => Some(CodexApprovalChoice::Untrusted),
         "on-request" | "onrequest" => Some(CodexApprovalChoice::OnRequest),
         "on-failure" | "onfailure" => Some(CodexApprovalChoice::OnFailure),
         "never" => Some(CodexApprovalChoice::Never),

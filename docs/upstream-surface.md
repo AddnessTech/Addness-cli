@@ -135,8 +135,8 @@ mod.rs 1009〜1158 行付近と 9381〜9649 行付近。これらが組むサブ
 | enum | 選択肢 | 対応フラグ |
 |---|---|---|
 | `CodexModelChoice` | config / gpt-5.5 / gpt-5 / o3 | `-m` |
-| `CodexReasoningChoice` | config / low / medium / high / xhigh | `-c model_reasoning_effort=` |
-| `CodexApprovalChoice` | config / untrusted / on-request / on-failure / never | `-a` |
+| `CodexReasoningChoice` | config / low / medium / high / xhigh / max / ultra | `-c model_reasoning_effort=` |
+| `CodexApprovalChoice` | config / on-request / on-failure / never | `-a` |
 | `CodexSandboxChoice` | read-only / workspace-write / danger-full-access | `-s` |
 | `CodexLocalProviderChoice` | config / lmstudio / ollama | `--local-provider` |
 | `CodexColorChoice` | never / auto / always | `--color` |

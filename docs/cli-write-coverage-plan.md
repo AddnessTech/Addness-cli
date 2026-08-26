@@ -108,7 +108,6 @@ Addness フロントエンド (`vision-todo-frontend`) からユーザーが実�
 
 ### Organization
 - create / update / delete / uploadLogo / updateContext
-- AI schedule settings (PUT)
 
 ### Member
 - update / pin / delete / uploadAvatar
@@ -168,7 +167,6 @@ Addness フロントエンド (`vision-todo-frontend`) からユーザーが実�
 
 ### その他
 - Notification settings
-- ObjectiveAISchedule upsert
 - Push token register
 - User settings update
 - Referral link

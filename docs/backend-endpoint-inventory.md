@@ -182,8 +182,6 @@
 | GET | /api/v2/organizations/:id/onboarding-billing-state | organizationV2Handler.GetOnboardingBillingState | Clerk/APIKey+Org | オンボーディング課金状態取得 |
 | POST | /api/v2/organizations/:id/onboarding-billing/require | organizationV2Handler.RequireOnboardingBilling | Clerk/APIKey+Org | 課金必須化 |
 | POST | /api/v2/organizations/:id/onboarding-billing/free | organizationV2Handler.CompleteOnboardingBillingFree | Clerk/APIKey+Org | 無料プランで完了 |
-| GET | /api/v2/organizations/:id/ai-schedule-settings | objectiveV2Handler.GetAIScheduleSetting | Clerk/APIKey+Org+Admin | AIスケジュール組織単位マスタースイッチ取得 |
-| PUT | /api/v2/organizations/:id/ai-schedule-settings | objectiveV2Handler.UpsertAIScheduleSetting | Clerk/APIKey+Org+Admin | 同上更新 |
 | GET | /api/v2/organizations/:id/ad-settings | organizationV2Handler.GetAdSetting | Clerk/APIKey+Org | アプリ内広告設定取得（組織全体） |
 | PUT | /api/v2/organizations/:id/ad-settings | organizationV2Handler.UpsertAdSetting | Clerk/APIKey+Org+Admin | アプリ内広告設定更新（組織全体） |
 | GET | /api/v2/organizations/:id/ad-settings/me | organizationV2Handler.GetMyAdSetting | Clerk/APIKey+Org | アプリ内広告設定取得（本人） |
@@ -275,8 +273,6 @@ v1（`/api/v1/team/objectives`, Clerk/APIKey+Sub）、v2（`/api/v2/objectives`,
 | POST | /api/v2/objectives/:id/parent | objectiveV2Handler.ChangeParent | 親変更（v2） |
 | POST | /api/v2/objectives/:id/insert-root | objectiveV2Handler.InsertRoot | ルート挿入 |
 | POST | /api/v2/objectives/:id/duplicate | objectiveV2Handler.Duplicate | 複製 |
-| GET | /api/v2/objectives/:id/ai-schedule | objectiveV2Handler.GetAISchedule | AIスケジュール取得（ゴール単位・Addy日次アドバイス） |
-| PUT | /api/v2/objectives/:id/ai-schedule | objectiveV2Handler.UpsertAISchedule | AIスケジュール更新 |
 | GET | /api/v2/organizations/:id/objectives/editable-picker-tree | objectiveV2Handler.GetEditablePickerTree | 親ピッカー初期ツリー取得（Clerk/APIKey+Sub、treePreWarm無し） |
 | GET | /api/v2/organizations/:id/objectives/manager-inbox | objectiveMovementV2Handler.ListManagerInbox | マネージャー受信箱一覧 |
 | GET | /api/v2/organizations/:id/objectives/:goalId/movement-summary | objectiveMovementV2Handler.GetMovementSummary | ゴール動態サマリ取得 |

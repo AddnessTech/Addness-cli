@@ -221,11 +221,6 @@ pub enum OrgCommands {
         #[command(subcommand)]
         command: OnboardingBillingCommands,
     },
-    /// Read or toggle the organization's AI schedule master switch
-    AiScheduleSettings {
-        #[command(subcommand)]
-        command: AiScheduleSettingsCommands,
-    },
     /// Read or change in-app ad settings (organization-wide or your own)
     AdSettings {
         #[command(subcommand)]
@@ -260,29 +255,6 @@ pub enum OnboardingBillingCommands {
     Free {
         /// Organization ID
         id: String,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Subcommand)]
-pub enum AiScheduleSettingsCommands {
-    /// Show the AI schedule master switch state
-    Get {
-        /// Organization ID
-        id: String,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Enable or disable the AI schedule master switch
-    Set {
-        /// Organization ID
-        id: String,
-        /// Whether the master switch is enabled (true/false)
-        #[arg(long, action = ArgAction::Set)]
-        enabled: bool,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -656,9 +628,6 @@ pub async fn handle_org(cmd: &OrgCommands, client: &ApiClient) -> Result<()> {
         OrgCommands::OnboardingBilling { command } => {
             handle_onboarding_billing(command, client).await
         }
-        OrgCommands::AiScheduleSettings { command } => {
-            handle_ai_schedule_settings(command, client).await
-        }
         OrgCommands::AdSettings { command } => handle_ad_settings(command, client).await,
         OrgCommands::Subscription { command } => handle_subscription(command, client).await,
     }
@@ -684,30 +653,6 @@ async fn handle_onboarding_billing(
         OnboardingBillingCommands::Free { id, json: _ } => {
             let data = client_for_org(client, id)
                 .complete_organization_onboarding_billing_free(id)
-                .await?;
-            print_json_value(&data)
-        }
-    }
-}
-
-async fn handle_ai_schedule_settings(
-    cmd: &AiScheduleSettingsCommands,
-    client: &ApiClient,
-) -> Result<()> {
-    match cmd {
-        AiScheduleSettingsCommands::Get { id, json: _ } => {
-            let data = client_for_org(client, id)
-                .get_organization_ai_schedule_settings(id)
-                .await?;
-            print_json_value(&data)
-        }
-        AiScheduleSettingsCommands::Set {
-            id,
-            enabled,
-            json: _,
-        } => {
-            let data = client_for_org(client, id)
-                .set_organization_ai_schedule_settings(id, *enabled)
                 .await?;
             print_json_value(&data)
         }

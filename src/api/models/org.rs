@@ -83,10 +83,9 @@ pub struct UpdateDefaultTimezoneRequest {
     pub default_timezone: String,
 }
 
-// PUT /api/v2/organizations/:id/ai-schedule-settings
 // PUT /api/v2/organizations/:id/ad-settings
-// Both bind `{"enabled": <bool>}`; the backend treats the field as required so it
-// can distinguish "omitted" from an explicit `false`.
+// The backend treats `{"enabled": <bool>}` as required so it can distinguish
+// "omitted" from an explicit `false`.
 #[derive(Debug, Serialize)]
 pub struct EnabledFlagRequest {
     pub enabled: bool,

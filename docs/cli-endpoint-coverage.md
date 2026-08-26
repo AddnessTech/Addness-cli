@@ -169,8 +169,6 @@ CLIから叩く実装対象として扱わない（DoDの分母から除外す�
 | GET | /api/v2/organizations/:id/onboarding-billing-state | `org onboarding-billing` | 実装済み |
 | POST | /api/v2/organizations/:id/onboarding-billing/require | `org onboarding-billing` | 実装済み |
 | POST | /api/v2/organizations/:id/onboarding-billing/free | `org onboarding-billing` | 実装済み |
-| GET | /api/v2/organizations/:id/ai-schedule-settings | `org ai-schedule-settings` | 実装済み |
-| PUT | /api/v2/organizations/:id/ai-schedule-settings | `org ai-schedule-settings` | 実装済み |
 | GET | /api/v2/organizations/:id/ad-settings(+`/me`) | `org ad-settings` | 実装済み（2本） |
 | PUT | /api/v2/organizations/:id/ad-settings(+`/me`) | `org ad-settings` | 実装済み（2本） |
 | GET | /api/v2/organizations/:id/admin/check | `org admin-check` | 実装済み |
@@ -255,8 +253,6 @@ CLIから叩く実装対象として扱わない（DoDの分母から除外す�
 | POST | /api/v2/objectives/:id/parent | `goal move` | 実装済み |
 | POST | /api/v2/objectives/:id/insert-root | - | 未実装 |
 | POST | /api/v2/objectives/:id/duplicate | `goal duplicate` | 実装済み |
-| GET | /api/v2/objectives/:id/ai-schedule | - | 未実装 |
-| PUT | /api/v2/objectives/:id/ai-schedule | - | 未実装 |
 | GET | /api/v2/organizations/:id/objectives/editable-picker-tree | - | 未実装 |
 | GET | /api/v2/organizations/:id/objectives/manager-inbox | - | 未実装 |
 | GET | /api/v2/organizations/:id/objectives/:goalId/movement-summary | - | 未実装 |

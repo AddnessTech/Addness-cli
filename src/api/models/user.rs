@@ -109,34 +109,3 @@ pub struct UserSettingUpdateRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub goal_decompose_enabled: Option<bool>,
 }
-
-// GET /api/v1/team/organization_members
-// Response (not paginated): { "data": [UserOrganizationMemberResource, ...] }
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OrganizationBasic {
-    pub id: String,
-    pub name: String,
-    #[serde(default)]
-    pub is_my_organization: bool,
-    #[serde(default)]
-    pub logo_url: String,
-    #[serde(default)]
-    pub plan_type: String,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UserOrganizationMember {
-    pub id: String,
-    pub organization_id: String,
-    pub organization: OrganizationBasic,
-    pub user_id: String,
-    pub name: String,
-    #[serde(default)]
-    pub avatar_url: String,
-    pub created_at: String,
-    pub updated_at: String,
-}

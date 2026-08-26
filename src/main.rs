@@ -834,8 +834,7 @@ fn user_outputs_json(command: &user::UserCommands) -> bool {
         | user::UserCommands::Get { json, .. }
         | user::UserCommands::Update { json, .. }
         | user::UserCommands::List { json, .. }
-        | user::UserCommands::Create { json, .. }
-        | user::UserCommands::Memberships { json } => *json,
+        | user::UserCommands::Create { json, .. } => *json,
         user::UserCommands::Rm { .. } => false,
         user::UserCommands::Settings { command } => match command {
             user::UserSettingsCommands::Get { json }

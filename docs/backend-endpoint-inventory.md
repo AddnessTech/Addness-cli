@@ -7,7 +7,7 @@
   - `/api/v2`（DDD新設計、本流）
   - `/api/ai/v1` `/api/ai/v2`（ALBパスマッチング段階移行用エイリアス。ハンドラは`/api/v1`・`/api/v2`と共用）
   - ルート直下（`/mcp*`, `/.well-known/*`, `/authorize`, `/register`, `/token`）
-- 総エンドポイント登録数（`r.GET/POST/PUT/PATCH/DELETE/Any(...)` 直接呼び出し + `postJSON/patchJSON/putJSON/deleteJSON/*NoContent` ヘルパー経由の登録を機械的に集計、`registerMCPRoute`のAny(3本)含む）: **651本**
+- 総エンドポイント登録数（`r.GET/POST/PUT/PATCH/DELETE/Any(...)` 直接呼び出し + `postJSON/patchJSON/putJSON/deleteJSON/*NoContent` ヘルパー経由の登録を機械的に集計、`registerMCPRoute`のAny(3本)含む）: **650本**
   - v1/v2/validate/ALBの重複カウント方法の違いにより、下記グループ別サマリの内訳合計と若干のズレがあるが、両者とも「実装上の登録個数」を指す。パスパターンの重複を除いた実質ユニークURL数は概ね450〜480程度と推定される。
 - 認証方式の凡例:
   | 表記 | 意味 |
@@ -147,7 +147,6 @@
 | PUT | /api/v1/team/users/:id | userHandler.Update | Clerk/APIKey | ユーザー更新 |
 | GET | /api/v1/team/user_settings | userHandler.GetUserSettings | Clerk/APIKey | ユーザー設定取得 |
 | PATCH | /api/v1/team/user_settings | userHandler.UpdateUserSettings | Clerk/APIKey | ユーザー設定更新 |
-| GET | /api/v1/team/organization_members | userHandler.ListOrganizationMembers | Clerk/APIKey | 組織メンバー一覧（認証ユーザー用、v1レガシー） |
 | GET | /api/v1/team/users | userHandler.List | Clerk/APIKey+Sub | ユーザー一覧（v1） |
 | GET | /api/v1/team/users/:id | userHandler.FindByID | Clerk/APIKey+Sub | ユーザー詳細（v1） |
 | POST | /api/v1/team/users | userHandler.Create | Clerk/APIKey+Sub | ユーザー作成（v1） |
@@ -773,7 +772,7 @@ v1（`/api/v1/team/objectives`, Clerk/APIKey+Sub）、v2（`/api/v2/objectives`,
 | 3 | Webhook | 9 |
 | 4 | 外部連携（Slack/Discord/GitHub/Google/LINE/Zoom/Codex Integrations） | 47 |
 | 5 | MCPプロトコル | 3 |
-| 6 | ユーザー / ユーザー設定 | 9 |
+| 6 | ユーザー / ユーザー設定 | 8 |
 | 7 | 組織 (Organization) | 26 |
 | 8 | メンバー / メンバータグ / 招待 | 39 |
 | 9 | ゴール/目標（v1+v2 CRUD・階層・共有・エイリアス・KPI・AIスケジュール・Sheets紐付け） | 60 |
@@ -795,7 +794,7 @@ v1（`/api/v1/team/objectives`, Clerk/APIKey+Sub）、v2（`/api/v2/objectives`,
 | 23 | 管理者 (Admin) | 5 |
 | 24 | ALB用エイリアスルート | 7 |
 
-**総エンドポイント数（`registerMCPRoute`のAny(3本)含む、grep実測値）: 651本**
+**総エンドポイント数（`registerMCPRoute`のAny(3本)含む、grep実測値）: 650本**
 （コード上の `r.GET/POST/PUT/PATCH/DELETE/Any(...)` 直接呼び出しと `postJSON/patchJSON/putJSON/deleteJSON/*NoContent` ヘルパー経由の登録を`presentation/routes/api.go`から機械的に集計。上記サマリの内訳合計とは、v1/v2/validate/ALBの重複カウント方法の違いにより多少のズレがあるが、両者とも「実装上の登録個数」を指しており、実質的なユニークURL数（パスパターンの重複除く）は概ね450〜480程度と推定される）
 
 ### 主要な重複パターン（設計上の意図的な二重化）

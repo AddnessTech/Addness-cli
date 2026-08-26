@@ -101,12 +101,6 @@ pub enum UserCommands {
         #[arg(long)]
         force: bool,
     },
-    /// List the organizations you belong to (one row per membership)
-    Memberships {
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
     /// Manage your user settings
     Settings {
         #[command(subcommand)]
@@ -306,24 +300,6 @@ pub async fn handle_user(cmd: &UserCommands, client: &ApiClient) -> Result<()> {
             }
             client.delete_user(id).await?;
             println!("Deleted user {id}");
-            Ok(())
-        }
-        UserCommands::Memberships { json } => {
-            let memberships = client.list_user_organization_memberships().await?;
-            if *json {
-                println!("{}", serde_json::to_string_pretty(&memberships)?);
-            } else if memberships.is_empty() {
-                println!("No organization memberships.");
-            } else {
-                for m in &memberships {
-                    let marker = if m.organization.is_my_organization {
-                        " (you)"
-                    } else {
-                        ""
-                    };
-                    println!("{} — {}{marker}", m.organization.id, m.organization.name);
-                }
-            }
             Ok(())
         }
         UserCommands::Settings { command } => handle_user_settings(command, client).await,

@@ -147,7 +147,6 @@
 | PUT | /api/v1/team/users/:id | userHandler.Update | Clerk/APIKey | ユーザー更新 |
 | GET | /api/v1/team/user_settings | userHandler.GetUserSettings | Clerk/APIKey | ユーザー設定取得 |
 | PATCH | /api/v1/team/user_settings | userHandler.UpdateUserSettings | Clerk/APIKey | ユーザー設定更新 |
-| GET | /api/v1/team/organization_members | userHandler.ListOrganizationMembers | Clerk/APIKey | 組織メンバー一覧（認証ユーザー用、v1レガシー） |
 | GET | /api/v1/team/users | userHandler.List | Clerk/APIKey+Sub | ユーザー一覧（v1） |
 | GET | /api/v1/team/users/:id | userHandler.FindByID | Clerk/APIKey+Sub | ユーザー詳細（v1） |
 | POST | /api/v1/team/users | userHandler.Create | Clerk/APIKey+Sub | ユーザー作成（v1） |

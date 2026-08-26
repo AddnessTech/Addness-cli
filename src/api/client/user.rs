@@ -1,6 +1,6 @@
 use crate::api::{
-    ApiClient, ApiResponse, User, UserCreateRequest, UserListResponse, UserOrganizationMember,
-    UserSetting, UserSettingUpdateRequest, UserUpdateRequest,
+    ApiClient, ApiResponse, User, UserCreateRequest, UserListResponse, UserSetting,
+    UserSettingUpdateRequest, UserUpdateRequest,
 };
 use anyhow::Result;
 
@@ -34,12 +34,6 @@ impl ApiClient {
         req: &UserSettingUpdateRequest,
     ) -> Result<UserSetting> {
         let resp: ApiResponse<UserSetting> = self.patch("/api/v1/team/user_settings", req).await?;
-        Ok(resp.data)
-    }
-
-    pub async fn list_user_organization_memberships(&self) -> Result<Vec<UserOrganizationMember>> {
-        let resp: ApiResponse<Vec<UserOrganizationMember>> =
-            self.get("/api/v1/team/organization_members").await?;
         Ok(resp.data)
     }
 

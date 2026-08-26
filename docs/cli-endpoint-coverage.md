@@ -132,13 +132,12 @@ CLIから叩く実装対象として扱わない（DoDの分母から除外す�
 | PUT | /api/v1/team/users/:id | `user update` | 実装済み |
 | GET | /api/v1/team/user_settings | `user settings get` | 実装済み |
 | PATCH | /api/v1/team/user_settings | `user settings update` | 実装済み |
-| GET | /api/v1/team/organization_members | `user memberships` | 実装済み |
 | GET | /api/v1/team/users | `user list` | 実装済み |
 | GET | /api/v1/team/users/:id | `user get` | 実装済み |
 | POST | /api/v1/team/users | `user create` | 実装済み |
 | DELETE | /api/v1/team/users/:id | `user rm` | 実装済み |
 
-`addness user` 系コマンドとして全9本実装済み（#140）。`user get` はサーバー仕様上self-onlyアクセス。
+`addness user` 系コマンドとして全8本実装済み。`user get` はサーバー仕様上self-onlyアクセス。
 
 ## 7. 組織 (Organization)
 

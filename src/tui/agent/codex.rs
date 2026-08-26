@@ -553,6 +553,7 @@ pub(super) fn codex_named_subcommand_args(name: &str, raw_args: &str) -> Result<
             Ok(args)
         }
         "mcp" => codex_command_with_default("mcp", "list", parsed),
+        "agents" => codex_command_with_args("agents", parsed),
         "plugin" => codex_command_with_default("plugin", "list", parsed),
         "cloud" => codex_command_with_default("cloud", "list", parsed),
         "debug" => codex_command_with_default("debug", "models", parsed),
@@ -733,7 +734,7 @@ fn codex_global_option_takes_value(arg: &str) -> bool {
 
 pub(super) fn codex_command_category(args: &[String]) -> &'static str {
     match codex_command_name(args) {
-        Some("exec") => "agent",
+        Some("exec" | "agents") => "agent",
         Some("review") | Some("apply") | Some("sandbox") => "workspace",
         Some("resume" | "fork" | "archive" | "delete" | "unarchive") => "session",
         Some("login" | "logout") => "auth",
@@ -1971,6 +1972,10 @@ mod tests {
             vec!["mcp", "list"]
         );
         assert_eq!(
+            codex_named_subcommand_args("agents", "").unwrap(),
+            vec!["agents"]
+        );
+        assert_eq!(
             codex_named_subcommand_args("plugin", "").unwrap(),
             vec!["plugin", "list"]
         );
@@ -2024,6 +2029,7 @@ mod tests {
     #[test]
     fn codex_command_category_labels_management_commands() {
         assert_eq!(codex_command_category(&["login".to_string()]), "auth");
+        assert_eq!(codex_command_category(&["agents".to_string()]), "agent");
         assert_eq!(codex_command_category(&["cloud".to_string()]), "cloud");
         assert_eq!(
             codex_command_category(&["app-server".to_string()]),

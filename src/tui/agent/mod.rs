@@ -95,6 +95,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/search", "web search を切替"),
     ("/config", "codex config override を追加"),
     ("/mcp", "MCP の一覧・管理"),
+    ("/agents", "Codex agent セッションを一覧"),
     ("/review", "codex review を実行"),
     ("/apply", "codex apply <task_id> を実行"),
     ("/cloud", "Codex Cloud task を操作"),
@@ -134,6 +135,7 @@ const CODEX_ONLY_SLASH_COMMANDS: &[&str] = &[
     "/logout",
     "/profile",
     "/mcp",
+    "/agents",
     "/theme",
     "/vim",
     "/personality",
@@ -7904,6 +7906,10 @@ impl CodexPane {
                 self.handle_named_codex_subcommand("mcp", args);
                 true
             }
+            "agents" => {
+                self.handle_named_codex_subcommand("agents", args);
+                true
+            }
             "apps" => {
                 self.handle_apps_slash_command(args);
                 true
@@ -10982,7 +10988,7 @@ Codex CLI commands:
   /exec-review <args> - run Codex review in direct mode
   /apply|/a <task_id> - codex apply
   /import [status|run], /hooks [key=value|clear], /skills [list|name]
-  /doctor, /features|/experimental, /mcp, /apps, /plugin, /cloud, /login, /logout
+  /doctor, /features|/experimental, /mcp, /agents, /apps, /plugin, /cloud, /login, /logout
   /update|/update-codex, /app, /app-server, /remote-control, /debug, /completion
   /mcp-server, /exec-server, /sandbox-run <args>
 Codex sessions:

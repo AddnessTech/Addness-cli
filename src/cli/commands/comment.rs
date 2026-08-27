@@ -366,6 +366,15 @@ pub async fn handle_comments(cmd: &CommentCommands, client: &ApiClient) -> Resul
             let users = client.get_comment_reaction_users(id, emoji).await?;
             if *json {
                 println!("{}", serde_json::to_string_pretty(&users)?);
+            } else if let Some(member_ids) = users.get("member_ids").and_then(|ids| ids.as_array())
+            {
+                if member_ids.is_empty() {
+                    println!("No reactions with {emoji} on comment {id}.");
+                } else {
+                    for member_id in member_ids.iter().filter_map(|value| value.as_str()) {
+                        println!("{member_id}");
+                    }
+                }
             } else {
                 match users.as_array() {
                     Some(members) if !members.is_empty() => {
@@ -397,7 +406,7 @@ pub async fn handle_comments(cmd: &CommentCommands, client: &ApiClient) -> Resul
             if *json {
                 println!("{}", serde_json::to_string_pretty(&comment)?);
             } else {
-                println!("Comment created: {}", comment.id);
+                println!("Comment created: {}", comment.id());
             }
             Ok(())
         }
@@ -413,7 +422,7 @@ pub async fn handle_comments(cmd: &CommentCommands, client: &ApiClient) -> Resul
             if *json {
                 println!("{}", serde_json::to_string_pretty(&comment)?);
             } else {
-                println!("Comment updated: {}", comment.id);
+                println!("Comment updated: {}", comment.id());
             }
             Ok(())
         }

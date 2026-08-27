@@ -5,7 +5,7 @@
 
 対応付けの根拠は、`/tmp/vtb-main`（vision-todo-backend読み取り専用worktree、Go/Gin、`presentation/routes/api.go`）のハンドラ実装と、本リポジトリ`src/api/client/*.rs` / `src/cli/commands/*.rs` の実装内容を実際に突き合わせて判定した。
 
-> **最終更新: 2026-08-27** — 廃止済みの v1 組織所属一覧 API に対応する `user memberships` コマンドを削除した。所属組織一覧は v2 の `org list` を利用する。
+> **最終更新: 2026-08-28** — deprecated comment mutation を Goal Issue v2-first に移行し、v2 root/reply delete を追加した。残存 v1 の全件判定は [`v1-api-migration-audit.md`](./v1-api-migration-audit.md) を参照。
 
 ---
 
@@ -321,23 +321,23 @@ list / create / delete / service-account-info / create-for-service-account / tri
 | GET | /api/v1/team/comments（グローバル一覧） | `comment list-all` | 実装済み |
 | GET | /api/v1/team/comments/:id/context | `comment context` | 実装済み |
 | GET | /api/v1/team/comments/:id | `comment get` | 実装済み |
-| POST | /api/v1/team/comments | `comment create` | 実装済み |
-| PUT | /api/v1/team/comments/:id | `comment update` | 実装済み |
-| DELETE | /api/v1/team/comments/:id | `comment delete` | 実装済み |
+| POST | /api/v1/team/comments | `comment create` compatibility fallback | v2-first（4,000文字超等のみv1） |
+| PUT | /api/v1/team/comments/:id | `comment update` compatibility fallback | v2-first（mention変更等のみv1） |
+| DELETE | /api/v1/team/comments/:id | `comment delete` compatibility fallback | v2-first（Goal Issue外のみv1） |
 | DELETE | /api/v1/team/comments/:id/attachments/:attachmentId | `comment attachment rm` | 実装済み |
-| PATCH | /api/v1/team/comments/:id/resolve | `comment resolve` | 実装済み |
-| PATCH | /api/v1/team/comments/:id/unresolve | `comment unresolve` | 実装済み |
-| POST | /api/v1/team/comments/:id/reactions | `comment react` | 実装済み |
-| GET | /api/v1/team/comments/:id/reactions/:emoji/users | `comment reactions` | 実装済み |
+| PATCH | /api/v1/team/comments/:id/resolve | `comment resolve` compatibility fallback | v2-first（Goal Issue root外のみv1） |
+| PATCH | /api/v1/team/comments/:id/unresolve | `comment unresolve` compatibility fallback | v2-first（Goal Issue root外のみv1） |
+| POST | /api/v1/team/comments/:id/reactions | `comment react` compatibility fallback | v2-first（Goal Issue外のみv1） |
+| GET | /api/v1/team/comments/:id/reactions/:emoji/users | `comment reactions` compatibility fallback | v2-first（Goal Issue外のみv1） |
 | GET | /api/v2/objectives/:id/comments | `comment list` | 実装済み |
 
 ### 11-2. Goal Issue（v2チャット型、後継の本流）
 
 | 対象 | 本数 | 状態 |
 |---|---|---|
-| issues一覧/作成/編集/既読化、issueメッセージCRUD＋リアクション、全issue一覧/検索/プレビュー/解決状態設定、goal-sections（一覧/ピン留め/未読数） | 20本 | **実装済み**（`issue list/list-all/create/update/read/messages/reply/edit-message/react/unreact/reactions/search/preview/resolve/unresolve` + `issue sections list/pinned/unread-count/unread-mentions/pin/unpin`） |
+| issues一覧/CRUD/既読化、issueメッセージCRUD＋リアクション、全issue一覧/検索/プレビュー/解決状態設定、goal-sections（一覧/ピン留め/未読数） | 21 endpoint / 23コマンド | **実装済み**（`issue list/list-all/create/update/delete/read/messages/reply/edit-message/delete-message/react/unreact/reactions/search/preview/resolve/unresolve` + `issue sections list/pinned/unread-count/unread-mentions/pin/unpin`） |
 
-comment系（chat-v1）はDEPRECATEDだが、後継の本流であるgoal-issue/goal-sectionsを `addness issue` としてCLIに実装済み（#150）。旧comment系依存のリスクは解消された。
+comment mutation は Goal Issue v2 を優先し、v2 で表現できない legacy-only 契約だけ v1 に fallback する。global list / get / context / attachment delete は同等 v2 がないため残る。詳細は `docs/v1-api-migration-audit.md` を参照。
 
 ### 11-3. 組織チャット (Org Chat)
 

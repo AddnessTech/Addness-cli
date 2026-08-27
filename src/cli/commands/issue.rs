@@ -108,6 +108,17 @@ pub enum IssueCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Delete an issue and all of its replies
+    Delete {
+        /// Issue ID (root message ID)
+        id: String,
+        /// Goal ID
+        #[arg(long)]
+        goal: String,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
+    },
     /// Mark an issue as read
     Read {
         /// Issue ID (root message ID)
@@ -175,6 +186,20 @@ pub enum IssueCommands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+    },
+    /// Delete a reply message from an issue thread
+    DeleteMessage {
+        /// Message ID
+        id: String,
+        /// Goal ID
+        #[arg(long)]
+        goal: String,
+        /// Issue ID (root message ID)
+        #[arg(long)]
+        issue: String,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
     },
     /// Add an emoji reaction to an issue message
     React {
@@ -560,6 +585,19 @@ pub async fn handle_issue(cmd: &IssueCommands, client: &ApiClient) -> Result<()>
             }
             Ok(())
         }
+        IssueCommands::Delete { id, goal, force } => {
+            if !*force
+                && !crate::cli::commands::confirm(&format!(
+                    "Delete issue {id} and all of its replies?"
+                ))?
+            {
+                println!("Cancelled.");
+                return Ok(());
+            }
+            client.delete_issue(goal, id).await?;
+            println!("Issue {id} deleted");
+            Ok(())
+        }
         IssueCommands::Read { id, goal } => {
             client.mark_issue_read(goal, id).await?;
             println!("Issue {id} marked as read");
@@ -643,6 +681,24 @@ pub async fn handle_issue(cmd: &IssueCommands, client: &ApiClient) -> Result<()>
             } else {
                 println!("Message updated: {}", message.id);
             }
+            Ok(())
+        }
+        IssueCommands::DeleteMessage {
+            id,
+            goal,
+            issue,
+            force,
+        } => {
+            if !*force
+                && !crate::cli::commands::confirm(&format!(
+                    "Delete message {id} from issue {issue}?"
+                ))?
+            {
+                println!("Cancelled.");
+                return Ok(());
+            }
+            client.delete_issue_message(goal, issue, id).await?;
+            println!("Message {id} deleted");
             Ok(())
         }
         IssueCommands::React {

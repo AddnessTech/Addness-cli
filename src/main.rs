@@ -714,7 +714,10 @@ fn issue_outputs_json(command: &issue::IssueCommands) -> bool {
         | issue::IssueCommands::Preview { json, .. }
         | issue::IssueCommands::Resolve { json, .. }
         | issue::IssueCommands::Unresolve { json, .. } => *json,
-        issue::IssueCommands::Read { .. } | issue::IssueCommands::Unreact { .. } => false,
+        issue::IssueCommands::Read { .. }
+        | issue::IssueCommands::Delete { .. }
+        | issue::IssueCommands::DeleteMessage { .. }
+        | issue::IssueCommands::Unreact { .. } => false,
         issue::IssueCommands::Sections { command } => match command {
             issue::SectionCommands::List { json, .. }
             | issue::SectionCommands::Pinned { json, .. }

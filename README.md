@@ -145,7 +145,7 @@ addness link --help
 - `comment` — ゴールコメントの作成・一覧・リアクション・解決管理・グローバルフィード。
   例: `addness comment list-all --json`
 - `issue` — Goal Issue（ゴール上の v2 チャットスレッド）とゴールセクションの管理。
-  例: `addness issue list --goal <goal-id>`
+  例: `addness issue list --goal <goal-id>`、`addness issue delete <issue-id> --goal <goal-id>`
 - `chat` — 組織チャット（DM/グループのルーム・メッセージ・招待・横断検索）。
   例: `addness chat room list`
 - `notification` — 通知の一覧・未読数・既読/未読管理・購読チャネル（Slack/Email/LINE/Discord）設定・作業通知送信。

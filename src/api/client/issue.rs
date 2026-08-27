@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -17,6 +17,18 @@ pub struct IssueListParams<'a> {
     pub limit: Option<u16>,
     pub before: Option<&'a str>,
     pub before_id: Option<&'a str>,
+}
+
+/// Objective/root/message coordinates resolved from the v2 quote-preview
+/// endpoint. The preview API is the only v2 lookup that accepts a message ID
+/// without requiring callers to already know its objective and issue IDs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct IssueMessageScope {
+    pub objective_id: String,
+    pub issue_id: String,
+    pub message_id: String,
+    pub is_root: bool,
+    pub mentioned_member_ids: Vec<String>,
 }
 
 /// Query parameters for GET /api/v2/goal-sections.
@@ -122,6 +134,75 @@ fn goal_section_query_suffix(params: &GoalSectionListParams<'_>) -> String {
     }
 }
 
+fn issue_message_scope_from_preview(
+    message_id: &str,
+    preview: &Value,
+) -> Result<Option<IssueMessageScope>> {
+    let messages = preview
+        .get("messages")
+        .and_then(Value::as_array)
+        .context("v2 message preview response is missing messages")?;
+    let Some(message) = messages.iter().find(|message| {
+        message
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id.eq_ignore_ascii_case(message_id))
+    }) else {
+        bail!("v2 message preview response did not include {message_id}");
+    };
+
+    match message.get("available").and_then(Value::as_bool) {
+        Some(false) => return Ok(None),
+        Some(true) => {}
+        None => bail!("v2 message preview is missing available"),
+    }
+
+    let canonical_message_id = message
+        .get("id")
+        .and_then(Value::as_str)
+        .context("v2 message preview is missing id")?;
+    let objective_id = message
+        .get("objective_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .context("v2 message preview is missing objective_id")?
+        .to_string();
+    let issue_id = message
+        .get("root_message_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .context("v2 message preview is missing root_message_id")?
+        .to_string();
+    let parent_message_id = message.get("parent_message_id").and_then(Value::as_str);
+    let is_root = parent_message_id.is_none();
+    if is_root && !issue_id.eq_ignore_ascii_case(canonical_message_id) {
+        bail!("v2 message preview returned an inconsistent issue scope for {message_id}");
+    }
+    if parent_message_id.is_some_and(|parent| !parent.eq_ignore_ascii_case(&issue_id)) {
+        // Legacy comments could be nested more than one reply deep. Goal Issue
+        // v2 only represents root + one reply level, so let the compatibility
+        // client use its V1-only fallback for this shape.
+        return Ok(None);
+    }
+
+    let mentioned_member_ids = message
+        .get("mentions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|mention| mention.get("org_member_id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect();
+
+    Ok(Some(IssueMessageScope {
+        objective_id,
+        issue_id,
+        message_id: canonical_message_id.to_string(),
+        is_root,
+        mentioned_member_ids,
+    }))
+}
+
 impl ApiClient {
     /// GET /api/v2/objectives/:id/issues
     pub async fn list_objective_issues(
@@ -173,6 +254,12 @@ impl ApiClient {
         };
         let resp: ApiResponse<MessageEnvelope> = self.patch(&path, &body).await?;
         Ok(resp.data.message)
+    }
+
+    /// DELETE /api/v2/objectives/:id/issues/:issueId (204)
+    pub async fn delete_issue(&self, goal_id: &str, issue_id: &str) -> Result<()> {
+        let path = format!("/api/v2/objectives/{goal_id}/issues/{issue_id}");
+        self.delete_no_body(&path).await
     }
 
     /// PUT /api/v2/objectives/:id/issues/:issueId/read (204)
@@ -227,6 +314,17 @@ impl ApiClient {
         };
         let resp: ApiResponse<MessageEnvelope> = self.patch(&path, &body).await?;
         Ok(resp.data.message)
+    }
+
+    /// DELETE /api/v2/objectives/:id/issues/:issueId/messages/:messageId (204)
+    pub async fn delete_issue_message(
+        &self,
+        goal_id: &str,
+        issue_id: &str,
+        message_id: &str,
+    ) -> Result<()> {
+        let path = format!("/api/v2/objectives/{goal_id}/issues/{issue_id}/messages/{message_id}");
+        self.delete_no_body(&path).await
     }
 
     /// POST /api/v2/objectives/:id/issues/:issueId/messages/:messageId/reactions
@@ -315,6 +413,20 @@ impl ApiClient {
         Ok(resp.data)
     }
 
+    /// Resolve an objective comment/message into the coordinates required by
+    /// the v2 issue mutation routes. `None` means the ID is not available via
+    /// goal-issue v2 (for example a template-node comment); callers may then
+    /// use a documented legacy-only fallback.
+    pub(super) async fn find_issue_message_scope(
+        &self,
+        message_id: &str,
+    ) -> Result<Option<IssueMessageScope>> {
+        let preview = self
+            .preview_issue_messages(vec![message_id.to_string()])
+            .await?;
+        issue_message_scope_from_preview(message_id, &preview)
+    }
+
     /// PATCH /api/v2/goal-issues/:issueId/resolution
     pub async fn set_issue_resolution(
         &self,
@@ -371,8 +483,9 @@ impl ApiClient {
 mod tests {
     use super::{
         GoalSectionListParams, IssueListParams, encode_path_segment, goal_section_query_suffix,
-        issue_list_query_suffix,
+        issue_list_query_suffix, issue_message_scope_from_preview,
     };
+    use serde_json::json;
 
     #[test]
     fn encode_path_segment_passes_unreserved_chars() {
@@ -431,5 +544,90 @@ mod tests {
              &section_before=2026-07-15T00%3A00%3A00Z&section_before_id=obj-1\
              &unread_as_of=2026-07-15T00%3A00%3A00Z"
         );
+    }
+
+    #[test]
+    fn issue_message_scope_parses_root_and_reply_previews() {
+        let root = issue_message_scope_from_preview(
+            "root-1",
+            &json!({
+                "messages": [{
+                    "id": "root-1",
+                    "available": true,
+                    "objective_id": "goal-1",
+                    "root_message_id": "root-1",
+                    "mentions": [{"org_member_id": "member-1"}]
+                }]
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(root.is_root);
+        assert_eq!(root.issue_id, "root-1");
+        assert_eq!(root.mentioned_member_ids, ["member-1"]);
+
+        let reply = issue_message_scope_from_preview(
+            "reply-1",
+            &json!({
+                "messages": [{
+                    "id": "reply-1",
+                    "available": true,
+                    "objective_id": "goal-1",
+                    "root_message_id": "root-1",
+                    "parent_message_id": "root-1",
+                    "mentions": []
+                }]
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!reply.is_root);
+        assert_eq!(reply.issue_id, "root-1");
+        assert_eq!(reply.message_id, "reply-1");
+    }
+
+    #[test]
+    fn issue_message_scope_returns_none_for_unavailable_preview() {
+        let scope = issue_message_scope_from_preview(
+            "missing-1",
+            &json!({"messages": [{"id": "missing-1", "available": false}]}),
+        )
+        .unwrap();
+        assert!(scope.is_none());
+    }
+
+    #[test]
+    fn issue_message_scope_rejects_inconsistent_root() {
+        let error = issue_message_scope_from_preview(
+            "root-1",
+            &json!({
+                "messages": [{
+                    "id": "root-1",
+                    "available": true,
+                    "objective_id": "goal-1",
+                    "root_message_id": "another-root"
+                }]
+            }),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("inconsistent issue scope"));
+    }
+
+    #[test]
+    fn issue_message_scope_treats_nested_legacy_reply_as_unavailable() {
+        let scope = issue_message_scope_from_preview(
+            "nested-reply",
+            &json!({
+                "messages": [{
+                    "id": "nested-reply",
+                    "available": true,
+                    "objective_id": "goal-1",
+                    "root_message_id": "root-1",
+                    "parent_message_id": "reply-1"
+                }]
+            }),
+        )
+        .unwrap();
+        assert!(scope.is_none());
     }
 }

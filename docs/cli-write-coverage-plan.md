@@ -53,12 +53,12 @@ Addness フロントエンド (`vision-todo-frontend`) からユーザーが実�
 ### Comment
 | 操作 | エンドポイント | CLI |
 |---|---|---|
-| create | POST /v1/comments | ✅ |
-| update | PUT /v1/comments/:id | ✅ |
-| delete | DELETE /v1/comments/:id | ✅ |
-| resolve | PATCH /v1/comments/:id/resolve | ✅ |
-| unresolve | PATCH /v1/comments/:id/unresolve | ✅ |
-| addReaction | POST /v1/comments/:id/reactions | ✅ |
+| create | POST /v2/objectives/:id/issues（legacy-only時はv1 fallback） | ✅ |
+| update | PATCH /v2/objectives/:id/issues/...（mention変更等はv1 fallback） | ✅ |
+| delete | DELETE /v2/objectives/:id/issues/...（Goal Issue外はv1 fallback） | ✅ |
+| resolve | PATCH /v2/goal-issues/:id/resolution | ✅ |
+| unresolve | PATCH /v2/goal-issues/:id/resolution | ✅ |
+| addReaction | POST /v2/objectives/:id/issues/:issueId/messages/:id/reactions | ✅ |
 | deleteAttachment | DELETE /v1/comments/:id/attachments/:attachmentId | ✅ |
 
 ### Deliverable (Outcome)
@@ -231,11 +231,11 @@ Addness フロントエンド (`vision-todo-frontend`) からユーザーが実�
 
 | サブコマンド | 引数 | API |
 |---|---|---|
-| `comment update <ID>` | `--body` または `--body-file` | PUT /v1/comments/:id |
-| `comment delete <ID>` | [`--force`] | DELETE /v1/comments/:id |
-| `comment resolve <ID>` | `<ID>` | PATCH /v1/comments/:id/resolve |
-| `comment unresolve <ID>` | `<ID>` | PATCH /v1/comments/:id/unresolve |
-| `comment react <ID> --emoji <e>` | `<ID> --emoji` | POST /v1/comments/:id/reactions |
+| `comment update <ID>` | `--body` または `--body-file` | PATCH /v2/objectives/:id/issues/...（legacy-only時はv1） |
+| `comment delete <ID>` | [`--force`] | DELETE /v2/objectives/:id/issues/...（Goal Issue外はv1） |
+| `comment resolve <ID>` | `<ID>` | PATCH /v2/goal-issues/:id/resolution |
+| `comment unresolve <ID>` | `<ID>` | PATCH /v2/goal-issues/:id/resolution |
+| `comment react <ID> --emoji <e>` | `<ID> --emoji` | POST /v2/objectives/:id/issues/:issueId/messages/:id/reactions |
 | `comment attachment rm <CID> <AID>` | `<CID> <AID>` | DELETE .../:id/attachments/:attachmentId |
 
 **実装メモ**:

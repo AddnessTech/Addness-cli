@@ -31,6 +31,7 @@
 | `--effort <level>` | effort 指定（下記 1.3） | `exec_args` |
 | `--permission-mode <mode>` | 権限モード指定（下記 1.4） | `exec_args` |
 | `--dangerously-skip-permissions` | 全許可（sticky / one-shot 昇格） | `exec_args` |
+| `--restricted` | コマンド実行を無効化し、ファイル操作を作業ディレクトリ内に制限 | `exec_args` |
 | `--add-dir <dir>` | 書込許可ディレクトリ追加（複数可） | `exec_args` |
 | `--append-system-prompt <text>` | Addness 手順を毎ターン注入 | `exec_args` |
 
@@ -50,9 +51,10 @@
 
 ### 1.4 permission-mode 選択肢（F4 / `/permissions`）— `ClaudePermissionMode`
 
-`config` / `plan` / `acceptEdits` / `dontAsk` / `bypassPermissions`。
+`config` / `plan` / `acceptEdits` / `dontAsk` / `bypassPermissions` / `restricted`。
 `--permission-mode` の選択肢追加（例: 上流 2.1.200 の `manual` 追加のようなケース）や
 名称変更は関係あり（`parse_permission_mode` も更新）。
+`restricted` は `--permission-mode` の値ではなく独立した `--restricted` 起動フラグとして扱う。
 関連: `PermissionEscalation` / `escalation_for_denials`（Edit/Write/MultiEdit/NotebookEdit
 のみの拒否なら `acceptEdits`、それ以外を含めば `--dangerously-skip-permissions` へ昇格）。
 

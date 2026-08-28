@@ -3325,6 +3325,7 @@ impl CodexPane {
                 claude::ClaudePermissionMode::AcceptEdits,
                 claude::ClaudePermissionMode::DontAsk,
                 claude::ClaudePermissionMode::BypassPermissions,
+                claude::ClaudePermissionMode::Restricted,
                 claude::ClaudePermissionMode::DangerouslySkipPermissions,
             ]
             .into_iter()
@@ -3332,6 +3333,8 @@ impl CodexPane {
                 label: choice.label().to_string(),
                 detail: if choice.is_dangerously_skip() {
                     "全権限チェックをバイパス（危険）".to_string()
+                } else if choice == claude::ClaudePermissionMode::Restricted {
+                    "コマンド実行を無効化し、ファイル操作を作業ディレクトリ内に制限".to_string()
                 } else {
                     config_choice_detail(choice == claude::ClaudePermissionMode::Config)
                 },
@@ -3706,7 +3709,7 @@ impl CodexPane {
                 "F2 model: config/gpt-5.6-sol/gpt-5.6-terra/gpt-5.6-luna/gpt-5.5/gpt-5/o3 | F3 effort: config/low/medium/high/xhigh | F4 approval: config/untrusted/on-request/on-failure/never | F5 sandbox: read-only/workspace-write/danger-full-access"
             }
             AgentKind::ClaudeCode => {
-                "F2 model: config/fable/opus/sonnet/haiku | F3 effort: config/low/medium/high/xhigh/max | F4 permission: config/plan/acceptEdits/dontAsk/bypassPermissions/skip-permissions | F5 unused"
+                "F2 model: config/fable/opus/sonnet/haiku | F3 effort: config/low/medium/high/xhigh/max | F4 permission: config/plan/acceptEdits/dontAsk/bypassPermissions/restricted/skip-permissions | F5 unused"
             }
         }
     }
@@ -3964,7 +3967,7 @@ impl CodexPane {
         if self.kind == AgentKind::ClaudeCode {
             self.push_log(
                 CodexLogKind::System,
-                "Claude Code では権限は F4（permission-mode: config/plan/acceptEdits/dontAsk/bypassPermissions/skip-permissions）で切り替えます。F5 のサンドボックス設定は使いません",
+                "Claude Code では権限は F4（permission-mode: config/plan/acceptEdits/dontAsk/bypassPermissions/restricted/skip-permissions）で切り替えます。F5 のサンドボックス設定は使いません",
             );
             return;
         }
@@ -4027,7 +4030,7 @@ impl CodexPane {
             } else {
                 self.push_log(
                     CodexLogKind::Error,
-                    "permission-mode は config / plan / acceptEdits / dontAsk / bypassPermissions / skip-permissions を指定してください",
+                    "permission-mode は config / plan / acceptEdits / dontAsk / bypassPermissions / restricted / skip-permissions を指定してください",
                 );
             }
         } else if let Some(choice) = parse_approval_choice(args) {
@@ -5934,19 +5937,18 @@ impl CodexPane {
 
     /// F4（permission-mode）を常駐プロセスへ set_permission_mode control_request で反映する。
     ///
-    /// `--dangerously-skip-permissions` は起動時フラグでランタイム切替できないため、この variant
-    /// へ/から切り替えた場合は control_request を送らず `claude_resident_restart_pending` を立てて
-    /// 次のアイドルで常駐プロセスを再起動させる（`previous` は切替前のモード）。
+    /// `--restricted` / `--dangerously-skip-permissions` は起動時フラグでランタイム切替できない。
+    /// これらへ/から切り替えた場合は control_request を送らず、次のアイドルで再起動する。
     fn push_claude_resident_permission_mode(&mut self, previous: claude::ClaudePermissionMode) {
         if self.claude_resident.is_none() {
             return;
         }
         let current = self.claude_settings.permission_mode_choice();
-        if current.is_dangerously_skip() || previous.is_dangerously_skip() {
+        if current.is_startup_only() || previous.is_startup_only() {
             self.claude_resident_restart_pending = true;
             self.push_log(
                 CodexLogKind::System,
-                "skip-permissions は起動時フラグのため、常駐プロセスを次のアイドルで再起動して反映します",
+                "restricted / skip-permissions は起動時フラグのため、常駐プロセスを次のアイドルで再起動して反映します",
             );
             return;
         }
@@ -9376,7 +9378,7 @@ impl CodexPane {
             } else {
                 self.push_log(
                     CodexLogKind::Error,
-                    "permissions は config / plan / acceptEdits / dontAsk / bypassPermissions / skip-permissions を指定してください",
+                    "permissions は config / plan / acceptEdits / dontAsk / bypassPermissions / restricted / skip-permissions を指定してください",
                 );
             }
             return;
@@ -10948,7 +10950,7 @@ Claude Code sessions:
 Claude Code options for next turn:
   /settings, /cd <dir>, /model [name|config], /reasoning|/effort [level]
   /lang|/language [auto|ja|en|off] - エージェントの応答言語（既定 auto は LANG/LC_ALL から判定）
-  /permissions|/approval [mode] - permission-mode: config/plan/acceptEdits/dontAsk/bypassPermissions/skip-permissions
+  /permissions|/approval [mode] - permission-mode: config/plan/acceptEdits/dontAsk/bypassPermissions/restricted/skip-permissions
   /bypass [on|off|status] - dangerously-skip-permissions を ON/OFF（危険: 全権限チェックをスキップ）
   /add-dir <path|list|clear>
 TUI helpers:
@@ -19527,6 +19529,7 @@ mod tests {
                 "acceptEdits",
                 "dontAsk",
                 "bypassPermissions",
+                "restricted（作業ディレクトリ内のみ）",
                 "skip-permissions（危険・全許可）"
             ]
         );

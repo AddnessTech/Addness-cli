@@ -134,10 +134,8 @@ pub(super) fn parse_effort_choice(value: &str) -> Option<ClaudeEffortChoice> {
 
 /// F4 で巡回する permission-mode。`config` は `--permission-mode` を付けない。
 ///
-/// `DangerouslySkipPermissions` だけは `--permission-mode` の値ではなく、独立した起動フラグ
-/// `--dangerously-skip-permissions`（全権限チェックをバイパス）を使う。起動時フラグなので
-/// 常駐プロセスのランタイム切替（`set_permission_mode` control_request）はできず、この variant
-/// へ/から切り替える場合は常駐プロセスの再起動で反映する（`mod.rs` 側で処理）。
+/// `Restricted` と `DangerouslySkipPermissions` は `--permission-mode` の値ではなく、独立した
+/// 起動フラグを使う。常駐プロセスでは、これらの variant へ/からの切替を再起動で反映する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ClaudePermissionMode {
     Config,
@@ -145,6 +143,7 @@ pub(super) enum ClaudePermissionMode {
     AcceptEdits,
     DontAsk,
     BypassPermissions,
+    Restricted,
     DangerouslySkipPermissions,
 }
 
@@ -155,7 +154,8 @@ impl ClaudePermissionMode {
             Self::Plan => Self::AcceptEdits,
             Self::AcceptEdits => Self::DontAsk,
             Self::DontAsk => Self::BypassPermissions,
-            Self::BypassPermissions => Self::DangerouslySkipPermissions,
+            Self::BypassPermissions => Self::Restricted,
+            Self::Restricted => Self::DangerouslySkipPermissions,
             Self::DangerouslySkipPermissions => Self::Config,
         }
     }
@@ -167,6 +167,7 @@ impl ClaudePermissionMode {
             Self::AcceptEdits => "acceptEdits",
             Self::DontAsk => "dontAsk",
             Self::BypassPermissions => "bypassPermissions",
+            Self::Restricted => "restricted（作業ディレクトリ内のみ）",
             Self::DangerouslySkipPermissions => "skip-permissions（危険・全許可）",
         }
     }
@@ -181,13 +182,18 @@ impl ClaudePermissionMode {
             Self::AcceptEdits => Some("acceptEdits"),
             Self::DontAsk => Some("dontAsk"),
             Self::BypassPermissions => Some("bypassPermissions"),
-            Self::DangerouslySkipPermissions => None,
+            Self::Restricted | Self::DangerouslySkipPermissions => None,
         }
     }
 
     /// 独立起動フラグ `--dangerously-skip-permissions` を使う variant か。
     pub(super) fn is_dangerously_skip(self) -> bool {
         matches!(self, Self::DangerouslySkipPermissions)
+    }
+
+    /// 独立した起動フラグを使い、常駐中の control request では変更できない variant か。
+    pub(super) fn is_startup_only(self) -> bool {
+        matches!(self, Self::Restricted | Self::DangerouslySkipPermissions)
     }
 }
 
@@ -199,6 +205,9 @@ pub(super) fn parse_permission_mode(value: &str) -> Option<ClaudePermissionMode>
         "dontask" | "dont-ask" | "auto" => Some(ClaudePermissionMode::DontAsk),
         "bypasspermissions" | "bypass" | "bypass-permissions" => {
             Some(ClaudePermissionMode::BypassPermissions)
+        }
+        "restricted" | "restricted（作業ディレクトリ内のみ）" => {
+            Some(ClaudePermissionMode::Restricted)
         }
         // ラベル（ピッカーの value）自身も受け付け、選択→parse の往復を成立させる。
         "skip"
@@ -274,9 +283,9 @@ impl ClaudeExecSettings {
             .or_else(|| self.model.cli_arg())
     }
 
-    /// `--permission-mode` に相当する現在の実効値。`config`（既定）と `skip-permissions` は None。
+    /// `--permission-mode` に相当する現在の実効値。独立起動フラグを使う値は None。
     /// 常駐モードの `set_permission_mode` control_request 送信可否の判定に使う（None なら再起動）。
-    /// `skip-permissions` は起動時フラグでランタイム切替不可のため None を返す。
+    /// `restricted` / `skip-permissions` は起動時フラグでランタイム切替不可のため None を返す。
     pub(super) fn effective_permission_mode_arg(&self) -> Option<&str> {
         self.permission_mode.cli_arg()
     }
@@ -492,14 +501,19 @@ fn push_resume_args(args: &mut Vec<OsString>, session_id: Option<&str>, fork: bo
     }
 }
 
-/// permission-mode を args へ追加する。`skip-permissions` は `--permission-mode` の値ではなく
-/// 独立起動フラグ `--dangerously-skip-permissions` を出力する。`config` は何も付けない。
+/// permission-mode または独立起動フラグを args へ追加する。`config` は何も付けない。
 fn push_permission_mode_args(args: &mut Vec<OsString>, mode: ClaudePermissionMode) {
-    if mode.is_dangerously_skip() {
-        args.push(OsString::from("--dangerously-skip-permissions"));
-    } else if let Some(mode) = mode.cli_arg() {
-        args.push(OsString::from("--permission-mode"));
-        args.push(OsString::from(mode));
+    match mode {
+        ClaudePermissionMode::Restricted => args.push(OsString::from("--restricted")),
+        ClaudePermissionMode::DangerouslySkipPermissions => {
+            args.push(OsString::from("--dangerously-skip-permissions"));
+        }
+        _ => {
+            if let Some(mode) = mode.cli_arg() {
+                args.push(OsString::from("--permission-mode"));
+                args.push(OsString::from(mode));
+            }
+        }
     }
 }
 
@@ -1420,9 +1434,32 @@ mod tests {
         assert_eq!(s.cycle_permission_mode(), "bypassPermissions");
         assert_eq!(
             s.cycle_permission_mode(),
+            "restricted（作業ディレクトリ内のみ）"
+        );
+        assert_eq!(
+            s.cycle_permission_mode(),
             "skip-permissions（危険・全許可）"
         );
         assert_eq!(s.cycle_permission_mode(), "config");
+    }
+
+    #[test]
+    fn restricted_uses_dedicated_flag() {
+        let mut settings = ClaudeExecSettings::default();
+        settings.set_permission_mode(ClaudePermissionMode::Restricted);
+        for args in [
+            exec_args(None, &settings, &[], false, "x"),
+            resident_args(None, &settings, false, "x"),
+        ] {
+            let args = os(&args);
+            assert!(args.iter().any(|a| a == "--restricted"));
+            assert!(!args.iter().any(|a| a == "--permission-mode"));
+            assert!(!args.iter().any(|a| a == "--dangerously-skip-permissions"));
+        }
+        assert_eq!(
+            parse_permission_mode("restricted"),
+            Some(ClaudePermissionMode::Restricted)
+        );
     }
 
     #[test]
@@ -1953,6 +1990,7 @@ mod tests {
             "--include-partial-messages",     // トークン単位ストリーミング
             "--verbose",                      // stream-json 全イベント出力
             "--permission-mode",              // 権限モード
+            "--restricted",                   // 作業ディレクトリ内へ制限（起動時フラグ）
             "--dangerously-skip-permissions", // 全権限スキップ（起動時フラグ）
             "--resume",                       // セッション継続
             "--fork-session",                 // resume 時のセッション複製

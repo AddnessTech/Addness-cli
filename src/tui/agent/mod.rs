@@ -9888,6 +9888,13 @@ impl CodexPane {
                 );
                 return;
             }
+            if claude::is_unsupported_add_dir(dir) {
+                self.push_log(
+                    CodexLogKind::Error,
+                    "Claude Code v2.1.257 以降ではネットワークパスを --add-dir に指定できません",
+                );
+                return;
+            }
             self.claude_settings.add_dir(dir.to_string());
             self.set_status_note(format!("add-dir: {dir}"));
             self.push_log(
@@ -18957,6 +18964,20 @@ mod tests {
         assert!(label.contains("color:auto"));
         assert!(label.contains("output-schema"));
         assert!(label.contains("output-last-message"));
+    }
+
+    #[test]
+    fn claude_add_dir_rejects_network_paths() {
+        let mut pane = CodexPane::test_with_output(8, 80, 0, "");
+        pane.kind = AgentKind::ClaudeCode;
+        pane.finished = false;
+
+        submit_line(&mut pane, "/add-dir /net/server/share");
+
+        assert!(pane.claude_settings.additional_dirs().is_empty());
+        assert!(pane.log.iter().any(|line| {
+            line.kind == CodexLogKind::Error && line.text.contains("ネットワークパス")
+        }));
     }
 
     #[test]

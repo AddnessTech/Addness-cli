@@ -74,6 +74,21 @@ pub(super) fn parse_model_choice(value: &str) -> Option<ClaudeModelChoice> {
     }
 }
 
+/// Claude Code v2.1.257 以降の `--add-dir` が拒否するネットワークパスかを判定する。
+/// Windows のマップ済みドライブ（`Z:\\...`）は上流同様に許可する。
+pub(super) fn is_unsupported_add_dir(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    if normalized.starts_with("//") {
+        return true;
+    }
+
+    let mut components = normalized.split('/').filter(|part| !part.is_empty());
+    matches!(
+        (components.next(), components.next()),
+        (Some("net"), Some(_))
+    ) && normalized.starts_with('/')
+}
+
 /// F3 で巡回する effort レベル。`--effort` に渡す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ClaudeEffortChoice {
@@ -1388,6 +1403,16 @@ mod tests {
         settings.add_dir("/b".to_string());
         let args = os(&exec_args(None, &settings, &[], false, "x"));
         assert_eq!(args.iter().filter(|a| *a == "--add-dir").count(), 2);
+    }
+
+    #[test]
+    fn unsupported_add_dir_detects_network_paths() {
+        assert!(is_unsupported_add_dir(r"\\server\share"));
+        assert!(is_unsupported_add_dir("//server/share"));
+        assert!(is_unsupported_add_dir("/net/server/share"));
+        assert!(!is_unsupported_add_dir("/net"));
+        assert!(!is_unsupported_add_dir("/workspace/net/server"));
+        assert!(!is_unsupported_add_dir(r"Z:\workspace"));
     }
 
     #[test]

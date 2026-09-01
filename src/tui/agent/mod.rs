@@ -5058,6 +5058,16 @@ impl CodexPane {
                 self.push_turn_complete_notice("Codex 失敗", message);
                 self.drop_restored_thread_on_failure();
             }
+            "auth_recovery_started" | "auth_recovery_completed" => {
+                let message = first_text_field(&value)
+                    .unwrap_or_else(|| "Codex の認証情報を更新しています".to_string());
+                let message = if event_type == "auth_recovery_completed" {
+                    format!("✓ {message}")
+                } else {
+                    message
+                };
+                self.push_log(CodexLogKind::System, message);
+            }
             "error" => {
                 let message = nested_error_message(&value)
                     .or_else(|| first_text_field(&value))
@@ -6370,6 +6380,14 @@ impl CodexPane {
                 self.record_codex_appserver_output(&item_id, &delta);
             }
             N::TokenUsage(usage) => self.record_codex_appserver_token_usage(usage),
+            N::AuthRecovery { message, completed } => {
+                let message = if completed {
+                    format!("✓ {message}")
+                } else {
+                    message
+                };
+                self.push_log(CodexLogKind::System, message);
+            }
             N::Error { message } => {
                 self.push_log(CodexLogKind::Error, message.clone());
                 self.push_terminal_notice("Codex エラー", message);

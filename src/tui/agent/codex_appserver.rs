@@ -353,6 +353,11 @@ pub(super) enum Notification {
         text: String,
     },
     TokenUsage(TokenUsageInfo),
+    /// modelProvider/authRecoveryStarted・Completed（資格情報の自動更新状況）。
+    AuthRecovery {
+        message: String,
+        completed: bool,
+    },
     Error {
         message: String,
     },
@@ -565,6 +570,17 @@ fn parse_notification(method: &str, params: &Value) -> Notification {
         },
         "thread/tokenUsage/updated" => {
             Notification::TokenUsage(parse_token_usage(params.get("tokenUsage")))
+        }
+        "modelProvider/authRecoveryStarted" | "modelProvider/authRecoveryCompleted" => {
+            let message = params
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("認証情報を更新しています")
+                .to_string();
+            Notification::AuthRecovery {
+                message,
+                completed: method.ends_with("Completed"),
+            }
         }
         "error" => {
             let message = params
@@ -1245,6 +1261,31 @@ mod tests {
                 assert_eq!(usage.model_context_window, Some(258400));
             }
             other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_auth_recovery_notifications() {
+        for (method, completed) in [
+            ("modelProvider/authRecoveryStarted", false),
+            ("modelProvider/authRecoveryCompleted", true),
+        ] {
+            let value = json!({
+                "method": method,
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "provider": "Amazon Bedrock",
+                    "message": "認証情報を更新しています"
+                }
+            });
+            assert_eq!(
+                parse_message(&value),
+                Some(ServerMessage::Notification(Notification::AuthRecovery {
+                    message: "認証情報を更新しています".to_string(),
+                    completed,
+                }))
+            );
         }
     }
 

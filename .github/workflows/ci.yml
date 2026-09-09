@@ -34,3 +34,18 @@ jobs:
 
       - name: test
         run: cargo test
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install verified agent CLI versions
+        run: >-
+          npm install --prefix "$RUNNER_TEMP/addness-upstream" --no-audit --no-fund
+          @openai/codex@0.153.4 @anthropic-ai/claude-code@2.1.266
+
+      - name: Agent protocol compatibility
+        env:
+          ADDNESS_PROBE_CODEX_BIN: ${{ runner.temp }}/addness-upstream/node_modules/.bin/codex
+          ADDNESS_PROBE_CLAUDE_BIN: ${{ runner.temp }}/addness-upstream/node_modules/.bin/claude
+        run: cargo test --locked upstream_probe_ -- --ignored

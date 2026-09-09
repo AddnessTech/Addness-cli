@@ -101,6 +101,14 @@ sync ジョブの最後（state 更新の後）に、Codex が作成した追随
 - `upstream_probe_claude_cli_flags` — `claude --help` に、`resident_args` / `exec_args`
   が渡すフラグが存在するか
 
+追加プローブ（v0.11.0）:
+
+- `upstream_probe_codex_current_model_catalog` — 実 `model/list` で Astra と max/ultra を確認。
+- `upstream_probe_codex_paginated_history_and_rename` — legacy/paginated 履歴の保存、
+  opaque cursor によるページング、rename、再接続後の取得を検証。モデル通信は localhost fixture のみ。
+- `upstream_probe_claude_resident_control_handshake` — `resident_args` が生成した実コマンドで
+  stream-json の initialize/control_response を往復する。モデルは呼び出さない。
+
 **失敗時の扱い**: プローブが FAIL してもワークフローは落とさない。実行コマンド・終了
 コード・出力（末尾 200 行）を `/tmp/probe-report.md` に書き出し、後続の
 codex exec へ判定材料として渡す。Codex 側では「FAIL は破壊的変更の強い証拠だが、

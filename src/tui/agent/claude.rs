@@ -143,6 +143,8 @@ pub(super) enum ClaudePermissionMode {
     Config,
     Plan,
     AcceptEdits,
+    Auto,
+    Manual,
     DontAsk,
     BypassPermissions,
     DangerouslySkipPermissions,
@@ -153,7 +155,9 @@ impl ClaudePermissionMode {
         match self {
             Self::Config => Self::Plan,
             Self::Plan => Self::AcceptEdits,
-            Self::AcceptEdits => Self::DontAsk,
+            Self::AcceptEdits => Self::Auto,
+            Self::Auto => Self::Manual,
+            Self::Manual => Self::DontAsk,
             Self::DontAsk => Self::BypassPermissions,
             Self::BypassPermissions => Self::DangerouslySkipPermissions,
             Self::DangerouslySkipPermissions => Self::Config,
@@ -165,6 +169,8 @@ impl ClaudePermissionMode {
             Self::Config => "config",
             Self::Plan => "plan",
             Self::AcceptEdits => "acceptEdits",
+            Self::Auto => "auto",
+            Self::Manual => "manual",
             Self::DontAsk => "dontAsk",
             Self::BypassPermissions => "bypassPermissions",
             Self::DangerouslySkipPermissions => "skip-permissions（危険・全許可）",
@@ -179,6 +185,8 @@ impl ClaudePermissionMode {
             Self::Config => None,
             Self::Plan => Some("plan"),
             Self::AcceptEdits => Some("acceptEdits"),
+            Self::Auto => Some("auto"),
+            Self::Manual => Some("manual"),
             Self::DontAsk => Some("dontAsk"),
             Self::BypassPermissions => Some("bypassPermissions"),
             Self::DangerouslySkipPermissions => None,
@@ -196,7 +204,9 @@ pub(super) fn parse_permission_mode(value: &str) -> Option<ClaudePermissionMode>
         "config" | "default" | "clear" => Some(ClaudePermissionMode::Config),
         "plan" => Some(ClaudePermissionMode::Plan),
         "acceptedits" | "accept-edits" | "accept" => Some(ClaudePermissionMode::AcceptEdits),
-        "dontask" | "dont-ask" | "auto" => Some(ClaudePermissionMode::DontAsk),
+        "auto" => Some(ClaudePermissionMode::Auto),
+        "manual" => Some(ClaudePermissionMode::Manual),
+        "dontask" | "dont-ask" => Some(ClaudePermissionMode::DontAsk),
         "bypasspermissions" | "bypass" | "bypass-permissions" => {
             Some(ClaudePermissionMode::BypassPermissions)
         }
@@ -364,6 +374,10 @@ impl ClaudeExecSettings {
     }
 
     /// 次ターンに渡す `--add-dir` の一覧（`/attachments` の list 表示用）。
+    pub(super) fn clear_additional_dirs(&mut self) {
+        self.additional_dirs.clear();
+    }
+
     pub(super) fn additional_dirs(&self) -> &[String] {
         &self.additional_dirs
     }
@@ -1412,10 +1426,41 @@ mod tests {
     }
 
     #[test]
+    fn auto_and_manual_permissions_are_distinct_from_dont_ask_in_both_transports() {
+        for (name, expected) in [
+            ("auto", ClaudePermissionMode::Auto),
+            ("manual", ClaudePermissionMode::Manual),
+            ("dontAsk", ClaudePermissionMode::DontAsk),
+        ] {
+            assert_eq!(parse_permission_mode(name), Some(expected));
+            let mut settings = ClaudeExecSettings::default();
+            settings.set_permission_mode(expected);
+            assert_eq!(settings.effective_permission_mode_arg(), Some(name));
+            for args in [
+                exec_args(None, &settings, &[], false, ""),
+                resident_args(None, &settings, false, ""),
+            ] {
+                let args = os(&args);
+                assert!(
+                    args.windows(2)
+                        .any(|pair| pair == ["--permission-mode", name])
+                );
+                assert!(
+                    !args
+                        .iter()
+                        .any(|arg| arg == "--dangerously-skip-permissions")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn permission_cycle_wraps() {
         let mut s = ClaudeExecSettings::default();
         assert_eq!(s.cycle_permission_mode(), "plan");
         assert_eq!(s.cycle_permission_mode(), "acceptEdits");
+        assert_eq!(s.cycle_permission_mode(), "auto");
+        assert_eq!(s.cycle_permission_mode(), "manual");
         assert_eq!(s.cycle_permission_mode(), "dontAsk");
         assert_eq!(s.cycle_permission_mode(), "bypassPermissions");
         assert_eq!(
@@ -1971,5 +2016,74 @@ mod tests {
             missing.is_empty(),
             "claude --help に存在しないフラグ: {missing:?}（bin={bin}）"
         );
+    }
+    #[test]
+    #[ignore = "実 claude が必要。initialize のみ、モデル呼び出しなし"]
+    fn upstream_probe_claude_resident_control_handshake() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::process::{Child, Command, Stdio};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        struct ProbeGuard {
+            child: Child,
+            root: PathBuf,
+        }
+        impl Drop for ProbeGuard {
+            fn drop(&mut self) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                let _ = std::fs::remove_dir_all(&self.root);
+            }
+        }
+        let root =
+            std::env::temp_dir().join(format!("addness-claude-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let bin =
+            std::env::var("ADDNESS_PROBE_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
+        let child = Command::new(bin)
+            .args(resident_args(
+                None,
+                &ClaudeExecSettings::default(),
+                false,
+                "Compatibility probe",
+            ))
+            .args(["--setting-sources", "", "--strict-mcp-config"])
+            .env("CLAUDE_CONFIG_DIR", &root)
+            .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+            .env_remove("CLAUDECODE")
+            .current_dir(&root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut guard = ProbeGuard { child, root };
+        let stdout = guard.child.stdout.take().unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let stdin = guard.child.stdin.as_mut().unwrap();
+        writeln!(stdin, "{}", serde_json::json!({"type":"control_request","request_id":"probe-init","request":{"subtype":"initialize"}})).unwrap();
+        stdin.flush().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let line = rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("Claude resident initialize timed out");
+            let value = serde_json::from_str(&line).unwrap();
+            if let Some(super::super::claude_resident::ResidentControl::Response(response)) =
+                super::super::claude_resident::parse_control(&value)
+                && response.request_id == "probe-init"
+            {
+                assert!(response.success, "{:?}", response.error);
+                break;
+            }
+        }
     }
 }

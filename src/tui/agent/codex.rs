@@ -21,6 +21,7 @@ use super::{CodexSessionCandidate, config_override_value, split_codex_command_ar
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodexModelChoice {
     Config,
+    Gpt6Astra,
     Gpt56Sol,
     Gpt56Terra,
     Gpt56Luna,
@@ -32,7 +33,8 @@ pub enum CodexModelChoice {
 impl CodexModelChoice {
     fn next(self) -> Self {
         match self {
-            Self::Config => Self::Gpt56Sol,
+            Self::Config => Self::Gpt6Astra,
+            Self::Gpt6Astra => Self::Gpt56Sol,
             Self::Gpt56Sol => Self::Gpt56Terra,
             Self::Gpt56Terra => Self::Gpt56Luna,
             Self::Gpt56Luna => Self::Gpt55,
@@ -45,6 +47,7 @@ impl CodexModelChoice {
     pub(super) fn label(self) -> &'static str {
         match self {
             Self::Config => "config",
+            Self::Gpt6Astra => "gpt-6-astra",
             Self::Gpt56Sol => "gpt-5.6-sol",
             Self::Gpt56Terra => "gpt-5.6-terra",
             Self::Gpt56Luna => "gpt-5.6-luna",
@@ -57,6 +60,7 @@ impl CodexModelChoice {
     fn cli_arg(self) -> Option<&'static str> {
         match self {
             Self::Config => None,
+            Self::Gpt6Astra => Some("gpt-6-astra"),
             Self::Gpt56Sol => Some("gpt-5.6-sol"),
             Self::Gpt56Terra => Some("gpt-5.6-terra"),
             Self::Gpt56Luna => Some("gpt-5.6-luna"),
@@ -70,6 +74,7 @@ impl CodexModelChoice {
 pub(super) fn parse_builtin_model_choice(value: &str) -> Option<CodexModelChoice> {
     match value.to_ascii_lowercase().as_str() {
         "config" | "default" | "clear" => Some(CodexModelChoice::Config),
+        "gpt-6-astra" | "gpt6-astra" | "astra" => Some(CodexModelChoice::Gpt6Astra),
         "gpt-5.6" | "gpt5.6" | "gpt56" | "gpt-5.6-sol" | "gpt5.6-sol" | "gpt56-sol" | "sol" => {
             Some(CodexModelChoice::Gpt56Sol)
         }
@@ -91,6 +96,8 @@ pub enum CodexReasoningChoice {
     Medium,
     High,
     XHigh,
+    Max,
+    Ultra,
 }
 
 impl CodexReasoningChoice {
@@ -100,7 +107,9 @@ impl CodexReasoningChoice {
             Self::Low => Self::Medium,
             Self::Medium => Self::High,
             Self::High => Self::XHigh,
-            Self::XHigh => Self::Config,
+            Self::XHigh => Self::Max,
+            Self::Max => Self::Ultra,
+            Self::Ultra => Self::Config,
         }
     }
 
@@ -111,6 +120,8 @@ impl CodexReasoningChoice {
             Self::Medium => "medium",
             Self::High => "high",
             Self::XHigh => "xhigh",
+            Self::Max => "max",
+            Self::Ultra => "ultra",
         }
     }
 
@@ -121,6 +132,8 @@ impl CodexReasoningChoice {
             Self::Medium => Some("medium"),
             Self::High => Some("high"),
             Self::XHigh => Some("xhigh"),
+            Self::Max => Some("max"),
+            Self::Ultra => Some("ultra"),
         }
     }
 }
@@ -132,6 +145,8 @@ pub(super) fn parse_reasoning_choice(value: &str) -> Option<CodexReasoningChoice
         "medium" | "med" => Some(CodexReasoningChoice::Medium),
         "high" => Some(CodexReasoningChoice::High),
         "xhigh" | "extra-high" | "extra_high" => Some(CodexReasoningChoice::XHigh),
+        "max" => Some(CodexReasoningChoice::Max),
+        "ultra" => Some(CodexReasoningChoice::Ultra),
         _ => None,
     }
 }
@@ -752,11 +767,19 @@ pub(super) fn codex_home_dir() -> Option<PathBuf> {
         .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
 }
 
-pub(super) fn load_codex_session_candidates(limit: usize) -> Result<Vec<CodexSessionCandidate>> {
-    let Some(home) = codex_home_dir() else {
-        return Ok(Vec::new());
-    };
-    load_codex_session_candidates_from(&home, limit)
+pub(super) fn load_codex_session_candidates(
+    bin: &Path,
+    cwd: &str,
+    limit: usize,
+) -> Result<Vec<CodexSessionCandidate>> {
+    let home = codex_home_dir();
+    match super::codex_history::load_sessions(bin, cwd, home.as_deref(), limit) {
+        Ok(sessions) => Ok(sessions),
+        Err(error) => match home {
+            Some(home) => load_codex_session_candidates_from(&home, limit),
+            None => Err(error),
+        },
+    }
 }
 
 pub(super) fn codex_skill_roots(cwd: &str) -> Vec<PathBuf> {
@@ -789,11 +812,13 @@ pub(super) fn load_codex_session_candidates_from(
     Ok(values)
 }
 
-pub(super) fn append_codex_session_rename(session_id: &str, title: &str) -> Result<()> {
-    let Some(home) = codex_home_dir() else {
-        anyhow::bail!("Codex home を解決できません");
-    };
-    append_codex_session_rename_to(&home, session_id, title)
+pub(super) fn append_codex_session_rename(
+    bin: &Path,
+    cwd: &str,
+    session_id: &str,
+    title: &str,
+) -> Result<()> {
+    super::codex_history::rename_session(bin, cwd, session_id, title)
 }
 
 pub(super) fn append_codex_session_rename_to(

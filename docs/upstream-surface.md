@@ -50,7 +50,8 @@
 
 ### 1.4 permission-mode 選択肢（F4 / `/permissions`）— `ClaudePermissionMode`
 
-`config` / `plan` / `acceptEdits` / `dontAsk` / `bypassPermissions`。
+`config` / `plan` / `acceptEdits` / `auto` / `manual` / `dontAsk` / `bypassPermissions` / `skip-permissions`。
+`auto` は上流の分類器モード、`dontAsk` は未許可操作を拒否する別モードとして扱う。
 `--permission-mode` の選択肢追加（例: 上流 2.1.200 の `manual` 追加のようなケース）や
 名称変更は関係あり（`parse_permission_mode` も更新）。
 関連: `PermissionEscalation` / `escalation_for_denials`（Edit/Write/MultiEdit/NotebookEdit
@@ -134,8 +135,8 @@ mod.rs 1009〜1158 行付近と 9381〜9649 行付近。これらが組むサブ
 
 | enum | 選択肢 | 対応フラグ |
 |---|---|---|
-| `CodexModelChoice` | config / gpt-5.5 / gpt-5 / o3 | `-m` |
-| `CodexReasoningChoice` | config / low / medium / high / xhigh | `-c model_reasoning_effort=` |
+| `CodexModelChoice` | config / gpt-6-astra / gpt-5.6-sol / gpt-5.6-terra / gpt-5.6-luna / gpt-5.5 / gpt-5 / o3 | `-m` |
+| `CodexReasoningChoice` | config / low / medium / high / xhigh / max / ultra | `-c model_reasoning_effort=` |
 | `CodexApprovalChoice` | config / untrusted / on-request / on-failure / never | `-a` |
 | `CodexSandboxChoice` | read-only / workspace-write / danger-full-access | `-s` |
 | `CodexLocalProviderChoice` | config / lmstudio / ollama | `--local-provider` |
@@ -155,9 +156,12 @@ mod.rs 1009〜1158 行付近と 9381〜9649 行付近。これらが組むサブ
 ### 2.4 セッション・skill 探索
 
 - ルート: `CODEX_HOME` または `~/.codex`（`codex_home_dir`、mod.rs 1254 行付近）
-- セッション: `~/.codex/sessions/` 配下のメタファイル + セッション index
-  （`load_codex_session_candidates_from` / `read_codex_session_index` /
-  `read_codex_session_meta_files`、1301〜1414 行付近）
+- セッション: `codex_history.rs` から app-server `thread/list` を使用。`updated_at` 降順、
+  全 provider / source（`exec` / `appServer` / subagent を含む）、非 archive。
+  `nextCursor` は opaque のまま渡し、要求件数または末尾までページングする。
+  app-server が利用できない旧環境では `~/.codex/sessions/` と `session_index.jsonl` にフォールバック。
+  `/rename` は `thread/name/set` を使い、上流の保存形式に従う。
+  一覧取得・rename はバックグラウンドで実行し、TUI の入力を止めない。
 - skill: `<cwd>/.codex/skills`, `<cwd>/.agents/skills`, `~/.codex/skills`
   （`codex_skill_roots`）
 
@@ -182,6 +186,8 @@ JSON-RPC 2.0 / stdio）を常駐プロセスとして起動し 1 プロセスで
   `developerInstructions`）
 - `turn/start`（`input`: text / localImage、`effort`）/ `turn/interrupt`
 - `thread/settings/update`（`model` / `effort` / `approvalPolicy` / `sandboxPolicy`）
+- `thread/list` / `thread/name/set`（履歴一覧・名前。`codex_history.rs`）
+- `thread/start` / `thread/resume` の `config.sandbox_workspace_write.writable_roots`（追加ディレクトリ）
 
 **サーバ発リクエスト（承認）**: `item/commandExecution/requestApproval` /
 `item/fileChange/requestApproval` / `item/permissions/requestApproval`
@@ -231,3 +237,17 @@ fileChange / mcpToolCall）/ `thread/tokenUsage/updated` / `error`。
 「本リポジトリがそのフラグ/イベント/パスを実際に使っているか」を `git grep` で確認する。
 使っていなければ関係なし。使っており挙動が変わるなら関係あり。確信が持てない・影響が
 大きい場合は PR ではなく Issue（label: `upstream-sync`）で人間に委ねる。
+
+
+## 4. 終了時の出力順序と実バイナリ検証
+
+`process_output.rs` はプロセスごとに独立した出力チャネルを持つ。stdout/stderr の
+reader は最後の行の後に EOF を通知する。`try_wait` だけでは完了せず、両 reader の
+出力を処理してから終了・次ターンを確定する。中断や再起動で古いチャネルを破棄する。
+
+追加の ignored probe は `upstream_probe_` の名前で既存の上流同期 CI からも実行される。
+Codex の `model/list`、legacy/paginated 履歴の作成・ページング・rename・再接続、
+Claude の双方向 stream-json initialize を検証する。モデル通信が必要な履歴 fixture は
+ローカル HTTP サーバーに限定し、API キーや実モデルの利用料を必要としない。
+
+最新の監査結果と対象バージョンは [2026-09-09 互換性監査](compatibility-2026-09-09.md) を参照。

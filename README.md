@@ -145,7 +145,7 @@ addness link --help
 - `comment` — ゴールコメントの作成・一覧・リアクション・解決管理・グローバルフィード。
   例: `addness comment list-all --json`
 - `issue` — Goal Issue（ゴール上の v2 チャットスレッド）とゴールセクションの管理。
-  例: `addness issue list --goal <goal-id>`
+  例: `addness issue list --goal <goal-id>`、`addness issue delete <issue-id> --goal <goal-id>`
 - `chat` — 組織チャット（DM/グループのルーム・メッセージ・招待・横断検索）。
   例: `addness chat room list`
 - `notification` — 通知の一覧・未読数・既読/未読管理・購読チャネル（Slack/Email/LINE/Discord）設定・作業通知送信。
@@ -199,6 +199,20 @@ addness
 ```
 
 主な操作はアプリ内で `?` を押すとヘルプが表示されます。
+
+### Codex / Claude Code の対応状況
+
+v0.11.0 は Codex CLI **0.153.4**、Claude Code **2.1.266** で検証しています。
+
+- Codex の `/model` / F2 から `gpt-6-astra`、`/reasoning` / F3 から `max` / `ultra` を選択できます。
+  推論強度の対応範囲は使用モデルに従います。既定の `config` は上流設定を使用します。
+- Claude の `/permissions auto` と `/permissions manual` に対応します。`auto` と `dontAsk` は別のモードです。
+- Codex の `/sessions` は新しいページング履歴も取得し、`/rename` は上流の履歴名を更新します。
+- 両バックエンドの `/add-dir list` / `/add-dir clear` を使用でき、常駐中の変更も次ターンへ反映します。
+  Claude の追加先にある agent file の inline MCP を使うには、対象フォルダーで `claude` を
+  対話起動してフォルダーの信頼確認を完了してください。
+
+検証内容と上流機能との対応範囲は [互換性監査](docs/compatibility-2026-09-09.md) を参照してください。
 
 ### TUI 内での codex 連携
 

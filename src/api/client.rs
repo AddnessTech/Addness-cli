@@ -724,6 +724,26 @@ mod tests {
     }
 
     #[test]
+    fn legacy_comment_routes_are_centralized_in_the_compatibility_client() {
+        let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let allowed = source_root.join("api/client/comment.rs");
+        let legacy_prefix = ["/api/v1/team", "/comments"].concat();
+        let mut files = Vec::new();
+        collect_rust_sources(&source_root, &mut files);
+
+        let offenders: Vec<_> = files
+            .into_iter()
+            .filter(|path| path != &allowed)
+            .filter(|path| fs::read_to_string(path).unwrap().contains(&legacy_prefix))
+            .collect();
+
+        assert!(
+            offenders.is_empty(),
+            "legacy comment routes must stay behind the v2-first compatibility client: {offenders:?}"
+        );
+    }
+
+    #[test]
     fn http_timeout_uses_default_without_valid_override() {
         assert_eq!(
             http_timeout_from_env_value(None),

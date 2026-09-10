@@ -710,7 +710,10 @@ fn issue_outputs_json(command: &issue::IssueCommands) -> bool {
         | issue::IssueCommands::Preview { json, .. }
         | issue::IssueCommands::Resolve { json, .. }
         | issue::IssueCommands::Unresolve { json, .. } => *json,
-        issue::IssueCommands::Read { .. } | issue::IssueCommands::Unreact { .. } => false,
+        issue::IssueCommands::Read { .. }
+        | issue::IssueCommands::Delete { .. }
+        | issue::IssueCommands::DeleteMessage { .. }
+        | issue::IssueCommands::Unreact { .. } => false,
         issue::IssueCommands::Sections { command } => match command {
             issue::SectionCommands::List { json, .. }
             | issue::SectionCommands::Pinned { json, .. }
@@ -830,8 +833,7 @@ fn user_outputs_json(command: &user::UserCommands) -> bool {
         | user::UserCommands::Get { json, .. }
         | user::UserCommands::Update { json, .. }
         | user::UserCommands::List { json, .. }
-        | user::UserCommands::Create { json, .. }
-        | user::UserCommands::Memberships { json } => *json,
+        | user::UserCommands::Create { json, .. } => *json,
         user::UserCommands::Rm { .. } => false,
         user::UserCommands::Settings { command } => match command {
             user::UserSettingsCommands::Get { json }

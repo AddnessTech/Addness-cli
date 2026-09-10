@@ -31,6 +31,7 @@ pub(super) struct ThreadConfig {
     /// sandbox（read-only / workspace-write / danger-full-access）。
     pub(super) sandbox: Option<String>,
     pub(super) developer_instructions: Option<String>,
+    pub(super) additional_dirs: Vec<String>,
 }
 
 impl ThreadConfig {
@@ -49,6 +50,14 @@ impl ThreadConfig {
         }
         if let Some(instructions) = &self.developer_instructions {
             params.insert("developerInstructions".to_string(), json!(instructions));
+        }
+        if !self.additional_dirs.is_empty() {
+            params.insert(
+                "config".to_string(),
+                json!({
+                    "sandbox_workspace_write.writable_roots": self.additional_dirs,
+                }),
+            );
         }
     }
 }
@@ -869,6 +878,7 @@ mod tests {
             approval_policy: Some("untrusted".to_string()),
             sandbox: Some("workspace-write".to_string()),
             developer_instructions: Some("do the thing".to_string()),
+            additional_dirs: vec!["/extra".to_string()],
         };
         let start = thread_start_request(2, &config);
         assert_eq!(start["method"], "thread/start");
@@ -882,6 +892,12 @@ mod tests {
         assert_eq!(resume["method"], "thread/resume");
         assert_eq!(resume["params"]["threadId"], "019f-thread");
         assert_eq!(resume["params"]["model"], "gpt-5");
+        for request in [start, resume] {
+            assert_eq!(
+                request["params"]["config"]["sandbox_workspace_write.writable_roots"],
+                json!(["/extra"])
+            );
+        }
     }
 
     #[test]

@@ -11,7 +11,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -26,6 +26,10 @@ mod claude;
 mod claude_resident;
 mod codex;
 mod codex_appserver;
+mod codex_history;
+mod process_output;
+
+use process_output::{OutputEvent, ProcessOutput};
 
 use self::codex::{
     CodexApprovalChoice, CodexExecSettings, CodexLocalProviderChoice, CodexModelChoice,
@@ -777,9 +781,9 @@ fn short_session_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
 }
 
-enum CodexProcessEvent {
-    Stdout(String),
-    Stderr(String),
+enum HistoryResult {
+    Sessions(Vec<CodexSessionCandidate>),
+    Renamed { thread_id: String, title: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1409,8 +1413,9 @@ pub struct CodexPane {
     codex_bin: PathBuf,
     addness_bin: String,
     child: Option<Child>,
-    tx: Sender<CodexProcessEvent>,
-    rx: Receiver<CodexProcessEvent>,
+    child_output: Option<ProcessOutput>,
+    claude_resident_output: Option<ProcessOutput>,
+    codex_server_output: Option<ProcessOutput>,
     /// Codex プロセスが終了済みか。通常のターン完了では true にせず、
     /// ユーザーが `/exit` した場合やペインを閉じる場合にだけ終了扱いにする。
     pub finished: bool,
@@ -1547,6 +1552,7 @@ pub struct CodexPane {
     pending_notices: VecDeque<TerminalNotice>,
     /// `/sessions` で最後に表示した Codex セッション候補。番号指定操作で使う。
     indexed_sessions: Vec<CodexSessionCandidate>,
+    history_rx: Option<Receiver<Result<HistoryResult>>>,
     /// 直近の exec 子プロセス終了イベントを JSON 側で受け取ったか。
     turn_finished_by_event: bool,
     /// Codex 履歴の表示フィルタ。
@@ -1719,7 +1725,6 @@ impl CodexPane {
         } = options;
         let dod_items = split_dod_items(&dod);
         let dod_checks = vec![None; dod_items.len()];
-        let (tx, rx) = mpsc::channel::<CodexProcessEvent>();
         let loaded = session_log_path
             .as_deref()
             .map(load_codex_session)
@@ -1778,8 +1783,9 @@ impl CodexPane {
             codex_bin: codex_bin.to_path_buf(),
             addness_bin: addness_bin.to_string(),
             child: None,
-            tx,
-            rx,
+            child_output: None,
+            claude_resident_output: None,
+            codex_server_output: None,
             finished: false,
             turn_running: false,
             rows: 24,
@@ -1850,6 +1856,7 @@ impl CodexPane {
             streaming_assistant_index: None,
             pending_notices: VecDeque::new(),
             indexed_sessions: Vec::new(),
+            history_rx: None,
             turn_finished_by_event: false,
             log_filter: CodexLogFilter::Conversation,
             search_query: String::new(),
@@ -1998,6 +2005,7 @@ impl CodexPane {
         pane.claude_approved_denials = Vec::new();
         pane.claude_resident_enabled = false;
         pane.claude_resident = None;
+        pane.claude_resident_output = None;
         pane.claude_resident_last_activity = None;
         pane.claude_interrupt_deadline = None;
         pane.claude_interrupting = false;
@@ -2011,6 +2019,7 @@ impl CodexPane {
         pane.claude_active_permission_mode = None;
         pane.codex_appserver_enabled = false;
         pane.codex_appserver = None;
+        pane.codex_server_output = None;
         pane.codex_appserver_phase = CodexAppServerPhase::Idle;
         pane.codex_appserver_pending_turn = None;
         pane.codex_appserver_turn_id = None;
@@ -2037,6 +2046,7 @@ impl CodexPane {
         pane.child_process_output.clear();
         pane.child_process_error_output.clear();
         pane.indexed_sessions.clear();
+        pane.history_rx = None;
         pane.collapsed_turns.clear();
         pane.pending_decision = None;
         pane.current_turn_prompt = None;
@@ -3236,6 +3246,7 @@ impl CodexPane {
             };
             let items = [
                 CodexModelChoice::Config,
+                CodexModelChoice::Gpt6Astra,
                 CodexModelChoice::Gpt56Sol,
                 CodexModelChoice::Gpt56Terra,
                 CodexModelChoice::Gpt56Luna,
@@ -3295,6 +3306,8 @@ impl CodexPane {
                 CodexReasoningChoice::Medium,
                 CodexReasoningChoice::High,
                 CodexReasoningChoice::XHigh,
+                CodexReasoningChoice::Max,
+                CodexReasoningChoice::Ultra,
             ]
             .into_iter()
             .map(|choice| CodexListPickerItem {
@@ -3323,6 +3336,8 @@ impl CodexPane {
                 claude::ClaudePermissionMode::Config,
                 claude::ClaudePermissionMode::Plan,
                 claude::ClaudePermissionMode::AcceptEdits,
+                claude::ClaudePermissionMode::Auto,
+                claude::ClaudePermissionMode::Manual,
                 claude::ClaudePermissionMode::DontAsk,
                 claude::ClaudePermissionMode::BypassPermissions,
                 claude::ClaudePermissionMode::DangerouslySkipPermissions,
@@ -3393,24 +3408,65 @@ impl CodexPane {
         });
     }
 
-    /// `/sessions` `/resume`（引数なし）: セッション候補ピッカーを開く。
-    /// 候補は `indexed_sessions` にも格納し、従来の `/resume-session <番号>` の
-    /// 番号解決と整合させる。候補 0 件なら開かない。
-    fn open_session_picker(&mut self, limit: usize) {
-        let candidates = if self.kind == AgentKind::ClaudeCode {
-            self.load_claude_session_candidates(limit)
-        } else {
-            match load_codex_session_candidates(limit) {
-                Ok(sessions) => sessions,
-                Err(e) => {
-                    self.push_log(
-                        CodexLogKind::Error,
-                        format!("Codex sessions の読み込みに失敗しました: {e}"),
-                    );
-                    return;
-                }
+    /// Keep app-server startup and history I/O off the TUI event loop.
+    fn start_history_operation(
+        &mut self,
+        operation: impl FnOnce() -> Result<HistoryResult> + Send + 'static,
+    ) {
+        let (tx, rx) = mpsc::channel();
+        self.history_rx = Some(rx);
+        std::thread::spawn(move || {
+            let _ = tx.send(operation());
+        });
+    }
+
+    fn poll_history_operation(&mut self) -> bool {
+        let Some(rx) = self.history_rx.as_ref() else {
+            return false;
+        };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return false,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err(anyhow::anyhow!("Codex 履歴処理が終了しました"))
             }
         };
+        self.history_rx = None;
+        match result {
+            Ok(HistoryResult::Sessions(sessions)) => self.show_session_picker(sessions),
+            Ok(HistoryResult::Renamed { thread_id, title }) => {
+                self.apply_session_rename(&thread_id, &title)
+            }
+            Err(error) => self.push_log(
+                CodexLogKind::Error,
+                format!("Codex 履歴操作に失敗しました: {error}"),
+            ),
+        }
+        true
+    }
+
+    /// `/sessions` / `/resume`: load candidates asynchronously for Codex.
+    fn open_session_picker(&mut self, limit: usize) {
+        if self.kind == AgentKind::ClaudeCode {
+            self.show_session_picker(self.load_claude_session_candidates(limit));
+            return;
+        }
+        if self.history_rx.is_some() {
+            self.push_log(CodexLogKind::System, "Codex 履歴を読み込み中です");
+            return;
+        }
+        let bin = self.codex_bin.clone();
+        let cwd = self.cwd.clone();
+        self.push_log(
+            CodexLogKind::System,
+            "Codex セッション一覧を読み込んでいます",
+        );
+        self.start_history_operation(move || {
+            load_codex_session_candidates(&bin, &cwd, limit).map(HistoryResult::Sessions)
+        });
+    }
+
+    fn show_session_picker(&mut self, candidates: Vec<CodexSessionCandidate>) {
         if candidates.is_empty() {
             self.push_log(CodexLogKind::System, "セッションがありません");
             return;
@@ -3703,10 +3759,10 @@ impl CodexPane {
     pub fn settings_shortcuts_label(&self) -> &'static str {
         match self.kind {
             AgentKind::Codex => {
-                "F2 model: config/gpt-5.6-sol/gpt-5.6-terra/gpt-5.6-luna/gpt-5.5/gpt-5/o3 | F3 effort: config/low/medium/high/xhigh | F4 approval: config/untrusted/on-request/on-failure/never | F5 sandbox: read-only/workspace-write/danger-full-access"
+                "F2 model: config/gpt-6-astra/gpt-5.6-sol/gpt-5.6-terra/gpt-5.6-luna/gpt-5.5/gpt-5/o3 | F3 effort: config/low/medium/high/xhigh/max/ultra | F4 approval: config/untrusted/on-request/on-failure/never | F5 sandbox: read-only/workspace-write/danger-full-access"
             }
             AgentKind::ClaudeCode => {
-                "F2 model: config/fable/opus/sonnet/haiku | F3 effort: config/low/medium/high/xhigh/max | F4 permission: config/plan/acceptEdits/dontAsk/bypassPermissions/skip-permissions | F5 unused"
+                "F2 model: config/fable/opus/sonnet/haiku | F3 effort: config/low/medium/high/xhigh/max | F4 permission: config/plan/acceptEdits/auto/manual/dontAsk/bypassPermissions/skip-permissions | F5 unused"
             }
         }
     }
@@ -3964,7 +4020,7 @@ impl CodexPane {
         if self.kind == AgentKind::ClaudeCode {
             self.push_log(
                 CodexLogKind::System,
-                "Claude Code では権限は F4（permission-mode: config/plan/acceptEdits/dontAsk/bypassPermissions/skip-permissions）で切り替えます。F5 のサンドボックス設定は使いません",
+                "Claude Code では権限は F4（permission-mode: config/plan/acceptEdits/auto/manual/dontAsk/bypassPermissions/skip-permissions）で切り替えます。F5 のサンドボックス設定は使いません",
             );
             return;
         }
@@ -4010,7 +4066,7 @@ impl CodexPane {
         } else {
             self.push_log(
                 CodexLogKind::Error,
-                "reasoning は config / low / medium / high / xhigh を指定してください",
+                "reasoning は config / low / medium / high / xhigh / max / ultra を指定してください",
             );
         }
     }
@@ -4027,7 +4083,7 @@ impl CodexPane {
             } else {
                 self.push_log(
                     CodexLogKind::Error,
-                    "permission-mode は config / plan / acceptEdits / dontAsk / bypassPermissions / skip-permissions を指定してください",
+                    "permission-mode は config / plan / acceptEdits / auto / manual / dontAsk / bypassPermissions / skip-permissions を指定してください",
                 );
             }
         } else if let Some(choice) = parse_approval_choice(args) {
@@ -4225,6 +4281,7 @@ impl CodexPane {
 
     fn add_writable_dir(&mut self, dir: String) {
         self.exec_settings.additional_dirs.push(dir.clone());
+        self.codex_appserver_restart_pending = true;
         let count = self.exec_settings.additional_dirs.len();
         self.set_status_note(format!("add-dir: {count}件"));
         self.push_log(
@@ -4235,6 +4292,7 @@ impl CodexPane {
 
     fn clear_writable_dirs(&mut self) {
         self.exec_settings.additional_dirs.clear();
+        self.codex_appserver_restart_pending = true;
         self.set_status_note("add-dir: cleared".to_string());
         self.push_log(CodexLogKind::System, "追加書込ディレクトリをクリアしました");
     }
@@ -4791,12 +4849,25 @@ impl CodexPane {
 
     /// JSONL と子プロセス終了を取り込み、画面に影響する変化があれば `true` を返す。
     pub fn update(&mut self) -> bool {
-        let mut changed = false;
-        while let Ok(event) = self.rx.try_recv() {
-            changed = true;
-            match event {
-                CodexProcessEvent::Stdout(line) => self.handle_stdout_line(&line),
-                CodexProcessEvent::Stderr(line) => self.handle_stderr_line(&line),
+        let mut changed = self.poll_history_operation();
+        for source in 0..3 {
+            loop {
+                // Handlers can replace/close a process. Re-read its channel each time
+                // so late output from the old process cannot enter the new turn.
+                let output = match source {
+                    0 => &mut self.child_output,
+                    1 => &mut self.claude_resident_output,
+                    _ => &mut self.codex_server_output,
+                };
+                let Some(event) = output.as_mut().and_then(ProcessOutput::try_recv) else {
+                    break;
+                };
+                changed = true;
+                match event {
+                    OutputEvent::Stdout(line) => self.handle_stdout_line(&line),
+                    OutputEvent::Stderr(line) => self.handle_stderr_line(&line),
+                    OutputEvent::Closed => {}
+                }
             }
         }
 
@@ -4812,9 +4883,11 @@ impl CodexPane {
 
         if let Some(child) = self.child.as_mut() {
             match child.try_wait() {
+                Ok(Some(_)) if self.child_output.as_ref().is_some_and(|o| !o.is_drained()) => {}
                 Ok(Some(status)) => {
                     let command_label = self.child_process_label.take();
                     self.child = None;
+                    self.child_output = None;
                     self.turn_running = false;
                     self.current_command = None;
                     self.current_command_started_at = None;
@@ -4871,6 +4944,7 @@ impl CodexPane {
                 Ok(None) => {}
                 Err(e) => {
                     self.child = None;
+                    self.child_output = None;
                     self.turn_running = false;
                     self.current_command = None;
                     self.current_command_started_at = None;
@@ -5505,8 +5579,7 @@ impl CodexPane {
             .stderr
             .take()
             .context("Claude Code 常駐プロセス stderr の取得に失敗しました")?;
-        spawn_line_reader(stdout, self.tx.clone(), false);
-        spawn_line_reader(stderr, self.tx.clone(), true);
+        self.claude_resident_output = Some(ProcessOutput::new(stdout, stderr));
         claude_resident::ResidentClient::new(child)
     }
 
@@ -5522,12 +5595,17 @@ impl CodexPane {
             return;
         }
 
+        if self.claude_resident_restart_pending {
+            self.teardown_claude_resident();
+        }
+
         // グレースフル終了中の常駐は使わず、確実に終了させてから作り直す。
         if let Some(resident) = self.claude_resident.as_mut()
             && resident.closing.is_some()
         {
             resident.kill();
             self.claude_resident = None;
+            self.claude_resident_output = None;
         }
 
         if self.claude_resident.is_none() {
@@ -5596,9 +5674,18 @@ impl CodexPane {
             None => return false,
         };
         match waited {
+            Ok(Some(_))
+                if self
+                    .claude_resident_output
+                    .as_ref()
+                    .is_some_and(|o| !o.is_drained()) =>
+            {
+                return false;
+            }
             Ok(Some(_status)) => {
                 let closing = self.claude_resident.as_ref().and_then(|r| r.closing);
                 self.claude_resident = None;
+                self.claude_resident_output = None;
                 match closing {
                     Some(claude_resident::CloseReason::Idle) => {
                         self.push_log(
@@ -5621,6 +5708,7 @@ impl CodexPane {
             Ok(None) => {}
             Err(e) => {
                 self.claude_resident = None;
+                self.claude_resident_output = None;
                 self.push_log(
                     CodexLogKind::Error,
                     format!("Claude Code 常駐プロセスの状態確認に失敗しました: {e}"),
@@ -5638,6 +5726,7 @@ impl CodexPane {
                 resident.kill();
             }
             self.claude_resident = None;
+            self.claude_resident_output = None;
             self.claude_interrupt_deadline = None;
             self.claude_interrupting = false;
             // kill フォールバックでも Addness へ作業メモを記録する（current_turn_prompt を消す前に）。
@@ -5708,6 +5797,7 @@ impl CodexPane {
     /// 常駐プロセスが予期せず死んだときの処理。実行中ターンはエラー終了扱い。
     fn handle_claude_resident_death(&mut self) {
         self.claude_resident = None;
+        self.claude_resident_output = None;
         self.claude_interrupt_deadline = None;
         self.claude_interrupting = false;
         self.claude_pending_setting_change = None;
@@ -6003,8 +6093,7 @@ impl CodexPane {
             .stderr
             .take()
             .context("codex app-server 常駐プロセス stderr の取得に失敗しました")?;
-        spawn_line_reader(stdout, self.tx.clone(), false);
-        spawn_line_reader(stderr, self.tx.clone(), true);
+        self.codex_server_output = Some(ProcessOutput::new(stdout, stderr));
         codex_appserver::AppServerClient::new(child)
     }
 
@@ -6026,6 +6115,7 @@ impl CodexPane {
             approval_policy: approval,
             sandbox: Some(sandbox),
             developer_instructions: Some(self.composed_developer_instructions()),
+            additional_dirs: settings.additional_dirs.clone(),
         }
     }
 
@@ -6044,12 +6134,17 @@ impl CodexPane {
             self.push_log(CodexLogKind::System, "前の Codex ターンがまだ実行中です");
             return;
         }
+        if self.codex_appserver_restart_pending {
+            self.teardown_codex_appserver();
+        }
+
         // グレースフル終了中の常駐は使わず、確実に終了させてから作り直す。
         if let Some(client) = self.codex_appserver.as_mut()
             && client.closing.is_some()
         {
             client.kill();
             self.codex_appserver = None;
+            self.codex_server_output = None;
             self.codex_appserver_phase = CodexAppServerPhase::Idle;
         }
 
@@ -6063,6 +6158,7 @@ impl CodexPane {
                     if !self.send_codex_appserver_initialize() {
                         // writer が死んでいる → ワンショットへ退避する。
                         self.codex_appserver = None;
+                        self.codex_server_output = None;
                         self.codex_appserver_phase = CodexAppServerPhase::Idle;
                         self.codex_appserver_enabled = false;
                         self.push_log(
@@ -6768,9 +6864,18 @@ impl CodexPane {
             None => return false,
         };
         match waited {
+            Ok(Some(_))
+                if self
+                    .codex_server_output
+                    .as_ref()
+                    .is_some_and(|o| !o.is_drained()) =>
+            {
+                return false;
+            }
             Ok(Some(_status)) => {
                 let closing = self.codex_appserver.as_ref().and_then(|c| c.closing);
                 self.codex_appserver = None;
+                self.codex_server_output = None;
                 self.codex_appserver_phase = CodexAppServerPhase::Idle;
                 match closing {
                     Some(codex_appserver::CloseReason::Idle) => {
@@ -6794,6 +6899,7 @@ impl CodexPane {
             Ok(None) => {}
             Err(e) => {
                 self.codex_appserver = None;
+                self.codex_server_output = None;
                 self.codex_appserver_phase = CodexAppServerPhase::Idle;
                 self.push_log(
                     CodexLogKind::Error,
@@ -6812,6 +6918,7 @@ impl CodexPane {
                 client.kill();
             }
             self.codex_appserver = None;
+            self.codex_server_output = None;
             self.codex_appserver_phase = CodexAppServerPhase::Idle;
             self.codex_appserver_interrupt_deadline = None;
             self.codex_appserver_interrupting = false;
@@ -6898,6 +7005,7 @@ impl CodexPane {
     /// 常駐プロセスが予期せず死んだときの処理。実行中ターンはエラー終了扱い。
     fn handle_codex_appserver_death(&mut self) {
         self.codex_appserver = None;
+        self.codex_server_output = None;
         self.codex_appserver_phase = CodexAppServerPhase::Idle;
         self.codex_appserver_interrupt_deadline = None;
         self.codex_appserver_handshake_deadline = None;
@@ -6933,6 +7041,7 @@ impl CodexPane {
 
     /// initialize / thread/start に失敗したとき、常駐を諦めてワンショットで同じターンを実行する。
     fn fallback_codex_appserver_to_oneshot(&mut self) {
+        self.codex_server_output = None;
         if let Some(mut client) = self.codex_appserver.take() {
             client.kill();
         }
@@ -6965,6 +7074,7 @@ impl CodexPane {
 
     /// 常駐 codex app-server を強制終了し状態をクリアする（`/stop` kill・ペイン切替など）。
     fn teardown_codex_appserver(&mut self) {
+        self.codex_server_output = None;
         if let Some(mut client) = self.codex_appserver.take() {
             client.kill();
         }
@@ -9264,44 +9374,56 @@ impl CodexPane {
             );
             return;
         };
-        let result = if let Some(home) = codex_home {
-            append_codex_session_rename_to(home, &thread_id, title)
-        } else {
-            append_codex_session_rename(&thread_id, title)
-        };
-        match result {
-            Ok(()) => {
-                for session in &mut self.indexed_sessions {
-                    if session.id == thread_id {
-                        session.title = title.to_string();
-                    }
-                }
-                self.set_status_note(format!("renamed: {title}"));
-                self.push_log(
-                    CodexLogKind::System,
-                    format!("Codex セッション名を更新しました: {title}"),
-                );
+        if let Some(home) = codex_home {
+            match append_codex_session_rename_to(home, &thread_id, title) {
+                Ok(()) => self.apply_session_rename(&thread_id, title),
+                Err(error) => self.push_log(
+                    CodexLogKind::Error,
+                    format!("Codex セッション名の更新に失敗しました: {error}"),
+                ),
             }
-            Err(e) => self.push_log(
-                CodexLogKind::Error,
-                format!("Codex セッション名の更新に失敗しました: {e}"),
-            ),
+            return;
         }
+        if self.history_rx.is_some() {
+            self.push_log(
+                CodexLogKind::System,
+                "Codex 履歴操作の完了後にもう一度実行してください",
+            );
+            return;
+        }
+        let bin = self.codex_bin.clone();
+        let cwd = self.cwd.clone();
+        let title = title.to_string();
+        self.start_history_operation(move || {
+            append_codex_session_rename(&bin, &cwd, &thread_id, &title)?;
+            Ok(HistoryResult::Renamed { thread_id, title })
+        });
+    }
+
+    fn apply_session_rename(&mut self, thread_id: &str, title: &str) {
+        for session in &mut self.indexed_sessions {
+            if session.id == thread_id {
+                session.title = title.to_string();
+            }
+        }
+        if self.thread_id.as_deref() == Some(thread_id) {
+            self.set_status_note(format!("renamed: {title}"));
+        }
+        self.push_log(
+            CodexLogKind::System,
+            format!("Codex セッション名を更新しました: {title}"),
+        );
     }
 
     fn resolve_session_ref(&mut self, session_ref: &str) -> Option<String> {
         if let Some(index) = parse_one_based_index(session_ref) {
             if self.indexed_sessions.is_empty() {
-                self.indexed_sessions = match load_codex_session_candidates(12) {
-                    Ok(sessions) => sessions,
-                    Err(e) => {
-                        self.push_log(
-                            CodexLogKind::Error,
-                            format!("Codex sessions の読み込みに失敗しました: {e}"),
-                        );
-                        return None;
-                    }
-                };
+                self.open_session_picker(20);
+                self.push_log(
+                    CodexLogKind::System,
+                    "一覧を確認してからセッションを選択してください",
+                );
+                return None;
             }
             return match self.indexed_sessions.get(index) {
                 Some(session) => Some(session.id.clone()),
@@ -9376,7 +9498,7 @@ impl CodexPane {
             } else {
                 self.push_log(
                     CodexLogKind::Error,
-                    "permissions は config / plan / acceptEdits / dontAsk / bypassPermissions / skip-permissions を指定してください",
+                    "permissions は config / plan / acceptEdits / auto / manual / dontAsk / bypassPermissions / skip-permissions を指定してください",
                 );
             }
             return;
@@ -9882,18 +10004,25 @@ impl CodexPane {
         if self.kind == AgentKind::ClaudeCode {
             let dir = args.trim();
             if dir.is_empty() || dir == "list" {
-                self.push_log(
-                    CodexLogKind::System,
-                    "Claude Code: /add-dir <絶対パス> で次ターンの --add-dir を追加します",
-                );
+                let dirs = self.claude_settings.additional_dirs().to_vec();
+                self.push_numbered_settings_list("Add dirs", &dirs);
                 return;
             }
-            self.claude_settings.add_dir(dir.to_string());
-            self.set_status_note(format!("add-dir: {dir}"));
-            self.push_log(
-                CodexLogKind::System,
-                format!("次回ターンに --add-dir {dir} を渡します"),
-            );
+            if dir == "clear" {
+                self.claude_settings.clear_additional_dirs();
+                self.set_status_note("add-dir: cleared".to_string());
+                self.push_log(CodexLogKind::System, "追加ディレクトリをクリアしました");
+            } else {
+                self.claude_settings.add_dir(dir.to_string());
+                self.set_status_note(format!("add-dir: {dir}"));
+                self.push_log(
+                    CodexLogKind::System,
+                    format!("次回ターンに --add-dir {dir} を渡します"),
+                );
+                self.push_log(CodexLogKind::System,
+                    "追加先の agent file の inline MCP を使うには、そのフォルダーで claude を対話起動して信頼確認を完了してください");
+            }
+            self.claude_resident_restart_pending = true;
             return;
         }
         if args.is_empty() || args == "list" {
@@ -10710,7 +10839,7 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
         true
     }
 
-    fn spawn_exec_process(&self, prompt: &str) -> Result<Child> {
+    fn spawn_exec_process(&mut self, prompt: &str) -> Result<Child> {
         let mut cmd = Command::new(&self.codex_bin);
         let developer_instructions = self.composed_developer_instructions();
         match self.kind {
@@ -10767,8 +10896,7 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
             .take()
             .with_context(|| format!("{name} stderr の取得に失敗しました"))?;
 
-        spawn_line_reader(stdout, self.tx.clone(), false);
-        spawn_line_reader(stderr, self.tx.clone(), true);
+        self.child_output = Some(ProcessOutput::new(stdout, stderr));
 
         Ok(child)
     }
@@ -10782,7 +10910,7 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
         settings
     }
 
-    fn spawn_codex_subcommand_process(&self, args: &[String]) -> Result<Child> {
+    fn spawn_codex_subcommand_process(&mut self, args: &[String]) -> Result<Child> {
         let mut cmd = Command::new(&self.codex_bin);
         for arg in args {
             cmd.arg(arg);
@@ -10805,8 +10933,7 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
             .take()
             .context("codex サブコマンド stderr の取得に失敗しました")?;
 
-        spawn_line_reader(stdout, self.tx.clone(), false);
-        spawn_line_reader(stderr, self.tx.clone(), true);
+        self.child_output = Some(ProcessOutput::new(stdout, stderr));
 
         Ok(child)
     }
@@ -10818,6 +10945,7 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
             let _ = child.wait();
         }
         self.child = None;
+        self.child_output = None;
         // 常駐 Claude Code プロセスも終了させる（次ターンで --resume 再接続する）。
         self.teardown_claude_resident();
         // 常駐 codex app-server プロセスも終了させる（次ターンで thread/resume 再接続する）。
@@ -10881,11 +11009,13 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
     /// 常駐/子プロセスをすべて終了させ、`turn_running` を落とす（プロセスの後始末のみ）。
     /// 状態クリアを伴う `kill()` と、`/exit`・`/quit` の即時終了経路で共有する。
     fn teardown_all_processes(&mut self) {
+        self.history_rx = None;
         if let Some(child) = self.child.as_mut() {
             let _ = child.kill();
             let _ = child.wait();
         }
         self.child = None;
+        self.child_output = None;
         self.teardown_claude_resident();
         // 常駐 codex app-server プロセスも終了させる（kill_current_turn と同様に孤児化を防ぐ）。
         self.teardown_codex_appserver();
@@ -10894,6 +11024,7 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
 
     /// 常駐 Claude Code プロセスを終了させ、常駐関連の一時状態をリセットする。
     fn teardown_claude_resident(&mut self) {
+        self.claude_resident_output = None;
         if let Some(mut resident) = self.claude_resident.take() {
             resident.kill();
         }
@@ -10948,7 +11079,7 @@ Claude Code sessions:
 Claude Code options for next turn:
   /settings, /cd <dir>, /model [name|config], /reasoning|/effort [level]
   /lang|/language [auto|ja|en|off] - エージェントの応答言語（既定 auto は LANG/LC_ALL から判定）
-  /permissions|/approval [mode] - permission-mode: config/plan/acceptEdits/dontAsk/bypassPermissions/skip-permissions
+  /permissions|/approval [mode] - permission-mode: config/plan/acceptEdits/auto/manual/dontAsk/bypassPermissions/skip-permissions
   /bypass [on|off|status] - dangerously-skip-permissions を ON/OFF（危険: 全権限チェックをスキップ）
   /add-dir <path|list|clear>
 TUI helpers:
@@ -11799,28 +11930,6 @@ fn sanitize_terminal_line(text: &str) -> String {
         }
     }
     out
-}
-
-fn spawn_line_reader<R>(reader: R, tx: Sender<CodexProcessEvent>, stderr: bool)
-where
-    R: std::io::Read + Send + 'static,
-{
-    std::thread::spawn(move || {
-        let reader = BufReader::new(reader);
-        for line in reader.lines() {
-            let Ok(line) = line else {
-                break;
-            };
-            let event = if stderr {
-                CodexProcessEvent::Stderr(line)
-            } else {
-                CodexProcessEvent::Stdout(line)
-            };
-            if tx.send(event).is_err() {
-                break;
-            }
-        }
-    });
 }
 
 fn normalize_submitted_line(line: &str) -> String {
@@ -14056,6 +14165,153 @@ mod tests {
         KeyEvent::new(code, modifiers)
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn exited_process_waits_for_final_output_before_advancing_queue() {
+        use std::io::{Cursor, Read};
+        struct DelayedRead {
+            release: Receiver<()>,
+            body: Cursor<Vec<u8>>,
+            waiting: bool,
+        }
+        impl Read for DelayedRead {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.waiting {
+                    self.release.recv_timeout(Duration::from_secs(5)).unwrap();
+                    self.waiting = false;
+                }
+                self.body.read(buffer)
+            }
+        }
+        let mut pane = claude_pane();
+        let (release, receiver) = mpsc::channel();
+        let payload = format!(
+            "{}{}",
+            "{\"type\":\"system\",\"subtype\":\"ignored\"}\n".repeat(2_000),
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"tail","session_id":"drained-session","usage":{"input_tokens":123,"output_tokens":45}}"#
+        );
+        pane.child_output = Some(ProcessOutput::new(
+            DelayedRead {
+                release: receiver,
+                body: Cursor::new(payload.into_bytes()),
+                waiting: true,
+            },
+            Cursor::new("final stderr"),
+        ));
+        let mut child = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        assert!(child.wait().unwrap().success());
+        pane.child = Some(child);
+        pane.turn_running = true;
+        pane.queued_prompts
+            .push_back(QueuedPrompt::user("next turn".to_string()));
+        pane.update();
+        assert!(pane.is_turn_running());
+        assert_eq!(pane.queued_prompts.len(), 1);
+        assert!(pane.claude_last_usage.is_none());
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pane.child.is_some() {
+            assert!(Instant::now() < deadline, "output was not drained");
+            pane.update();
+            std::thread::yield_now();
+        }
+        assert_eq!(pane.thread_id.as_deref(), Some("drained-session"));
+        assert!(pane.claude_last_usage.as_deref().unwrap().contains("123"));
+        assert!(
+            pane.queued_prompts.is_empty(),
+            "queue advances only after the final result"
+        );
+        let completed = pane
+            .log
+            .iter()
+            .position(|line| line.text.contains("応答が完了しました"))
+            .unwrap();
+        let next = pane
+            .log
+            .iter()
+            .position(|line| line.text.contains("予約した入力を実行します"))
+            .unwrap();
+        assert!(completed < next);
+        assert!(
+            pane.log
+                .iter()
+                .any(|line| line.text.contains("final stderr"))
+        );
+    }
+
+    #[test]
+    fn replaced_process_output_cannot_finish_new_turn() {
+        use std::io::Cursor;
+        let mut pane = claude_pane();
+        pane.child_output = Some(ProcessOutput::new(
+            Cursor::new(
+                r#"{"type":"result","subtype":"success","is_error":false,"session_id":"old-session"}"#,
+            ),
+            Cursor::new("old stderr"),
+        ));
+        pane.teardown_all_processes();
+        pane.turn_running = true;
+        pane.update();
+        assert!(pane.turn_running);
+        assert_ne!(pane.thread_id.as_deref(), Some("old-session"));
+        assert!(!pane.log.iter().any(|line| line.text.contains("old stderr")));
+    }
+
+    #[test]
+    fn add_dir_list_and_clear_update_claude_resident_settings() {
+        let mut pane = claude_resident_pane();
+        assert!(pane.handle_local_slash_command("/add-dir /tmp/extra"));
+        assert!(pane.claude_resident_restart_pending);
+        assert_eq!(pane.claude_settings.additional_dirs(), ["/tmp/extra"]);
+        assert!(pane.handle_local_slash_command("/add-dir list"));
+        assert!(
+            pane.log
+                .iter()
+                .any(|line| line.text.contains("1. /tmp/extra"))
+        );
+        assert!(pane.handle_local_slash_command("/add-dir clear"));
+        assert!(pane.claude_settings.additional_dirs().is_empty());
+        let args = claude::resident_args(None, &pane.claude_settings, false, "");
+        assert!(!args.iter().any(|arg| arg == "--add-dir"));
+    }
+
+    #[test]
+    fn add_dir_reaches_codex_appserver_and_clear_restarts_it() {
+        let mut pane = live_pane();
+        assert!(pane.handle_local_slash_command("/add-dir /tmp/extra"));
+        assert!(pane.codex_appserver_restart_pending);
+        let config = pane.codex_appserver_thread_config();
+        assert_eq!(config.additional_dirs, ["/tmp/extra"]);
+        assert!(pane.handle_local_slash_command("/add-dir clear"));
+        assert!(
+            pane.codex_appserver_thread_config()
+                .additional_dirs
+                .is_empty()
+        );
+        assert!(pane.codex_appserver_restart_pending);
+    }
+
+    #[test]
+    fn current_model_and_reasoning_options_reach_both_codex_transports() {
+        let mut pane = live_pane();
+        assert!(pane.handle_local_slash_command("/model astra"));
+        assert_eq!(pane.exec_settings.model, CodexModelChoice::Gpt6Astra);
+        for effort in ["max", "ultra"] {
+            assert!(pane.handle_local_slash_command(&format!("/reasoning {effort}")));
+            let args = codex_exec_args(None, &pane.cwd, &pane.exec_settings, "");
+            assert!(args.iter().any(|a| a == "gpt-6-astra"));
+            assert!(
+                args.iter()
+                    .any(|a| a == &format!("model_reasoning_effort=\"{effort}\""))
+            );
+            assert_eq!(
+                pane.codex_appserver_thread_config().model.as_deref(),
+                Some("gpt-6-astra")
+            );
+            assert_eq!(pane.codex_appserver_effort().as_deref(), Some(effort));
+        }
+    }
+
     #[test]
     fn agent_kind_labels_differ_per_backend() {
         assert_eq!(AgentKind::Codex.label(), "codex");
@@ -15569,8 +15825,10 @@ mod tests {
     }
 
     #[test]
-    fn codex_f2_cycles_through_gpt56_variants() {
+    fn codex_f2_cycles_through_astra_and_gpt56_variants() {
         let mut pane = live_pane();
+        pane.cycle_model();
+        assert!(pane.settings_label().contains("model:gpt-6-astra"));
         pane.cycle_model();
         assert!(pane.settings_label().contains("model:gpt-5.6-sol"));
         pane.cycle_model();
@@ -19460,6 +19718,7 @@ mod tests {
             labels,
             [
                 "config",
+                "gpt-6-astra",
                 "gpt-5.6-sol",
                 "gpt-5.6-terra",
                 "gpt-5.6-luna",
@@ -19468,8 +19727,8 @@ mod tests {
                 "o3"
             ]
         );
-        assert!(picker.items[5].current, "現在値 gpt-5 にマーカー");
-        assert_eq!(picker.selected, 5, "初期選択は現在値");
+        assert!(picker.items[6].current, "現在値 gpt-5 にマーカー");
+        assert_eq!(picker.selected, 6, "初期選択は現在値");
         pane.move_list_picker_selection(-1); // gpt-5 -> gpt-5.5
         pane.accept_list_picker(false);
         assert_eq!(pane.exec_settings.model, CodexModelChoice::Gpt55);
@@ -19525,6 +19784,8 @@ mod tests {
                 "config",
                 "plan",
                 "acceptEdits",
+                "auto",
+                "manual",
                 "dontAsk",
                 "bypassPermissions",
                 "skip-permissions（危険・全許可）"

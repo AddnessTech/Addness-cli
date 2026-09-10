@@ -8,6 +8,27 @@ use crate::api::{
 };
 use anyhow::{Context, Result};
 
+/// Links commonly use URLs or owner/repo names as their label. Keep them readable
+/// while respecting the backend's display-name contract (255 chars, no /, \\, NUL).
+fn link_display_name(name: &str) -> String {
+    let normalized: String = name
+        .trim()
+        .chars()
+        .map(|ch| match ch {
+            '/' => '／',
+            '\\' => '＼',
+            '\0' => ' ',
+            _ => ch,
+        })
+        .take(255)
+        .collect();
+    if normalized.trim().is_empty() {
+        "Link".to_string()
+    } else {
+        normalized
+    }
+}
+
 impl ApiClient {
     pub async fn create_folder_deliverable(
         &self,
@@ -33,7 +54,7 @@ impl ApiClient {
     ) -> Result<ApiResponse<DeliverableCreateData>> {
         let body = CreateDeliverableRequest {
             node_type: DeliverableType::Link,
-            display_name: display_name.to_string(),
+            display_name: link_display_name(display_name),
             content: None,
             link_url: Some(url.to_string()),
             file: None,
@@ -337,4 +358,29 @@ fn guess_content_type(path: &Path) -> Result<String> {
         ),
     };
     Ok(ct.to_string())
+}
+
+#[cfg(test)]
+mod link_name_tests {
+    use super::link_display_name;
+
+    #[test]
+    fn pr_and_url_labels_obey_backend_display_name_contract() {
+        assert_eq!(
+            link_display_name("AddnessTech/Addness-cli#118"),
+            "AddnessTech／Addness-cli#118"
+        );
+        assert_eq!(
+            link_display_name(" https://example.com/a/b "),
+            "https:／／example.com／a／b"
+        );
+        assert_eq!(
+            link_display_name("review\\path\0notes"),
+            "review＼path notes"
+        );
+        assert_eq!(link_display_name("  \0  "), "Link");
+        let long = link_display_name(&"日本語".repeat(100));
+        assert_eq!(long.chars().count(), 255);
+        assert_eq!(link_display_name(&long), long);
+    }
 }

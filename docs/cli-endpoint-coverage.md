@@ -5,7 +5,7 @@
 
 対応付けの根拠は、`/tmp/vtb-main`（vision-todo-backend読み取り専用worktree、Go/Gin、`presentation/routes/api.go`）のハンドラ実装と、本リポジトリ`src/api/client/*.rs` / `src/cli/commands/*.rs` の実装内容を実際に突き合わせて判定した。
 
-> **最終更新: 2026-08-13** — Legacy Tools APIの公開停止に合わせ、`tool`コマンドを廃止した。Skillの作成・編集を含む非Tools機能は引き続き利用できる。
+> **最終更新: 2026-08-28** — deprecated comment mutation を Goal Issue v2-first に移行し、v2 root/reply delete を追加した。残存 v1 の全件判定は [`v1-api-migration-audit.md`](./v1-api-migration-audit.md) を参照。
 
 ---
 
@@ -35,7 +35,7 @@ CLIから叩く実装対象として扱わない（DoDの分母から除外す�
 | 3 | Webhook | 9 | 0 | 0 | 9 |
 | 4 | 外部連携 | 47 | 0 | 40 | 7 |
 | 5 | MCPプロトコル | 3 | 0 | 0 | 3 |
-| 6 | ユーザー / ユーザー設定 | 9 | 9 | 0 | 0 |
+| 6 | ユーザー / ユーザー設定 | 8 | 8 | 0 | 0 |
 | 7 | 組織 (Organization) | 33 | 28 | 0 | 5 |
 | 8 | メンバー / メンバータグ / 招待 | 39 | 38 | 0 | 1 |
 | 9 | ゴール/目標（v1+v2, KPI, Assignment, Sheets等） | 113 | 28 | 78 | 7 |
@@ -54,7 +54,7 @@ CLIから叩く実装対象として扱わない（DoDの分母から除外す�
 | 22 | Codexジョブ | 17 | 9 | 0 | 8 |
 | 23 | 管理者 (Admin) | 5 | 0 | 0 | 5 |
 | 24 | ALB用エイリアスルート | 7 | 0 | 0 | 7 |
-| | **合計** | **~605**※ | **~318** | **~187** | **~87** |
+| | **合計** | **~604**※ | **~317** | **~187** | **~87** |
 
 ※ グループ9の「AIバックグラウンドタスク23機能×v1/v2」を1機能=2登録として計上、実行タブのvalidate系（24本）を含む。棚卸し表側の登録行ベースの総数とは、MCP Any(3本)・重複カウント方法の違いにより一致しない。
 
@@ -132,13 +132,12 @@ CLIから叩く実装対象として扱わない（DoDの分母から除外す�
 | PUT | /api/v1/team/users/:id | `user update` | 実装済み |
 | GET | /api/v1/team/user_settings | `user settings get` | 実装済み |
 | PATCH | /api/v1/team/user_settings | `user settings update` | 実装済み |
-| GET | /api/v1/team/organization_members | `user memberships` | 実装済み |
 | GET | /api/v1/team/users | `user list` | 実装済み |
 | GET | /api/v1/team/users/:id | `user get` | 実装済み |
 | POST | /api/v1/team/users | `user create` | 実装済み |
 | DELETE | /api/v1/team/users/:id | `user rm` | 実装済み |
 
-`addness user` 系コマンドとして全9本実装済み（#140）。`user get` はサーバー仕様上self-onlyアクセス。
+`addness user` 系コマンドとして全8本実装済み。`user get` はサーバー仕様上self-onlyアクセス。
 
 ## 7. 組織 (Organization)
 
@@ -318,23 +317,23 @@ list / create / delete / service-account-info / create-for-service-account / tri
 | GET | /api/v1/team/comments（グローバル一覧） | `comment list-all` | 実装済み |
 | GET | /api/v1/team/comments/:id/context | `comment context` | 実装済み |
 | GET | /api/v1/team/comments/:id | `comment get` | 実装済み |
-| POST | /api/v1/team/comments | `comment create` | 実装済み |
-| PUT | /api/v1/team/comments/:id | `comment update` | 実装済み |
-| DELETE | /api/v1/team/comments/:id | `comment delete` | 実装済み |
+| POST | /api/v1/team/comments | `comment create` compatibility fallback | v2-first（4,000文字超等のみv1） |
+| PUT | /api/v1/team/comments/:id | `comment update` compatibility fallback | v2-first（mention変更等のみv1） |
+| DELETE | /api/v1/team/comments/:id | `comment delete` compatibility fallback | v2-first（Goal Issue外のみv1） |
 | DELETE | /api/v1/team/comments/:id/attachments/:attachmentId | `comment attachment rm` | 実装済み |
-| PATCH | /api/v1/team/comments/:id/resolve | `comment resolve` | 実装済み |
-| PATCH | /api/v1/team/comments/:id/unresolve | `comment unresolve` | 実装済み |
-| POST | /api/v1/team/comments/:id/reactions | `comment react` | 実装済み |
-| GET | /api/v1/team/comments/:id/reactions/:emoji/users | `comment reactions` | 実装済み |
+| PATCH | /api/v1/team/comments/:id/resolve | `comment resolve` compatibility fallback | v2-first（Goal Issue root外のみv1） |
+| PATCH | /api/v1/team/comments/:id/unresolve | `comment unresolve` compatibility fallback | v2-first（Goal Issue root外のみv1） |
+| POST | /api/v1/team/comments/:id/reactions | `comment react` compatibility fallback | v2-first（Goal Issue外のみv1） |
+| GET | /api/v1/team/comments/:id/reactions/:emoji/users | `comment reactions` compatibility fallback | v2-first（Goal Issue外のみv1） |
 | GET | /api/v2/objectives/:id/comments | `comment list` | 実装済み |
 
 ### 11-2. Goal Issue（v2チャット型、後継の本流）
 
 | 対象 | 本数 | 状態 |
 |---|---|---|
-| issues一覧/作成/編集/既読化、issueメッセージCRUD＋リアクション、全issue一覧/検索/プレビュー/解決状態設定、goal-sections（一覧/ピン留め/未読数） | 20本 | **実装済み**（`issue list/list-all/create/update/read/messages/reply/edit-message/react/unreact/reactions/search/preview/resolve/unresolve` + `issue sections list/pinned/unread-count/unread-mentions/pin/unpin`） |
+| issues一覧/CRUD/既読化、issueメッセージCRUD＋リアクション、全issue一覧/検索/プレビュー/解決状態設定、goal-sections（一覧/ピン留め/未読数） | 21 endpoint / 23コマンド | **実装済み**（`issue list/list-all/create/update/delete/read/messages/reply/edit-message/delete-message/react/unreact/reactions/search/preview/resolve/unresolve` + `issue sections list/pinned/unread-count/unread-mentions/pin/unpin`） |
 
-comment系（chat-v1）はDEPRECATEDだが、後継の本流であるgoal-issue/goal-sectionsを `addness issue` としてCLIに実装済み（#150）。旧comment系依存のリスクは解消された。
+comment mutation は Goal Issue v2 を優先し、v2 で表現できない legacy-only 契約だけ v1 に fallback する。global list / get / context / attachment delete は同等 v2 がないため残る。詳細は `docs/v1-api-migration-audit.md` を参照。
 
 ### 11-3. 組織チャット (Org Chat)
 

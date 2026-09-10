@@ -46,6 +46,16 @@ use self::codex::{
 
 pub const CODEX_LOG_PREFIX_WIDTH: usize = 7;
 
+/// Match the command before recording input, including pasted tabs/newlines.
+fn codex_answer_text(line: &str) -> Option<&str> {
+    let rest = line.trim_start().strip_prefix("/answer")?;
+    if rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace) {
+        Some(rest.trim_start())
+    } else {
+        None
+    }
+}
+
 /// スラッシュコマンドのパレット候補（コマンド名, 1 行説明）。
 /// `handle_local_slash_command` が受け付ける主要コマンドの正本。よく使う
 /// Addness 連携・セッション操作を上に、codex 委譲・設定系を下に並べる。
@@ -2756,10 +2766,16 @@ impl CodexPane {
             .front()
             .and_then(|q| q.current())
             .is_some_and(|q| q.is_secret)
-            && let Some(answer) = line.strip_prefix("/answer ")
+            && let Some(answer) = codex_answer_text(line)
         {
-            let masked = format!("/answer {}", "*".repeat(answer.chars().count()));
-            let cursor = line[..self.input_cursor().min(line.len())].chars().count();
+            let prefix = &line[..line.len() - answer.len()];
+            let masked = format!("{prefix}{}", "*".repeat(answer.chars().count()));
+            let original_cursor = self.input_cursor().min(line.len());
+            let cursor = if original_cursor <= prefix.len() {
+                original_cursor
+            } else {
+                prefix.len() + line[prefix.len()..original_cursor].chars().count()
+            };
             return (std::borrow::Cow::Owned(masked), cursor);
         }
         (std::borrow::Cow::Borrowed(line), self.input_cursor())
@@ -2785,7 +2801,7 @@ impl CodexPane {
             .front()
             .and_then(|q| q.current())
             .is_some_and(|q| q.is_secret)
-            && self.input_line().starts_with("/answer")
+            && codex_answer_text(self.input_line()).is_some()
         {
             self.input_state.clear();
             self.pending_pastes.clear();
@@ -7935,8 +7951,8 @@ impl CodexPane {
         let submitted = self.expand_pending_pastes(submitted);
 
         // Answers (including secret questions) must never enter prompt/history logs.
-        if submitted == "/answer" || submitted.starts_with("/answer ") {
-            self.answer_codex_question(submitted.strip_prefix("/answer").unwrap().trim());
+        if let Some(answer) = codex_answer_text(&submitted) {
+            self.answer_codex_question(answer);
             return;
         }
 
@@ -15524,15 +15540,18 @@ mod tests {
         }});
         pane.handle_json_event(event);
         assert!(pane.codex_question_status().unwrap().contains("回答待ち"));
-        pane.input_state.insert_text("/answer 非公開の回答");
+        pane.input_state.insert_text("　 /answer\t非公開の回答");
         assert!(!pane.displayed_input().0.contains("非公開"));
+        let (display, cursor) = pane.displayed_input();
+        assert!(display.is_char_boundary(cursor));
+        assert_eq!(cursor, display.len());
         assert!(!pane.start_next_queued_turn_if_idle());
         pane.handle_json_event(serde_json::json!({"method":"serverRequest/resolved","params":{"threadId":"other","requestId":"q1"}}));
         assert_eq!(pane.codex_pending_questions.len(), 1);
         pane.handle_json_event(serde_json::json!({"method":"serverRequest/resolved","params":{"threadId":"th-1","requestId":"q1"}}));
         assert!(pane.codex_pending_questions.is_empty());
         assert!(pane.input_line().is_empty());
-        pane.submit_user_line("/answer stale secret");
+        pane.submit_user_line("/answer\tstale secret");
         assert!(
             !pane
                 .input_state
@@ -15546,6 +15565,20 @@ mod tests {
                 .iter()
                 .any(|line| line.text.contains("stale secret"))
         );
+    }
+
+    #[test]
+    fn answer_command_whitespace_is_not_a_normal_prompt() {
+        for line in [
+            "/answer",
+            "/answer 1",
+            "  /answer\tsecret",
+            "/answer\nsecret",
+        ] {
+            assert!(codex_answer_text(line).is_some());
+        }
+        assert!(codex_answer_text("/answers secret").is_none());
+        assert_eq!(codex_answer_text("/answer\tsecret"), Some("secret"));
     }
 
     #[test]

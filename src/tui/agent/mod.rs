@@ -2770,7 +2770,12 @@ impl CodexPane {
         {
             let prefix = &line[..line.len() - answer.len()];
             let masked = format!("{prefix}{}", "*".repeat(answer.chars().count()));
-            let cursor = line[..self.input_cursor().min(line.len())].chars().count();
+            let original_cursor = self.input_cursor().min(line.len());
+            let cursor = if original_cursor <= prefix.len() {
+                original_cursor
+            } else {
+                prefix.len() + line[prefix.len()..original_cursor].chars().count()
+            };
             return (std::borrow::Cow::Owned(masked), cursor);
         }
         (std::borrow::Cow::Borrowed(line), self.input_cursor())
@@ -15535,8 +15540,11 @@ mod tests {
         }});
         pane.handle_json_event(event);
         assert!(pane.codex_question_status().unwrap().contains("回答待ち"));
-        pane.input_state.insert_text("  /answer\t非公開の回答");
+        pane.input_state.insert_text("　 /answer\t非公開の回答");
         assert!(!pane.displayed_input().0.contains("非公開"));
+        let (display, cursor) = pane.displayed_input();
+        assert!(display.is_char_boundary(cursor));
+        assert_eq!(cursor, display.len());
         assert!(!pane.start_next_queued_turn_if_idle());
         pane.handle_json_event(serde_json::json!({"method":"serverRequest/resolved","params":{"threadId":"other","requestId":"q1"}}));
         assert_eq!(pane.codex_pending_questions.len(), 1);

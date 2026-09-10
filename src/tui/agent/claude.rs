@@ -236,6 +236,8 @@ pub(super) struct ClaudeExecSettings {
     /// 古い claude CLI が `--include-partial-messages` 未対応と判明した場合に立てる sticky フラグ。
     /// 立つと以後の全ターンで同フラグを付けず、ストリーミングなしのブロック表示へ退化する。
     no_partial_messages: bool,
+    /// Pre-2.1.257 CLIs reject --system-prompt-snapshot before starting a turn.
+    pub(super) no_system_prompt_snapshot: bool,
 }
 
 impl Default for ClaudeExecSettings {
@@ -248,6 +250,7 @@ impl Default for ClaudeExecSettings {
             sticky_allowed_tools: Vec::new(),
             additional_dirs: Vec::new(),
             no_partial_messages: false,
+            no_system_prompt_snapshot: false,
         }
     }
 }
@@ -445,7 +448,7 @@ pub(super) fn exec_args(
     // Addness 操作は CLI に一本化するため addness MCP を拒否する。
     push_disallowed_addness_mcp_args(&mut args);
     push_add_dir_args(&mut args, settings);
-    push_system_prompt_args(&mut args, developer_instructions);
+    push_system_prompt_args(&mut args, settings, developer_instructions);
     args
 }
 
@@ -484,7 +487,7 @@ pub(super) fn resident_args(
     // Addness 操作は CLI に一本化するため addness MCP を拒否する。
     push_disallowed_addness_mcp_args(&mut args);
     push_add_dir_args(&mut args, settings);
-    push_system_prompt_args(&mut args, developer_instructions);
+    push_system_prompt_args(&mut args, settings, developer_instructions);
     args
 }
 
@@ -563,9 +566,29 @@ fn push_add_dir_args(args: &mut Vec<OsString>, settings: &ClaudeExecSettings) {
     }
 }
 
-fn push_system_prompt_args(args: &mut Vec<OsString>, developer_instructions: &str) {
+fn push_system_prompt_args(
+    args: &mut Vec<OsString>,
+    settings: &ClaudeExecSettings,
+    developer_instructions: &str,
+) {
+    // Addness refreshes language and goal instructions when reconnecting/resuming.
+    // Recorded prompts otherwise retain the first launch's instructions after 2.1.265.
+    if !settings.no_system_prompt_snapshot {
+        args.extend([
+            OsString::from("--system-prompt-snapshot"),
+            OsString::from("off"),
+        ]);
+    }
     args.push(OsString::from("--append-system-prompt"));
     args.push(OsString::from(developer_instructions));
+}
+
+pub(super) fn stderr_indicates_no_system_prompt_snapshot(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("--system-prompt-snapshot")
+        && ["unknown option", "unknown argument", "unexpected argument"]
+            .iter()
+            .any(|s| lower.contains(s))
 }
 
 /// 古い claude CLI が `--include-partial-messages` を未対応で拒否した stderr かどうか。
@@ -1269,6 +1292,39 @@ mod tests {
             .position(|a| a == "--append-system-prompt")
             .unwrap();
         assert_eq!(args[idx + 1], "INSTRUCTIONS");
+    }
+
+    #[test]
+    fn resumed_prompt_refreshes_and_old_cli_can_omit_snapshot_flag() {
+        let mut settings = ClaudeExecSettings::default();
+        for instructions in ["English", "日本語"] {
+            for args in [
+                exec_args(Some("sid"), &settings, &[], false, instructions),
+                resident_args(Some("sid"), &settings, false, instructions),
+            ] {
+                let args = os(&args);
+                assert!(
+                    args.windows(2)
+                        .any(|p| p == ["--system-prompt-snapshot", "off"])
+                );
+                assert!(
+                    args.windows(2)
+                        .any(|p| p == ["--append-system-prompt", instructions])
+                );
+            }
+        }
+        settings.no_system_prompt_snapshot = true;
+        assert!(
+            !os(&resident_args(Some("sid"), &settings, false, "new"))
+                .iter()
+                .any(|a| a == "--system-prompt-snapshot")
+        );
+        assert!(stderr_indicates_no_system_prompt_snapshot(
+            "error: unknown option '--system-prompt-snapshot'"
+        ));
+        assert!(!stderr_indicates_no_system_prompt_snapshot(
+            "some unrelated error"
+        ));
     }
 
     #[test]

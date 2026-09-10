@@ -35,6 +35,9 @@ jobs:
       - name: test
         run: cargo test
 
+      - name: Upstream read retries
+        run: bash .github/scripts/test-retry-read.sh
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -42,10 +45,12 @@ jobs:
       - name: Install verified agent CLI versions
         run: >-
           npm install --prefix "$RUNNER_TEMP/addness-upstream" --no-audit --no-fund
-          @openai/codex@0.153.4 @anthropic-ai/claude-code@2.1.266
+          @openai/codex@0.154.0 @anthropic-ai/claude-code@2.1.267
 
       - name: Agent protocol compatibility
         env:
           ADDNESS_PROBE_CODEX_BIN: ${{ runner.temp }}/addness-upstream/node_modules/.bin/codex
           ADDNESS_PROBE_CLAUDE_BIN: ${{ runner.temp }}/addness-upstream/node_modules/.bin/claude
-        run: cargo test --locked upstream_probe_ -- --ignored
+        run: |
+          cargo test --locked upstream_probe_ -- --ignored
+          python3 .github/scripts/probe-claude-prompt.py

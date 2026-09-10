@@ -21,6 +21,10 @@ on:
         description: "state を無視して最新リリースを強制処理する"
         type: boolean
         default: false
+      detect_only:
+        description: "検出だけを検証し、AI分析・state更新を実行しない"
+        type: boolean
+        default: false
 
 concurrency:
   group: upstream-sync
@@ -48,8 +52,9 @@ jobs:
           set -euo pipefail
 
           # --- 最新リリースの取得 ---
-          latest_claude="$(gh api repos/anthropics/claude-code/releases/latest --jq '.tag_name // empty')"
-          latest_codex="$(gh api 'repos/openai/codex/releases?per_page=100' \
+          source .github/scripts/retry-read.sh
+          latest_claude="$(retry_read gh api repos/anthropics/claude-code/releases/latest --jq '.tag_name // empty')"
+          latest_codex="$(retry_read gh api 'repos/openai/codex/releases?per_page=100' \
             --jq '[.[] | select(.prerelease == false)][0].tag_name // empty')"
           if [ -z "$latest_claude" ] || [ -z "$latest_codex" ]; then
             echo "::error::最新リリースの取得に失敗しました (claude-code='${latest_claude}' codex='${latest_codex}')"
@@ -58,9 +63,17 @@ jobs:
           echo "最新: claude-code=${latest_claude} codex=${latest_codex}"
 
           # --- state 取得（無ければ初回ブートストラップ） ---
-          if git fetch origin automation/upstream-state; then
+          state_status=0
+          retry_read git ls-remote --exit-code --heads origin automation/upstream-state > /dev/null || state_status=$?
+          if [ "$state_status" -eq 0 ]; then
+            retry_read git fetch origin automation/upstream-state
             git show FETCH_HEAD:state.json > /tmp/state.json
-          else
+          elif [ "$state_status" -eq 2 ]; then
+            if [ "${{ inputs.detect_only }}" = "true" ]; then
+              echo "state ブランチ未作成（検出のみのため作成をスキップ）"
+              echo "targets=[]" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
             echo "state ブランチが無いため初回ブートストラップします（現在の最新版を記録して終了）"
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -72,6 +85,9 @@ jobs:
             git push origin automation/upstream-state
             echo "targets=[]" >> "$GITHUB_OUTPUT"
             exit 0
+          else
+            echo "::error::state ブランチの確認に失敗しました（通信障害を未作成と扱いません）"
+            exit "$state_status"
           fi
 
           last_claude="$(jq -r '."claude-code".last_processed // empty' /tmp/state.json)"
@@ -79,7 +95,7 @@ jobs:
           echo "state: claude-code=${last_claude} codex=${last_codex}"
 
           # --- 既存 open PR（label: upstream-sync）のブランチ一覧 ---
-          open_prs="$(gh pr list --label upstream-sync --state open --json headRefName --jq '.[].headRefName')"
+          open_prs="$(retry_read gh pr list --label upstream-sync --state open --json headRefName --jq '.[].headRefName')"
 
           # --- 対象を判定して matrix 用 JSON 配列を組み立てる ---
           targets='[]'
@@ -107,7 +123,7 @@ jobs:
 
   sync:
     needs: detect
-    if: needs.detect.outputs.targets != '' && needs.detect.outputs.targets != '[]'
+    if: needs.detect.outputs.targets != '' && needs.detect.outputs.targets != '[]' && inputs.detect_only != true
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
@@ -137,11 +153,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          source .github/scripts/retry-read.sh
           case "$TARGET" in
             claude-code)
               # CHANGELOG.md は `## 2.1.201` 形式（タグの v プレフィックスなし）
               # raw メディアタイプで取得（JSON+base64 経由は 1MB 超のファイルで content が空になる）
-              gh api "repos/anthropics/claude-code/contents/CHANGELOG.md?ref=${NEW_VERSION}" \
+              retry_read gh api "repos/anthropics/claude-code/contents/CHANGELOG.md?ref=${NEW_VERSION}" \
                 -H "Accept: application/vnd.github.raw+json" > /tmp/full-changelog.md
               last_no_v="${LAST_VERSION#v}"
               status=0
@@ -165,7 +182,7 @@ jobs:
             codex)
               # 安定版（prerelease でない）release の body を新しい順に連結。
               # LAST_VERSION が一覧に無い場合は直近 15 件、force 再実行（区間が空）は最新 1 件。
-              gh api 'repos/openai/codex/releases?per_page=100' > /tmp/releases.json
+              retry_read gh api 'repos/openai/codex/releases?per_page=100' > /tmp/releases.json
               jq -r --arg from "$LAST_VERSION" '
                 [.[] | select(.prerelease == false) | {tag: .tag_name, body: (.body // "")}]
                 | (map(.tag) | index($from)) as $idx

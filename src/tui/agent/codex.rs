@@ -156,7 +156,6 @@ pub enum CodexApprovalChoice {
     Config,
     Untrusted,
     OnRequest,
-    OnFailure,
     Never,
 }
 
@@ -165,8 +164,7 @@ impl CodexApprovalChoice {
         match self {
             Self::Config => Self::Untrusted,
             Self::Untrusted => Self::OnRequest,
-            Self::OnRequest => Self::OnFailure,
-            Self::OnFailure => Self::Never,
+            Self::OnRequest => Self::Never,
             Self::Never => Self::Config,
         }
     }
@@ -176,7 +174,6 @@ impl CodexApprovalChoice {
             Self::Config => "config",
             Self::Untrusted => "untrusted",
             Self::OnRequest => "on-request",
-            Self::OnFailure => "on-failure",
             Self::Never => "never",
         }
     }
@@ -186,7 +183,6 @@ impl CodexApprovalChoice {
             Self::Config => None,
             Self::Untrusted => Some("untrusted"),
             Self::OnRequest => Some("on-request"),
-            Self::OnFailure => Some("on-failure"),
             Self::Never => Some("never"),
         }
     }
@@ -197,7 +193,6 @@ pub(super) fn parse_approval_choice(value: &str) -> Option<CodexApprovalChoice> 
         "config" | "default" | "clear" => Some(CodexApprovalChoice::Config),
         "untrusted" => Some(CodexApprovalChoice::Untrusted),
         "on-request" | "onrequest" => Some(CodexApprovalChoice::OnRequest),
-        "on-failure" | "onfailure" => Some(CodexApprovalChoice::OnFailure),
         "never" => Some(CodexApprovalChoice::Never),
         _ => None,
     }
@@ -390,6 +385,14 @@ impl Default for CodexExecSettings {
 }
 
 impl CodexExecSettings {
+    pub(super) fn validate_cli_approval(&self) -> Result<()> {
+        if self.approval == CodexApprovalChoice::Untrusted && !self.bypass_approvals_and_sandbox {
+            anyhow::bail!(
+                "untrusted はCodex 0.154.0の常駐モード専用です。CLIを使う場合はF4で対応する承認設定を明示的に選んでください"
+            );
+        }
+        Ok(())
+    }
     pub fn label(&self) -> String {
         let approval = if self.bypass_approvals_and_sandbox {
             "bypass-all"
@@ -575,7 +578,10 @@ pub(super) fn codex_named_subcommand_args(name: &str, raw_args: &str) -> Result<
         "help" => codex_command_with_args("help", parsed),
         "version" => Ok(vec!["--version".to_string()]),
         "logout" | "update" | "app" | "completion" => codex_command_with_args(name, parsed),
-        "sandbox" | "mcp-server" | "exec-server" => codex_command_with_help_default(name, parsed),
+        "sandbox" | "exec-server" => codex_command_with_help_default(name, parsed),
+        "mcp-server" => anyhow::bail!(
+            "Codex 0.154.0でmcp-serverは廃止されました。MCP接続の管理は /mcp を使用してください"
+        ),
         "app-server" => {
             let default = vec![
                 "app-server".to_string(),
@@ -992,7 +998,9 @@ fn push_global_exec_settings(
     }
     if settings.bypass_approvals_and_sandbox {
         args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
-    } else if let Some(approval) = settings.approval.cli_arg() {
+    } else if settings.approval != CodexApprovalChoice::Untrusted
+        && let Some(approval) = settings.approval.cli_arg()
+    {
         // `-a` is a global Codex option. `codex exec -a ...` is rejected, so keep it before `exec`.
         args.push("-a".to_string());
         args.push(approval.to_string());
@@ -1448,6 +1456,22 @@ mod tests {
             args.windows(2)
                 .any(|pair| pair == ["-c", "memories.generate_memories=false"])
         );
+    }
+
+    #[test]
+    fn untrusted_requires_resident_and_retired_policy_is_rejected() {
+        let settings = CodexExecSettings {
+            approval: CodexApprovalChoice::Untrusted,
+            ..Default::default()
+        };
+        for session in [None, Some("session-1")] {
+            let args = codex_exec_args(session, "/repo", &settings, TEST_DEV_INSTRUCTIONS);
+            assert!(settings.validate_cli_approval().is_err());
+            assert!(!args.iter().any(|a| a == "approval_policy=\"untrusted\""));
+            assert!(!args.iter().any(|a| a == "-a" || a == "on-failure"));
+        }
+        assert_eq!(CodexApprovalChoice::Untrusted.cli_arg(), Some("untrusted"));
+        assert_eq!(parse_approval_choice("on-failure"), None);
     }
 
     #[test]
@@ -2011,10 +2035,7 @@ mod tests {
             codex_named_subcommand_args("app-server", "").unwrap(),
             vec!["app-server", "daemon", "version"]
         );
-        assert_eq!(
-            codex_named_subcommand_args("mcp-server", "").unwrap(),
-            vec!["mcp-server", "--help"]
-        );
+        assert!(codex_named_subcommand_args("mcp-server", "").is_err());
         assert_eq!(
             codex_named_subcommand_args("exec-server", "").unwrap(),
             vec!["exec-server", "--help"]

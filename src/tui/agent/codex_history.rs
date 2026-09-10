@@ -312,6 +312,31 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "実 codex が必要。認証不要、モデルへのリクエストなし"]
+    fn upstream_probe_codex_thread_approval_policies() {
+        let root = ProbeDirectory::new();
+        let bin = std::env::var("ADDNESS_PROBE_CODEX_BIN").unwrap_or_else(|_| "codex".to_string());
+        let mut connection =
+            HistoryClient::connect(Path::new(&bin), root.0.to_str().unwrap(), Some(&root.0))
+                .unwrap();
+        for policy in [None, Some("untrusted"), Some("on-request"), Some("never")] {
+            let id = connection.client.next_id();
+            let config = codex_appserver::ThreadConfig {
+                cwd: Some(root.0.to_string_lossy().into_owned()),
+                approval_policy: policy.map(str::to_string),
+                sandbox: Some("read-only".to_string()),
+                ..Default::default()
+            };
+            let mut request = codex_appserver::thread_start_request(id, &config);
+            request["params"]["ephemeral"] = json!(true);
+            let response = connection.request(request).unwrap();
+            if let Some(policy) = policy {
+                assert_eq!(response["approvalPolicy"], policy);
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "実 codex が必要。モデル通信はローカル HTTP fixture のみ"]
     fn upstream_probe_codex_paginated_history_and_rename() {
         use std::io::{Read, Write};

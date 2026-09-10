@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 pub(super) struct ThreadConfig {
     pub(super) cwd: Option<String>,
     pub(super) model: Option<String>,
-    /// approvalPolicy（untrusted / on-request / on-failure / never）。
+    /// approvalPolicy（untrusted / on-request / never）。
     pub(super) approval_policy: Option<String>,
     /// sandbox（read-only / workspace-write / danger-full-access）。
     pub(super) sandbox: Option<String>,
@@ -343,6 +343,10 @@ pub(super) struct TokenUsageInfo {
 /// サーバから届く通知の意味づけ。
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum Notification {
+    RequestResolved {
+        thread_id: String,
+        request_id: Value,
+    },
     TurnStarted,
     /// turn/completed（status: completed / interrupted / failed）。
     TurnCompleted {
@@ -380,8 +384,16 @@ pub(super) enum ServerMessage {
     },
     /// サーバ発の承認リクエスト。
     Approval(ApprovalRequest),
+    Questions(super::codex_questions::Questions),
+    InvalidRequest {
+        id: Value,
+        message: String,
+    },
     /// 承認以外の未対応サーバ発リクエスト（エラー応答を返して継続する）。
-    UnhandledRequest { id: Value, method: String },
+    UnhandledRequest {
+        id: Value,
+        method: String,
+    },
     /// 通知。
     Notification(Notification),
 }
@@ -458,6 +470,12 @@ pub(super) fn parse_message(value: &Value) -> Option<ServerMessage> {
 }
 
 fn parse_server_request(id: Value, method: &str, params: &Value) -> ServerMessage {
+    if method == "item/tool/requestUserInput" {
+        return match super::codex_questions::Questions::parse(id.clone(), params) {
+            Ok(request) => ServerMessage::Questions(request),
+            Err(message) => ServerMessage::InvalidRequest { id, message },
+        };
+    }
     let kind = match method {
         "item/commandExecution/requestApproval" => Some(ApprovalKind::Command),
         "item/fileChange/requestApproval" => Some(ApprovalKind::FileChange),
@@ -525,6 +543,14 @@ fn decision_label(value: &Value) -> Option<String> {
 
 fn parse_notification(method: &str, params: &Value) -> Notification {
     match method {
+        "serverRequest/resolved" => Notification::RequestResolved {
+            thread_id: params
+                .get("threadId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            request_id: params.get("requestId").cloned().unwrap_or(Value::Null),
+        },
         "turn/started" => Notification::TurnStarted,
         "turn/completed" => {
             let status = params
@@ -1533,6 +1559,52 @@ mod tests {
             .unwrap_or_else(|e| panic!("{bin} {args:?} の実行に失敗しました: {e}"));
         let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
         text.push_str(&String::from_utf8_lossy(&output.stderr));
+        assert!(output.status.success(), "{bin} {args:?} failed: {text}");
         text
+    }
+
+    #[test]
+    #[ignore = "実 codex バイナリが必要"]
+    fn upstream_probe_codex_approval_values_and_subcommands() {
+        use super::super::codex::{
+            CodexApprovalChoice as A, CodexExecSettings, codex_root_interactive_args,
+        };
+        let bin = probe_codex_bin();
+        for approval in [A::Config, A::OnRequest, A::Never] {
+            let settings = CodexExecSettings {
+                approval,
+                ..Default::default()
+            };
+            let mut args = codex_root_interactive_args("", ".", &settings, "probe");
+            settings.validate_cli_approval().unwrap();
+            args.push("--version".to_string());
+            let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+            probe_help(&bin, &refs);
+        }
+        // `codex unknown --help` succeeds with root help. `help unknown` validates the name.
+        for command in [
+            "doctor",
+            "features",
+            "mcp",
+            "plugin",
+            "cloud",
+            "debug",
+            "login",
+            "logout",
+            "update",
+            "app",
+            "completion",
+            "sandbox",
+            "exec-server",
+            "app-server",
+            "remote-control",
+            "review",
+            "apply",
+            "exec",
+            "resume",
+            "fork",
+        ] {
+            probe_help(&bin, &["help", command]);
+        }
     }
 }

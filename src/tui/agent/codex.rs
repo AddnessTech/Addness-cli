@@ -553,6 +553,10 @@ impl CodexExecSettings {
     }
 }
 
+pub(super) fn codex_desktop_available() -> bool {
+    cfg!(any(target_os = "macos", target_os = "windows"))
+}
+
 pub(super) fn codex_named_subcommand_args(name: &str, raw_args: &str) -> Result<Vec<String>> {
     let mut parsed = split_codex_command_args(raw_args)?;
     match name {
@@ -577,6 +581,9 @@ pub(super) fn codex_named_subcommand_args(name: &str, raw_args: &str) -> Result<
         "login" => codex_command_with_default("login", "status", parsed),
         "help" => codex_command_with_args("help", parsed),
         "version" => Ok(vec!["--version".to_string()]),
+        "app" if !codex_desktop_available() => anyhow::bail!(
+            "Codex Desktopの起動はmacOS / Windows専用です。このOSでは /app-server を使用できます"
+        ),
         "logout" | "update" | "app" | "completion" => codex_command_with_args(name, parsed),
         "sandbox" | "exec-server" => codex_command_with_help_default(name, parsed),
         "mcp-server" => anyhow::bail!(
@@ -1472,6 +1479,15 @@ mod tests {
         }
         assert_eq!(CodexApprovalChoice::Untrusted.cli_arg(), Some("untrusted"));
         assert_eq!(parse_approval_choice("on-failure"), None);
+    }
+
+    #[test]
+    fn desktop_command_matches_supported_platforms() {
+        assert_eq!(
+            codex_named_subcommand_args("app", "").is_ok(),
+            codex_desktop_available()
+        );
+        assert!(codex_named_subcommand_args("app-server", "").is_ok());
     }
 
     #[test]

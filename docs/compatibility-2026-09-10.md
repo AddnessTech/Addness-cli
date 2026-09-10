@@ -8,6 +8,7 @@
 - `untrusted`はapp-serverのthread/start・thread/resume・設定変更で維持する。CLIの`-a untrusted`だけでなく`-c approval_policy="untrusted"`も0.154.0では拒否されることを実バイナリで確認した。CLI経路へ切り替える場合はプロセス起動前にF4での明示的な設定選択を案内する。`never`等へ暗黙に変換しない。
 - Addnessの承認選択はペイン内の状態。外部Codex設定ファイルに保存された旧`approval_policy`は自動編集しない。`on-failure`やCLIの`untrusted`が残る場合は、現行設定を利用者が選び直す。
 - `/mcp-server`は廃止を案内し起動しない。現行ヘルプからも除外した。MCP接続の管理は`/mcp`で行う。
+- `/app`によるDesktop起動はmacOS・Windows向け。Linuxでは未対応の案内を出し、ヘルプ・実CLIプローブもこのOS差を反映する。`/app-server`は引き続き利用できる。
 
 ## Codexからの質問
 

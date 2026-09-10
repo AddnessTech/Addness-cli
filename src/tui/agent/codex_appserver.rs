@@ -1604,6 +1604,9 @@ mod tests {
             "resume",
             "fork",
         ] {
+            if command == "app" && !super::super::codex::codex_desktop_available() {
+                continue;
+            }
             probe_help(&bin, &["help", command]);
         }
     }

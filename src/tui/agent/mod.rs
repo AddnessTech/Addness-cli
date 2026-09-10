@@ -9159,7 +9159,7 @@ impl CodexPane {
         if args.trim().is_empty() || matches!(args, "show" | "status" | "list") {
             self.push_log(
                 CodexLogKind::System,
-                "Apps: /app でCodex Desktop、/app-server でapp-server、/remote-control でremote controlを実行できます",
+                "Apps: /app はmacOS・WindowsのDesktop起動用です。/app-server でapp-server、/remote-control でremote controlを実行できます",
             );
         } else {
             self.handle_named_codex_subcommand("app-server", args);

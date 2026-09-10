@@ -1284,7 +1284,18 @@ fn draw_codex_help_overlay(frame: &mut Frame, app: &mut App) {
             kv("/cloud", "Codex Cloud taskのlist/status/apply/diff等を実行"),
             kv("/login / /logout", "ログイン状態確認 / ログアウト"),
             kv("/version / /update", "codex --version / update を実行"),
-            kv("/app / /app-server", "Codex Desktop起動 / app-server管理"),
+            kv(
+                if cfg!(any(target_os = "macos", target_os = "windows")) {
+                    "/app / /app-server"
+                } else {
+                    "/app-server"
+                },
+                if cfg!(any(target_os = "macos", target_os = "windows")) {
+                    "Codex Desktop起動 / app-server管理"
+                } else {
+                    "app-server管理"
+                },
+            ),
             kv("/remote-control", "app-server remote control をstart/stop"),
             kv("/debug / /completion", "debug出力 / shell completion生成"),
             kv("/exec-server", "server系コマンド（空ならhelp表示）"),

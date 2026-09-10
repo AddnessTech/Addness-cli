@@ -5,7 +5,7 @@
 
 対応付けの根拠は、`/tmp/vtb-main`（vision-todo-backend読み取り専用worktree、Go/Gin、`presentation/routes/api.go`）のハンドラ実装と、本リポジトリ`src/api/client/*.rs` / `src/cli/commands/*.rs` の実装内容を実際に突き合わせて判定した。
 
-> **最終更新: 2026-08-28** — deprecated comment mutation を Goal Issue v2-first に移行し、v2 root/reply delete を追加した。残存 v1 の全件判定は [`v1-api-migration-audit.md`](./v1-api-migration-audit.md) を参照。
+> **最終更新: 2026-09-10** — 廃止済みAI scheduleの組織2件・Objective2件を除外し、24グループの合計を再集計した。2026-08-28: — deprecated comment mutation を Goal Issue v2-first に移行し、v2 root/reply delete を追加した。残存 v1 の全件判定は [`v1-api-migration-audit.md`](./v1-api-migration-audit.md) を参照。
 
 ---
 
@@ -36,9 +36,9 @@ CLIから叩く実装対象として扱わない（DoDの分母から除外す�
 | 4 | 外部連携 | 47 | 0 | 40 | 7 |
 | 5 | MCPプロトコル | 3 | 0 | 0 | 3 |
 | 6 | ユーザー / ユーザー設定 | 8 | 8 | 0 | 0 |
-| 7 | 組織 (Organization) | 33 | 28 | 0 | 5 |
+| 7 | 組織 (Organization) | 31 | 26 | 0 | 5 |
 | 8 | メンバー / メンバータグ / 招待 | 39 | 38 | 0 | 1 |
-| 9 | ゴール/目標（v1+v2, KPI, Assignment, Sheets等） | 113 | 28 | 78 | 7 |
+| 9 | ゴール/目標（v1+v2, KPI, Assignment, Sheets等） | 111 | 28 | 76 | 7 |
 | 10 | 成果物 (Deliverable) | 11 | 9 | 2 | 0 |
 | 11 | コメント / Goal Issue / 組織チャット | 56 | 53 | 0 | 3 |
 | 12 | AIスレッド・エージェント | 55 | 0 | 53 | 2 |
@@ -54,7 +54,7 @@ CLIから叩く実装対象として扱わない（DoDの分母から除外す�
 | 22 | Codexジョブ | 17 | 9 | 0 | 8 |
 | 23 | 管理者 (Admin) | 5 | 0 | 0 | 5 |
 | 24 | ALB用エイリアスルート | 7 | 0 | 0 | 7 |
-| | **合計** | **~604**※ | **~317** | **~187** | **~87** |
+| | **合計** | **600**※ | **318** | **185** | **97** |
 
 ※ グループ9の「AIバックグラウンドタスク23機能×v1/v2」を1機能=2登録として計上、実行タブのvalidate系（24本）を含む。棚卸し表側の登録行ベースの総数とは、MCP Any(3本)・重複カウント方法の違いにより一致しない。
 
@@ -168,8 +168,6 @@ CLIから叩く実装対象として扱わない（DoDの分母から除外す�
 | GET | /api/v2/organizations/:id/onboarding-billing-state | `org onboarding-billing` | 実装済み |
 | POST | /api/v2/organizations/:id/onboarding-billing/require | `org onboarding-billing` | 実装済み |
 | POST | /api/v2/organizations/:id/onboarding-billing/free | `org onboarding-billing` | 実装済み |
-| GET | /api/v2/organizations/:id/ai-schedule-settings | `org ai-schedule-settings` | 実装済み |
-| PUT | /api/v2/organizations/:id/ai-schedule-settings | `org ai-schedule-settings` | 実装済み |
 | GET | /api/v2/organizations/:id/ad-settings(+`/me`) | `org ad-settings` | 実装済み（2本） |
 | PUT | /api/v2/organizations/:id/ad-settings(+`/me`) | `org ad-settings` | 実装済み（2本） |
 | GET | /api/v2/organizations/:id/admin/check | `org admin-check` | 実装済み |
@@ -254,8 +252,6 @@ CLIから叩く実装対象として扱わない（DoDの分母から除外す�
 | POST | /api/v2/objectives/:id/parent | `goal move` | 実装済み |
 | POST | /api/v2/objectives/:id/insert-root | - | 未実装 |
 | POST | /api/v2/objectives/:id/duplicate | `goal duplicate` | 実装済み |
-| GET | /api/v2/objectives/:id/ai-schedule | - | 未実装 |
-| PUT | /api/v2/objectives/:id/ai-schedule | - | 未実装 |
 | GET | /api/v2/organizations/:id/objectives/editable-picker-tree | - | 未実装 |
 | GET | /api/v2/organizations/:id/objectives/manager-inbox | - | 未実装 |
 | GET | /api/v2/organizations/:id/objectives/:goalId/movement-summary | - | 未実装 |

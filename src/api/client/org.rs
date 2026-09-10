@@ -250,25 +250,6 @@ impl ApiClient {
         Ok(resp.data)
     }
 
-    /// GET /api/v2/organizations/:id/ai-schedule-settings
-    pub async fn get_organization_ai_schedule_settings(&self, org_id: &str) -> Result<Value> {
-        let path = format!("/api/v2/organizations/{org_id}/ai-schedule-settings");
-        let resp: ApiResponse<Value> = self.get(&path).await?;
-        Ok(resp.data)
-    }
-
-    /// PUT /api/v2/organizations/:id/ai-schedule-settings
-    pub async fn set_organization_ai_schedule_settings(
-        &self,
-        org_id: &str,
-        enabled: bool,
-    ) -> Result<Value> {
-        let path = format!("/api/v2/organizations/{org_id}/ai-schedule-settings");
-        let body = EnabledFlagRequest { enabled };
-        let resp: ApiResponse<Value> = self.put(&path, &body).await?;
-        Ok(resp.data)
-    }
-
     /// GET /api/v2/organizations/:id/ad-settings
     pub async fn get_organization_ad_settings(&self, org_id: &str) -> Result<Value> {
         let path = format!("/api/v2/organizations/{org_id}/ad-settings");

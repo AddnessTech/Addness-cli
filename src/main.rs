@@ -373,10 +373,6 @@ fn org_outputs_json(command: &org::OrgCommands) -> bool {
             | org::OnboardingBillingCommands::Require { json, .. }
             | org::OnboardingBillingCommands::Free { json, .. } => *json,
         },
-        org::OrgCommands::AiScheduleSettings { command } => match command {
-            org::AiScheduleSettingsCommands::Get { json, .. }
-            | org::AiScheduleSettingsCommands::Set { json, .. } => *json,
-        },
         org::OrgCommands::AdSettings { command } => match command {
             org::AdSettingsCommands::Get { json, .. }
             | org::AdSettingsCommands::Set { json, .. }

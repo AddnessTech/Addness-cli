@@ -137,7 +137,7 @@ mod.rs 1009〜1158 行付近と 9381〜9649 行付近。これらが組むサブ
 |---|---|---|
 | `CodexModelChoice` | config / gpt-6-astra / gpt-5.6-sol / gpt-5.6-terra / gpt-5.6-luna / gpt-5.5 / gpt-5 / o3 | `-m` |
 | `CodexReasoningChoice` | config / low / medium / high / xhigh / max / ultra | `-c model_reasoning_effort=` |
-| `CodexApprovalChoice` | config / untrusted / on-request / on-failure / never | `-a` |
+| `CodexApprovalChoice` | config / untrusted / on-request / never | `-a`（untrusted はapp-server専用。CLIは起動前に設定変更を案内） |
 | `CodexSandboxChoice` | read-only / workspace-write / danger-full-access | `-s` |
 | `CodexLocalProviderChoice` | config / lmstudio / ollama | `--local-provider` |
 | `CodexColorChoice` | never / auto / always | `--color` |

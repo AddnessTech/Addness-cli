@@ -27,6 +27,7 @@ mod claude_resident;
 mod codex;
 mod codex_appserver;
 mod codex_history;
+mod codex_questions;
 mod process_output;
 
 use process_output::{OutputEvent, ProcessOutput};
@@ -50,6 +51,7 @@ pub const CODEX_LOG_PREFIX_WIDTH: usize = 7;
 /// Addness 連携・セッション操作を上に、codex 委譲・設定系を下に並べる。
 /// 表示はコマンド名の先頭一致で絞り込む。
 const SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("/answer", "Codexの質問に回答（番号 / 自由入力 / --cancel）"),
     ("/goal", "継続ゴールを設定してそのまま着手"),
     ("/work", "子ゴールへ着手（next / all / N、引数なしは一覧）"),
     ("/dual", "Codex + Claude Code の実装/レビュー分担"),
@@ -127,6 +129,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
 /// ここから外してある（画像は `append_claude_image_paths` でプロンプトへ、`/fork` は
 /// dispatch で `/fork-last` / `/fork-session` へ委譲する）。
 const CODEX_ONLY_SLASH_COMMANDS: &[&str] = &[
+    "/answer",
     "/review",
     "/apply",
     "/cloud",
@@ -1637,6 +1640,7 @@ pub struct CodexPane {
     /// 承認待ちのサーバ発リクエスト（応答用）。並列ツール実行では複数要求が同時に届くため、
     /// 先頭だけをバナー表示し、残りは到着順に保持する。
     codex_appserver_pending_approvals: VecDeque<codex_appserver::ApprovalRequest>,
+    codex_pending_questions: VecDeque<codex_questions::Questions>,
     /// 送信済みの thread/settings/update 応答待ち。
     codex_appserver_pending_setting: Option<CodexAppServerSettingChange>,
     /// 設定変更が settings/update では反映できず、アイドル時に再起動が必要な状態。
@@ -1898,6 +1902,7 @@ impl CodexPane {
             codex_appserver_turn_id: None,
             codex_appserver_turn_req_id: None,
             codex_appserver_pending_approvals: VecDeque::new(),
+            codex_pending_questions: VecDeque::new(),
             codex_appserver_pending_setting: None,
             codex_appserver_restart_pending: false,
             codex_appserver_last_activity: None,
@@ -2024,6 +2029,7 @@ impl CodexPane {
         pane.codex_appserver_pending_turn = None;
         pane.codex_appserver_turn_id = None;
         pane.codex_appserver_turn_req_id = None;
+        pane.codex_pending_questions.clear();
         pane.codex_appserver_pending_approvals.clear();
         pane.codex_appserver_pending_setting = None;
         pane.codex_appserver_restart_pending = false;
@@ -2743,6 +2749,107 @@ impl CodexPane {
         self.input_state.cursor
     }
 
+    pub fn displayed_input(&self) -> (std::borrow::Cow<'_, str>, usize) {
+        let line = self.input_line();
+        if self
+            .codex_pending_questions
+            .front()
+            .and_then(|q| q.current())
+            .is_some_and(|q| q.is_secret)
+            && let Some(answer) = line.strip_prefix("/answer ")
+        {
+            let masked = format!("/answer {}", "*".repeat(answer.chars().count()));
+            let cursor = line[..self.input_cursor().min(line.len())].chars().count();
+            return (std::borrow::Cow::Owned(masked), cursor);
+        }
+        (std::borrow::Cow::Borrowed(line), self.input_cursor())
+    }
+
+    pub fn codex_question_status(&self) -> Option<String> {
+        self.codex_pending_questions.front().map(|request| {
+            let state = if request.is_blocking {
+                "回答待ち"
+            } else {
+                "作業継続中の質問"
+            };
+            format!(
+                "{state}: {} | /answer で表示・回答",
+                request.current().map_or("送信中", |q| q.header.as_str())
+            )
+        })
+    }
+
+    fn clear_secret_question_input(&mut self) {
+        if self
+            .codex_pending_questions
+            .front()
+            .and_then(|q| q.current())
+            .is_some_and(|q| q.is_secret)
+            && self.input_line().starts_with("/answer")
+        {
+            self.input_state.clear();
+            self.pending_pastes.clear();
+        }
+    }
+
+    fn present_codex_question(&mut self) {
+        if let Some(request) = self.codex_pending_questions.front() {
+            let prompt = request.prompt();
+            self.push_log(CodexLogKind::System, prompt);
+            self.push_terminal_notice("Codex 質問", "/answer で質問に回答できます");
+        }
+    }
+
+    fn answer_codex_question(&mut self, text: &str) {
+        self.clear_secret_question_input();
+        if self.codex_pending_questions.is_empty() {
+            self.push_log(CodexLogKind::System, "回答待ちのCodex質問はありません");
+            return;
+        }
+        if text.is_empty() {
+            self.present_codex_question();
+            return;
+        }
+        if self.codex_appserver.is_none() {
+            self.push_log(
+                CodexLogKind::Error,
+                "Codexに接続していないため回答を送信できません",
+            );
+            return;
+        }
+        let cancel = text == "--cancel";
+        let request = self.codex_pending_questions.front_mut().unwrap();
+        if !cancel {
+            match request.answer(text) {
+                Ok(false) => {
+                    self.present_codex_question();
+                    return;
+                }
+                Ok(true) => {}
+                Err(message) => {
+                    self.push_log(CodexLogKind::Error, message);
+                    return;
+                }
+            }
+        }
+        let reply = request.result(cancel);
+        if self.codex_appserver.as_ref().unwrap().send_value(&reply) {
+            self.clear_secret_question_input();
+            self.codex_pending_questions.pop_front();
+            self.push_log(
+                CodexLogKind::System,
+                if cancel {
+                    "Codexへの回答を取り消しました"
+                } else {
+                    "Codexへ回答しました"
+                },
+            );
+            self.present_codex_question();
+        } else {
+            self.handle_codex_appserver_death();
+        }
+    }
+
     /// 現在の入力に対するスラッシュコマンド候補（コマンド名, 説明）。
     /// 入力が `/xxx` でコマンド名を入力中（空白・改行を含まない）のときのみ返す。
     /// 空の `/` は全コマンドを返す。
@@ -3361,13 +3468,16 @@ impl CodexPane {
                 CodexApprovalChoice::Config,
                 CodexApprovalChoice::Untrusted,
                 CodexApprovalChoice::OnRequest,
-                CodexApprovalChoice::OnFailure,
                 CodexApprovalChoice::Never,
             ]
             .into_iter()
             .map(|choice| CodexListPickerItem {
                 label: choice.label().to_string(),
-                detail: config_choice_detail(choice == CodexApprovalChoice::Config),
+                detail: if choice == CodexApprovalChoice::Untrusted {
+                    "常駐モード専用（CLIへの切替時は設定の選び直しが必要）".to_string()
+                } else {
+                    config_choice_detail(choice == CodexApprovalChoice::Config)
+                },
                 value: choice.label().to_string(),
                 current: choice == current,
             })
@@ -3759,7 +3869,7 @@ impl CodexPane {
     pub fn settings_shortcuts_label(&self) -> &'static str {
         match self.kind {
             AgentKind::Codex => {
-                "F2 model: config/gpt-6-astra/gpt-5.6-sol/gpt-5.6-terra/gpt-5.6-luna/gpt-5.5/gpt-5/o3 | F3 effort: config/low/medium/high/xhigh/max/ultra | F4 approval: config/untrusted/on-request/on-failure/never | F5 sandbox: read-only/workspace-write/danger-full-access"
+                "F2 model: config/gpt-6-astra/gpt-5.6-sol/gpt-5.6-terra/gpt-5.6-luna/gpt-5.5/gpt-5/o3 | F3 effort: config/low/medium/high/xhigh/max/ultra | F4 approval: config/untrusted/on-request/never | F5 sandbox: read-only/workspace-write/danger-full-access"
             }
             AgentKind::ClaudeCode => {
                 "F2 model: config/fable/opus/sonnet/haiku | F3 effort: config/low/medium/high/xhigh/max | F4 permission: config/plan/acceptEdits/auto/manual/dontAsk/bypassPermissions/skip-permissions | F5 unused"
@@ -4006,6 +4116,12 @@ impl CodexPane {
 
     fn set_approval(&mut self, value: CodexApprovalChoice) {
         self.exec_settings.approval = value;
+        if value == CodexApprovalChoice::Untrusted {
+            self.push_log(
+                CodexLogKind::System,
+                "untrusted は常駐モード専用です。CLI経路はF4で対応する設定を選ぶまで起動しません",
+            );
+        }
         let value = self.exec_settings.approval.label();
         self.set_status_note(format!("approval: {value}"));
         self.push_activity(format!("Codex approval を {value} に変更"));
@@ -4091,7 +4207,7 @@ impl CodexPane {
         } else {
             self.push_log(
                 CodexLogKind::Error,
-                "approval は config / untrusted / on-request / on-failure / never を指定してください",
+                "approval は config / untrusted / on-request / never を指定してください（on-failure は廃止済みです）",
             );
         }
     }
@@ -5002,6 +5118,15 @@ impl CodexPane {
             return;
         }
         self.persist_raw_event("stderr", trimmed);
+        if self.kind == AgentKind::ClaudeCode
+            && !self.claude_settings.no_system_prompt_snapshot
+            && claude::stderr_indicates_no_system_prompt_snapshot(trimmed)
+        {
+            self.claude_settings.no_system_prompt_snapshot = true;
+            self.push_log(CodexLogKind::System, "旧版Claudeの起動に合わせてプロンプト保存フラグを省略します（言語変更は従来の追加指示で反映）");
+            self.retry_current_turn_after_permission_change("旧版Claude互換設定");
+            return;
+        }
         // 古い claude CLI が `--include-partial-messages` を拒否した場合、ストリーミングを
         // 無効化して現在のターンを一度だけ自動再試行する（sticky フラグで無限ループを防ぐ）。
         if self.kind == AgentKind::ClaudeCode
@@ -6323,6 +6448,21 @@ impl CodexPane {
             codex_appserver::ServerMessage::Approval(request) => {
                 self.handle_codex_appserver_approval(request);
             }
+            codex_appserver::ServerMessage::Questions(request) => {
+                if !self
+                    .codex_pending_questions
+                    .iter()
+                    .any(|q| q.id == request.id)
+                {
+                    self.codex_pending_questions.push_back(request);
+                    self.present_codex_question();
+                }
+            }
+            codex_appserver::ServerMessage::InvalidRequest { id, message } => {
+                if let Some(client) = self.codex_appserver.as_ref() {
+                    client.send_value(&codex_appserver::error_response(&id, -32602, &message));
+                }
+            }
             codex_appserver::ServerMessage::UnhandledRequest { id, method } => {
                 if let Some(client) = self.codex_appserver.as_ref() {
                     client.send_value(&codex_appserver::error_response(
@@ -6449,6 +6589,21 @@ impl CodexPane {
     fn handle_codex_appserver_notification(&mut self, notification: codex_appserver::Notification) {
         use codex_appserver::Notification as N;
         match notification {
+            N::RequestResolved {
+                thread_id,
+                request_id,
+            } => {
+                let affected = self
+                    .codex_pending_questions
+                    .iter()
+                    .any(|q| q.id == request_id && q.thread_id == thread_id);
+                if affected {
+                    self.clear_secret_question_input();
+                    self.codex_pending_questions
+                        .retain(|q| q.id != request_id || q.thread_id != thread_id);
+                    self.present_codex_question();
+                }
+            }
             N::TurnStarted => self.begin_codex_appserver_turn(),
             N::TurnCompleted { status } => self.handle_codex_appserver_turn_completed(&status),
             N::AgentMessageDelta { delta } => self.append_assistant_delta(&delta),
@@ -6476,6 +6631,8 @@ impl CodexPane {
 
     /// turn/started（ターン境界の始まり）で見出し行を出す。
     fn begin_codex_appserver_turn(&mut self) {
+        self.clear_secret_question_input();
+        self.codex_pending_questions.clear();
         if self.turn_count > 0 {
             self.collapsed_turns.insert(self.turn_count);
         }
@@ -6513,6 +6670,8 @@ impl CodexPane {
             self.codex_appserver_interrupting = false;
             self.codex_appserver_interrupt_deadline = None;
             self.pending_decision = None;
+            self.clear_secret_question_input();
+            self.codex_pending_questions.clear();
             self.codex_appserver_pending_approvals.clear();
             self.current_turn_prompt = None;
             self.current_turn_retry_prompt = None;
@@ -6530,6 +6689,8 @@ impl CodexPane {
         }
 
         self.pending_decision = None;
+        self.clear_secret_question_input();
+        self.codex_pending_questions.clear();
         self.codex_appserver_pending_approvals.clear();
         self.refresh_current_turn_title();
         self.queue_completed_turn_body_record();
@@ -6555,6 +6716,8 @@ impl CodexPane {
         self.streaming_assistant_index = None;
         self.codex_appserver_turn_id = None;
         self.pending_decision = None;
+        self.clear_secret_question_input();
+        self.codex_pending_questions.clear();
         self.codex_appserver_pending_approvals.clear();
         self.codex_appserver_pending_turn = None;
         self.refresh_current_turn_title();
@@ -6927,6 +7090,8 @@ impl CodexPane {
             self.current_command_started_at = None;
             self.streaming_assistant_index = None;
             self.pending_decision = None;
+            self.clear_secret_question_input();
+            self.codex_pending_questions.clear();
             self.codex_appserver_pending_approvals.clear();
             self.codex_appserver_turn_id = None;
             self.codex_appserver_pending_turn = None;
@@ -6973,6 +7138,7 @@ impl CodexPane {
             && !self.turn_running
             && self.pending_decision.is_none()
             && self.codex_appserver_pending_approvals.is_empty()
+            && self.codex_pending_questions.is_empty()
         {
             self.codex_appserver_restart_pending = false;
             if let Some(client) = self.codex_appserver.as_mut() {
@@ -6989,6 +7155,7 @@ impl CodexPane {
         if !self.turn_running
             && self.pending_decision.is_none()
             && self.codex_appserver_pending_approvals.is_empty()
+            && self.codex_pending_questions.is_empty()
             && let Some(last) = self.codex_appserver_last_activity
             && last.elapsed() >= CODEX_APPSERVER_IDLE_TIMEOUT
         {
@@ -7011,6 +7178,8 @@ impl CodexPane {
         self.codex_appserver_handshake_deadline = None;
         self.codex_appserver_interrupting = false;
         self.codex_appserver_pending_setting = None;
+        self.clear_secret_question_input();
+        self.codex_pending_questions.clear();
         self.codex_appserver_pending_approvals.clear();
         self.codex_appserver_pending_turn = None;
         self.codex_appserver_pending_images.clear();
@@ -7083,6 +7252,8 @@ impl CodexPane {
         self.codex_appserver_handshake_deadline = None;
         self.codex_appserver_interrupting = false;
         self.codex_appserver_pending_setting = None;
+        self.clear_secret_question_input();
+        self.codex_pending_questions.clear();
         self.codex_appserver_pending_approvals.clear();
         self.codex_appserver_pending_turn = None;
         self.codex_appserver_pending_images.clear();
@@ -7762,6 +7933,12 @@ impl CodexPane {
 
         // 畳み込んだ長文ペーストのプレースホルダを全文へ展開してから履歴・実行へ渡す。
         let submitted = self.expand_pending_pastes(submitted);
+
+        // Answers (including secret questions) must never enter prompt/history logs.
+        if submitted == "/answer" || submitted.starts_with("/answer ") {
+            self.answer_codex_question(submitted.strip_prefix("/answer").unwrap().trim());
+            return;
+        }
 
         self.record_input_history(&submitted);
 
@@ -8982,7 +9159,7 @@ impl CodexPane {
         if args.trim().is_empty() || matches!(args, "show" | "status" | "list") {
             self.push_log(
                 CodexLogKind::System,
-                "Apps: /app でCodex Desktop、/app-server でapp-server、/remote-control でremote controlを実行できます",
+                "Apps: /app はmacOS・WindowsのDesktop起動用です。/app-server でapp-server、/remote-control でremote controlを実行できます",
             );
         } else {
             self.handle_named_codex_subcommand("app-server", args);
@@ -9515,7 +9692,7 @@ impl CodexPane {
                 } else {
                     self.push_log(
                         CodexLogKind::Error,
-                        "permissions approval は config / untrusted / on-request / on-failure / never を指定してください",
+                        "permissions approval は config / untrusted / on-request / never を指定してください（on-failure は廃止済みです）",
                     );
                 }
             }
@@ -10799,6 +10976,9 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
     }
 
     fn start_next_queued_turn_if_idle(&mut self) -> bool {
+        if self.codex_pending_questions.iter().any(|q| q.is_blocking) {
+            return false;
+        }
         // 承認バナー待ちの間は予約ターンを勝手に開始しない（ユーザー判断を待つ）。
         if self.finished || self.is_turn_running() || self.pending_decision.is_some() {
             return false;
@@ -10845,6 +11025,7 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
         match self.kind {
             AgentKind::Codex => {
                 let exec_settings = self.exec_settings_for_spawn();
+                exec_settings.validate_cli_approval()?;
                 for arg in codex_exec_args(
                     self.thread_id.as_deref(),
                     &self.cwd,
@@ -10911,6 +11092,9 @@ Act on the user_request first. Use Addness only as supporting memory and as the 
     }
 
     fn spawn_codex_subcommand_process(&mut self, args: &[String]) -> Result<Child> {
+        if !matches!(args.first().map(String::as_str), Some("--version" | "help")) {
+            self.exec_settings.validate_cli_approval()?;
+        }
         let mut cmd = Command::new(&self.codex_bin);
         for arg in args {
             cmd.arg(arg);
@@ -11115,7 +11299,7 @@ Codex CLI commands:
   /import [status|run], /hooks [key=value|clear], /skills [list|name]
   /doctor, /features|/experimental, /mcp, /apps, /plugin, /cloud, /login, /logout
   /update|/update-codex, /app, /app-server, /remote-control, /debug, /completion
-  /mcp-server, /exec-server, /sandbox-run <args>
+  /exec-server, /sandbox-run <args>
 Codex sessions:
   /sessions [N] - list local Codex sessions
   /codex-resume <args> - root codex resume; /resume is a TUI helper
@@ -15327,6 +15511,144 @@ mod tests {
         pane.codex_appserver_phase = CodexAppServerPhase::Ready;
         pane.thread_id = Some("th-1".to_string());
         Some(pane)
+    }
+
+    #[test]
+    fn codex_questions_resolve_without_answering_or_persisting_secrets() {
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        let event = serde_json::json!({"id":"q1","method":"item/tool/requestUserInput","params":{
+            "threadId":"th-1","turnId":"turn-1","itemId":"i","isBlocking":true,
+            "questions":[{"id":"secret","header":"秘密","question":"値？","isSecret":true}]
+        }});
+        pane.handle_json_event(event);
+        assert!(pane.codex_question_status().unwrap().contains("回答待ち"));
+        pane.input_state.insert_text("/answer 非公開の回答");
+        assert!(!pane.displayed_input().0.contains("非公開"));
+        assert!(!pane.start_next_queued_turn_if_idle());
+        pane.handle_json_event(serde_json::json!({"method":"serverRequest/resolved","params":{"threadId":"other","requestId":"q1"}}));
+        assert_eq!(pane.codex_pending_questions.len(), 1);
+        pane.handle_json_event(serde_json::json!({"method":"serverRequest/resolved","params":{"threadId":"th-1","requestId":"q1"}}));
+        assert!(pane.codex_pending_questions.is_empty());
+        assert!(pane.input_line().is_empty());
+        pane.submit_user_line("/answer stale secret");
+        assert!(
+            !pane
+                .input_state
+                .history
+                .iter()
+                .any(|line| line.contains("secret"))
+        );
+        assert!(
+            !pane
+                .log
+                .iter()
+                .any(|line| line.text.contains("stale secret"))
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn codex_questions_send_answers_and_cancel_through_resident_protocol() {
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        pane.codex_appserver = Some(codex_appserver::AppServerClient::new(child).unwrap());
+        for (id, blocking) in [(10, false), (11, true)] {
+            pane.handle_json_event(serde_json::json!({"id":id,"method":"item/tool/requestUserInput","params":{
+                "threadId":"th-1","turnId":"turn-1","itemId":"i","isBlocking":blocking,
+                "questions":[{"id":"language","header":"言語","question":"どちら？","options":[{"label":"日本語","description":"日本語で回答"}]}]
+            }}));
+        }
+        assert_eq!(pane.codex_pending_questions.len(), 2);
+        pane.submit_user_line("/answer 1");
+        let response: Value =
+            serde_json::from_str(&rx.recv_timeout(Duration::from_secs(2)).unwrap()).unwrap();
+        assert_eq!(response["id"], 10);
+        assert_eq!(
+            response["result"]["answers"]["language"]["answers"],
+            serde_json::json!(["日本語"])
+        );
+        pane.submit_user_line("/answer --cancel");
+        let response: Value =
+            serde_json::from_str(&rx.recv_timeout(Duration::from_secs(2)).unwrap()).unwrap();
+        assert_eq!(response["id"], 11);
+        assert_eq!(response["result"], serde_json::json!({"answers":{}}));
+        assert!(pane.codex_pending_questions.is_empty());
+        assert!(
+            !pane
+                .input_state
+                .history
+                .iter()
+                .any(|line| line.starts_with("/answer"))
+        );
+    }
+
+    #[test]
+    fn claude_old_snapshot_flag_rejection_is_sticky() {
+        let mut pane = claude_resident_pane();
+        let line = "error: unknown option '--system-prompt-snapshot'";
+        pane.handle_stderr_line(line);
+        assert!(pane.claude_settings.no_system_prompt_snapshot);
+        let before = pane
+            .log
+            .iter()
+            .filter(|l| l.text.contains("旧版Claudeの起動"))
+            .count();
+        pane.handle_stderr_line(line);
+        assert_eq!(
+            pane.log
+                .iter()
+                .filter(|l| l.text.contains("旧版Claudeの起動"))
+                .count(),
+            before
+        );
+    }
+
+    #[test]
+    fn removed_codex_policy_and_server_do_not_launch() {
+        let Some(mut pane) = codex_appserver_pane() else {
+            return;
+        };
+        pane.exec_settings.approval = CodexApprovalChoice::Untrusted;
+        assert!(
+            pane.spawn_exec_process("probe")
+                .unwrap_err()
+                .to_string()
+                .contains("常駐モード専用")
+        );
+        assert!(
+            pane.spawn_codex_subcommand_process(&["exec".into()])
+                .unwrap_err()
+                .to_string()
+                .contains("常駐モード専用")
+        );
+        pane.handle_approval_slash_command("on-failure");
+        assert_eq!(pane.exec_settings.approval, CodexApprovalChoice::Untrusted);
+        assert_eq!(
+            pane.codex_appserver_thread_config()
+                .approval_policy
+                .as_deref(),
+            Some("untrusted")
+        );
+        pane.submit_user_line("/mcp-server");
+        assert!(!pane.is_turn_running());
+        assert!(pane.log.iter().any(|l| l.text.contains("廃止")));
     }
 
     #[test]

@@ -1284,13 +1284,21 @@ fn draw_codex_help_overlay(frame: &mut Frame, app: &mut App) {
             kv("/cloud", "Codex Cloud taskのlist/status/apply/diff等を実行"),
             kv("/login / /logout", "ログイン状態確認 / ログアウト"),
             kv("/version / /update", "codex --version / update を実行"),
-            kv("/app / /app-server", "Codex Desktop起動 / app-server管理"),
+            kv(
+                if cfg!(any(target_os = "macos", target_os = "windows")) {
+                    "/app / /app-server"
+                } else {
+                    "/app-server"
+                },
+                if cfg!(any(target_os = "macos", target_os = "windows")) {
+                    "Codex Desktop起動 / app-server管理"
+                } else {
+                    "app-server管理"
+                },
+            ),
             kv("/remote-control", "app-server remote control をstart/stop"),
             kv("/debug / /completion", "debug出力 / shell completion生成"),
-            kv(
-                "/mcp-server / /exec-server",
-                "server系コマンド（空ならhelp表示）",
-            ),
+            kv("/exec-server", "server系コマンド（空ならhelp表示）"),
             kv("/sandbox-run", "Codex sandbox command を実行"),
             kv("/review <args>", "codex review を実行"),
             kv("/exec-review", "Codex reviewを機械判定向けに実行"),
@@ -3167,9 +3175,10 @@ fn draw_codex_exec_panel_contents(frame: &mut Frame, inner: Rect, pane: &mut Cod
             } else {
                 input_chunk.height.saturating_sub(1) as usize
             };
+            let (displayed_input, displayed_cursor) = pane.displayed_input();
             let render = codex_input_prompt_render(
-                pane.input_line(),
-                pane.input_cursor(),
+                &displayed_input,
+                displayed_cursor,
                 input_width,
                 prompt_rows,
                 input_style,
@@ -5230,6 +5239,9 @@ fn json_output_summary(output: &str) -> Option<String> {
 }
 
 fn codex_runtime_status(pane: &CodexPane, max_width: usize) -> String {
+    if let Some(question) = pane.codex_question_status() {
+        return ellipsize_width(&format!("  {question}"), max_width);
+    }
     let state = pane.run_state_elapsed_label();
     let view = format!("表示:{} Ctrl-Tで切替", pane.log_filter_display_label());
     let fixed_width = UnicodeWidthStr::width(state.as_str())

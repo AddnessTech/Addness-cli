@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use reqwest::Response;
 use serde_json::{Value, json};
 
@@ -133,9 +133,15 @@ impl ApiClient {
         org_id: &str,
         form_id: &str,
         max_bytes: u32,
+        view: &str,
     ) -> Result<Response> {
+        let view_query = match view {
+            "raw" => "",
+            "labels" => "&view=labels",
+            _ => bail!("Invalid CSV view: {view}"),
+        };
         let path = format!(
-            "{}/responses.csv?maxBytes={max_bytes}",
+            "{}/responses.csv?maxBytes={max_bytes}{view_query}",
             form_path(org_id, form_id)
         );
         self.get_raw(&path).await

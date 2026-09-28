@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
 use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio::fs::OpenOptions;
@@ -11,6 +11,21 @@ use uuid::Uuid;
 
 use crate::api::{ApiClient, FormListParams, FormResponseListParams};
 use crate::cli::commands::org::resolve_org_id;
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum FormCsvView {
+    Raw,
+    Labels,
+}
+
+impl FormCsvView {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::Labels => "labels",
+        }
+    }
+}
 
 #[derive(Subcommand)]
 pub enum FormCommands {
@@ -152,6 +167,9 @@ pub enum FormCommands {
         output: PathBuf,
         #[arg(long, default_value_t = 268_435_456, value_parser = clap::value_parser!(u32).range(1..=268_435_456))]
         max_bytes: u32,
+        /// raw preserves IDs; labels shows question and choice names
+        #[arg(long, value_enum, default_value = "raw")]
+        view: FormCsvView,
         #[arg(long)]
         json: bool,
     },
@@ -461,6 +479,7 @@ pub async fn handle_form(command: &FormCommands, client: &ApiClient) -> Result<(
             org,
             output,
             max_bytes,
+            view,
             json,
         } => {
             checked_id(id, "form ID")?;
@@ -469,13 +488,13 @@ pub async fn handle_form(command: &FormCommands, client: &ApiClient) -> Result<(
             }
             let (client, org_id) = scoped_client(client, org.as_deref())?;
             let response = client
-                .get_form_responses_csv(&org_id, id, *max_bytes)
+                .get_form_responses_csv(&org_id, id, *max_bytes, view.as_str())
                 .await?;
             let bytes = save_csv_response(response, output, *max_bytes).await?;
             if *json {
                 println!(
                     "{}",
-                    json!({ "formId": id, "path": output, "bytes": bytes })
+                    json!({ "formId": id, "path": output, "bytes": bytes, "view": view.as_str() })
                 );
             } else {
                 println!("Saved {bytes} bytes to {}", output.display());

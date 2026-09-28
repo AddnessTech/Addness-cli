@@ -368,10 +368,14 @@ pub async fn handle_form(command: &FormCommands, client: &ApiClient) -> Result<(
                     .context("API response has no forms")?
                 {
                     println!(
-                        "{}  {}  {}",
+                        "{}  {}  {}  responses={}",
                         form["id"].as_str().unwrap_or("?"),
                         form["status"].as_str().unwrap_or("?"),
-                        form["title"].as_str().unwrap_or("?")
+                        form["title"].as_str().unwrap_or("?"),
+                        form["responseCount"]
+                            .as_u64()
+                            .map(|count| count.to_string())
+                            .unwrap_or_else(|| "?".to_string())
                     );
                 }
                 if let Some(next) = data["nextCursor"].as_str() {

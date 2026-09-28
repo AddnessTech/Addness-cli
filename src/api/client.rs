@@ -9,6 +9,7 @@ mod core_values;
 mod deliverable;
 mod desktop_auth;
 mod diagnosis;
+mod form;
 mod goal;
 mod goal_chat;
 mod goal_decompose;
@@ -40,6 +41,7 @@ pub use activity::{
 };
 pub use chat::{ChatMessageListParams, ChatRoomListParams, ChatSearchParams};
 pub use comment::{ListAllCommentsParams, ListCommentsParams};
+pub use form::{FormListParams, FormResponseListParams};
 pub use goal_chat::GoalChatThreadListParams;
 pub use invoice::InvoiceListParams;
 pub use issue::{GoalSectionListParams, IssueListParams};

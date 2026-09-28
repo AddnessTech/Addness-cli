@@ -142,16 +142,27 @@ impl ApiClient {
         org_id: &str,
         form_id: &str,
         time_zone: Option<&str>,
+        submitted_at_from: Option<&str>,
+        submitted_at_before: Option<&str>,
     ) -> Result<Value> {
         let mut path = format!("{}/summary", form_path(org_id, form_id));
+        let mut query = form_urlencoded::Serializer::new(String::new());
         if let Some(zone) = time_zone {
             if zone.is_empty() || zone.len() > 64 {
                 bail!("time-zone must be a nonempty IANA time zone of at most 64 bytes");
             }
-            let mut query = form_urlencoded::Serializer::new(String::new());
             query.append_pair("timeZone", zone);
+        }
+        if let Some(from) = submitted_at_from {
+            query.append_pair("submittedAtFrom", from);
+        }
+        if let Some(before) = submitted_at_before {
+            query.append_pair("submittedAtBefore", before);
+        }
+        let query = query.finish();
+        if !query.is_empty() {
             path.push('?');
-            path.push_str(&query.finish());
+            path.push_str(&query);
         }
         let resp: ApiResponse<Value> = self.get(&path).await?;
         Ok(resp.data)

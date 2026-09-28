@@ -179,6 +179,12 @@ pub enum FormCommands {
         /// IANA time zone for daily counts (default: UTC)
         #[arg(long)]
         time_zone: Option<String>,
+        /// Include responses submitted at or after this timezone-aware RFC3339 timestamp
+        #[arg(long)]
+        submitted_at_from: Option<String>,
+        /// Include responses submitted before this timezone-aware RFC3339 timestamp
+        #[arg(long)]
+        submitted_at_before: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -555,12 +561,20 @@ pub async fn handle_form(command: &FormCommands, client: &ApiClient) -> Result<(
             id,
             org,
             time_zone,
+            submitted_at_from,
+            submitted_at_before,
             json: _,
         } => {
             checked_id(id, "form ID")?;
             let (client, org_id) = scoped_client(client, org.as_deref())?;
             let data = client
-                .get_form_summary(&org_id, id, time_zone.as_deref())
+                .get_form_summary(
+                    &org_id,
+                    id,
+                    time_zone.as_deref(),
+                    submitted_at_from.as_deref(),
+                    submitted_at_before.as_deref(),
+                )
                 .await?;
             println!("{}", serde_json::to_string_pretty(&data)?);
         }

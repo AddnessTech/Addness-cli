@@ -155,6 +155,9 @@ pub enum FormCommands {
         id: String,
         #[arg(long)]
         org: Option<String>,
+        /// IANA time zone for daily counts (default: UTC)
+        #[arg(long)]
+        time_zone: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -474,10 +477,17 @@ pub async fn handle_form(command: &FormCommands, client: &ApiClient) -> Result<(
             let data = client.get_form_response(&org_id, id, response_id).await?;
             println!("{}", serde_json::to_string_pretty(&data)?);
         }
-        FormCommands::Summary { id, org, json: _ } => {
+        FormCommands::Summary {
+            id,
+            org,
+            time_zone,
+            json: _,
+        } => {
             checked_id(id, "form ID")?;
             let (client, org_id) = scoped_client(client, org.as_deref())?;
-            let data = client.get_form_summary(&org_id, id).await?;
+            let data = client
+                .get_form_summary(&org_id, id, time_zone.as_deref())
+                .await?;
             println!("{}", serde_json::to_string_pretty(&data)?);
         }
         FormCommands::ExportCsv {

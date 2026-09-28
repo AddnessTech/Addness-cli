@@ -122,8 +122,22 @@ impl ApiClient {
         Ok(resp.data)
     }
 
-    pub async fn get_form_summary(&self, org_id: &str, form_id: &str) -> Result<Value> {
-        let path = format!("{}/summary", form_path(org_id, form_id));
+    pub async fn get_form_summary(
+        &self,
+        org_id: &str,
+        form_id: &str,
+        time_zone: Option<&str>,
+    ) -> Result<Value> {
+        let mut path = format!("{}/summary", form_path(org_id, form_id));
+        if let Some(zone) = time_zone {
+            if zone.is_empty() || zone.len() > 64 {
+                bail!("time-zone must be a nonempty IANA time zone of at most 64 bytes");
+            }
+            let mut query = form_urlencoded::Serializer::new(String::new());
+            query.append_pair("timeZone", zone);
+            path.push('?');
+            path.push_str(&query.finish());
+        }
         let resp: ApiResponse<Value> = self.get(&path).await?;
         Ok(resp.data)
     }

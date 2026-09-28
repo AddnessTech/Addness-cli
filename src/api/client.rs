@@ -510,6 +510,12 @@ impl ApiClient {
         self.send_json_with_retry(req, &url, true).await
     }
 
+    /// CSV 等の JSON 以外の GET レスポンスを逐次読み込むために返す。
+    pub(super) async fn get_raw(&self, path: &str) -> Result<Response> {
+        let (url, req) = self.request(Method::GET, path, true)?;
+        self.send(req, &url).await
+    }
+
     pub(super) async fn post<B: Serialize, T: DeserializeOwned>(
         &self,
         path: &str,

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use reqwest::Response;
 use serde_json::{Value, json};
 
 use crate::api::{ApiClient, ApiResponse};
@@ -125,5 +126,18 @@ impl ApiClient {
         let path = format!("{}/summary", form_path(org_id, form_id));
         let resp: ApiResponse<Value> = self.get(&path).await?;
         Ok(resp.data)
+    }
+
+    pub async fn get_form_responses_csv(
+        &self,
+        org_id: &str,
+        form_id: &str,
+        max_bytes: u32,
+    ) -> Result<Response> {
+        let path = format!(
+            "{}/responses.csv?maxBytes={max_bytes}",
+            form_path(org_id, form_id)
+        );
+        self.get_raw(&path).await
     }
 }

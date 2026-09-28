@@ -1,9 +1,12 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
+use futures::StreamExt;
 use serde_json::{Value, json};
+use tokio::fs::OpenOptions;
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 use crate::api::{ApiClient, FormListParams, FormResponseListParams};
@@ -140,6 +143,18 @@ pub enum FormCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Save response CSV to a new file without overwriting existing data
+    ExportCsv {
+        id: String,
+        #[arg(long)]
+        org: Option<String>,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long, default_value_t = 268_435_456, value_parser = clap::value_parser!(u32).range(1..=268_435_456))]
+        max_bytes: u32,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 impl FormCommands {
@@ -156,7 +171,8 @@ impl FormCommands {
             | Self::Delete { json, .. }
             | Self::Responses { json, .. }
             | Self::Response { json, .. }
-            | Self::Summary { json, .. } => *json,
+            | Self::Summary { json, .. }
+            | Self::ExportCsv { json, .. } => *json,
         }
     }
 }
@@ -216,6 +232,51 @@ fn print_form(data: &Value, json_output: bool) -> Result<()> {
         println!("public ID: {public_id}");
     }
     Ok(())
+}
+
+async fn save_csv_response(
+    response: reqwest::Response,
+    output: &Path,
+    max_bytes: u32,
+) -> Result<u64> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(output)
+        .await
+        .with_context(|| format!("Failed to create output file: {}", output.display()))?;
+    let write_result = async {
+        let mut stream = response.bytes_stream();
+        let mut written = 0_u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("Failed to read CSV response")?;
+            written += chunk.len() as u64;
+            if written > u64::from(max_bytes) {
+                bail!("CSV response exceeds --max-bytes ({max_bytes})");
+            }
+            file.write_all(&chunk)
+                .await
+                .with_context(|| format!("Failed to write CSV to {}", output.display()))?;
+        }
+        file.flush().await.context("Failed to flush CSV output")?;
+        Ok(written)
+    }
+    .await;
+    drop(file);
+    match write_result {
+        Ok(bytes) => Ok(bytes),
+        Err(err) => {
+            if let Err(cleanup_err) = tokio::fs::remove_file(output).await {
+                return Err(err.context(format!(
+                    "Failed to remove incomplete CSV at {}: {cleanup_err}",
+                    output.display()
+                )));
+            }
+            Err(err)
+        }
+    }
 }
 
 pub async fn handle_form(command: &FormCommands, client: &ApiClient) -> Result<()> {
@@ -394,6 +455,31 @@ pub async fn handle_form(command: &FormCommands, client: &ApiClient) -> Result<(
             let (client, org_id) = scoped_client(client, org.as_deref())?;
             let data = client.get_form_summary(&org_id, id).await?;
             println!("{}", serde_json::to_string_pretty(&data)?);
+        }
+        FormCommands::ExportCsv {
+            id,
+            org,
+            output,
+            max_bytes,
+            json,
+        } => {
+            checked_id(id, "form ID")?;
+            if output.exists() {
+                bail!("Output file already exists: {}", output.display());
+            }
+            let (client, org_id) = scoped_client(client, org.as_deref())?;
+            let response = client
+                .get_form_responses_csv(&org_id, id, *max_bytes)
+                .await?;
+            let bytes = save_csv_response(response, output, *max_bytes).await?;
+            if *json {
+                println!(
+                    "{}",
+                    json!({ "formId": id, "path": output, "bytes": bytes })
+                );
+            } else {
+                println!("Saved {bytes} bytes to {}", output.display());
+            }
         }
     }
     Ok(())

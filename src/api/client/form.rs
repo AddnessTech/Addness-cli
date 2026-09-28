@@ -134,15 +134,28 @@ impl ApiClient {
         form_id: &str,
         max_bytes: u32,
         view: &str,
+        submitted_at_from: Option<&str>,
+        submitted_at_before: Option<&str>,
     ) -> Result<Response> {
-        let view_query = match view {
-            "raw" => "",
-            "labels" => "&view=labels",
+        let mut query = form_urlencoded::Serializer::new(String::new());
+        query.append_pair("maxBytes", &max_bytes.to_string());
+        match view {
+            "raw" => {}
+            "labels" => {
+                query.append_pair("view", view);
+            }
             _ => bail!("Invalid CSV view: {view}"),
-        };
+        }
+        if let Some(from) = submitted_at_from {
+            query.append_pair("submittedAtFrom", from);
+        }
+        if let Some(before) = submitted_at_before {
+            query.append_pair("submittedAtBefore", before);
+        }
         let path = format!(
-            "{}/responses.csv?maxBytes={max_bytes}{view_query}",
-            form_path(org_id, form_id)
+            "{}/responses.csv?{}",
+            form_path(org_id, form_id),
+            query.finish()
         );
         self.get_raw(&path).await
     }

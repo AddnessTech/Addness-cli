@@ -170,6 +170,12 @@ pub enum FormCommands {
         /// raw preserves IDs; labels shows question and choice names
         #[arg(long, value_enum, default_value = "raw")]
         view: FormCsvView,
+        /// Include responses submitted at or after this timezone-aware RFC3339 timestamp
+        #[arg(long)]
+        submitted_at_from: Option<String>,
+        /// Include responses submitted before this timezone-aware RFC3339 timestamp
+        #[arg(long)]
+        submitted_at_before: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -480,6 +486,8 @@ pub async fn handle_form(command: &FormCommands, client: &ApiClient) -> Result<(
             output,
             max_bytes,
             view,
+            submitted_at_from,
+            submitted_at_before,
             json,
         } => {
             checked_id(id, "form ID")?;
@@ -488,14 +496,26 @@ pub async fn handle_form(command: &FormCommands, client: &ApiClient) -> Result<(
             }
             let (client, org_id) = scoped_client(client, org.as_deref())?;
             let response = client
-                .get_form_responses_csv(&org_id, id, *max_bytes, view.as_str())
+                .get_form_responses_csv(
+                    &org_id,
+                    id,
+                    *max_bytes,
+                    view.as_str(),
+                    submitted_at_from.as_deref(),
+                    submitted_at_before.as_deref(),
+                )
                 .await?;
             let bytes = save_csv_response(response, output, *max_bytes).await?;
             if *json {
-                println!(
-                    "{}",
-                    json!({ "formId": id, "path": output, "bytes": bytes, "view": view.as_str() })
-                );
+                let mut result =
+                    json!({ "formId": id, "path": output, "bytes": bytes, "view": view.as_str() });
+                if let Some(from) = submitted_at_from {
+                    result["submittedAtFrom"] = json!(from);
+                }
+                if let Some(before) = submitted_at_before {
+                    result["submittedAtBefore"] = json!(before);
+                }
+                println!("{result}");
             } else {
                 println!("Saved {bytes} bytes to {}", output.display());
             }

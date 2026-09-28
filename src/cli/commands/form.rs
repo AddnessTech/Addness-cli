@@ -41,6 +41,9 @@ pub enum FormCommands {
         limit: Option<u8>,
         #[arg(long)]
         cursor: Option<String>,
+        /// List forms in Trash that can still be restored
+        #[arg(long)]
+        trash: bool,
         #[arg(long)]
         json: bool,
     },
@@ -115,8 +118,26 @@ pub enum FormCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Delete a form and remove its responses from management APIs
+    /// Move a form and its responses to Trash for 30 days
     Delete {
+        id: String,
+        #[arg(long)]
+        org: Option<String>,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Restore a form and its responses from Trash
+    Restore {
+        id: String,
+        #[arg(long)]
+        org: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Permanently delete a form and its responses from Trash
+    Purge {
         id: String,
         #[arg(long)]
         org: Option<String>,
@@ -223,6 +244,8 @@ impl FormCommands {
             | Self::Close { json, .. }
             | Self::Unpublish { json, .. }
             | Self::Delete { json, .. }
+            | Self::Restore { json, .. }
+            | Self::Purge { json, .. }
             | Self::Responses { json, .. }
             | Self::Response { json, .. }
             | Self::DeleteResponse { json, .. }
@@ -343,6 +366,7 @@ pub async fn handle_form(command: &FormCommands, client: &ApiClient) -> Result<(
             query,
             limit,
             cursor,
+            trash,
             json,
         } => {
             let (client, org_id) = scoped_client(client, org.as_deref())?;
@@ -357,6 +381,7 @@ pub async fn handle_form(command: &FormCommands, client: &ApiClient) -> Result<(
                         query: query.as_deref(),
                         limit: limit.map(u16::from),
                         cursor: cursor.as_deref(),
+                        trash: *trash,
                     },
                 )
                 .await?;
@@ -463,14 +488,51 @@ pub async fn handle_form(command: &FormCommands, client: &ApiClient) -> Result<(
         } => {
             checked_id(id, "form ID")?;
             let (client, org_id) = scoped_client(client, org.as_deref())?;
-            if !force && !super::confirm(&format!("Delete form {id} and its responses?"))? {
+            if !force
+                && !super::confirm(&format!(
+                    "Move form {id} and its responses to Trash for 30 days?"
+                ))?
+            {
                 bail!("Cancelled");
             }
             client.delete_form(&org_id, id).await?;
             if *json {
-                println!("{}", json!({ "deleted": true, "id": id }));
+                println!(
+                    "{}",
+                    json!({ "deleted": true, "restorable": true, "id": id })
+                );
             } else {
-                println!("Form {id} deleted");
+                println!("Form {id} moved to Trash; it can be restored within 30 days");
+            }
+        }
+        FormCommands::Restore { id, org, json } => {
+            checked_id(id, "form ID")?;
+            let (client, org_id) = scoped_client(client, org.as_deref())?;
+            print_form(&client.restore_form(&org_id, id).await?, *json)?;
+        }
+        FormCommands::Purge {
+            id,
+            org,
+            force,
+            json,
+        } => {
+            checked_id(id, "form ID")?;
+            let (client, org_id) = scoped_client(client, org.as_deref())?;
+            if !force
+                && !super::confirm(&format!(
+                    "Permanently delete form {id} and all its responses? This cannot be undone."
+                ))?
+            {
+                bail!("Cancelled");
+            }
+            client.permanently_delete_form(&org_id, id).await?;
+            if *json {
+                println!(
+                    "{}",
+                    json!({ "deleted": true, "permanent": true, "id": id })
+                );
+            } else {
+                println!("Form {id} permanently deleted");
             }
         }
         FormCommands::Responses {

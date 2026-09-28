@@ -203,6 +203,7 @@ addness summary --json
 ```bash
 addness form list --json
 addness form list --goal <GOAL_ID> --query "アンケート" --limit 20 --json
+addness form list --trash --json
 addness form get <FORM_ID> --json
 addness form create --definition-file ./form.json --json
 addness form replace <FORM_ID> --revision 1 --definition-file ./form.json --json
@@ -211,6 +212,8 @@ addness form publish <FORM_ID> --revision 2 --json
 addness form close <FORM_ID> --revision 3 --json
 addness form unpublish <FORM_ID> --revision 4 --json
 addness form delete <FORM_ID> --json
+addness form restore <FORM_ID> --json
+addness form purge <FORM_ID> --json
 addness form responses <FORM_ID> --limit 50 --json
 addness form response <FORM_ID> <RESPONSE_ID> --json
 addness form summary <FORM_ID> --json

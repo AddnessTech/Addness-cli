@@ -9,6 +9,7 @@ pub struct FormListParams<'a> {
     pub query: Option<&'a str>,
     pub limit: Option<u16>,
     pub cursor: Option<&'a str>,
+    pub trash: bool,
 }
 
 pub struct FormResponseListParams<'a> {
@@ -30,6 +31,9 @@ impl ApiClient {
     pub async fn list_forms(&self, org_id: &str, params: FormListParams<'_>) -> Result<Value> {
         let mut query = form_urlencoded::Serializer::new(String::new());
         query.append_pair("summaryOnly", "true");
+        if params.trash {
+            query.append_pair("trash", "true");
+        }
         if let Some(goal_id) = params.goal_id {
             query.append_pair("goalId", goal_id);
         }
@@ -69,6 +73,17 @@ impl ApiClient {
 
     pub async fn delete_form(&self, org_id: &str, form_id: &str) -> Result<()> {
         self.delete_no_body(&form_path(org_id, form_id)).await
+    }
+
+    pub async fn restore_form(&self, org_id: &str, form_id: &str) -> Result<Value> {
+        let path = format!("{}/restore", form_path(org_id, form_id));
+        let resp: ApiResponse<Value> = self.post(&path, &json!({})).await?;
+        Ok(resp.data)
+    }
+
+    pub async fn permanently_delete_form(&self, org_id: &str, form_id: &str) -> Result<()> {
+        let path = format!("{}/permanent", form_path(org_id, form_id));
+        self.delete_no_body(&path).await
     }
 
     pub async fn change_form_state(

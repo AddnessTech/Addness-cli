@@ -150,6 +150,27 @@ pub enum FormCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Permanently delete one submitted response
+    DeleteResponse {
+        id: String,
+        response_id: String,
+        #[arg(long)]
+        org: Option<String>,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Permanently delete every response while keeping the form
+    DeleteAllResponses {
+        id: String,
+        #[arg(long)]
+        org: Option<String>,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Show counts and quiz score statistics
     Summary {
         id: String,
@@ -198,6 +219,8 @@ impl FormCommands {
             | Self::Delete { json, .. }
             | Self::Responses { json, .. }
             | Self::Response { json, .. }
+            | Self::DeleteResponse { json, .. }
+            | Self::DeleteAllResponses { json, .. }
             | Self::Summary { json, .. }
             | Self::ExportCsv { json, .. } => *json,
         }
@@ -476,6 +499,57 @@ pub async fn handle_form(command: &FormCommands, client: &ApiClient) -> Result<(
             let (client, org_id) = scoped_client(client, org.as_deref())?;
             let data = client.get_form_response(&org_id, id, response_id).await?;
             println!("{}", serde_json::to_string_pretty(&data)?);
+        }
+        FormCommands::DeleteResponse {
+            id,
+            response_id,
+            org,
+            force,
+            json,
+        } => {
+            checked_id(id, "form ID")?;
+            checked_id(response_id, "response ID")?;
+            let (client, org_id) = scoped_client(client, org.as_deref())?;
+            if !force
+                && !super::confirm(&format!(
+                    "Permanently delete response {response_id} from form {id}?"
+                ))?
+            {
+                bail!("Cancelled");
+            }
+            client
+                .delete_form_response(&org_id, id, response_id)
+                .await?;
+            if *json {
+                println!(
+                    "{}",
+                    json!({ "deleted": true, "formId": id, "responseId": response_id })
+                );
+            } else {
+                println!("Deleted response {response_id} from form {id}");
+            }
+        }
+        FormCommands::DeleteAllResponses {
+            id,
+            org,
+            force,
+            json,
+        } => {
+            checked_id(id, "form ID")?;
+            let (client, org_id) = scoped_client(client, org.as_deref())?;
+            if !force
+                && !super::confirm(&format!(
+                    "Permanently delete every response from form {id}?"
+                ))?
+            {
+                bail!("Cancelled");
+            }
+            client.delete_all_form_responses(&org_id, id).await?;
+            if *json {
+                println!("{}", json!({ "deletedAll": true, "formId": id }));
+            } else {
+                println!("Deleted all responses from form {id}");
+            }
         }
         FormCommands::Summary {
             id,

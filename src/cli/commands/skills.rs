@@ -214,9 +214,12 @@ addness form delete <FORM_ID> --json
 addness form responses <FORM_ID> --limit 50 --json
 addness form response <FORM_ID> <RESPONSE_ID> --json
 addness form summary <FORM_ID> --json
+addness form export-csv <FORM_ID> --output ./responses.csv --view labels --json
+addness form delete-response <FORM_ID> <RESPONSE_ID> --json
+addness form delete-all-responses <FORM_ID> --json
 ```
 
-`list` と `responses` の結果に `nextCursor` がある場合、同じ絞り込み条件で `--cursor` を渡すと次ページを取得できます。フォームの削除操作には確認が入ります。
+`list` と `responses` の結果に `nextCursor` がある場合、同じ絞り込み条件で `--cursor` を渡すと次ページを取得できます。CSV は既存ファイルを上書きしません。フォーム・回答の削除操作には確認が入り、削除後は復元できません。
 
 ## ゴール検出
 

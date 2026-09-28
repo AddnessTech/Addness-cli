@@ -122,6 +122,21 @@ impl ApiClient {
         Ok(resp.data)
     }
 
+    pub async fn delete_form_response(
+        &self,
+        org_id: &str,
+        form_id: &str,
+        response_id: &str,
+    ) -> Result<()> {
+        let path = format!("{}/responses/{response_id}", form_path(org_id, form_id));
+        self.delete_no_body(&path).await
+    }
+
+    pub async fn delete_all_form_responses(&self, org_id: &str, form_id: &str) -> Result<()> {
+        let path = format!("{}/responses", form_path(org_id, form_id));
+        self.delete_no_body(&path).await
+    }
+
     pub async fn get_form_summary(
         &self,
         org_id: &str,

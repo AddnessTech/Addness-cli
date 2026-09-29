@@ -12,10 +12,10 @@ use crate::config::{Credentials, DEFAULT_API_URL, Settings};
 use api::ApiClient;
 use cli::commands::{
     activity, api_key, assignment, chat, codex_job, comment, configure, consent, core_values,
-    deliverable, desktop_auth, detect, diagnosis, execution, goal, goal_chat, invitation, invoice,
-    issue, kpi, link, login, master_plan, media, meeting, member, notification, org, personal,
-    referral, search, sharetree, skill, skills, streak, summary, thread, today, todo_chat, update,
-    user,
+    deliverable, desktop_auth, detect, diagnosis, execution, form, goal, goal_chat, invitation,
+    invoice, issue, kpi, link, login, master_plan, media, meeting, member, notification, org,
+    personal, referral, search, sharetree, skill, skills, streak, summary, thread, today,
+    todo_chat, update, user,
 };
 
 #[derive(Parser)]
@@ -59,6 +59,11 @@ enum Commands {
     Goal {
         #[command(subcommand)]
         command: goal::GoalCommands,
+    },
+    /// Manage Addness Forms and read their responses
+    Form {
+        #[command(subcommand)]
+        command: form::FormCommands,
     },
     /// AI agent chat scoped to a goal: send a message and stream the reply
     /// (SSE), get an encouragement message, and browse threads/messages
@@ -309,6 +314,7 @@ fn command_outputs_json(command: &Commands) -> bool {
         Commands::Referral { command } => referral_outputs_json(command),
         Commands::Invoice { command } => invoice_outputs_json(command),
         Commands::ShareTree { command } => sharetree_outputs_json(command),
+        Commands::Form { command } => command.outputs_json(),
         Commands::Media { command } => media_outputs_json(command),
         Commands::Personal { command } => personal_outputs_json(command),
         Commands::Execution { command } => execution_outputs_json(command),
@@ -1133,6 +1139,10 @@ async fn main() -> Result<()> {
         Some(Commands::Goal { command }) => {
             let client = build_client()?;
             goal::handle_goals(command, &client).await
+        }
+        Some(Commands::Form { command }) => {
+            let client = build_client()?;
+            form::handle_form(command, &client).await
         }
         Some(Commands::GoalChat { command }) => {
             let client = build_client()?;

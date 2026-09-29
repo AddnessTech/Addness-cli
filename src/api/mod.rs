@@ -18,6 +18,7 @@ pub use client::{
     ChatMessageListParams, ChatRoomListParams, ChatSearchParams, GoalChatThreadListParams,
     GoalSectionListParams, IssueListParams, ListAllCommentsParams,
 };
+pub use client::{FormListParams, FormResponseListParams};
 pub use client::{
     HuddleInviteableMembersParams, InvoiceListParams, MinuteListParams, SearchQueryParams,
 };

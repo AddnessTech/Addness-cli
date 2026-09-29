@@ -196,6 +196,35 @@ addness summary --depth 5
 addness summary --json
 ```
 
+## Addness Form
+
+フォームの定義は JSON ファイルから渡します。作成時は `title` が必須です。更新時は最新の `revision` を `--revision` に指定し、ファイル側には含めません。管理用の取得コマンドには `--json` を付けてください。
+
+```bash
+addness form list --json
+addness form list --goal <GOAL_ID> --query "アンケート" --limit 20 --json
+addness form list --trash --json
+addness form get <FORM_ID> --json
+addness form create --definition-file ./form.json --json
+addness form replace <FORM_ID> --revision 1 --definition-file ./form.json --json
+addness form patch <FORM_ID> --revision 1 --definition-file ./changes.json --json
+addness form publish <FORM_ID> --revision 2 --json
+addness form close <FORM_ID> --revision 3 --json
+addness form unpublish <FORM_ID> --revision 4 --json
+addness form delete <FORM_ID> --json
+addness form restore <FORM_ID> --json
+addness form purge <FORM_ID> --json
+addness form responses <FORM_ID> --limit 50 --json
+addness form response <FORM_ID> <RESPONSE_ID> --json
+addness form summary <FORM_ID> --json
+addness form summary <FORM_ID> --submitted-at-from 2026-09-01T00:00:00+09:00 --submitted-at-before 2026-10-01T00:00:00+09:00 --json
+addness form export-csv <FORM_ID> --output ./responses.csv --view labels --json
+addness form delete-response <FORM_ID> <RESPONSE_ID> --json
+addness form delete-all-responses <FORM_ID> --json
+```
+
+`list` と `responses` の結果に `nextCursor` がある場合、同じ絞り込み条件で `--cursor` を渡すと次ページを取得できます。`summary` も提出時刻の範囲で回答数・設問・クイズの集計を絞り込めます。CSV は既存ファイルを上書きしません。フォーム・回答の削除操作には確認が入り、削除後は復元できません。
+
 ## ゴール検出
 
 ```bash

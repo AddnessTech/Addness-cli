@@ -13,6 +13,7 @@ pub mod desktop_auth;
 pub mod detect;
 pub mod diagnosis;
 pub mod execution;
+pub mod form;
 pub mod goal;
 pub mod goal_chat;
 pub mod goal_decompose_render;

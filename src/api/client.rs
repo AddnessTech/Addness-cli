@@ -9,6 +9,7 @@ mod core_values;
 mod deliverable;
 mod desktop_auth;
 mod diagnosis;
+mod form;
 mod goal;
 mod goal_chat;
 mod goal_decompose;
@@ -40,6 +41,7 @@ pub use activity::{
 };
 pub use chat::{ChatMessageListParams, ChatRoomListParams, ChatSearchParams};
 pub use comment::{ListAllCommentsParams, ListCommentsParams};
+pub use form::{FormListParams, FormResponseListParams};
 pub use goal_chat::GoalChatThreadListParams;
 pub use invoice::InvoiceListParams;
 pub use issue::{GoalSectionListParams, IssueListParams};
@@ -506,6 +508,12 @@ impl ApiClient {
     pub(super) async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
         let (url, req) = self.request(Method::GET, path, true)?;
         self.send_json_with_retry(req, &url, true).await
+    }
+
+    /// CSV 等の JSON 以外の GET レスポンスを逐次読み込むために返す。
+    pub(super) async fn get_raw(&self, path: &str) -> Result<Response> {
+        let (url, req) = self.request(Method::GET, path, true)?;
+        self.send(req, &url).await
     }
 
     pub(super) async fn post<B: Serialize, T: DeserializeOwned>(

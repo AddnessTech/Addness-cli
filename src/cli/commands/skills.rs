@@ -239,6 +239,12 @@ addness detect-goal --json
 
 ## AIエージェント向けガイドライン
 
+### 旧APIコマンドの互換性
+- `kpi` は旧ゴール紐付けKPI APIを呼びます。現行KPIツリーAPIには未対応です。
+- `goal-chat` / `todo-chat` / `goal decompose` は旧API向けで、現行サーバーでは404になります。
+- `execution generate` は廃止済みです。定期ルーティンは `addness today planned --help` で確認してください。
+- 404時はエラーに表示された `Request path` と `addness status --json` の接続先を確認してください。
+
 ### 作業開始時（必須）
 1. `addness detect-goal --json` でブランチに紐づくゴールを確認してください。
 2. ゴールが検出された場合、`addness goal get <ID> --json --with-deliverable --with-comment` で詳細を確認してから作業を開始してください。

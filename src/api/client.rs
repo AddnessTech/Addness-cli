@@ -298,10 +298,20 @@ impl ApiClient {
                          Run: addness goal search <keyword>"
                             .to_string(),
                     )
+                } else if body.trim().eq_ignore_ascii_case("404 page not found") {
+                    Some(
+                        "接続先のAddness APIにこのルートがありません。`addness status --json` でAPI URLを確認してください。URLが正しければ、CLIではなくサーバー側の対応が必要です。"
+                            .to_string(),
+                    )
                 } else {
                     None
                 }
             }
+            // 410 Gone
+            StatusCode::GONE if body.contains("RECURRING_GENERATION_REMOVED") => Some(
+                "定常ゴールの回生成は廃止され、テンプレートのルーティンに移行しました。CLIの予定・定期ToDo機能は `addness today planned --help` を確認してください。"
+                    .to_string(),
+            ),
             // 400 Bad Request
             StatusCode::BAD_REQUEST => {
                 if body.contains("タイトルは必須") {
@@ -371,7 +381,8 @@ impl ApiClient {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(Self::api_error(status, &body));
+            return Err(Self::api_error(status, &body)
+                .context(format!("Request path: {}", request_path(url))));
         }
 
         Ok(response)
@@ -683,11 +694,17 @@ impl ApiClient {
     }
 }
 
+fn request_path(url: &str) -> String {
+    Url::parse(url)
+        .map(|parsed| parsed.path().to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         API_RESOLVE_ENV, ApiClient, DEFAULT_HTTP_TIMEOUT_SECS, body_snippet,
-        http_timeout_from_env_value, parse_dns_override_addrs, send_failure_context,
+        http_timeout_from_env_value, parse_dns_override_addrs, request_path, send_failure_context,
     };
     use reqwest::StatusCode;
     use std::fs;
@@ -843,6 +860,35 @@ mod tests {
         let message = err.to_string();
 
         assert!(message.contains("ブラウザ（Clerk）認証専用"));
+    }
+
+    #[test]
+    fn api_error_explains_unregistered_routes() {
+        let err = ApiClient::api_error(StatusCode::NOT_FOUND, "404 page not found");
+        let message = err.to_string();
+
+        assert!(message.contains("このルートがありません"));
+        assert!(message.contains("addness status --json"));
+    }
+
+    #[test]
+    fn api_error_explains_removed_recurring_generation() {
+        let err = ApiClient::api_error(
+            StatusCode::GONE,
+            r#"{"code":"RECURRING_GENERATION_REMOVED"}"#,
+        );
+        let message = err.to_string();
+
+        assert!(message.contains("テンプレートのルーティン"));
+        assert!(message.contains("addness today planned --help"));
+    }
+
+    #[test]
+    fn request_path_omits_query_parameters() {
+        assert_eq!(
+            request_path("https://api.example.test/api/v2/search?q=private"),
+            "/api/v2/search"
+        );
     }
 
     #[test]

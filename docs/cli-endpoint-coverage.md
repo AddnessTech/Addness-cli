@@ -257,9 +257,9 @@ CLIから叩く実装対象として扱わない（DoDの分母から除外す�
 | GET | /api/v2/organizations/:id/objectives/:goalId/movement-summary | - | 未実装 |
 | POST | /api/v2/organizations/:id/objectives/:goalId/manager-events | - | 未実装 |
 | GET | /api/v2/objectives/:id/kpis | - | 未実装（`kpi list`相当なし） |
-| POST | /api/v2/objectives/:id/kpis | `kpi add` | 実装済み |
-| PATCH | /api/v2/objective-kpis/:id | `kpi update` | 実装済み |
-| DELETE | /api/v2/objective-kpis/:id | `kpi rm` | 実装済み |
+| POST | /api/v2/objectives/:id/kpis | `kpi add` | 旧API。現行サーバーでは未登録のため404。新KPIツリー(`/api/v2/analytics/kpi-tree`)には未対応 |
+| PATCH | /api/v2/objective-kpis/:id | `kpi update` | 旧API。現行サーバーでは未登録のため404 |
+| DELETE | /api/v2/objective-kpis/:id | `kpi rm` | 旧API。現行サーバーでは未登録のため404 |
 | GET | /api/v2/objective-kpis/:id/records | - | 未実装 |
 | GET | /api/v2/objectives/:id/suggested-assignees | - | 未実装 |
 | GET | /api/v2/objectives/:id/subtree/recurring-goals | - | 未実装 |
@@ -362,17 +362,14 @@ comment mutation は Goal Issue v2 を優先し、v2 で表現できない legac
 
 | 対象 | 本数 | 状態 |
 |---|---|---|
-| goal-chat（stream/encouragement/threads/messages） | 4本 | 未実装 |
-| todo-chat（stream/threads/messages） | 3本 | 実装済み（`addness todo-chat send/start/threads/messages`） |
+| goal-chat（stream/encouragement/threads/messages） | 4本 | 旧API。現行サーバーでは未登録のため404 |
+| todo-chat（stream/threads/messages） | 3本 | 旧API。現行サーバーでは未登録のため404 |
 | todo-chat/validate/*（同上の検証用並走） | 3本 | 対象外（検証用並走ルート） |
 | core-values（stream/threads/messages） | 3本 | 実装済み（`addness core-values send/start/threads/messages`） |
 | master-plan（stream/threads/messages） | 3本 | 実装済み（`addness master-plan send/start/threads/messages`） |
-| goal decompose（`POST /api/v1/objectives/:id/decompose`） | 1本 | 実装済み（`addness goal decompose`） |
+| goal decompose（`POST /api/v1/objectives/:id/decompose`） | 1本 | 旧API。現行サーバーでは未登録のため404 |
 
-いずれもSSEストリーミング。CLIで実装する場合はストリーミング出力のUX設計が必要。todo-chat/core-values/master-planはgoal-chatと同一のジェネリックハンドラ（`internal/chat/handler`）を共有するが、
-`openGoalId`不要・`opening`（口火）対応・`goal`イベント無し、かつ`threads`一覧はページング未対応（常に配列レスポンス）という差異がある。
-core-values/master-planはそれぞれ`internal/aicorevalues/chat.RuntimeAgent`・`internal/aimasterplan/chat.RuntimeAgent`がtodo-chatと同型（`runtime.ThreadPageLister`未実装）であることをGoソースで確認済み、本番スモークテストでも空配列（`{"data": [...]}`形式）の疎通を確認した。
-goal decomposeはこの表にこれまで未掲載だったが、`presentation/routes/api.go`の`POST /:id/decompose`（コメント「AI目標分解（SSE）」）としてGoソースで確認した。`presentation/handlers/ai`・`application/usecases/ai`配下のV1レガシー実装（ソースコード冒頭に"Deprecated. Use internal/aigoalchat / internal/aitodochat for new implementations."と明記）で、上記チャット系とは別系統（`GraphRunUsecase.RunStream`、`pkg/ai/streaming`のgraph-runエージェントループイベント語彙）だが、ユーザーが特定ゴールをサブゴールへ分解できる唯一の現行ルートであり、フロントエンドからも呼ばれている。スレッド継続やmessages一覧は無い単発生成コマンドのため、SSEイベント形式もチャット系（`event:`行＋`thread`/`text_delta`等）ではなく、`event:`行なしの`data: {"type": "...", ...}`のみで、`type`フィールドで種別判定する必要がある（`infra/ai/streaming/sse_writer.go`で確認済み）。LLM課金系のため本番実行によるスモークテストは未実施（`--help`表示とコード配線のみ確認）。
+現行サーバーでは goal-chat / todo-chat / goal decompose の旧ルートが廃止されています。コマンドは旧サーバーとの互換性のため残し、404時はAPIパスと接続先を示します。core-values / master-plan は現行ルートです。
 
 ## 14. 通知 (Notification) / 通知設定 / プッシュトークン / メール宛先
 
@@ -401,7 +398,7 @@ goal decomposeはこの表にこれまで未掲載だったが、`presentation/r
 | GET | /api/v2/organizations/:id/goal-history | `today calendar goal-history` | 実装済み |
 | GET | /api/v2/organizations/:id/execute-goals/summary | `execution member-summary` | 実装済み |
 | GET/PUT | /api/v2/organizations/:id/preferences/goal-collapse（2本） | `execution preference get/set` | 実装済み |
-| POST/PUT/GET | /api/v2/execute-goals/generate, /:id, /history（3本） | `execution generate/update/history` | 実装済み |
+| POST/PUT/GET | /api/v2/execute-goals/generate, /:id, /history（3本） | `execution generate/update/history` | generateは現行サーバーで410 (`RECURRING_GENERATION_REMOVED`)。update/historyは実装済み |
 | GET | /api/v2/todays-goals/active-huddles | `execution active-huddles` | 実装済み |
 | GET/POST/PATCH/DELETE | /api/v2/organizations/:id/validate/...（18本） | - | 対象外（検証用並走ルート） |
 | GET/POST | /api/v2/personal/validate/today-list, /daily-activity（2本） | - | 対象外（検証用並走ルート） |

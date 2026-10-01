@@ -77,7 +77,7 @@ pub enum ExecutionCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Generate today's execution records for every goal due today
+    /// Deprecated: recurring-goal generation has moved to template routines
     Generate {
         /// Organization ID (uses default if not specified)
         #[arg(long)]

@@ -8,7 +8,7 @@ use crate::cli::commands::org::resolve_org_id;
 /// Build a client whose `X-Organization-ID` header targets `org_id`, for the
 /// handful of execution-tab endpoints that live outside
 /// `/organizations/:id/...` and so resolve the organization purely from the
-/// header (`execute-goals/generate`, `execute-goals/:id`,
+/// header (`execute-goals/:id`,
 /// `todays-goals/active-huddles`, `codex/todays-goals/*`). Mirrors
 /// `client_for_org` in `org.rs`/`media.rs`.
 fn client_for_org(client: &ApiClient, org_id: &str) -> ApiClient {
@@ -73,15 +73,6 @@ pub enum ExecutionCommands {
         /// Sort direction: asc, desc
         #[arg(long)]
         sort_dir: Option<String>,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Deprecated: recurring-goal generation has moved to template routines
-    Generate {
-        /// Organization ID (uses default if not specified)
-        #[arg(long)]
-        org: Option<String>,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -280,17 +271,6 @@ pub async fn handle_execution(cmd: &ExecutionCommands, client: &ApiClient) -> Re
                     "page {}/{} ({} total)",
                     resp.page, resp.total_pages, resp.total_count
                 );
-            }
-            Ok(())
-        }
-        ExecutionCommands::Generate { org, json } => {
-            let org_id = resolve_org_id(org.as_deref())?;
-            let scoped = client_for_org(client, &org_id);
-            let resp = scoped.generate_execution().await?;
-            if *json {
-                println!("{}", serde_json::to_string_pretty(&resp)?);
-            } else {
-                println!("Generated {} execution record(s).", resp.created);
             }
             Ok(())
         }

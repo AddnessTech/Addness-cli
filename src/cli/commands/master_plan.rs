@@ -172,7 +172,7 @@ pub async fn handle_master_plan(cmd: &MasterPlanCommands, client: &ApiClient) ->
 
 /// Shared SSE-streaming driver for `Send` and `Start`: streams the turn and
 /// turns a terminal `error` event into a command failure once the stream
-/// ends (matching goal-chat/todo-chat/core-values' behavior).
+/// ends.
 async fn run_stream(
     client: &ApiClient,
     req: &MasterPlanChatStreamRequest,
@@ -198,7 +198,7 @@ async fn run_stream(
 /// `text_delta`/`reasoning_delta` chunks without trailing newlines. `error`
 /// events are captured into `stream_error` instead of printed immediately,
 /// so the caller can surface them as a command failure once the stream ends.
-/// Unlike goal-chat, there is no `goal` event to render since master-plan
+/// There is no `goal` event to render since master-plan
 /// isn't scoped to a single goal.
 fn render_plain_event(
     event_type: &str,

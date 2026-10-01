@@ -11,15 +11,12 @@ mod desktop_auth;
 mod diagnosis;
 mod form;
 mod goal;
-mod goal_chat;
-mod goal_decompose;
 mod goal_execution;
 mod goalreport;
 mod inlinemedia;
 mod invitation;
 mod invoice;
 mod issue;
-mod kpi;
 mod master_plan;
 mod meeting;
 mod member;
@@ -31,8 +28,6 @@ mod search;
 mod sharetree;
 mod skill;
 mod streak;
-mod thread;
-mod todo_chat;
 mod user;
 
 pub use activity::{
@@ -42,7 +37,6 @@ pub use activity::{
 pub use chat::{ChatMessageListParams, ChatRoomListParams, ChatSearchParams};
 pub use comment::{ListAllCommentsParams, ListCommentsParams};
 pub use form::{FormListParams, FormResponseListParams};
-pub use goal_chat::GoalChatThreadListParams;
 pub use invoice::InvoiceListParams;
 pub use issue::{GoalSectionListParams, IssueListParams};
 pub use meeting::{HuddleInviteableMembersParams, MinuteListParams};
@@ -50,12 +44,11 @@ pub use member::BrowseMembersParams;
 pub use notification::ListNotificationsParams;
 pub use org::{CreateOrganizationParams, ListAllOrganizationsParams};
 pub use search::SearchQueryParams;
-pub use thread::ThreadListParams;
 pub use user::ListUsersParams;
 
 use anyhow::{Context, Result};
 use reqwest::Client;
-use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Method, RequestBuilder, Response, StatusCode, Url};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -206,15 +199,25 @@ impl ApiClient {
         self.org_id = org_id;
     }
 
-    fn api_error(status: StatusCode, body: &str) -> anyhow::Error {
-        let hint = Self::error_hint(status, body);
+    fn is_json_content_type(content_type: Option<&str>) -> bool {
+        content_type.is_some_and(|value| value.to_ascii_lowercase().contains("application/json"))
+    }
+
+    fn api_error(status: StatusCode, body: &str, content_type: Option<&str>) -> anyhow::Error {
+        let hint = Self::error_hint(status, body, content_type);
+        let display_body =
+            if status == StatusCode::FORBIDDEN && !Self::is_json_content_type(content_type) {
+                "<non-JSON response body omitted>"
+            } else {
+                body
+            };
         match hint {
-            Some(h) => anyhow::anyhow!("API error ({status}): {body}\n\nHint: {h}"),
-            None => anyhow::anyhow!("API error ({status}): {body}"),
+            Some(h) => anyhow::anyhow!("API error ({status}): {display_body}\n\nHint: {h}"),
+            None => anyhow::anyhow!("API error ({status}): {display_body}"),
         }
     }
 
-    fn error_hint(status: StatusCode, body: &str) -> Option<String> {
+    fn error_hint(status: StatusCode, body: &str, content_type: Option<&str>) -> Option<String> {
         match status {
             // 401 Unauthorized
             StatusCode::UNAUTHORIZED => {
@@ -240,7 +243,12 @@ impl ApiClient {
             }
             // 403 Forbidden
             StatusCode::FORBIDDEN => {
-                if body.contains("AUTH_API_KEY_SCOPE_FORBIDDEN") {
+                if !Self::is_json_content_type(content_type) {
+                    Some(
+                        "Addness API がJSONではない403レスポンスを返しました。画面側と同じ判定では、WAFまたはセキュリティルールによる一時ブロックの可能性があります。ゴールのOWNER/EDITOR権限を変更しても解決しません。しばらく待って再試行し、続く場合は発生時刻とRequest pathを添えて運用担当に確認してください。"
+                            .to_string(),
+                    )
+                } else if body.contains("AUTH_API_KEY_SCOPE_FORBIDDEN") {
                     Some(
                         "このエンドポイントは現在のAPI Keyのスコープでは呼び出せません。\n\
                          （例: `addness login` で発行されるキーは organization スコープのため、\n\
@@ -380,9 +388,15 @@ impl ApiClient {
 
         let status = response.status();
         if !status.is_success() {
+            let diagnostics = request_trace_context(response.headers());
+            let content_type = response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
             let body = response.text().await.unwrap_or_default();
-            return Err(Self::api_error(status, &body)
-                .context(format!("Request path: {}", request_path(url))));
+            return Err(Self::api_error(status, &body, content_type.as_deref())
+                .context(format!("Request path: {}{diagnostics}", request_path(url))));
         }
 
         Ok(response)
@@ -670,23 +684,10 @@ impl ApiClient {
 
     /// POST a JSON body to a server-sent-events endpoint, returning the raw
     /// `Response` for the caller to consume as a byte stream. Mirrors
-    /// `get_stream`, but for endpoints (e.g. AI goal chat) whose SSE stream
+    /// `get_stream`, but for endpoints (e.g. mode-specific AI chat) whose SSE stream
     /// is initiated with a POST + JSON payload rather than a GET.
     pub(super) async fn post_stream<B: Serialize>(&self, path: &str, body: &B) -> Result<Response> {
         let (url, req) = self.request(Method::POST, path, true)?;
-        let req = req
-            .json(body)
-            .timeout(Duration::from_secs(EVENT_STREAM_TIMEOUT_SECS));
-        self.send(req, &url).await
-    }
-
-    /// PUT a JSON body to a server-sent-events endpoint, returning the raw
-    /// `Response` for the caller to consume as a byte stream. Mirrors
-    /// `post_stream`; used by `addness thread edit-and-regenerate`
-    /// (`PUT .../messages/:messageId/edit-and-regenerate`), the only SSE
-    /// route in this CLI initiated with PUT rather than GET/POST.
-    pub(super) async fn put_stream<B: Serialize>(&self, path: &str, body: &B) -> Result<Response> {
-        let (url, req) = self.request(Method::PUT, path, true)?;
         let req = req
             .json(body)
             .timeout(Duration::from_secs(EVENT_STREAM_TIMEOUT_SECS));
@@ -700,13 +701,52 @@ fn request_path(url: &str) -> String {
         .unwrap_or_else(|_| "<unknown>".to_string())
 }
 
+fn request_trace_context(headers: &HeaderMap) -> String {
+    const DIAGNOSTIC_HEADERS: &[&str] = &[
+        "cf-ray",
+        "x-amz-cf-id",
+        "x-amz-cf-pop",
+        "x-amzn-trace-id",
+        "x-amzn-requestid",
+        "x-request-id",
+        "request-id",
+        "server",
+        "via",
+        "date",
+    ];
+
+    let values = DIAGNOSTIC_HEADERS
+        .iter()
+        .filter_map(|name| {
+            let value = headers.get(*name)?.to_str().ok()?.trim();
+            if value.is_empty()
+                || value.len() > 160
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+            {
+                return None;
+            }
+            Some(format!("{name}={value}"))
+        })
+        .collect::<Vec<_>>();
+
+    if values.is_empty() {
+        String::new()
+    } else {
+        format!("; edge diagnostics: {}", values.join(", "))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         API_RESOLVE_ENV, ApiClient, DEFAULT_HTTP_TIMEOUT_SECS, body_snippet,
-        http_timeout_from_env_value, parse_dns_override_addrs, request_path, send_failure_context,
+        http_timeout_from_env_value, parse_dns_override_addrs, request_path, request_trace_context,
+        send_failure_context,
     };
     use reqwest::StatusCode;
+    use reqwest::header::HeaderMap;
     use std::fs;
     use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
@@ -835,7 +875,11 @@ mod tests {
 
     #[test]
     fn api_error_keeps_existing_auth_hint() {
-        let err = ApiClient::api_error(StatusCode::UNAUTHORIZED, "AUTH_INVALID_API_KEY");
+        let err = ApiClient::api_error(
+            StatusCode::UNAUTHORIZED,
+            "AUTH_INVALID_API_KEY",
+            Some("application/json"),
+        );
         let message = err.to_string();
 
         assert!(message.contains("API error (401 Unauthorized): AUTH_INVALID_API_KEY"));
@@ -847,6 +891,7 @@ mod tests {
         let err = ApiClient::api_error(
             StatusCode::FORBIDDEN,
             r#"{"code":"AUTH_API_KEY_SCOPE_FORBIDDEN"}"#,
+            Some("application/json"),
         );
         let message = err.to_string();
 
@@ -856,15 +901,39 @@ mod tests {
 
     #[test]
     fn api_error_hints_clerk_only_endpoints() {
-        let err = ApiClient::api_error(StatusCode::FORBIDDEN, r#"{"code":"AUTH_CLERK_ONLY"}"#);
+        let err = ApiClient::api_error(
+            StatusCode::FORBIDDEN,
+            r#"{"code":"AUTH_CLERK_ONLY"}"#,
+            Some("application/json"),
+        );
         let message = err.to_string();
 
         assert!(message.contains("ブラウザ（Clerk）認証専用"));
     }
 
     #[test]
+    fn api_error_classifies_non_json_forbidden_as_waf_without_role_hint() {
+        let err = ApiClient::api_error(
+            StatusCode::FORBIDDEN,
+            "<html><body>blocked</body></html>",
+            Some("text/html; charset=utf-8"),
+        );
+        let message = err.to_string();
+
+        assert!(message.contains("WAFまたはセキュリティルール"));
+        assert!(message.contains("OWNER/EDITOR権限を変更しても解決しません"));
+        assert!(message.contains("non-JSON response body omitted"));
+        assert!(!message.contains("<html>"));
+        assert!(!message.contains("対象ゴールに OWNER または EDITOR"));
+    }
+
+    #[test]
     fn api_error_explains_unregistered_routes() {
-        let err = ApiClient::api_error(StatusCode::NOT_FOUND, "404 page not found");
+        let err = ApiClient::api_error(
+            StatusCode::NOT_FOUND,
+            "404 page not found",
+            Some("text/plain"),
+        );
         let message = err.to_string();
 
         assert!(message.contains("このルートがありません"));
@@ -876,6 +945,7 @@ mod tests {
         let err = ApiClient::api_error(
             StatusCode::GONE,
             r#"{"code":"RECURRING_GENERATION_REMOVED"}"#,
+            Some("application/json"),
         );
         let message = err.to_string();
 
@@ -888,6 +958,20 @@ mod tests {
         assert_eq!(
             request_path("https://api.example.test/api/v2/search?q=private"),
             "/api/v2/search"
+        );
+    }
+
+    #[test]
+    fn request_trace_context_includes_only_safe_diagnostic_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("cf-ray", "7ab123-lax".parse().unwrap());
+        headers.insert("x-request-id", "trace-42".parse().unwrap());
+        headers.insert("server", "cloudflare".parse().unwrap());
+        headers.insert("set-cookie", "session=private".parse().unwrap());
+
+        assert_eq!(
+            request_trace_context(&headers),
+            "; edge diagnostics: cf-ray=7ab123-lax, x-request-id=trace-42, server=cloudflare"
         );
     }
 

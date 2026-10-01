@@ -27,8 +27,8 @@ impl CoreValuesReasoning {
     }
 }
 
-/// Build a client whose `X-Organization-ID` header targets `org_id`. Mirrors
-/// `todo_chat::client_for_org` — the `/api/v2/ai-core-values/*` routes
+/// Build a client whose `X-Organization-ID` header targets `org_id`. The
+/// `/api/v2/ai-core-values/*` routes
 /// resolve the organization from that header (no org segment in the path).
 fn client_for_org(client: &ApiClient, org_id: &str) -> ApiClient {
     let mut scoped = client.clone();
@@ -172,7 +172,7 @@ pub async fn handle_core_values(cmd: &CoreValuesCommands, client: &ApiClient) ->
 
 /// Shared SSE-streaming driver for `Send` and `Start`: streams the turn and
 /// turns a terminal `error` event into a command failure once the stream
-/// ends (matching goal-chat/todo-chat's behavior).
+/// ends.
 async fn run_stream(
     client: &ApiClient,
     req: &CoreValuesChatStreamRequest,
@@ -198,7 +198,7 @@ async fn run_stream(
 /// `text_delta`/`reasoning_delta` chunks without trailing newlines. `error`
 /// events are captured into `stream_error` instead of printed immediately,
 /// so the caller can surface them as a command failure once the stream ends.
-/// Unlike goal-chat, there is no `goal` event to render since core-values
+/// There is no `goal` event to render since core-values
 /// isn't scoped to a single goal.
 fn render_plain_event(
     event_type: &str,

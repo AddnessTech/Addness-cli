@@ -409,16 +409,8 @@ pub struct UpdateGoalPreferenceRequest {
 }
 
 // ---------------------------------------------------------------------------
-// 実行記録 — generate / update / history / member summary
+// 実行記録 — update / history / member summary
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GenerateExecutionResponse {
-    pub created: i32,
-    #[serde(default)]
-    pub records: Vec<ExecutionRecord>,
-}
 
 #[cfg(test)]
 mod tests {

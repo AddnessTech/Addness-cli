@@ -9,8 +9,6 @@ pub struct Organization {
     pub name: String,
     #[serde(default)]
     pub plan_type: Option<String>,
-    #[serde(default)]
-    pub context_text: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -53,12 +51,6 @@ pub struct CreateOrganizationRequest {
 #[serde(rename_all = "camelCase")]
 pub struct UpdateOrganizationRequest {
     pub name: String,
-}
-
-// PATCH /api/v2/organizations/:id/context
-#[derive(Debug, Serialize)]
-pub struct UpdateContextRequest {
-    pub context_text: String,
 }
 
 // POST /api/v1/team/organizations/:id/push_tokens

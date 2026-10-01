@@ -9,14 +9,13 @@ pub use client::ListCommentsParams;
 pub use client::ListNotificationsParams;
 pub use client::ListUsersParams;
 pub use client::RelatedFetchError;
-pub use client::ThreadListParams;
 pub use client::{
     ActivityLogByGoalParams, ActivityLogByMemberParams, ActivityLogSummaryParams,
     GoalActivitySummaryParams,
 };
 pub use client::{
-    ChatMessageListParams, ChatRoomListParams, ChatSearchParams, GoalChatThreadListParams,
-    GoalSectionListParams, IssueListParams, ListAllCommentsParams,
+    ChatMessageListParams, ChatRoomListParams, ChatSearchParams, GoalSectionListParams,
+    IssueListParams, ListAllCommentsParams,
 };
 pub use client::{FormListParams, FormResponseListParams};
 pub use client::{

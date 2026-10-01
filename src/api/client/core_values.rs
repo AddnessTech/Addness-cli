@@ -15,9 +15,9 @@ impl ApiClient {
     /// `done` (success) or `error` (failure; the caller decides whether to
     /// surface it). Event types: `thread`, `reasoning_delta`, `text_delta`,
     /// `tool_call`, `tool_result`, `usage`, `message_saved`, `done`,
-    /// `error`. Unlike goal-chat, no `goal` event is emitted since
-    /// core-values isn't scoped to a single goal. Mirrors
-    /// `stream_todo_chat` — same generic handler, same event contract.
+    /// `error`. No `goal` event is emitted since core-values isn't scoped to
+    /// a single goal. Current mode-specific chat routes share this event
+    /// contract.
     pub async fn stream_core_values_chat<F>(
         &self,
         req: &CoreValuesChatStreamRequest,
@@ -40,7 +40,7 @@ impl ApiClient {
 
     /// GET /api/v2/ai-core-values/threads
     ///
-    /// Like todo-chat, the backend's core-values agent
+    /// The backend's core-values agent
     /// (`internal/aicorevalues/chat.RuntimeAgent`) doesn't implement
     /// pagination (`runtime.ThreadPageLister`), so this always returns the
     /// full list of threads as a plain array (`{"data": [...]}`) — confirmed

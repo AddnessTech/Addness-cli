@@ -15,9 +15,8 @@ impl ApiClient {
     /// `done` (success) or `error` (failure; the caller decides whether to
     /// surface it). Event types: `thread`, `reasoning_delta`, `text_delta`,
     /// `tool_call`, `tool_result`, `usage`, `message_saved`, `done`,
-    /// `error`. Unlike goal-chat, no `goal` event is emitted since
-    /// master-plan isn't scoped to a single goal. Mirrors
-    /// `stream_core_values_chat` — same generic handler, same event
+    /// `error`. No `goal` event is emitted since master-plan isn't scoped to
+    /// a single goal. Current mode-specific chat routes share this event
     /// contract.
     pub async fn stream_master_plan_chat<F>(
         &self,
@@ -41,7 +40,7 @@ impl ApiClient {
 
     /// GET /api/v2/ai-master-plan/threads
     ///
-    /// Like core-values/todo-chat, the backend's master-plan agent
+    /// The backend's master-plan agent
     /// (`internal/aimasterplan/chat.RuntimeAgent`) doesn't implement
     /// pagination (`runtime.ThreadPageLister`), so this always returns the
     /// full list of threads as a plain array (`{"data": [...]}`) — confirmed

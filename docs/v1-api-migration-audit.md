@@ -1,5 +1,7 @@
 # CLI v1 API migration audit
 
+> This is a historical audit snapshot from 2026-08-28. The 2026-10-02 removal of retired command routes and the current backend replacements are recorded in [`cli-current-api-migrations.md`](./cli-current-api-migrations.md); use that document for current command behavior.
+
 監査基準日: 2026-08-28
 
 - CLI baseline: `626fed7db40672c3dbaaaa1900dfb00483d64e82`

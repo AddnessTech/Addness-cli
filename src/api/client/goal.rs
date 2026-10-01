@@ -209,8 +209,13 @@ impl ApiClient {
         }
         if !response.status().is_success() {
             let status = response.status();
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
             let body = response.text().await.unwrap_or_default();
-            return Err(Self::api_error(status, &body));
+            return Err(Self::api_error(status, &body, content_type.as_deref()));
         }
         let bytes = response
             .bytes()

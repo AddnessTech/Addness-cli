@@ -5,7 +5,7 @@
 
 対応付けの根拠は、`/tmp/vtb-main`（vision-todo-backend読み取り専用worktree、Go/Gin、`presentation/routes/api.go`）のハンドラ実装と、本リポジトリ`src/api/client/*.rs` / `src/cli/commands/*.rs` の実装内容を実際に突き合わせて判定した。
 
-> **最終更新: 2026-09-10** — 廃止済みAI scheduleの組織2件・Objective2件を除外し、24グループの合計を再集計した。2026-08-28: — deprecated comment mutation を Goal Issue v2-first に移行し、v2 root/reply delete を追加した。残存 v1 の全件判定は [`v1-api-migration-audit.md`](./v1-api-migration-audit.md) を参照。
+> **集計基準: 2026-09-10。** 2026-10-02に現行バックエンドを再照合し、廃止APIコマンドを削除した。影響するAPIの移行先と削除内容は [`cli-current-api-migrations.md`](./cli-current-api-migrations.md) を参照。以下の集計値は再集計前のスナップショット。
 
 ---
 
@@ -162,9 +162,9 @@ CLIから叩く実装対象として扱わない（DoDの分母から除外す�
 | PUT | /api/v2/organizations/:id/logo | `org set-logo` | 実装済み |
 | PUT/PATCH | /api/v2/organizations/:id | `org update` | 実装済み |
 | PUT/PATCH | /api/v2/organizations/:id/default-timezone | `org set-timezone` | 実装済み |
-| GET | /api/v2/organizations/:id/context | `org get-context` | 実装済み |
-| PATCH | /api/v2/organizations/:id/context | `org set-context` | 実装済み |
-| GET | /api/v2/organizations/:id/context/revisions | `org context-revisions` | 実装済み |
+| GET | /api/v2/organizations/:id/context | - | 廃止（backend commit `f3ae686d` で機能とルートを撤去） |
+| PATCH | /api/v2/organizations/:id/context | - | 廃止（保存内容がAddyへ注入されず、機能自体を撤去） |
+| GET | /api/v2/organizations/:id/context/revisions | - | 廃止（backend commit `f3ae686d` で機能とルートを撤去） |
 | GET | /api/v2/organizations/:id/onboarding-billing-state | `org onboarding-billing` | 実装済み |
 | POST | /api/v2/organizations/:id/onboarding-billing/require | `org onboarding-billing` | 実装済み |
 | POST | /api/v2/organizations/:id/onboarding-billing/free | `org onboarding-billing` | 実装済み |
@@ -256,11 +256,8 @@ CLIから叩く実装対象として扱わない（DoDの分母から除外す�
 | GET | /api/v2/organizations/:id/objectives/manager-inbox | - | 未実装 |
 | GET | /api/v2/organizations/:id/objectives/:goalId/movement-summary | - | 未実装 |
 | POST | /api/v2/organizations/:id/objectives/:goalId/manager-events | - | 未実装 |
-| GET | /api/v2/objectives/:id/kpis | - | 未実装（`kpi list`相当なし） |
-| POST | /api/v2/objectives/:id/kpis | `kpi add` | 旧API。現行サーバーでは未登録のため404。新KPIツリー(`/api/v2/analytics/kpi-tree`)には未対応 |
-| PATCH | /api/v2/objective-kpis/:id | `kpi update` | 旧API。現行サーバーでは未登録のため404 |
-| DELETE | /api/v2/objective-kpis/:id | `kpi rm` | 旧API。現行サーバーでは未登録のため404 |
-| GET | /api/v2/objective-kpis/:id/records | - | 未実装 |
+| GET/POST/PATCH/DELETE | /api/v2/analytics/kpi-tree* | - | 現行KPIツリーAPI。CLI未対応。旧 `kpi add/update/rm` は削除 |
+| GET/POST/PATCH/PUT/DELETE | /api/v2/analytics/recipes*、/runs/*/metric-points | - | 現行KPI定義・実績記録API。旧ゴール直結KPIと契約が異なるためCLI未対応 |
 | GET | /api/v2/objectives/:id/suggested-assignees | - | 未実装 |
 | GET | /api/v2/objectives/:id/subtree/recurring-goals | - | 未実装 |
 | GET/POST/PUT/DELETE | /api/v2/objectives/:id/recurring（4本） | `goal recurring get/set/remove`（setが作成/更新を兼務） | 実装済み |
@@ -358,18 +355,19 @@ comment mutation は Goal Issue v2 を優先し、v2 で表現できない legac
 
 **小計: 53本未実装、2本対象外。** 現状CLIにAI関連コマンドは一切存在しない最大の未着手領域。
 
-## 13. AIエージェントチャット (Goal Chat / Todo Chat / Core Values / Master Plan) / Goal Decompose
+## 13. AIエージェントチャットと廃止済みルート
 
 | 対象 | 本数 | 状態 |
 |---|---|---|
-| goal-chat（stream/encouragement/threads/messages） | 4本 | 旧API。現行サーバーでは未登録のため404 |
-| todo-chat（stream/threads/messages） | 3本 | 旧API。現行サーバーでは未登録のため404 |
+| goal-chat（stream/encouragement/threads/messages） | 4本 | 現行バックエンドに未登録。CLIコマンドを削除 |
+| todo-chat（stream/threads/messages） | 3本 | 現行バックエンドに未登録。CLIコマンドを削除 |
 | todo-chat/validate/*（同上の検証用並走） | 3本 | 対象外（検証用並走ルート） |
 | core-values（stream/threads/messages） | 3本 | 実装済み（`addness core-values send/start/threads/messages`） |
 | master-plan（stream/threads/messages） | 3本 | 実装済み（`addness master-plan send/start/threads/messages`） |
-| goal decompose（`POST /api/v1/objectives/:id/decompose`） | 1本 | 旧API。現行サーバーでは未登録のため404 |
+| legacy thread (`/api/v1/team/ai/threads*`) | 16操作 | 現行バックエンドに未登録。CLIコマンドを削除 |
+| goal decompose（`POST /api/v1/objectives/:id/decompose`） | 1本 | 同等ルートなし。CLIコマンドを削除 |
 
-現行サーバーでは goal-chat / todo-chat / goal decompose の旧ルートが廃止されています。コマンドは旧サーバーとの互換性のため残し、404時はAPIパスと接続先を示します。core-values / master-plan は現行ルートです。
+現行バックエンドには `ai-current-map` と `ai-onboarding-hearing` もありますが、CLIコマンドは未実装です。ゴール上の会話は `issue` / `comment`、AI診断対話は `core-values` / `master-plan`、クラウドCodex作業は `codex-job` に分かれています。これらは旧AI thread APIと同じ契約ではありません。詳細は [`cli-current-api-migrations.md`](./cli-current-api-migrations.md) を参照してください。
 
 ## 14. 通知 (Notification) / 通知設定 / プッシュトークン / メール宛先
 
@@ -398,7 +396,8 @@ comment mutation は Goal Issue v2 を優先し、v2 で表現できない legac
 | GET | /api/v2/organizations/:id/goal-history | `today calendar goal-history` | 実装済み |
 | GET | /api/v2/organizations/:id/execute-goals/summary | `execution member-summary` | 実装済み |
 | GET/PUT | /api/v2/organizations/:id/preferences/goal-collapse（2本） | `execution preference get/set` | 実装済み |
-| POST/PUT/GET | /api/v2/execute-goals/generate, /:id, /history（3本） | `execution generate/update/history` | generateは現行サーバーで410 (`RECURRING_GENERATION_REMOVED`)。update/historyは実装済み |
+| PUT/GET | /api/v2/execute-goals/:id, /history（2本） | `execution update/history` | 実装済み |
+| POST | /api/v2/execute-goals/generate | - | バックエンドは410 (`RECURRING_GENERATION_REMOVED`) を返すためCLIコマンドを削除。テンプレートのルーティンは `today planned` |
 | GET | /api/v2/todays-goals/active-huddles | `execution active-huddles` | 実装済み |
 | GET/POST/PATCH/DELETE | /api/v2/organizations/:id/validate/...（18本） | - | 対象外（検証用並走ルート） |
 | GET/POST | /api/v2/personal/validate/today-list, /daily-activity（2本） | - | 対象外（検証用並走ルート） |
@@ -500,11 +499,11 @@ Huddleのライブ参加・画面共有制御を除くミーティング系22本
 
 「依存が少なく（外部OAuth・SSEストリーミング・音声/録画等の複雑な状態管理が不要）、利用頻度が高い（既存CLIワークフローの中核機能を補完する）」ものから着手する。
 
-> **2026-07-15時点の進捗**: Tier 1 の APIキー管理・ユーザー・通知・Goal Issue、Tier 2 の Recurring・招待受け取り側・today拡張・アクティビティログ・Member残り・組織詳細/タイムゾーン、低頻度領域のミーティング主要操作・スキル/ツール・Codexジョブは実装完了。Tier 1 で残るのは KPI一覧、Assignment一覧・詳細、ゴール祖先/子孫取得。
+> **2026-10-02更新**: 旧ゴール直結KPI APIは現行バックエンドにないため、KPI一覧の追加計画を取り下げた。Analytics Recipe/KPI treeは別契約で、CLI未対応。
 
 ### Tier 1（最優先: 既存機能の欠けている読み取り操作・自動化に必須な基本機能）
 
-1. **KPI一覧取得**（`GET /api/v2/objectives/:id/kpis`, `GET /api/v2/objective-kpis/:id/records`）— `kpi add/update/rm`はあるのに`list`が無い非対称を解消。
+1. **現行Analytics Recipe/KPI tree API** — 旧 `kpi add/update/rm` と同等ではないため、別コマンド設計が必要。
 2. **Assignment一覧・詳細取得**（`GET /api/v2/objectives/:id/assignments`, `GET .../assignments/:assignmentId`）— 同上の非対称解消。
 3. **ゴール祖先/子孫取得**（`GET /api/v2/objectives/:id/ancestors`, `/descendants`）— `goal tree`/`goal children`と並ぶナビゲーション基本機能で依存なし。
 
@@ -518,7 +517,7 @@ Huddleのライブ参加・画面共有制御を除くミーティング系22本
 
 1. 外部連携（Slack/Discord/GitHub/LINE/Zoom/Codex Integrations）— OAuthブラウザ導線が前提でCLI単体では完結しない。
 2. AIスレッド/エージェント/AIバックグラウンドタスク（Phase 3全般）— レート制限・SSEストリーミング・複雑な状態遷移。
-3. AIエージェントチャット（goal-chat/todo-chat/core-values/master-plan）— SSEストリーミング。
+3. AIエージェントチャット（current-map/onboarding-hearing）— SSEストリーミング。core-values/master-planは実装済み。
 4. Huddleライブ参加操作（join/leave/switch/token/screen-share/heartbeat）— LiveKitセッションの接続ライフサイクル設計が必要。
 5. 通知SSEストリームとAIスレッド公開共有など、ブラウザ常駐・ストリーミング前提の低頻度機能。
 

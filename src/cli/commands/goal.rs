@@ -7,8 +7,6 @@ use crate::api::{
     GoalStatus, GoalTreeData, GoalTreeItem, RecurringGoal, RecurringGoalRequest, RelatedFetchError,
     UpdateGoalRequest,
 };
-use crate::cli::commands::ai_chat_render::json_event_line;
-use crate::cli::commands::goal_decompose_render;
 use crate::cli::commands::org::resolve_org_id;
 use crate::cli::output::{
     print_children_table, print_goals_table, print_search_results, resolve_status,
@@ -422,18 +420,6 @@ pub enum GoalCommands {
         #[arg(long, conflicts_with = "parent")]
         root: bool,
         /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Ask the legacy AI endpoint to decompose a goal into sub-goals (may return 404 on current servers)
-    Decompose {
-        /// Goal ID to decompose
-        id: String,
-        /// Organization ID (uses default if not specified)
-        #[arg(long)]
-        org: Option<String>,
-        /// Emit each SSE event as a JSON line (`{"event":...,"data":...}`)
-        /// instead of formatted text
         #[arg(long)]
         json: bool,
     },
@@ -1216,27 +1202,6 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
             } else {
                 let dest = new_parent.as_deref().unwrap_or("(root)");
                 println!("Moved goal {} to {dest}", resp.data.id);
-            }
-            Ok(())
-        }
-        GoalCommands::Decompose { id, org, json } => {
-            let org_id = resolve_org_id(org.as_deref())?;
-            let mut scoped = client.clone();
-            scoped.set_org_id(Some(org_id));
-            let emit_json = *json;
-            let mut stream_error: Option<String> = None;
-            scoped
-                .stream_goal_decompose(id, |event_type, data| {
-                    if emit_json {
-                        println!("{}", json_event_line(event_type, data));
-                        return Ok(());
-                    }
-                    goal_decompose_render::render_plain_event(event_type, data, &mut stream_error);
-                    Ok(())
-                })
-                .await?;
-            if let Some(message) = stream_error {
-                bail!("goal decompose error: {message}");
             }
             Ok(())
         }

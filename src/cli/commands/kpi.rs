@@ -5,7 +5,7 @@ use crate::api::{ApiClient, CreateKpiRequest, UpdateKpiRequest};
 
 #[derive(Subcommand)]
 pub enum KpiCommands {
-    /// Add a KPI to a goal
+    /// Add a legacy goal-linked KPI (current servers may return 404)
     Add {
         /// Goal ID
         #[arg(long)]

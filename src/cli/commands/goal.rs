@@ -425,10 +425,7 @@ pub enum GoalCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Ask the AI agent to decompose a goal into sub-goals and stream its
-    /// progress (SSE; legacy V1 endpoint — still the only user-triggered
-    /// decompose route, but LLM-billed: this runs a real agent against the
-    /// org's AI usage quota)
+    /// Ask the legacy AI endpoint to decompose a goal into sub-goals (may return 404 on current servers)
     Decompose {
         /// Goal ID to decompose
         id: String,

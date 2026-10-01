@@ -83,9 +83,9 @@ Addness フロントエンド (`vision-todo-frontend`) からユーザーが実�
 ### KPI（定量目標）
 | 操作 | エンドポイント | CLI |
 |---|---|---|
-| create | POST /v2/objectives/:id/kpis | ✅ |
-| update | PATCH /v2/objective-kpis/:id | ✅ |
-| delete | DELETE /v2/objective-kpis/:id | ✅ |
+| create | POST /v2/objectives/:id/kpis | 旧API。現行サーバーでは未登録 |
+| update | PATCH /v2/objective-kpis/:id | 旧API。現行サーバーでは未登録 |
+| delete | DELETE /v2/objective-kpis/:id | 旧API。現行サーバーでは未登録 |
 
 ### AI Thread（AIチャット）
 - create / update / delete / chat / cancel
@@ -319,7 +319,7 @@ Addness フロントエンド (`vision-todo-frontend`) からユーザーが実�
 - `subscription register/cancel/change-plan/end-trial`
 - `apikey create/revoke`
 - `recurring create/update/rm`（Goal の繰り返し設定）
-- `goal-execution generate/update`
+- `goal-execution update`（`generate` は現行サーバーで廃止済み）
 
 規模見積もり: 約 800〜1200 行
 

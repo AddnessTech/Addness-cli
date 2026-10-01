@@ -65,15 +65,12 @@ enum Commands {
         #[command(subcommand)]
         command: form::FormCommands,
     },
-    /// AI agent chat scoped to a goal: send a message and stream the reply
-    /// (SSE), get an encouragement message, and browse threads/messages
+    /// Legacy goal-scoped AI chat API; only available on servers that expose the old v2 routes
     GoalChat {
         #[command(subcommand)]
         command: goal_chat::GoalChatCommands,
     },
-    /// AI agent chat for the today's-todo walk-and-talk mode (not scoped to
-    /// a single goal): send a message and stream the reply (SSE), fire the
-    /// silent "opening" turn, and browse threads/messages
+    /// Legacy today's-todo AI chat API; only available on servers that expose the old v2 routes
     TodoChat {
         #[command(subcommand)]
         command: todo_chat::TodoChatCommands,
@@ -130,7 +127,7 @@ enum Commands {
         #[command(subcommand)]
         command: assignment::AssignmentCommands,
     },
-    /// Manage KPIs on goals
+    /// Legacy goal-linked KPI API; the current KPI tree is a separate feature
     Kpi {
         #[command(subcommand)]
         command: kpi::KpiCommands,

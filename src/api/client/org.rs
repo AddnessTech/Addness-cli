@@ -1,7 +1,7 @@
 use crate::api::{
     ApiClient, ApiResponse, CreateOrganizationRequest, EnabledFlagRequest, MyAdSettingRequest,
     Organization, OrganizationsResponse, PushTokenRegisterRequest, RegisterSubscriptionRequest,
-    UpdateContextRequest, UpdateDefaultTimezoneRequest, UpdateOrganizationRequest,
+    UpdateDefaultTimezoneRequest, UpdateOrganizationRequest,
 };
 use anyhow::Result;
 use serde_json::Value;
@@ -64,18 +64,6 @@ impl ApiClient {
         self.delete_no_body(&path).await
     }
 
-    pub async fn update_organization_context(
-        &self,
-        org_id: &str,
-        context_text: &str,
-    ) -> Result<ApiResponse<Organization>> {
-        let path = format!("/api/v2/organizations/{org_id}/context");
-        let body = UpdateContextRequest {
-            context_text: context_text.to_string(),
-        };
-        self.patch(&path, &body).await
-    }
-
     // ---- Organization info / read endpoints ----
     //
     // Every organization endpoint (both the v1 `/team` handlers and the v2
@@ -126,28 +114,6 @@ impl ApiClient {
         params: ListAllOrganizationsParams<'_>,
     ) -> Result<Value> {
         let path = format!("/api/v2/organizations{}", list_all_query_suffix(&params));
-        let resp: ApiResponse<Value> = self.get(&path).await?;
-        Ok(resp.data)
-    }
-
-    /// GET /api/v2/organizations/:id/context
-    pub async fn get_organization_context(&self, org_id: &str) -> Result<Value> {
-        let path = format!("/api/v2/organizations/{org_id}/context");
-        let resp: ApiResponse<Value> = self.get(&path).await?;
-        Ok(resp.data)
-    }
-
-    /// GET /api/v2/organizations/:id/context/revisions?limit=
-    pub async fn list_organization_context_revisions(
-        &self,
-        org_id: &str,
-        limit: Option<u16>,
-    ) -> Result<Value> {
-        let suffix = match limit {
-            Some(limit) => format!("?limit={limit}"),
-            None => String::new(),
-        };
-        let path = format!("/api/v2/organizations/{org_id}/context/revisions{suffix}");
         let resp: ApiResponse<Value> = self.get(&path).await?;
         Ok(resp.data)
     }

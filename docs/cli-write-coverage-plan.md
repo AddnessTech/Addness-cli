@@ -1,5 +1,7 @@
 # Addness CLI 書き込み機能カバレッジ計画
 
+> Historical plan. 2026-10-02の現行バックエンド照合で、旧KPI/AI thread系と組織コンテキストのルートをCLIから削除した。以下の集計と未実装一覧は当時のスナップショットで、現行APIの移行先は [`cli-current-api-migrations.md`](./cli-current-api-migrations.md) を参照すること。旧API行を再実装しない。
+
 ## ゴール
 Addness フロントエンド (`vision-todo-frontend`) からユーザーが実行できる **書き込み系操作（POST/PUT/PATCH/DELETE）すべて** を、CLI (`addness ...`) からも実行可能にする。TUI（ratatui）は対象外、純 CLI サブコマンド拡張のみ。
 
@@ -18,9 +20,8 @@ Addness フロントエンド (`vision-todo-frontend`) からユーザーが実�
 - `comment create` / `comment update` / `comment delete` / `comment resolve` / `comment unresolve` / `comment react` / `comment attachment rm`
 - `deliverable add` / `deliverable update` / `deliverable rename` / `deliverable move` / `deliverable rm` / `deliverable batch-move` / `deliverable batch-rm`
 - `assignment add` / `assignment update` / `assignment rm` / `assignment transfer`
-- `kpi add` / `kpi update` / `kpi rm`
 - `link pr` / `link progress`
-- `org create` / `org update` / `org rm` / `org set-context`
+- `org create` / `org update` / `org rm`
 - `member update` / `member pin` / `member unpin` / `member rm` / `member admin grant` / `member admin revoke` / `member set-source-org`
 - `invitation create` / `invitation resend` / `invitation revoke` / `invitation accept` / `invitation link create` / `invitation link deactivate`
 - `today add` / `today done` / `today reopen` / `today status`
@@ -83,9 +84,7 @@ Addness フロントエンド (`vision-todo-frontend`) からユーザーが実�
 ### KPI（定量目標）
 | 操作 | エンドポイント | CLI |
 |---|---|---|
-| create | POST /v2/objectives/:id/kpis | 旧API。現行サーバーでは未登録 |
-| update | PATCH /v2/objective-kpis/:id | 旧API。現行サーバーでは未登録 |
-| delete | DELETE /v2/objective-kpis/:id | 旧API。現行サーバーでは未登録 |
+| 定義・実績・ツリー | `/v2/analytics/recipes*`, `/v2/analytics/kpi-tree*`, `/v2/analytics/runs*` | 未対応。旧 `kpi add/update/rm` は削除。現行APIの移行メモを参照 |
 
 ### AI Thread（AIチャット）
 - create / update / delete / chat / cancel
@@ -248,7 +247,7 @@ Addness フロントエンド (`vision-todo-frontend`) からユーザーが実�
 
 ---
 
-## Phase 2: Deliverable + Assignment + KPI
+## Phase 2: Deliverable + Assignment
 
 新規追加サブコマンド見込み: 14
 
@@ -256,9 +255,8 @@ Addness フロントエンド (`vision-todo-frontend`) からユーザーが実�
 |---|---|
 | Deliverable | `rename`, `move`, `rm`, `update`, `batch-move`, `batch-rm` |
 | Assignment | `assignment add/update/rm <GoalID>`, `assignment transfer <GoalID> --to <user>` |
-| KPI | `kpi add/update/rm` |
 
-実装ファイル: `deliverable.rs` 拡張 + 新規 `assignment.rs`、`kpi.rs`
+実装ファイル: `deliverable.rs` 拡張 + 新規 `assignment.rs`
 
 規模見積もり: 約 500〜700 行
 
@@ -267,8 +265,7 @@ Addness フロントエンド (`vision-todo-frontend`) からユーザーが実�
 ## Phase 3: AI 関連
 
 ### 3.1 AI Thread
-新規ファイル `src/cli/commands/ai.rs` を作る方針。
-サブコマンド: `ai thread create/list/update/rm/chat/cancel`、`ai thread share`、`ai trace revert`
+旧 `/api/v1/team/ai/threads*` は現行バックエンドに未登録のため実装対象から除外。現行移行先は [`cli-current-api-migrations.md`](./cli-current-api-migrations.md) を参照。
 
 ### 3.2 AI Background Tasks (11 種)
 統一サブコマンド: `addness ai run <task-type> --goal <ID> [--params <json>]`
@@ -285,7 +282,7 @@ Addness フロントエンド (`vision-todo-frontend`) からユーザーが実�
 ## Phase 4: 組織・メンバー・招待
 
 ### 4.1 Organization
-拡張: `org create/update/rm/upload-logo/set-context`
+拡張: `org create/update/rm/upload-logo`
 
 ### 4.2 Member
 新規 `src/cli/commands/member.rs`:

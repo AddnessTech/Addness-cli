@@ -4,11 +4,11 @@ use crate::api::{
     ActiveHuddlesResponse, ApiClient, ApiResponse, CalendarEvent, CalendarEventCompletionRequest,
     CalendarEventCompletionResponse, CodexTodaysGoalsApplyRequest, CreatePlannedTodoRequest,
     CreateTodayTodoRequest, DeletePlannedTodoResponse, ExecutionHistoryResponse, ExecutionRecord,
-    ExecutionSummaryResponse, GenerateExecutionResponse, GoalCalendarEnvelope,
-    GoalCalendarResponse, GoalHistoryResponse, GoalPreferenceResponse, MemberId,
-    PlannedTodoMaterial, PlannedTodoView, RecordTodayTodoActivityRequest, TodayTodoActivityView,
-    TodayTodoView, TodaysGoalsData, TodaysGoalsSummaryResponse, UpdateChatTodayTodoRequest,
-    UpdateGoalPreferenceRequest, UpdatePlannedTodoRequest,
+    ExecutionSummaryResponse, GoalCalendarEnvelope, GoalCalendarResponse, GoalHistoryResponse,
+    GoalPreferenceResponse, MemberId, PlannedTodoMaterial, PlannedTodoView,
+    RecordTodayTodoActivityRequest, TodayTodoActivityView, TodayTodoView, TodaysGoalsData,
+    TodaysGoalsSummaryResponse, UpdateChatTodayTodoRequest, UpdateGoalPreferenceRequest,
+    UpdatePlannedTodoRequest,
 };
 
 /// Build the `?a=1&b=2` query-string suffix, sharing the same encoding style
@@ -329,15 +329,6 @@ impl ApiClient {
             ])
         );
         let resp: ApiResponse<ExecutionSummaryResponse> = self.get(&path).await?;
-        Ok(resp.data)
-    }
-
-    /// POST /api/v2/execute-goals/generate — requires an X-Organization-ID
-    /// header (no path/query org param), so callers must scope the client
-    /// with `set_org_id` first.
-    pub async fn generate_execution(&self) -> Result<GenerateExecutionResponse> {
-        let resp: ApiResponse<GenerateExecutionResponse> =
-            self.post_empty("/api/v2/execute-goals/generate").await?;
         Ok(resp.data)
     }
 

@@ -6,9 +6,8 @@ use serde::{Deserialize, Serialize};
 // — internal/chat/handler/{chat,threads}.go, internal/aicorevalues/wire.go
 // — presentation/routes/api.go の `/api/v2/ai-core-values/...`（v2Auth配下）
 //
-// goal-chat/todo-chat/master-plan と同一のジェネリックハンドラ
-// （internal/chat/handler）を共有する。todo-chatとの差異は無く、以下の点で
-// goal-chatとは異なる（todo-chatと同一の振る舞い）:
+// 現行のモード別チャットとジェネリックハンドラ
+// （internal/chat/handler）を共有する。以下の点がコアバリュー診断の契約:
 //   - `openGoalId` は不要（単一ゴールに紐づかない。送っても無視される）
 //   - `opening: true` を新規スレッドに対して送ると「口火」（パネルを開いた
 //     直後の自動起動）を実行できる。message は空でよい。opening は既存
@@ -20,7 +19,7 @@ use serde::{Deserialize, Serialize};
 //     `RuntimeAgent` が `runtime.ThreadPageLister` を実装していない。
 //     `Kind`/`Stream`/`ValidateTurnInput`/`ListThreads`/`Messages` のみ）。
 //     `page` クエリを送っても常にレガシーな配列形式 `{"data": [...]}` が
-//     返る（Go側実装で確認済み、todo-chatと同一の教訓）
+//     返る（Go側実装で確認済み）
 // ---------------------------------------------------------------------------
 
 /// `POST /api/v2/ai-core-values/stream` のリクエストボディ。

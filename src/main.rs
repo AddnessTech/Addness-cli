@@ -12,10 +12,9 @@ use crate::config::{Credentials, DEFAULT_API_URL, Settings};
 use api::ApiClient;
 use cli::commands::{
     activity, api_key, assignment, chat, codex_job, comment, configure, consent, core_values,
-    deliverable, desktop_auth, detect, diagnosis, execution, form, goal, goal_chat, invitation,
-    invoice, issue, kpi, link, login, master_plan, media, meeting, member, notification, org,
-    personal, referral, search, sharetree, skill, skills, streak, summary, thread, today,
-    todo_chat, update, user,
+    deliverable, desktop_auth, detect, diagnosis, execution, form, goal, invitation, invoice,
+    issue, link, login, master_plan, media, meeting, member, notification, org, personal, referral,
+    search, sharetree, skill, skills, streak, summary, today, update, user,
 };
 
 #[derive(Parser)]
@@ -65,16 +64,6 @@ enum Commands {
         #[command(subcommand)]
         command: form::FormCommands,
     },
-    /// Legacy goal-scoped AI chat API; only available on servers that expose the old v2 routes
-    GoalChat {
-        #[command(subcommand)]
-        command: goal_chat::GoalChatCommands,
-    },
-    /// Legacy today's-todo AI chat API; only available on servers that expose the old v2 routes
-    TodoChat {
-        #[command(subcommand)]
-        command: todo_chat::TodoChatCommands,
-    },
     /// AI agent chat for the core-values diagnosis mode (tool-less
     /// hearing-style dialogue, not scoped to a single goal): send a message
     /// and stream the reply (SSE), fire the silent "opening" turn, and
@@ -89,13 +78,6 @@ enum Commands {
     MasterPlan {
         #[command(subcommand)]
         command: master_plan::MasterPlanCommands,
-    },
-    /// Manage AI threads (legacy V1 "AI エージェント" layer): CRUD, chat
-    /// (SSE), action traces, share links, question responses, and
-    /// tool-confirmation responses
-    Thread {
-        #[command(subcommand)]
-        command: thread::ThreadCommands,
     },
     /// Manage comments on goals
     Comment {
@@ -126,11 +108,6 @@ enum Commands {
     Assignment {
         #[command(subcommand)]
         command: assignment::AssignmentCommands,
-    },
-    /// Legacy goal-linked KPI API; the current KPI tree is a separate feature
-    Kpi {
-        #[command(subcommand)]
-        command: kpi::KpiCommands,
     },
     /// Manage organization members
     Member {
@@ -226,7 +203,7 @@ enum Commands {
         #[command(subcommand)]
         command: personal::PersonalCommands,
     },
-    /// Execution-tab reporting: summaries, execution-record generation/history, goal-collapse
+    /// Execution-tab reporting: summaries, execution-record history, goal-collapse
     /// preferences, active huddles, and the Codex-agent today's-goals view/apply
     Execution {
         #[command(subcommand)]
@@ -323,18 +300,14 @@ fn command_outputs_json(command: &Commands) -> bool {
         Commands::Consent { command } => consent_outputs_json(command),
         Commands::Org { command } => org_outputs_json(command),
         Commands::Goal { command } => goal_outputs_json(command),
-        Commands::GoalChat { command } => goal_chat_outputs_json(command),
-        Commands::TodoChat { command } => todo_chat_outputs_json(command),
         Commands::CoreValues { command } => core_values_outputs_json(command),
         Commands::MasterPlan { command } => master_plan_outputs_json(command),
-        Commands::Thread { command } => thread_outputs_json(command),
         Commands::Comment { command } => comment_outputs_json(command),
         Commands::Issue { command } => issue_outputs_json(command),
         Commands::Chat { command } => chat_outputs_json(command),
         Commands::Link { command } => link_outputs_json(command),
         Commands::Deliverable { command } => deliverable_outputs_json(command),
         Commands::Assignment { command } => assignment_outputs_json(command),
-        Commands::Kpi { command } => kpi_outputs_json(command),
         Commands::Member { command } => member_outputs_json(command),
         Commands::User { command } => user_outputs_json(command),
         Commands::Notification { command } => notification_outputs_json(command),
@@ -357,7 +330,6 @@ fn org_outputs_json(command: &org::OrgCommands) -> bool {
         | org::OrgCommands::Current { json }
         | org::OrgCommands::Create { json, .. }
         | org::OrgCommands::Update { json, .. }
-        | org::OrgCommands::SetContext { json, .. }
         | org::OrgCommands::Get { json, .. }
         | org::OrgCommands::ListAll { json, .. }
         | org::OrgCommands::RootOwner { json, .. }
@@ -366,8 +338,6 @@ fn org_outputs_json(command: &org::OrgCommands) -> bool {
         | org::OrgCommands::AccessState { json, .. }
         | org::OrgCommands::CurrentMember { json, .. }
         | org::OrgCommands::AdminCheck { json, .. }
-        | org::OrgCommands::GetContext { json, .. }
-        | org::OrgCommands::ContextRevisions { json, .. }
         | org::OrgCommands::SetTimezone { json, .. }
         | org::OrgCommands::SetLogo { json, .. }
         | org::OrgCommands::PushTokenRegister { json, .. } => *json,
@@ -405,8 +375,7 @@ fn goal_outputs_json(command: &goal::GoalCommands) -> bool {
         | goal::GoalCommands::Unarchive { json, .. }
         | goal::GoalCommands::Restore { json, .. }
         | goal::GoalCommands::Duplicate { json, .. }
-        | goal::GoalCommands::Move { json, .. }
-        | goal::GoalCommands::Decompose { json, .. } => *json,
+        | goal::GoalCommands::Move { json, .. } => *json,
         goal::GoalCommands::Share { command } => match command {
             goal::ShareCommands::Create { json, .. }
             | goal::ShareCommands::GetPublic { json, .. } => *json,
@@ -514,7 +483,6 @@ fn execution_outputs_json(command: &execution::ExecutionCommands) -> bool {
     match command {
         execution::ExecutionCommands::Summary { json, .. }
         | execution::ExecutionCommands::MemberSummary { json, .. }
-        | execution::ExecutionCommands::Generate { json, .. }
         | execution::ExecutionCommands::Update { json, .. }
         | execution::ExecutionCommands::History { json, .. }
         | execution::ExecutionCommands::ActiveHuddles { json, .. } => *json,
@@ -603,24 +571,6 @@ fn codex_job_outputs_json(command: &codex_job::CodexJobCommands) -> bool {
     }
 }
 
-fn goal_chat_outputs_json(command: &goal_chat::GoalChatCommands) -> bool {
-    match command {
-        goal_chat::GoalChatCommands::Send { json, .. }
-        | goal_chat::GoalChatCommands::Encouragement { json, .. }
-        | goal_chat::GoalChatCommands::Threads { json, .. }
-        | goal_chat::GoalChatCommands::Messages { json, .. } => *json,
-    }
-}
-
-fn todo_chat_outputs_json(command: &todo_chat::TodoChatCommands) -> bool {
-    match command {
-        todo_chat::TodoChatCommands::Send { json, .. }
-        | todo_chat::TodoChatCommands::Start { json, .. }
-        | todo_chat::TodoChatCommands::Threads { json, .. }
-        | todo_chat::TodoChatCommands::Messages { json, .. } => *json,
-    }
-}
-
 fn core_values_outputs_json(command: &core_values::CoreValuesCommands) -> bool {
     match command {
         core_values::CoreValuesCommands::Send { json, .. }
@@ -636,27 +586,6 @@ fn master_plan_outputs_json(command: &master_plan::MasterPlanCommands) -> bool {
         | master_plan::MasterPlanCommands::Start { json, .. }
         | master_plan::MasterPlanCommands::Threads { json, .. }
         | master_plan::MasterPlanCommands::Messages { json, .. } => *json,
-    }
-}
-
-fn thread_outputs_json(command: &thread::ThreadCommands) -> bool {
-    match command {
-        thread::ThreadCommands::Create { json, .. }
-        | thread::ThreadCommands::List { json, .. }
-        | thread::ThreadCommands::Get { json, .. }
-        | thread::ThreadCommands::Update { json, .. }
-        | thread::ThreadCommands::Messages { json, .. }
-        | thread::ThreadCommands::Chat { json, .. }
-        | thread::ThreadCommands::EditAndRegenerate { json, .. }
-        | thread::ThreadCommands::Traces { json, .. }
-        | thread::ThreadCommands::RevertTrace { json, .. }
-        | thread::ThreadCommands::ShareCreate { json, .. }
-        | thread::ThreadCommands::QuestionRespond { json, .. }
-        | thread::ThreadCommands::ToolConfirmationRespond { json, .. }
-        | thread::ThreadCommands::Assignment { json, .. } => *json,
-        thread::ThreadCommands::Delete { .. }
-        | thread::ThreadCommands::Cancel { .. }
-        | thread::ThreadCommands::ShareRevoke { .. } => false,
     }
 }
 
@@ -790,13 +719,6 @@ fn assignment_outputs_json(command: &assignment::AssignmentCommands) -> bool {
         | assignment::AssignmentCommands::Update { json, .. }
         | assignment::AssignmentCommands::Transfer { json, .. } => *json,
         assignment::AssignmentCommands::Rm { .. } => false,
-    }
-}
-
-fn kpi_outputs_json(command: &kpi::KpiCommands) -> bool {
-    match command {
-        kpi::KpiCommands::Add { json, .. } | kpi::KpiCommands::Update { json, .. } => *json,
-        kpi::KpiCommands::Rm { .. } => false,
     }
 }
 
@@ -1141,14 +1063,6 @@ async fn main() -> Result<()> {
             let client = build_client()?;
             form::handle_form(command, &client).await
         }
-        Some(Commands::GoalChat { command }) => {
-            let client = build_client()?;
-            goal_chat::handle_goal_chat(command, &client).await
-        }
-        Some(Commands::TodoChat { command }) => {
-            let client = build_client()?;
-            todo_chat::handle_todo_chat(command, &client).await
-        }
         Some(Commands::CoreValues { command }) => {
             let client = build_client()?;
             core_values::handle_core_values(command, &client).await
@@ -1156,10 +1070,6 @@ async fn main() -> Result<()> {
         Some(Commands::MasterPlan { command }) => {
             let client = build_client()?;
             master_plan::handle_master_plan(command, &client).await
-        }
-        Some(Commands::Thread { command }) => {
-            let client = build_client()?;
-            thread::handle_thread(command, &client).await
         }
         Some(Commands::Comment { command }) => {
             let client = build_client()?;
@@ -1184,10 +1094,6 @@ async fn main() -> Result<()> {
         Some(Commands::Assignment { command }) => {
             let client = build_client()?;
             assignment::handle_assignment(command, &client).await
-        }
-        Some(Commands::Kpi { command }) => {
-            let client = build_client()?;
-            kpi::handle_kpi(command, &client).await
         }
         Some(Commands::Member { command }) => {
             let client = build_client()?;
@@ -1310,6 +1216,28 @@ mod tests {
             .expect("tool command must be retired");
 
         assert_eq!(error.kind(), ErrorKind::InvalidSubcommand);
+    }
+
+    #[test]
+    fn retired_backend_api_commands_are_not_exposed() {
+        let retired_commands: &[&[&str]] = &[
+            &["addness", "goal-chat"],
+            &["addness", "todo-chat"],
+            &["addness", "thread"],
+            &["addness", "kpi"],
+            &["addness", "goal", "decompose"],
+            &["addness", "execution", "generate"],
+            &["addness", "org", "set-context"],
+            &["addness", "org", "get-context", "org-1"],
+            &["addness", "org", "context-revisions", "org-1"],
+        ];
+
+        for args in retired_commands {
+            let error = Cli::try_parse_from(*args)
+                .err()
+                .unwrap_or_else(|| panic!("retired command was accepted: {args:?}"));
+            assert_eq!(error.kind(), ErrorKind::InvalidSubcommand, "{args:?}");
+        }
     }
 
     #[test]

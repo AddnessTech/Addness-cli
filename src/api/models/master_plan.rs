@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 // — internal/chat/handler/{chat,threads}.go, internal/aimasterplan/{wire,chat}.go
 // — presentation/routes/api.go の `/api/v2/ai-master-plan/...`（v2Auth配下）
 //
-// goal-chat/todo-chat/core-values と同一のジェネリックハンドラ
+// 現行のモード別チャットとジェネリックハンドラ
 // （internal/chat/handler）を共有する。core-valuesとリクエスト/レスポンス形は
 // 完全に同一（Go側 `internal/aimasterplan/chat/types.go` の `Input` に
 // `OpenGoalID` は無く、`internal/chat/handler/handler.go` の
@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 //   - `RuntimeAgent`（`internal/aimasterplan/chat/agent.go`）も
 //     `runtime.ThreadPageLister` を実装していない。`threads` はページング
 //     未対応で、常にレガシーな配列形式 `{"data": [...]}` が返る
-//     （Go側実装で確認済み、core-values/todo-chatと同一の教訓）
+//     （Go側実装で確認済み）
 // ---------------------------------------------------------------------------
 
 /// `POST /api/v2/ai-master-plan/stream` のリクエストボディ。

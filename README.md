@@ -136,7 +136,7 @@ addness link --help
   `goal recurring` で定期（繰り返し）スケジュール、`goal report-schedule` で活動レポート配信を管理。
   例: `addness goal recurring get <goal-id>`
 - `deliverable` — 成果物（ドキュメント/リンク/ファイル）の管理。例: `addness deliverable list --goal <goal-id>`
-- `assignment` — ゴールへのメンバー割り当て。`kpi` は旧ゴール紐付けAPI向けで、現行KPIツリーには対応していません。
+- `assignment` — ゴールへのメンバー割り当て。
 - `link` — GitHub PR や URL をゴールに紐付け。例: `addness link pr --goal <goal-id> --url <pr-url>`
 - `summary` / `detect-goal` — 全ゴールの進捗サマリ表示、git ブランチ名からのゴール ID 検出。
 
@@ -153,7 +153,7 @@ addness link --help
 
 ### 組織・メンバー
 
-- `org` — 組織の CRUD・切り替え・コンテキスト・タイムゾーン・ロゴ・課金/広告/AIスケジュール設定・サブスクリプション。
+- `org` — 組織の CRUD・切り替え・タイムゾーン・ロゴ・課金/広告/AIスケジュール設定・サブスクリプション。
   例: `addness org get <org-id>`
 - `member` — メンバーの一覧/検索/詳細・管理者権限・ピン留め・タグ・アバター・削除プレビュー。
   例: `addness member browse --limit 20`

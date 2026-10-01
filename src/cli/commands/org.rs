@@ -79,20 +79,6 @@ pub enum OrgCommands {
         #[arg(long)]
         force: bool,
     },
-    /// Update the organization's context text (free-form AI context)
-    SetContext {
-        /// Organization ID
-        id: String,
-        /// Inline context text
-        #[arg(long, conflicts_with = "text_file")]
-        text: Option<String>,
-        /// Read context text from a file
-        #[arg(long, conflicts_with = "text")]
-        text_file: Option<String>,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
     /// Show a single organization's details
     Get {
         /// Organization ID
@@ -160,25 +146,6 @@ pub enum OrgCommands {
     AdminCheck {
         /// Organization ID
         id: String,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Show the organization's context text
-    GetContext {
-        /// Organization ID
-        id: String,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// List revisions of the organization's context text
-    ContextRevisions {
-        /// Organization ID
-        id: String,
-        /// Maximum number of revisions to return
-        #[arg(long)]
-        limit: Option<u16>,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -510,29 +477,6 @@ pub async fn handle_org(cmd: &OrgCommands, client: &ApiClient) -> Result<()> {
             println!("Organization {id} deleted");
             Ok(())
         }
-        OrgCommands::SetContext {
-            id,
-            text,
-            text_file,
-            json,
-        } => {
-            let body = match (text, text_file) {
-                (Some(s), None) => s.clone(),
-                (None, Some(p)) => std::fs::read_to_string(p)?,
-                (Some(_), Some(_)) => bail!("Specify only one of --text or --text-file"),
-                (None, None) => bail!("Specify --text or --text-file"),
-            };
-            let resp = client.update_organization_context(id, &body).await?;
-            if *json {
-                println!("{}", serde_json::to_string_pretty(&resp)?);
-            } else {
-                println!(
-                    "Organization {id} context updated ({} chars)",
-                    body.chars().count()
-                );
-            }
-            Ok(())
-        }
         OrgCommands::Get { id, json: _ } => {
             let data = client_for_org(client, id).get_organization(id).await?;
             print_json_value(&data)
@@ -585,18 +529,6 @@ pub async fn handle_org(cmd: &OrgCommands, client: &ApiClient) -> Result<()> {
         OrgCommands::AdminCheck { id, json: _ } => {
             let data = client_for_org(client, id)
                 .check_organization_admin(id)
-                .await?;
-            print_json_value(&data)
-        }
-        OrgCommands::GetContext { id, json: _ } => {
-            let data = client_for_org(client, id)
-                .get_organization_context(id)
-                .await?;
-            print_json_value(&data)
-        }
-        OrgCommands::ContextRevisions { id, limit, json: _ } => {
-            let data = client_for_org(client, id)
-                .list_organization_context_revisions(id, *limit)
                 .await?;
             print_json_value(&data)
         }

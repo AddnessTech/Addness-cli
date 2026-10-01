@@ -22,6 +22,7 @@
   | `不要` | 認証なし（署名/state/トークン/HMAC等で別途検証するものを含む） |
 - 「備考」列に internal/debug/webhook/検証用並走ルート/ALBエイリアス等の特記事項を記載している。これらの分類は `docs/cli-endpoint-coverage.md` の「対象外」定義と対応する。
 - 本表はCLI実装計画（`docs/cli-endpoint-coverage.md`）の土台となる棚卸し表であり、バックエンドコード自体は変更していない。
+- この棚卸しは以前のバックエンド断面の記録。現行 `origin/main` は commit `f3ae686d` で組織コンテキスト機能と下記3ルートを撤去している。
 
 ---
 
@@ -175,9 +176,9 @@
 | PUT | /api/v2/organizations/:id/logo | organizationV2Handler.UploadLogo | Clerk/APIKey+Org+Admin | 組織ロゴアップロード |
 | PUT/PATCH | /api/v2/organizations/:id | organizationV2Handler.Update | Clerk/APIKey+Org+Admin | 組織情報更新（名前等） |
 | PUT/PATCH | /api/v2/organizations/:id/default-timezone | organizationV2Handler.UpdateDefaultTimezone | Clerk/APIKey+Org+Admin | 既定タイムゾーン更新 |
-| GET | /api/v2/organizations/:id/context | organizationV2Handler.GetContext | Clerk/APIKey+Org | 組織コンテキスト取得（Addy向けCLAUDE.md相当） |
-| PATCH | /api/v2/organizations/:id/context | organizationV2Handler.UpdateContext | Clerk/APIKey+Org+Admin | 組織コンテキスト更新 |
-| GET | /api/v2/organizations/:id/context/revisions | organizationV2Handler.ListContextRevisions | Clerk/APIKey+Org | コンテキスト履歴一覧 |
+| GET | /api/v2/organizations/:id/context | - | - | 廃止（backend commit `f3ae686d`、現行ルートなし） |
+| PATCH | /api/v2/organizations/:id/context | - | - | 廃止（保存内容がAddyへ注入されず、機能自体を撤去） |
+| GET | /api/v2/organizations/:id/context/revisions | - | - | 廃止（backend commit `f3ae686d`、現行ルートなし） |
 | GET | /api/v2/organizations/:id/onboarding-billing-state | organizationV2Handler.GetOnboardingBillingState | Clerk/APIKey+Org | オンボーディング課金状態取得 |
 | POST | /api/v2/organizations/:id/onboarding-billing/require | organizationV2Handler.RequireOnboardingBilling | Clerk/APIKey+Org | 課金必須化 |
 | POST | /api/v2/organizations/:id/onboarding-billing/free | organizationV2Handler.CompleteOnboardingBillingFree | Clerk/APIKey+Org | 無料プランで完了 |

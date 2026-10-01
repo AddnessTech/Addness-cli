@@ -239,11 +239,12 @@ addness detect-goal --json
 
 ## AIエージェント向けガイドライン
 
-### 旧APIコマンドの互換性
-- `kpi` は旧ゴール紐付けKPI APIを呼びます。現行KPIツリーAPIには未対応です。
-- `goal-chat` / `todo-chat` / `goal decompose` は旧API向けで、現行サーバーでは404になります。
-- `execution generate` は廃止済みです。定期ルーティンは `addness today planned --help` で確認してください。
-- 404時はエラーに表示された `Request path` と `addness status --json` の接続先を確認してください。
+### 現行APIと移行先
+- `execution generate` は廃止され、バックエンドは `RECURRING_GENERATION_REMOVED` を返します。テンプレートの定期ルーティンは `addness today planned --help` で確認してください。
+- `goal-chat` / `todo-chat` / `thread` / `goal decompose` は、現行バックエンドに同じルートがないためCLIから削除されています。ゴール上の会話には `issue` または `comment`、AI診断には `core-values` / `master-plan`、Codexのエージェント作業には `codex-job` を使ってください。いずれも旧スレッドAPIと完全に同じ機能ではありません。ゴール分解APIの後継はないため、子ゴールは `addness goal create --parent <GOAL_ID>` で作成します。
+- 旧 `kpi add/update/rm` は廃止しました。現行バックエンドのKPIはAnalytics Recipeを定義し、KPIツリーに配置し、Runで実績を記録する構造です。CLIにはまだ同等の操作がないため、旧コマンドを代用しないでください。
+- 403でレスポンスがJSONではない場合は、画面側と同じくWAF/セキュリティルールによるブロックの可能性があります。OWNER/EDITOR権限の変更では直りません。発生時刻と `Request path` を添えて運用担当に確認してください。
+- `org get-context` / `set-context` / `context-revisions` は、backendが組織コンテキスト機能を撤去したためCLIから削除されています。保存内容がAddyの挙動に反映されなかった機能で、現行APIに直接の後継はありません。
 
 ### 作業開始時（必須）
 1. `addness detect-goal --json` でブランチに紐づくゴールを確認してください。

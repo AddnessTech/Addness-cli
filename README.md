@@ -95,6 +95,22 @@ addness goal update <goal-id> --due-date 2026-07-01
 addness comment create --goal <goal-id> --body "実装を開始しました"
 ```
 
+完了が確認できたゴールと、その配下をまとめて完了する:
+
+```bash
+addness goal complete <goal-id> --recursive --dry-run --json
+addness goal complete <goal-id> --recursive --json
+# フィードバック待ちなど、未完了で残す枝をIDで指定する（複数指定可）
+addness goal complete <goal-id> --recursive --exclude <feedback-goal-id> --json
+```
+
+`--recursive` は子一覧の全ページを全階層から取得し、子から順に完了して最後に指定ゴールを完了します。
+`--exclude` で指定した未完了の枝と、それを含む親ゴールは未完了のままです。
+途中で失敗した場合は完了済みIDと失敗したIDを表示して停止し、終了コードは非ゼロになります。
+同じコマンドを再実行すると、完了済みゴールを飛ばして残りを処理します。
+`--recursive` を省略すると指定した1件だけを完了し、未完了の子があれば停止します。
+`goal tree` / `goal get` の子一覧は標準で深さ2のプレビューです。全件完了の対象確認には上記の `--dry-run` を使ってください。
+
 プルリクエストを紐付ける:
 
 ```bash

@@ -235,8 +235,8 @@ CLIから叩く実装対象として扱わない（DoDの分母から除外す�
 | DELETE | /api/v1/team/objectives/:id/aliases/:aliasId | `goal alias rm` | 実装済み |
 | GET | /api/v1/team/objectives/:id/recurring-goals | - | 未実装 |
 | POST | /api/v2/objectives | `goal create` | 実装済み |
-| GET | /api/v2/objectives/:id | `goal get` | 実装済み |
-| PATCH | /api/v2/objectives/:id | `goal update` | 実装済み |
+| GET | /api/v2/objectives/:id | `goal get` / `goal complete` | 実装済み |
+| PATCH | /api/v2/objectives/:id | `goal update` / `goal complete` | 実装済み |
 | POST | /api/v2/objectives/:id/text-patch | - | 未実装（既知のギャップ、`cli-write-coverage-plan.md`で明示済み） |
 | DELETE | /api/v2/objectives/delete | `goal delete` | 実装済み |
 | DELETE | /api/v2/objectives/bulk-delete | - | 未実装 |
@@ -244,7 +244,7 @@ CLIから叩く実装対象として扱わない（DoDの分母から除外す�
 | POST | /api/v2/objectives/archive | `goal archive` | 実装済み |
 | POST | /api/v2/objectives/unarchive | `goal unarchive` | 実装済み |
 | GET | /api/v2/objectives/:id/ancestors | - | 未実装 |
-| GET | /api/v2/objectives/:id/children | `goal children` | 実装済み |
+| GET | /api/v2/objectives/:id/children | `goal children` / `goal complete --recursive` | 実装済み（一括完了は全ページ・全階層を走査） |
 | GET | /api/v2/objectives/:id/descendants | - | 未実装 |
 | GET | /api/v2/objectives/:id/deliverable-descendants | - | 未実装 |
 | GET | /api/v2/objectives/:id/subtree | `goal tree` / `goal siblings` | 実装済み |

@@ -283,7 +283,7 @@ pub enum GoalCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Show subtree of a goal
+    /// Show a goal subtree preview (default depth: 2)
     Tree {
         /// Goal ID
         id: String,
@@ -363,6 +363,8 @@ pub enum GoalCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Complete a goal, optionally including all descendants (children first)
+    Complete(super::goal_complete::CompleteArgs),
     /// Delete a goal (soft delete)
     Delete {
         /// Goal ID
@@ -895,7 +897,7 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
                 None
             };
 
-            // サブツリーの情報を取得（階層の終わりまで）
+            // サブツリーのプレビューを取得（API既定の深さ2）。全件処理には使わない。
             let subtree_resp: ApiResponse<GoalTreeData> = client.get_goal_subtree(id).await?;
             let subtree_items: Vec<GoalTreeItem> = subtree_resp
                 .data
@@ -1162,6 +1164,7 @@ pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> 
             }
             Ok(())
         }
+        GoalCommands::Complete(args) => super::goal_complete::handle(args, client).await,
         GoalCommands::Archive { id, json } => {
             client.archive_goals(vec![id.clone()]).await?;
             print_status_result(*json, "archived", id)

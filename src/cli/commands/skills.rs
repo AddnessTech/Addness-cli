@@ -83,7 +83,7 @@ addness goal children <GOAL_ID>
 addness goal children <GOAL_ID> --limit 50 --offset 0
 addness goal children <GOAL_ID> --json
 
-# サブツリーを表示
+# サブツリーのプレビューを表示（標準では深さ2まで）
 addness goal tree <GOAL_ID>
 addness goal tree <GOAL_ID> --json
 
@@ -106,9 +106,23 @@ addness goal update <GOAL_ID> --body-file ./status.md
 addness goal update <GOAL_ID> --due-date 2026-07-01
 addness goal update <GOAL_ID> --clear-due-date
 addness goal update <GOAL_ID> --status NOT_STARTED --title "タイトル変更" --json
+
+# 完了が確認できた範囲だけ、子から親へまとめて完了（全階層・全ページ）
+addness goal complete <GOAL_ID> --recursive --dry-run --json
+addness goal complete <GOAL_ID> --recursive --json
+addness goal complete <GOAL_ID> --recursive --exclude <FEEDBACK_GOAL_ID> --json
+# 指定した1件だけを完了（未完了の子があると停止）
+addness goal complete <GOAL_ID> --json
 ```
 
 ステータスの選択肢: `NOT_STARTED`, `IN_PROGRESS`, `COMPLETED`, `CANCELLED`
+
+`goal complete --recursive` は指定ゴールを含み、子一覧の全ページを全階層から取得して子から完了します。
+`--exclude` は複数回指定でき、対象の未完了の枝と、それを含む親を未完了のまま残します。
+失敗時は非ゼロで終了し、JSONに `completed_ids`・`failed_goal_id`・`error` を返します。
+完了済みは再更新しないため、同じコマンドで残りを処理できます。
+`--dry-run` は更新せず `planned` に子から親の順で対象を表示します。
+`goal tree` / `goal get` の深さ2のプレビューを、配下すべての一覧とみなさないでください。
 
 ## コメント
 

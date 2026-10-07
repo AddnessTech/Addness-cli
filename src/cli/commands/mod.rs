@@ -15,6 +15,7 @@ pub mod diagnosis;
 pub mod execution;
 pub mod form;
 pub mod goal;
+mod goal_complete;
 pub mod invitation;
 pub mod invoice;
 pub mod issue;

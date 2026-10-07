@@ -362,6 +362,7 @@ fn org_outputs_json(command: &org::OrgCommands) -> bool {
 
 fn goal_outputs_json(command: &goal::GoalCommands) -> bool {
     match command {
+        goal::GoalCommands::Complete(args) => args.outputs_json(),
         goal::GoalCommands::List { json, .. }
         | goal::GoalCommands::Get { json, .. }
         | goal::GoalCommands::Children { json, .. }

@@ -1579,7 +1579,7 @@ impl App {
             self.selected_deliverable_context()
         {
             let mut items = Vec::new();
-            if node_type == DeliverableType::Document {
+            if matches!(node_type, DeliverableType::Document | DeliverableType::File) {
                 items.push(ActionMenuItem::UpdateDeliverable);
             }
             items.push(ActionMenuItem::RenameDeliverable);
@@ -3992,11 +3992,11 @@ impl App {
         let Some((goal_id, deliverable_id, deliverable_name, _, node_type)) =
             self.selected_deliverable_context()
         else {
-            self.set_error_message("Please select a document deliverable to update".to_string());
+            self.set_error_message("Please select a file deliverable to update".to_string());
             return;
         };
-        if node_type != DeliverableType::Document {
-            self.set_error_message("Only document deliverables can be updated".to_string());
+        if !matches!(node_type, DeliverableType::Document | DeliverableType::File) {
+            self.set_error_message("Only file deliverables can be updated".to_string());
             return;
         }
 
@@ -5071,12 +5071,10 @@ impl App {
             }
         };
 
-        match self.api_call(self.client.update_deliverable(
-            &goal_id,
-            &deliverable_id,
-            &content,
-            vec![],
-        )) {
+        match self.api_call(
+            self.client
+                .update_deliverable(&goal_id, &deliverable_id, &content),
+        ) {
             Ok(_) => {
                 self.set_success_message("Deliverable updated".to_string());
                 self.reload_deliverables_for_goal(&goal_id);
@@ -5121,7 +5119,7 @@ impl App {
     ) {
         match self.api_call(
             self.client
-                .move_deliverable(&goal_id, &deliverable_id, parent, 0.0),
+                .move_deliverable(&goal_id, &deliverable_id, parent),
         ) {
             Ok(_) => {
                 self.set_success_message("Deliverable moved".to_string());

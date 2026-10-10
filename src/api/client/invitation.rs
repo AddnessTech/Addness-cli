@@ -2,10 +2,8 @@ use anyhow::Result;
 use serde_json::Value;
 
 use crate::api::{
-    AcceptInvitationByTokenRequest, AcceptInvitationRequest, AcceptInvitationResponse, ApiClient,
-    ApiResponse, CheckPlanUpgradeRequest, CreateInvitationsRequest, CreateInviteLinkRequest,
-    DeclineInvitationRequest, Invitation, InvitationsData, InviteLink,
-    LegacyAcceptInvitationRequest,
+    ApiClient, ApiResponse, CreateInvitationsRequest, CreateInviteLinkRequest, Invitation,
+    InvitationsData, InviteLink,
 };
 
 impl ApiClient {
@@ -31,18 +29,6 @@ impl ApiClient {
     pub async fn revoke_invitation(&self, org_id: &str, invitation_id: &str) -> Result<()> {
         let path = format!("/api/v2/organizations/{org_id}/invitations/{invitation_id}");
         self.delete_no_body(&path).await
-    }
-
-    pub async fn accept_invitation(
-        &self,
-        invited_member_id: &str,
-        token: &str,
-    ) -> Result<ApiResponse<AcceptInvitationResponse>> {
-        let body = AcceptInvitationRequest {
-            invited_member_id: invited_member_id.to_string(),
-            token: token.to_string(),
-        };
-        self.post("/api/v2/invitations/accept", &body).await
     }
 
     pub async fn create_invite_link(
@@ -78,88 +64,12 @@ impl ApiClient {
         Ok(resp.data)
     }
 
-    /// POST /api/v2/invite-links/:code/join
-    pub async fn join_invite_link(&self, code: &str) -> Result<Value> {
-        let path = format!("/api/v2/invite-links/{code}/join");
-        let resp: ApiResponse<Value> = self.post_empty(&path).await?;
-        Ok(resp.data)
-    }
-
-    /// POST /api/v1/team/organization_invitations/accept?verify_only=true|false
-    pub async fn legacy_accept_invitation(&self, token: &str, verify_only: bool) -> Result<Value> {
-        let path =
-            format!("/api/v1/team/organization_invitations/accept?verify_only={verify_only}");
-        let body = LegacyAcceptInvitationRequest {
-            token: token.to_string(),
-        };
-        let resp: ApiResponse<Value> = self.post(&path, &body).await?;
-        Ok(resp.data)
-    }
-
-    /// POST /api/v1/team/organization_invitations/check_plan_upgrade
-    pub async fn check_invitation_plan_upgrade(
-        &self,
-        org_id: &str,
-        additional_members_count: i64,
-    ) -> Result<Value> {
-        let body = CheckPlanUpgradeRequest {
-            organization_id: org_id.to_string(),
-            additional_members_count,
-        };
-        let resp: ApiResponse<Value> = self
-            .post(
-                "/api/v1/team/organization_invitations/check_plan_upgrade",
-                &body,
-            )
-            .await?;
-        Ok(resp.data)
-    }
-
     /// GET /api/v2/invitations/:token
     /// Public preview endpoint: no auth/organization header required.
     pub async fn preview_invitation(&self, token: &str) -> Result<Value> {
         let path = format!("/api/v2/invitations/{token}");
         let resp: ApiResponse<Value> = self.get_without_org(&path).await?;
         Ok(resp.data)
-    }
-
-    /// POST /api/v2/invitations/:token/accept
-    pub async fn accept_invitation_by_token(
-        &self,
-        token: &str,
-        source_organization_id: Option<&str>,
-    ) -> Result<Value> {
-        let path = format!("/api/v2/invitations/{token}/accept");
-        let body = AcceptInvitationByTokenRequest {
-            source_organization_id: source_organization_id.map(str::to_string),
-        };
-        let resp: ApiResponse<Value> = self.post(&path, &body).await?;
-        Ok(resp.data)
-    }
-
-    /// GET /api/v2/invitations/pending
-    /// Resolved from the authenticated user's email; no organization header needed.
-    pub async fn list_pending_invitations(&self) -> Result<Value> {
-        let resp: ApiResponse<Value> = self.get_without_org("/api/v2/invitations/pending").await?;
-        Ok(resp.data)
-    }
-
-    /// POST /api/v2/invitations/pending/:invId/access
-    /// No request body; resolved from the authenticated user's email.
-    pub async fn create_invitation_access_token(&self, invitation_id: &str) -> Result<Value> {
-        let path = format!("/api/v2/invitations/pending/{invitation_id}/access");
-        let resp: ApiResponse<Value> = self.post_without_org(&path, &serde_json::json!({})).await?;
-        Ok(resp.data)
-    }
-
-    /// POST /api/v2/invitations/decline
-    pub async fn decline_invitation(&self, invited_member_id: &str, token: &str) -> Result<()> {
-        let body = DeclineInvitationRequest {
-            invited_member_id: invited_member_id.to_string(),
-            token: token.to_string(),
-        };
-        self.post_no_content("/api/v2/invitations/decline", &body)
-            .await
     }
 
     /// GET /api/v2/organizations/:id/invited-members?status=

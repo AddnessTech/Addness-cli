@@ -1,7 +1,7 @@
 use crate::api::{
     ApiClient, ApiResponse, CreateOrganizationRequest, EnabledFlagRequest, MyAdSettingRequest,
-    Organization, OrganizationsResponse, PushTokenRegisterRequest, RegisterSubscriptionRequest,
-    UpdateDefaultTimezoneRequest, UpdateOrganizationRequest,
+    Organization, OrganizationsResponse, PushTokenRegisterRequest, UpdateDefaultTimezoneRequest,
+    UpdateOrganizationRequest,
 };
 use anyhow::Result;
 use serde_json::Value;
@@ -93,13 +93,6 @@ impl ApiClient {
         Ok(resp.data)
     }
 
-    /// GET /api/v1/team/organizations/:id/ai_agent_member
-    pub async fn get_organization_ai_agent_member(&self, org_id: &str) -> Result<Value> {
-        let path = format!("/api/v1/team/organizations/{org_id}/ai_agent_member");
-        let resp: ApiResponse<Value> = self.get(&path).await?;
-        Ok(resp.data)
-    }
-
     /// GET /api/v1/team/organizations/:id/access-state
     pub async fn get_organization_access_state(&self, org_id: &str) -> Result<Value> {
         let path = format!("/api/v1/team/organizations/{org_id}/access-state");
@@ -114,13 +107,6 @@ impl ApiClient {
         params: ListAllOrganizationsParams<'_>,
     ) -> Result<Value> {
         let path = format!("/api/v2/organizations{}", list_all_query_suffix(&params));
-        let resp: ApiResponse<Value> = self.get(&path).await?;
-        Ok(resp.data)
-    }
-
-    /// GET /api/v2/organizations/:id/admin/check
-    pub async fn check_organization_admin(&self, org_id: &str) -> Result<Value> {
-        let path = format!("/api/v2/organizations/{org_id}/admin/check");
         let resp: ApiResponse<Value> = self.get(&path).await?;
         Ok(resp.data)
     }
@@ -145,36 +131,6 @@ impl ApiClient {
             token: token.to_string(),
         };
         let resp: ApiResponse<Value> = self.post(&path, &body).await?;
-        Ok(resp.data)
-    }
-
-    /// POST /api/v1/team/organization_subscriptions/register
-    pub async fn register_organization_subscription(
-        &self,
-        univapay_subscription_id: &str,
-    ) -> Result<Value> {
-        let body = RegisterSubscriptionRequest {
-            univapay_subscription_id: univapay_subscription_id.to_string(),
-        };
-        let resp: ApiResponse<Value> = self
-            .post("/api/v1/team/organization_subscriptions/register", &body)
-            .await?;
-        Ok(resp.data)
-    }
-
-    /// PATCH /api/v1/team/organization_subscriptions/:id/cancel
-    pub async fn cancel_organization_subscription(&self, subscription_id: &str) -> Result<Value> {
-        let path = format!("/api/v1/team/organization_subscriptions/{subscription_id}/cancel");
-        let resp: ApiResponse<Value> = self.patch_empty(&path).await?;
-        Ok(resp.data)
-    }
-
-    /// GET /api/v1/team/organization_subscriptions/current
-    /// Resolves the subscription from the `X-Organization-ID` header.
-    pub async fn get_current_organization_subscription(&self) -> Result<Value> {
-        let resp: ApiResponse<Value> = self
-            .get("/api/v1/team/organization_subscriptions/current")
-            .await?;
         Ok(resp.data)
     }
 

@@ -36,15 +36,9 @@ pub enum CommentCommands {
     },
     /// List comments across goals (global feed with filters)
     ListAll {
-        /// Filter by goal ID
-        #[arg(long)]
-        goal: Option<String>,
         /// Filter by author (organization member ID)
         #[arg(long)]
-        author: Option<String>,
-        /// Parent comment ID (list replies to this comment)
-        #[arg(long)]
-        parent: Option<String>,
+        author: String,
         /// Filter by resolved status
         #[arg(long)]
         resolved: Option<bool>,
@@ -54,12 +48,6 @@ pub enum CommentCommands {
         /// Pagination offset
         #[arg(long)]
         offset: Option<u64>,
-        /// Sort order: asc or desc
-        #[arg(long)]
-        sort: Option<String>,
-        /// Include thread replies when supported by the API
-        #[arg(long)]
-        include_replies: bool,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -167,25 +155,6 @@ pub enum CommentCommands {
         #[arg(long)]
         emoji: String,
     },
-    /// Manage comment attachments
-    Attachment {
-        #[command(subcommand)]
-        command: AttachmentCommands,
-    },
-}
-
-#[derive(Subcommand)]
-pub enum AttachmentCommands {
-    /// Remove an attachment from a comment
-    Rm {
-        /// Comment ID
-        comment_id: String,
-        /// Attachment ID
-        attachment_id: String,
-        /// Skip confirmation prompt
-        #[arg(long)]
-        force: bool,
-    },
 }
 
 /// Read a message body from an inline flag, a file, or stdin (`-`).
@@ -285,26 +254,18 @@ pub async fn handle_comments(cmd: &CommentCommands, client: &ApiClient) -> Resul
             Ok(())
         }
         CommentCommands::ListAll {
-            goal,
             author,
-            parent,
             resolved,
             limit,
             offset,
-            sort,
-            include_replies,
             json,
         } => {
             let resp = client
                 .list_all_comments(ListAllCommentsParams {
-                    goal_id: goal.as_deref(),
-                    author_id: author.as_deref(),
-                    parent_id: parent.as_deref(),
+                    author_id: author,
                     resolved: *resolved,
                     limit: validate_limit(*limit)?,
                     offset: *offset,
-                    sort: validate_sort(sort.as_ref())?,
-                    include_replies: *include_replies,
                 })
                 .await?;
 
@@ -458,27 +419,6 @@ pub async fn handle_comments(cmd: &CommentCommands, client: &ApiClient) -> Resul
             println!("Reacted {emoji} on comment {id}");
             Ok(())
         }
-        CommentCommands::Attachment { command } => match command {
-            AttachmentCommands::Rm {
-                comment_id,
-                attachment_id,
-                force,
-            } => {
-                if !*force
-                    && !crate::cli::commands::confirm(&format!(
-                        "Delete attachment {attachment_id} from comment {comment_id}?"
-                    ))?
-                {
-                    println!("Cancelled.");
-                    return Ok(());
-                }
-                client
-                    .delete_comment_attachment(comment_id, attachment_id)
-                    .await?;
-                println!("Attachment {attachment_id} deleted");
-                Ok(())
-            }
-        },
     }
 }
 

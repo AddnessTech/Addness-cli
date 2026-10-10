@@ -60,14 +60,6 @@ pub struct PushTokenRegisterRequest {
     pub token: String,
 }
 
-// POST /api/v1/team/organization_subscriptions/register
-// Backend binds `{"univapaySubscriptionId": "..."}` (RegisterSubscriptionRequest).
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RegisterSubscriptionRequest {
-    pub univapay_subscription_id: String,
-}
-
 // PUT/PATCH /api/v2/organizations/:id/default-timezone
 // Backend binds `{"default_timezone": "..."}` (snake_case, unlike most v2 bodies).
 #[derive(Debug, Serialize)]
@@ -99,20 +91,8 @@ pub struct MyAdSettingRequest {
 mod tests {
     use super::{
         EnabledFlagRequest, MyAdSettingRequest, PushTokenRegisterRequest,
-        RegisterSubscriptionRequest, UpdateDefaultTimezoneRequest,
+        UpdateDefaultTimezoneRequest,
     };
-
-    #[test]
-    fn register_subscription_request_uses_camel_case_key() {
-        let json = serde_json::to_value(RegisterSubscriptionRequest {
-            univapay_subscription_id: "sub_123".to_string(),
-        })
-        .unwrap();
-        assert_eq!(
-            json,
-            serde_json::json!({"univapaySubscriptionId": "sub_123"})
-        );
-    }
 
     #[test]
     fn update_default_timezone_request_uses_snake_case_key() {

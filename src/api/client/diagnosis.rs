@@ -4,7 +4,7 @@ use serde_json::Value;
 use crate::api::{
     ApiClient, ApiResponse, DiagnosisMemberProfile, DiagnosisMemberProfilesData,
     DiagnosisMyResultsData, DiagnosisResultByKindData, DiagnosisResultSummary, DiagnosisSaveData,
-    DiagnosisSaveRequest, DiagnosisStats, DiagnosisVisibility, DiagnosisVisibilityRequest,
+    DiagnosisSaveRequest, DiagnosisStats,
 };
 
 impl ApiClient {
@@ -45,25 +45,6 @@ impl ApiClient {
     pub async fn get_diagnosis_stats(&self, kind: &str) -> Result<DiagnosisStats> {
         let path = format!("/api/v1/public/diagnosis-results/stats?diagnosis_kind={kind}");
         let resp: ApiResponse<DiagnosisStats> = self.get_without_org(&path).await?;
-        Ok(resp.data)
-    }
-
-    /// GET /api/v2/organizations/:id/me/diagnosis-visibility
-    pub async fn get_diagnosis_visibility(&self, org_id: &str) -> Result<DiagnosisVisibility> {
-        let path = format!("/api/v2/organizations/{org_id}/me/diagnosis-visibility");
-        let resp: ApiResponse<DiagnosisVisibility> = self.get(&path).await?;
-        Ok(resp.data)
-    }
-
-    /// PATCH /api/v2/organizations/:id/me/diagnosis-visibility
-    pub async fn update_diagnosis_visibility(
-        &self,
-        org_id: &str,
-        visibilities: std::collections::HashMap<String, bool>,
-    ) -> Result<DiagnosisVisibility> {
-        let path = format!("/api/v2/organizations/{org_id}/me/diagnosis-visibility");
-        let body = DiagnosisVisibilityRequest { visibilities };
-        let resp: ApiResponse<DiagnosisVisibility> = self.patch(&path, &body).await?;
         Ok(resp.data)
     }
 

@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use anyhow::{Result, bail};
 use clap::{Subcommand, ValueEnum};
 use colored::Colorize;
@@ -86,11 +84,6 @@ pub enum DiagnosisCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Manage which diagnosis kinds are visible to other org members
-    Visibility {
-        #[command(subcommand)]
-        command: VisibilityCommands,
-    },
     /// List diagnosis profiles for multiple org members
     Profiles {
         /// Organization ID (uses default if not specified)
@@ -116,31 +109,6 @@ pub enum DiagnosisCommands {
     },
 }
 
-#[derive(Subcommand)]
-pub enum VisibilityCommands {
-    /// Show your current diagnosis visibility settings
-    Get {
-        /// Organization ID (uses default if not specified)
-        #[arg(long)]
-        org: Option<String>,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Set diagnosis visibility for one or more kinds
-    Set {
-        /// Organization ID (uses default if not specified)
-        #[arg(long)]
-        org: Option<String>,
-        /// `<kind>=<true|false>` pair, repeatable (e.g. --visibility goal_style=true)
-        #[arg(long = "visibility", required = true)]
-        visibilities: Vec<String>,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-}
-
 fn parse_result_json(inline: Option<&String>, file: Option<&String>) -> Result<serde_json::Value> {
     let raw = match (inline, file) {
         (Some(s), None) => s.clone(),
@@ -160,21 +128,6 @@ fn parse_result_json(inline: Option<&String>, file: Option<&String>) -> Result<s
         bail!("--result must be a JSON object (e.g. {{\"typeCode\":\"ENFJ\"}})");
     }
     Ok(value)
-}
-
-/// Parse `<kind>=<true|false>` visibility pairs into the wire map.
-fn parse_visibility_pairs(pairs: &[String]) -> Result<HashMap<String, bool>> {
-    let mut map = HashMap::new();
-    for pair in pairs {
-        let (kind, value) = pair.split_once('=').ok_or_else(|| {
-            anyhow::anyhow!("--visibility must be in `<kind>=<true|false>` form, got '{pair}'")
-        })?;
-        let value: bool = value
-            .parse()
-            .map_err(|_| anyhow::anyhow!("--visibility value must be true or false: '{pair}'"))?;
-        map.insert(kind.to_string(), value);
-    }
-    Ok(map)
 }
 
 fn print_member_profile(profile: &DiagnosisMemberProfile) {
@@ -254,7 +207,6 @@ pub async fn handle_diagnosis(cmd: &DiagnosisCommands, client: &ApiClient) -> Re
             }
             Ok(())
         }
-        DiagnosisCommands::Visibility { command } => handle_visibility(command, client).await,
         DiagnosisCommands::Profiles {
             org,
             member_ids,
@@ -296,47 +248,9 @@ pub async fn handle_diagnosis(cmd: &DiagnosisCommands, client: &ApiClient) -> Re
     }
 }
 
-async fn handle_visibility(cmd: &VisibilityCommands, client: &ApiClient) -> Result<()> {
-    match cmd {
-        VisibilityCommands::Get { org, json } => {
-            let org_id = resolve_org_id(org.as_deref())?;
-            let scoped = client_for_org(client, &org_id);
-            let visibility = scoped.get_diagnosis_visibility(&org_id).await?;
-            if *json {
-                println!("{}", serde_json::to_string_pretty(&visibility)?);
-            } else {
-                println!("default_public: {}", visibility.default_public);
-                for (kind, visible) in &visibility.visibilities {
-                    println!("  {kind:<12} {visible}");
-                }
-            }
-            Ok(())
-        }
-        VisibilityCommands::Set {
-            org,
-            visibilities,
-            json,
-        } => {
-            let org_id = resolve_org_id(org.as_deref())?;
-            let map = parse_visibility_pairs(visibilities)?;
-            let scoped = client_for_org(client, &org_id);
-            let visibility = scoped.update_diagnosis_visibility(&org_id, map).await?;
-            if *json {
-                println!("{}", serde_json::to_string_pretty(&visibility)?);
-            } else {
-                println!("Diagnosis visibility updated.");
-                for (kind, visible) in &visibility.visibilities {
-                    println!("  {kind:<12} {visible}");
-                }
-            }
-            Ok(())
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{DiagnosisKind, parse_result_json, parse_visibility_pairs};
+    use super::{DiagnosisKind, parse_result_json};
 
     #[test]
     fn diagnosis_kind_as_str_maps_to_backend_values() {
@@ -370,26 +284,5 @@ mod tests {
     fn parse_result_json_rejects_invalid_json() {
         let err = parse_result_json(Some(&"not json".to_string()), None).unwrap_err();
         assert!(err.to_string().contains("valid JSON"));
-    }
-
-    #[test]
-    fn parse_visibility_pairs_parses_bool_values() {
-        let map =
-            parse_visibility_pairs(&["goal_style=true".to_string(), "values=false".to_string()])
-                .unwrap();
-        assert_eq!(map.get("goal_style"), Some(&true));
-        assert_eq!(map.get("values"), Some(&false));
-    }
-
-    #[test]
-    fn parse_visibility_pairs_rejects_missing_equals() {
-        let err = parse_visibility_pairs(&["goal_style".to_string()]).unwrap_err();
-        assert!(err.to_string().contains("<kind>=<true|false>"));
-    }
-
-    #[test]
-    fn parse_visibility_pairs_rejects_non_bool_value() {
-        let err = parse_visibility_pairs(&["goal_style=maybe".to_string()]).unwrap_err();
-        assert!(err.to_string().contains("true or false"));
     }
 }

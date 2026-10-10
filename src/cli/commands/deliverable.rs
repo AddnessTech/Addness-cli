@@ -53,9 +53,6 @@ pub enum DeliverableCommands {
         /// New content from a file
         #[arg(long, conflicts_with = "content")]
         content_file: Option<PathBuf>,
-        /// Mention member IDs (UUID), repeatable
-        #[arg(long)]
-        mention: Vec<String>,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -74,26 +71,6 @@ pub enum DeliverableCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Move a deliverable under a different parent (or to root with --root)
-    Move {
-        /// Goal ID
-        #[arg(long)]
-        goal: String,
-        /// Deliverable ID to move
-        id: String,
-        /// New parent deliverable ID (folder)
-        #[arg(long, conflicts_with = "root")]
-        parent: Option<String>,
-        /// Move to root of the goal's deliverable tree
-        #[arg(long, conflicts_with = "parent")]
-        root: bool,
-        /// Display order (default 0.0)
-        #[arg(long, default_value = "0.0")]
-        order: f64,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
     /// Remove a deliverable
     Rm {
         /// Goal ID
@@ -104,24 +81,6 @@ pub enum DeliverableCommands {
         /// Skip confirmation prompt
         #[arg(long)]
         force: bool,
-    },
-    /// Batch-move multiple deliverables
-    BatchMove {
-        /// Goal ID
-        #[arg(long)]
-        goal: String,
-        /// Comma-separated deliverable IDs to move
-        #[arg(long)]
-        ids: String,
-        /// New parent deliverable ID
-        #[arg(long, conflicts_with = "root")]
-        parent: Option<String>,
-        /// Move to root (clear parent)
-        #[arg(long, conflicts_with = "parent")]
-        root: bool,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
     },
     /// Batch-delete multiple deliverables
     BatchRm {
@@ -186,13 +145,10 @@ pub async fn handle_deliverable(cmd: &DeliverableCommands, client: &ApiClient) -
             id,
             content,
             content_file,
-            mention,
             json,
         } => {
             let body = read_content(content, content_file)?;
-            let resp = client
-                .update_deliverable(goal, id, &body, mention.clone())
-                .await?;
+            let resp = client.update_deliverable(goal, id, &body).await?;
             if *json {
                 println!("{}", serde_json::to_string_pretty(&resp)?);
             } else {
@@ -214,29 +170,6 @@ pub async fn handle_deliverable(cmd: &DeliverableCommands, client: &ApiClient) -
             }
             Ok(())
         }
-        DeliverableCommands::Move {
-            goal,
-            id,
-            parent,
-            root,
-            order,
-            json,
-        } => {
-            if parent.is_none() && !*root {
-                bail!("Specify --parent <ID> or --root.");
-            }
-            let target = if *root { None } else { parent.clone() };
-            let resp = client
-                .move_deliverable(goal, id, target.clone(), *order)
-                .await?;
-            if *json {
-                println!("{}", serde_json::to_string_pretty(&resp)?);
-            } else {
-                let dest = target.as_deref().unwrap_or("(root)");
-                println!("Moved deliverable {id} to {dest}");
-            }
-            Ok(())
-        }
         DeliverableCommands::Rm { goal, id, force } => {
             if !*force && !crate::cli::commands::confirm(&format!("Delete deliverable {id}?"))? {
                 println!("Cancelled.");
@@ -244,32 +177,6 @@ pub async fn handle_deliverable(cmd: &DeliverableCommands, client: &ApiClient) -
             }
             client.delete_deliverable(goal, id).await?;
             println!("Deliverable {id} deleted");
-            Ok(())
-        }
-        DeliverableCommands::BatchMove {
-            goal,
-            ids,
-            parent,
-            root,
-            json,
-        } => {
-            let id_list = split_ids(ids);
-            if id_list.is_empty() {
-                bail!("--ids must contain at least one ID");
-            }
-            if parent.is_none() && !*root {
-                bail!("Specify --parent <ID> or --root.");
-            }
-            let target = if *root { None } else { parent.clone() };
-            let resp = client
-                .batch_move_deliverables(goal, id_list.clone(), target.clone())
-                .await?;
-            if *json {
-                println!("{}", serde_json::to_string_pretty(&resp)?);
-            } else {
-                let dest = target.as_deref().unwrap_or("(root)");
-                println!("Moved {} deliverables to {dest}", id_list.len());
-            }
             Ok(())
         }
         DeliverableCommands::BatchRm { goal, ids, force } => {

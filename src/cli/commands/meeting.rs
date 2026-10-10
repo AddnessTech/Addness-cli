@@ -1,16 +1,10 @@
-use std::path::Path;
-
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use clap::Subcommand;
 use colored::Colorize;
 
 use crate::api::{
     ApiClient, HuddleInvitationSendRequest, HuddleInviteableMembersParams, HuddleMemberSortBy,
     HuddleRecordingStartRequest, HuddleSortDir, MeetingBotJobCreateRequest,
-    MeetingNoteCreateGoalsRequest, MeetingNoteCreateGoalsRequestItem,
-    MeetingNotePostMinutesRequest, MeetingNotePostType, MeetingNoteSuggestGoalsRequest,
-    MeetingNoteSummarizeRequest, MinuteCreateRequest, MinuteListParams, MinuteSourceType,
-    MinuteUpdateRequest,
 };
 use crate::cli::commands::confirm;
 use crate::cli::commands::org::resolve_org_id;
@@ -21,34 +15,6 @@ fn client_for_org(client: &ApiClient, org_id: &str) -> ApiClient {
     let mut scoped = client.clone();
     scoped.set_org_id(Some(org_id.to_string()));
     scoped
-}
-
-/// Allowed audio MIME types for `meeting notes transcribe`, mirrored from the
-/// backend content-type whitelist
-/// (`presentation/handlers/meeting_note/transcribe.go`).
-fn guess_meeting_audio_content_type(path: &Path) -> Result<String> {
-    let ext = path
-        .extension()
-        .and_then(|s| s.to_str())
-        .map(str::to_ascii_lowercase);
-    let content_type = match ext.as_deref() {
-        Some("webm") => "audio/webm",
-        Some("mp4") => "audio/mp4",
-        Some("m4a") => "audio/x-m4a",
-        Some("mp3") => "audio/mpeg",
-        Some("wav") => "audio/wav",
-        Some("flac") => "audio/flac",
-        other => bail!(
-            "Unsupported file extension {:?}. Meeting-note transcription only accepts \
-             webm/mp4/m4a/mp3/wav/flac audio.",
-            other.unwrap_or("(none)")
-        ),
-    };
-    Ok(content_type.to_string())
-}
-
-fn parse_goals_json(raw: &str) -> Result<Vec<MeetingNoteCreateGoalsRequestItem>> {
-    serde_json::from_str(raw).context("--goals-json must be a JSON array of {title, description?}")
 }
 
 #[derive(Subcommand)]
@@ -64,16 +30,6 @@ pub enum MeetingCommands {
     Bot {
         #[command(subcommand)]
         command: BotCommands,
-    },
-    /// Meeting-note transcription/summary/goal workflow
-    Notes {
-        #[command(subcommand)]
-        command: NotesCommands,
-    },
-    /// Minutes (議事録) CRUD
-    Minutes {
-        #[command(subcommand)]
-        command: MinutesCommands,
     },
 }
 
@@ -168,24 +124,6 @@ pub enum HuddleCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Show the huddle you're currently in, if any (floating-bar state)
-    Active {
-        /// Organization ID (uses default if not specified)
-        #[arg(long)]
-        org: Option<String>,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// List in-progress huddle transcription jobs
-    TranscriptionProgress {
-        /// Organization ID (uses default if not specified)
-        #[arg(long)]
-        org: Option<String>,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
     /// Send manual huddle invitations to organization members
     Invite {
         /// Huddle session ID
@@ -204,15 +142,6 @@ pub enum HuddleCommands {
 
 #[derive(Subcommand)]
 pub enum BotCommands {
-    /// List meeting-bot (Recall.ai) jobs
-    List {
-        /// Organization ID (uses default if not specified)
-        #[arg(long)]
-        org: Option<String>,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
     /// Get a single meeting-bot job
     Get {
         /// Job ID
@@ -226,18 +155,21 @@ pub enum BotCommands {
     },
     /// Create a meeting-bot job to join and record a meeting
     Create {
-        /// Video platform (e.g. "zoom", "google_meet", "teams")
-        #[arg(long)]
-        platform: String,
         /// Meeting URL the bot should join
         #[arg(long)]
         meeting_url: String,
-        /// Display name for the bot in the meeting
+        /// Optional meeting title
         #[arg(long)]
-        bot_name: String,
-        /// Message the bot posts in the meeting chat on join
+        meeting_title: Option<String>,
+        /// Destination Drive folder
         #[arg(long)]
-        chat_join_message: Option<String>,
+        drive_folder: Option<String>,
+        /// Destination goal
+        #[arg(long)]
+        goal: Option<String>,
+        /// Record video (true or false; defaults to the server setting)
+        #[arg(long, action = clap::ArgAction::Set)]
+        record_video: Option<bool>,
         /// Organization ID (uses default if not specified)
         #[arg(long)]
         org: Option<String>,
@@ -245,172 +177,9 @@ pub enum BotCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Delete (cancel) a meeting-bot job
-    Delete {
+    /// Stop recording for a meeting-bot job
+    Stop {
         /// Job ID
-        id: String,
-        /// Organization ID (uses default if not specified)
-        #[arg(long)]
-        org: Option<String>,
-        /// Skip the confirmation prompt
-        #[arg(long)]
-        force: bool,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Subcommand)]
-pub enum NotesCommands {
-    /// Transcribe a local audio recording (webm/mp4/m4a/mp3/wav/flac, 10KB-5MB)
-    Transcribe {
-        /// Path to the local audio file
-        file: String,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Summarize a transcript into meeting minutes
-    Summarize {
-        /// Raw transcript text
-        #[arg(long)]
-        transcript: String,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Post minutes to a goal as a comment and/or deliverable
-    PostMinutes {
-        /// Objective (goal) ID to post to
-        objective_id: String,
-        /// Existing minute ID to link (omit to post ad-hoc minutes/transcript)
-        #[arg(long)]
-        minute_id: Option<String>,
-        /// Minutes text (required unless --minute-id is given)
-        #[arg(long)]
-        minutes: Option<String>,
-        /// Transcript text (required unless --minute-id is given)
-        #[arg(long)]
-        transcript: Option<String>,
-        /// Where to post: comment, deliverable, or both
-        #[arg(long, value_enum)]
-        post_type: MeetingNotePostType,
-        /// Organization ID (uses default if not specified)
-        #[arg(long)]
-        org: Option<String>,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Suggest candidate goals from meeting minutes
-    SuggestGoals {
-        /// Objective (goal) ID to attach suggestions to
-        objective_id: String,
-        /// Minutes text (max 10000 chars)
-        #[arg(long)]
-        minutes: String,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Create goals (1-7) from meeting minutes
-    CreateGoals {
-        /// Parent objective (goal) ID
-        objective_id: String,
-        /// Raw JSON array of goals: `[{"title":"...","description":"..."}]`
-        #[arg(long)]
-        goals_json: String,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Subcommand)]
-pub enum MinutesCommands {
-    /// Create a minute record
-    Create {
-        /// Objective (goal) ID the minute belongs to
-        #[arg(long)]
-        objective_id: Option<String>,
-        /// Zoom job ID (required when --source-type zoom)
-        #[arg(long)]
-        zoom_job_id: Option<String>,
-        /// Source of the minute
-        #[arg(long, value_enum)]
-        source_type: MinuteSourceType,
-        /// Title (max 200 chars)
-        #[arg(long)]
-        title: String,
-        /// Summary (max 10000 chars)
-        #[arg(long)]
-        summary: String,
-        /// Transcript (max 50000 chars)
-        #[arg(long)]
-        transcript: Option<String>,
-        /// Organization ID (uses default if not specified)
-        #[arg(long)]
-        org: Option<String>,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// List minutes
-    List {
-        /// Filter by objective (goal) ID
-        #[arg(long)]
-        objective_id: Option<String>,
-        /// Filter by source type
-        #[arg(long, value_enum)]
-        source_type: Option<MinuteSourceType>,
-        /// Only show minutes not yet linked to a goal
-        #[arg(long)]
-        only_unlinked: bool,
-        /// Organization ID (uses default if not specified)
-        #[arg(long)]
-        org: Option<String>,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Get a single minute (with full transcript)
-    Get {
-        /// Minute ID
-        id: String,
-        /// Organization ID (uses default if not specified)
-        #[arg(long)]
-        org: Option<String>,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Update a minute (partial update)
-    Update {
-        /// Minute ID
-        id: String,
-        /// New title
-        #[arg(long)]
-        title: Option<String>,
-        /// New summary
-        #[arg(long)]
-        summary: Option<String>,
-        /// New transcript
-        #[arg(long)]
-        transcript: Option<String>,
-        /// Re-link to a different objective (goal) ID
-        #[arg(long)]
-        objective_id: Option<String>,
-        /// Organization ID (uses default if not specified)
-        #[arg(long)]
-        org: Option<String>,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Delete a minute
-    Delete {
-        /// Minute ID
         id: String,
         /// Organization ID (uses default if not specified)
         #[arg(long)]
@@ -428,8 +197,6 @@ pub async fn handle_meeting(cmd: &MeetingCommands, client: &ApiClient) -> Result
     match cmd {
         MeetingCommands::Huddle { command } => handle_huddle(command, client).await,
         MeetingCommands::Bot { command } => handle_bot(command, client).await,
-        MeetingCommands::Notes { command } => handle_notes(command, client).await,
-        MeetingCommands::Minutes { command } => handle_minutes(command, client).await,
     }
 }
 
@@ -575,41 +342,6 @@ async fn handle_huddle(cmd: &HuddleCommands, client: &ApiClient) -> Result<()> {
             }
             Ok(())
         }
-        HuddleCommands::Active { org, json } => {
-            let org_id = resolve_org_id(org.as_deref())?;
-            let scoped = client_for_org(client, &org_id);
-            let active = scoped.get_huddle_active().await?;
-            match active {
-                Some(active) if *json => println!("{}", serde_json::to_string_pretty(&active)?),
-                Some(active) => println!(
-                    "{} — {} participant(s), joined {}",
-                    active.objective_title,
-                    active.participants.len(),
-                    active.joined_at
-                ),
-                None if *json => println!("null"),
-                None => println!("{}", "Not currently in a huddle.".dimmed()),
-            }
-            Ok(())
-        }
-        HuddleCommands::TranscriptionProgress { org, json } => {
-            let org_id = resolve_org_id(org.as_deref())?;
-            let scoped = client_for_org(client, &org_id);
-            let resp = scoped.get_huddle_transcription_progress().await?;
-            if *json {
-                println!("{}", serde_json::to_string_pretty(&resp)?);
-            } else if resp.items.is_empty() {
-                println!("{}", "No transcription jobs in progress.".dimmed());
-            } else {
-                for item in &resp.items {
-                    println!(
-                        "{} [{}] — objective {}",
-                        item.id, item.status, item.objective_id
-                    );
-                }
-            }
-            Ok(())
-        }
         HuddleCommands::Invite {
             session_id,
             member_ids,
@@ -636,21 +368,6 @@ async fn handle_huddle(cmd: &HuddleCommands, client: &ApiClient) -> Result<()> {
 
 async fn handle_bot(cmd: &BotCommands, client: &ApiClient) -> Result<()> {
     match cmd {
-        BotCommands::List { org, json } => {
-            let org_id = resolve_org_id(org.as_deref())?;
-            let scoped = client_for_org(client, &org_id);
-            let jobs = scoped.list_meeting_bot_jobs().await?;
-            if *json {
-                println!("{}", serde_json::to_string_pretty(&jobs)?);
-            } else if jobs.is_empty() {
-                println!("{}", "No meeting-bot jobs found.".dimmed());
-            } else {
-                for job in &jobs {
-                    println!("{} [{}] — {}", job.id, job.status, job.meeting_url);
-                }
-            }
-            Ok(())
-        }
         BotCommands::Get { id, org, json } => {
             let org_id = resolve_org_id(org.as_deref())?;
             let scoped = client_for_org(client, &org_id);
@@ -663,20 +380,22 @@ async fn handle_bot(cmd: &BotCommands, client: &ApiClient) -> Result<()> {
             Ok(())
         }
         BotCommands::Create {
-            platform,
             meeting_url,
-            bot_name,
-            chat_join_message,
+            meeting_title,
+            drive_folder,
+            goal,
+            record_video,
             org,
             json,
         } => {
             let org_id = resolve_org_id(org.as_deref())?;
             let scoped = client_for_org(client, &org_id);
             let req = MeetingBotJobCreateRequest {
-                platform: platform.clone(),
                 meeting_url: meeting_url.clone(),
-                bot_name: bot_name.clone(),
-                chat_join_message: chat_join_message.clone(),
+                meeting_title: meeting_title.clone(),
+                drive_folder_id: drive_folder.clone(),
+                objective_id: goal.clone(),
+                record_video: *record_video,
             };
             let job = scoped.create_meeting_bot_job(&req).await?;
             if *json {
@@ -686,337 +405,30 @@ async fn handle_bot(cmd: &BotCommands, client: &ApiClient) -> Result<()> {
             }
             Ok(())
         }
-        BotCommands::Delete {
+        BotCommands::Stop {
             id,
             org,
             force,
             json,
         } => {
-            if !*force && !confirm(&format!("Delete meeting-bot job {id}?"))? {
+            if !*force && !confirm(&format!("Stop recording for meeting-bot job {id}?"))? {
                 println!("Cancelled.");
                 return Ok(());
             }
             let org_id = resolve_org_id(org.as_deref())?;
             let scoped = client_for_org(client, &org_id);
-            scoped.delete_meeting_bot_job(id).await?;
+            scoped.stop_meeting_bot_job(id).await?;
             if *json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({"deleted": true, "id": id}))?
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({"stopRequested": true, "id": id})
+                    )?
                 );
             } else {
-                println!("Deleted meeting-bot job {id}");
+                println!("Stop requested for meeting-bot job {id}");
             }
             Ok(())
         }
-    }
-}
-
-async fn handle_notes(cmd: &NotesCommands, client: &ApiClient) -> Result<()> {
-    match cmd {
-        NotesCommands::Transcribe { file, json } => {
-            let file_path = Path::new(file);
-            let metadata = std::fs::metadata(file_path)
-                .with_context(|| format!("Failed to stat file {file}"))?;
-            if !metadata.is_file() {
-                bail!("{file} is not a regular file");
-            }
-            let file_name = file_path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .map(String::from)
-                .ok_or_else(|| anyhow::anyhow!("Cannot derive file name from {file}"))?;
-            let content_type = guess_meeting_audio_content_type(file_path)?;
-            let bytes =
-                std::fs::read(file_path).with_context(|| format!("Failed to read file {file}"))?;
-            let resp = client
-                .transcribe_meeting_note(bytes, &file_name, &content_type)
-                .await?;
-            if *json {
-                println!("{}", serde_json::to_string_pretty(&resp)?);
-            } else {
-                println!("{}", resp.transcript);
-            }
-            Ok(())
-        }
-        NotesCommands::Summarize { transcript, json } => {
-            let req = MeetingNoteSummarizeRequest {
-                transcript: transcript.clone(),
-            };
-            let resp = client.summarize_meeting_note(&req).await?;
-            if *json {
-                println!("{}", serde_json::to_string_pretty(&resp)?);
-            } else {
-                println!("{}", resp.minutes);
-            }
-            Ok(())
-        }
-        NotesCommands::PostMinutes {
-            objective_id,
-            minute_id,
-            minutes,
-            transcript,
-            post_type,
-            org,
-            json,
-        } => {
-            if minute_id.is_none() && minutes.is_none() && transcript.is_none() {
-                bail!("--minute-id, or --minutes/--transcript, is required");
-            }
-            let org_id = resolve_org_id(org.as_deref())?;
-            let scoped = client_for_org(client, &org_id);
-            let req = MeetingNotePostMinutesRequest {
-                objective_id: objective_id.clone(),
-                minute_id: minute_id.clone(),
-                minutes: minutes.clone(),
-                transcript: transcript.clone(),
-                post_type: *post_type,
-            };
-            let resp = scoped.post_meeting_note_minutes(&req).await?;
-            if *json {
-                println!("{}", serde_json::to_string_pretty(&resp)?);
-            } else {
-                println!(
-                    "posted: comment={} deliverable={}",
-                    resp.comment, resp.deliverable
-                );
-            }
-            Ok(())
-        }
-        NotesCommands::SuggestGoals {
-            objective_id,
-            minutes,
-            json,
-        } => {
-            let req = MeetingNoteSuggestGoalsRequest {
-                objective_id: objective_id.clone(),
-                minutes: minutes.clone(),
-            };
-            let resp = client.suggest_meeting_note_goals(&req).await?;
-            if *json {
-                println!("{}", serde_json::to_string_pretty(&resp)?);
-            } else if resp.suggestions.is_empty() {
-                println!("{}", "No goal suggestions.".dimmed());
-            } else {
-                for suggestion in &resp.suggestions {
-                    println!("- {}", suggestion.title);
-                    if let Some(description) = &suggestion.description {
-                        println!("  {description}");
-                    }
-                }
-            }
-            Ok(())
-        }
-        NotesCommands::CreateGoals {
-            objective_id,
-            goals_json,
-            json,
-        } => {
-            let goals = parse_goals_json(goals_json)?;
-            if goals.is_empty() || goals.len() > 7 {
-                bail!(
-                    "--goals-json must contain between 1 and 7 goals (got {})",
-                    goals.len()
-                );
-            }
-            let req = MeetingNoteCreateGoalsRequest {
-                objective_id: objective_id.clone(),
-                goals,
-            };
-            let resp = client.create_meeting_note_goals(&req).await?;
-            if *json {
-                println!("{}", serde_json::to_string_pretty(&resp)?);
-            } else {
-                println!(
-                    "Created {}/{} goal(s):",
-                    resp.created_count, resp.requested_count
-                );
-                for goal in &resp.goals {
-                    println!("- {} ({})", goal.title, goal.id);
-                }
-            }
-            Ok(())
-        }
-    }
-}
-
-async fn handle_minutes(cmd: &MinutesCommands, client: &ApiClient) -> Result<()> {
-    match cmd {
-        MinutesCommands::Create {
-            objective_id,
-            zoom_job_id,
-            source_type,
-            title,
-            summary,
-            transcript,
-            org,
-            json,
-        } => {
-            if matches!(source_type, MinuteSourceType::Zoom) && zoom_job_id.is_none() {
-                bail!("--zoom-job-id is required when --source-type zoom");
-            }
-            let org_id = resolve_org_id(org.as_deref())?;
-            let scoped = client_for_org(client, &org_id);
-            let req = MinuteCreateRequest {
-                objective_id: objective_id.clone(),
-                zoom_job_id: zoom_job_id.clone(),
-                source_type: *source_type,
-                title: title.clone(),
-                summary: summary.clone(),
-                transcript: transcript.clone(),
-            };
-            let minute = scoped.create_minute(&req).await?;
-            if *json {
-                println!("{}", serde_json::to_string_pretty(&minute)?);
-            } else {
-                println!("Created minute {} — {}", minute.id, minute.title);
-            }
-            Ok(())
-        }
-        MinutesCommands::List {
-            objective_id,
-            source_type,
-            only_unlinked,
-            org,
-            json,
-        } => {
-            let org_id = resolve_org_id(org.as_deref())?;
-            let scoped = client_for_org(client, &org_id);
-            let params = MinuteListParams {
-                objective_id: objective_id.as_deref(),
-                source_type: source_type.map(minute_source_type_as_str),
-                only_unlinked: *only_unlinked,
-            };
-            let resp = scoped.list_minutes(&params).await?;
-            if *json {
-                println!("{}", serde_json::to_string_pretty(&resp)?);
-            } else if resp.minutes.is_empty() {
-                println!("{}", "No minutes found.".dimmed());
-            } else {
-                for minute in &resp.minutes {
-                    println!(
-                        "{} — {} — {}",
-                        minute.id, minute.title, minute.summary_preview
-                    );
-                }
-            }
-            Ok(())
-        }
-        MinutesCommands::Get { id, org, json } => {
-            let org_id = resolve_org_id(org.as_deref())?;
-            let scoped = client_for_org(client, &org_id);
-            let minute = scoped.get_minute(id).await?;
-            if *json {
-                println!("{}", serde_json::to_string_pretty(&minute)?);
-            } else {
-                println!("{} — {}", minute.id, minute.title);
-                println!("{}", minute.summary);
-            }
-            Ok(())
-        }
-        MinutesCommands::Update {
-            id,
-            title,
-            summary,
-            transcript,
-            objective_id,
-            org,
-            json,
-        } => {
-            if title.is_none()
-                && summary.is_none()
-                && transcript.is_none()
-                && objective_id.is_none()
-            {
-                bail!("At least one of --title/--summary/--transcript/--objective-id is required");
-            }
-            let org_id = resolve_org_id(org.as_deref())?;
-            let scoped = client_for_org(client, &org_id);
-            let req = MinuteUpdateRequest {
-                title: title.clone(),
-                summary: summary.clone(),
-                transcript: transcript.clone(),
-                objective_id: objective_id.clone(),
-            };
-            let minute = scoped.update_minute(id, &req).await?;
-            if *json {
-                println!("{}", serde_json::to_string_pretty(&minute)?);
-            } else {
-                println!("Updated minute {} — {}", minute.id, minute.title);
-            }
-            Ok(())
-        }
-        MinutesCommands::Delete {
-            id,
-            org,
-            force,
-            json,
-        } => {
-            if !*force && !confirm(&format!("Delete minute {id}?"))? {
-                println!("Cancelled.");
-                return Ok(());
-            }
-            let org_id = resolve_org_id(org.as_deref())?;
-            let scoped = client_for_org(client, &org_id);
-            scoped.delete_minute(id).await?;
-            if *json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({"deleted": true, "id": id}))?
-                );
-            } else {
-                println!("Deleted minute {id}");
-            }
-            Ok(())
-        }
-    }
-}
-
-fn minute_source_type_as_str(source_type: MinuteSourceType) -> &'static str {
-    match source_type {
-        MinuteSourceType::Recording => "recording",
-        MinuteSourceType::Zoom => "zoom",
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{guess_meeting_audio_content_type, parse_goals_json};
-    use std::path::Path;
-
-    #[test]
-    fn guess_meeting_audio_content_type_maps_known_extensions() {
-        assert_eq!(
-            guess_meeting_audio_content_type(Path::new("a.mp3")).unwrap(),
-            "audio/mpeg"
-        );
-        assert_eq!(
-            guess_meeting_audio_content_type(Path::new("a.WAV")).unwrap(),
-            "audio/wav"
-        );
-        assert_eq!(
-            guess_meeting_audio_content_type(Path::new("a.webm")).unwrap(),
-            "audio/webm"
-        );
-    }
-
-    #[test]
-    fn guess_meeting_audio_content_type_rejects_unsupported_extension() {
-        let err = guess_meeting_audio_content_type(Path::new("a.pdf")).unwrap_err();
-        assert!(err.to_string().contains("Unsupported file extension"));
-    }
-
-    #[test]
-    fn parse_goals_json_accepts_valid_array() {
-        let goals = parse_goals_json(r#"[{"title":"a"},{"title":"b","description":"d"}]"#).unwrap();
-        assert_eq!(goals.len(), 2);
-        assert_eq!(goals[0].title, "a");
-        assert_eq!(goals[1].description.as_deref(), Some("d"));
-    }
-
-    #[test]
-    fn parse_goals_json_rejects_invalid_json() {
-        let err = parse_goals_json("not json").unwrap_err();
-        assert!(err.to_string().contains("--goals-json"));
     }
 }

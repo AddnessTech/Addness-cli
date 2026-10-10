@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -61,19 +59,6 @@ pub struct DiagnosisStats {
     pub total: i64,
     #[serde(default)]
     pub distribution: Vec<DiagnosisStatsBucket>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct DiagnosisVisibilityRequest {
-    pub visibilities: HashMap<String, bool>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiagnosisVisibility {
-    #[serde(default)]
-    pub default_public: bool,
-    #[serde(default)]
-    pub visibilities: HashMap<String, bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

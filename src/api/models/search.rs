@@ -3,12 +3,11 @@ use serde_json::Value;
 
 // Unified search API models (GET /api/v2/search).
 //
-// The response is not envelope-wrapped (no `{"data": ...}` wrapper) — the
-// wire body is the raw `{"items": [...], "hasMore": bool}` object.
+// v2 returns {"data":{"items":[...],"hasMore":bool}}. This is the inner data.
 // Each item's `data` shape depends on `type` (objective/comment/member), so
 // it is surfaced as raw JSON rather than a fully-typed union, mirroring how
 // `preview_issue_messages` handles polymorphic goal-issue payloads.
-// Backend reference: application/resources/search_resource.go.
+// Backend reference: internal/objective/usecase/search_response.go.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

@@ -1,9 +1,7 @@
 use anyhow::{Result, bail};
 use clap::{Subcommand, ValueEnum};
 
-use crate::api::{
-    ApiClient, ListUsersParams, UserCreateRequest, UserSettingUpdateRequest, UserUpdateRequest,
-};
+use crate::api::{ApiClient, UserSettingUpdateRequest, UserUpdateRequest};
 
 /// Gender values accepted by the Addness backend for a user profile.
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -62,44 +60,6 @@ pub enum UserCommands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
-    },
-    /// Search/list Addness users (requires an active subscription)
-    List {
-        /// Filter by name (substring match on backend)
-        #[arg(long)]
-        name: Option<String>,
-        /// Filter by email
-        #[arg(long)]
-        email: Option<String>,
-        /// Max users to return (1-100, default 10)
-        #[arg(long)]
-        limit: Option<u16>,
-        /// Pagination offset
-        #[arg(long)]
-        offset: Option<u64>,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Create a new Addness user account
-    Create {
-        /// Display name (1-100 chars)
-        #[arg(long)]
-        name: String,
-        /// Email address
-        #[arg(long)]
-        email: String,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Delete your own Addness user account (destructive, irreversible)
-    Rm {
-        /// User ID (must be your own ID; the server enforces self-only access)
-        id: String,
-        /// Skip confirmation prompt
-        #[arg(long)]
-        force: bool,
     },
     /// Manage your user settings
     Settings {
@@ -244,62 +204,6 @@ pub async fn handle_user(cmd: &UserCommands, client: &ApiClient) -> Result<()> {
                 println!("Updated user {}", user.id);
                 print_user_summary(&user);
             }
-            Ok(())
-        }
-        UserCommands::List {
-            name,
-            email,
-            limit,
-            offset,
-            json,
-        } => {
-            let resp = client
-                .list_users(ListUsersParams {
-                    name: name.as_deref(),
-                    email: email.as_deref(),
-                    limit: *limit,
-                    offset: *offset,
-                })
-                .await?;
-            if *json {
-                println!("{}", serde_json::to_string_pretty(&resp)?);
-            } else if resp.data.is_empty() {
-                println!("No users found.");
-            } else {
-                for u in &resp.data {
-                    println!("{} — {} ({})", u.id, u.name, u.gender);
-                }
-                let shown = resp.pagination.offset + resp.data.len() as i64;
-                if shown < resp.pagination.total {
-                    println!("More users available (use --offset or --limit).");
-                }
-            }
-            Ok(())
-        }
-        UserCommands::Create { name, email, json } => {
-            let req = UserCreateRequest {
-                name: name.clone(),
-                email: email.clone(),
-            };
-            let user = client.create_user(&req).await?;
-            if *json {
-                println!("{}", serde_json::to_string_pretty(&user)?);
-            } else {
-                println!("Created user {} ({})", user.id, user.name);
-            }
-            Ok(())
-        }
-        UserCommands::Rm { id, force } => {
-            if !*force
-                && !crate::cli::commands::confirm(&format!(
-                    "Delete your Addness user account {id}? This cannot be undone."
-                ))?
-            {
-                println!("Cancelled.");
-                return Ok(());
-            }
-            client.delete_user(id).await?;
-            println!("Deleted user {id}");
             Ok(())
         }
         UserCommands::Settings { command } => handle_user_settings(command, client).await,

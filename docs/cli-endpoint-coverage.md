@@ -1,5 +1,7 @@
 # CLI エンドポイントカバレッジ・ギャップ対応表
 
+> 過去の API 断面の記録です。v0.15.0 では MCP 公開ツールへの動的な入口を追加し、廃止 API を整理しています。現行の対応範囲と移行先は [MCP/CLI 対応と API 移行](mcp-cli-parity.md) を参照してください。
+
 親ゴールDoD「vision-todo-backend最新mainのユーザー向けエンドポイントすべてをCLIから叩ける」の実装計画の土台。
 [`docs/backend-endpoint-inventory.md`](./backend-endpoint-inventory.md)とCLI実装断面を突き合わせ、グループごとに「バックエンドendpoint ⇔ 既存CLIコマンド ⇔ 状態」を対応付ける。
 

@@ -11,10 +11,10 @@ use clap::{CommandFactory, Parser, Subcommand};
 use crate::config::{Credentials, DEFAULT_API_URL, Settings};
 use api::ApiClient;
 use cli::commands::{
-    activity, api_key, assignment, chat, codex_job, comment, configure, consent, core_values,
-    deliverable, desktop_auth, detect, diagnosis, execution, form, goal, invitation, invoice,
-    issue, link, login, master_plan, media, meeting, member, notification, org, personal, referral,
-    search, sharetree, skill, skills, streak, summary, today, update, user,
+    activity, assignment, chat, comment, configure, consent, core_values, deliverable,
+    desktop_auth, detect, diagnosis, execution, form, goal, invitation, issue, link, login,
+    master_plan, mcp, media, meeting, member, notification, org, personal, referral, search,
+    skills, streak, summary, today, update, user,
 };
 
 #[derive(Parser)]
@@ -30,6 +30,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Discover and use every current Addness MCP tool through the CLI
+    Mcp(mcp::McpArgs),
     /// Log in via browser (recommended for first setup)
     Login {
         /// API base URL
@@ -183,22 +185,12 @@ enum Commands {
         #[command(subcommand)]
         command: referral::ReferralCommands,
     },
-    /// View organization invoices
-    Invoice {
-        #[command(subcommand)]
-        command: invoice::InvoiceCommands,
-    },
-    /// Manage portable, cloneable goal-tree exports (distinct from `goal share`)
-    ShareTree {
-        #[command(subcommand)]
-        command: sharetree::ShareTreeCommands,
-    },
     /// Manage inline media (editor paste/drop images and videos)
     Media {
         #[command(subcommand)]
         command: media::MediaCommands,
     },
-    /// Manage your personal space (now/today docs, Markdown editing, agent sessions, projects)
+    /// Read cross-organization todos/activity and ensure your personal organization
     Personal {
         #[command(subcommand)]
         command: personal::PersonalCommands,
@@ -211,29 +203,10 @@ enum Commands {
     },
     /// Manage meeting features: Huddle voice calls (status/recording/invites,
     /// excluding live participation), Meeting Bot (Recall.ai) jobs, meeting-note
-    /// transcription/summary/goal workflow, and minutes CRUD
+    /// recording controls, and meeting bots
     Meeting {
         #[command(subcommand)]
         command: meeting::MeetingCommands,
-    },
-    /// Manage skills (reusable AI prompt templates): CRUD, search, performance,
-    /// supplementary resources, and improvement-suggestion accept/reject.
-    /// Distinct from `addness skills` (this CLI's own usage prompt).
-    Skill {
-        #[command(subcommand)]
-        command: skill::SkillCommands,
-    },
-    /// Manage cloud Codex jobs (agent sessions): create, list, follow-up input,
-    /// resume, cancel/close, delete, and the live event stream
-    CodexJob {
-        #[command(subcommand)]
-        command: codex_job::CodexJobCommands,
-    },
-    /// Manage personal API keys (list, create, revoke). The plaintext key is
-    /// only ever returned by `create` — it cannot be retrieved again
-    ApiKey {
-        #[command(subcommand)]
-        command: api_key::ApiKeyCommands,
     },
     /// Manage desktop browser-auth handoff operations
     DesktopAuth {
@@ -280,22 +253,18 @@ impl Cli {
 
 fn command_outputs_json(command: &Commands) -> bool {
     match command {
+        Commands::Mcp(args) => args.json,
         Commands::Status { json }
         | Commands::Summary { json, .. }
         | Commands::Search { json, .. }
         | Commands::DetectGoal { json } => *json,
         Commands::Diagnosis { command } => diagnosis_outputs_json(command),
         Commands::Referral { command } => referral_outputs_json(command),
-        Commands::Invoice { command } => invoice_outputs_json(command),
-        Commands::ShareTree { command } => sharetree_outputs_json(command),
         Commands::Form { command } => command.outputs_json(),
         Commands::Media { command } => media_outputs_json(command),
         Commands::Personal { command } => personal_outputs_json(command),
         Commands::Execution { command } => execution_outputs_json(command),
         Commands::Meeting { command } => meeting_outputs_json(command),
-        Commands::Skill { command } => skill_outputs_json(command),
-        Commands::CodexJob { command } => codex_job_outputs_json(command),
-        Commands::ApiKey { command } => api_key_outputs_json(command),
         Commands::DesktopAuth { command } => desktop_auth_outputs_json(command),
         Commands::Consent { command } => consent_outputs_json(command),
         Commands::Org { command } => org_outputs_json(command),
@@ -334,10 +303,8 @@ fn org_outputs_json(command: &org::OrgCommands) -> bool {
         | org::OrgCommands::ListAll { json, .. }
         | org::OrgCommands::RootOwner { json, .. }
         | org::OrgCommands::AccessibleRoot { json, .. }
-        | org::OrgCommands::AiAgentMember { json, .. }
         | org::OrgCommands::AccessState { json, .. }
         | org::OrgCommands::CurrentMember { json, .. }
-        | org::OrgCommands::AdminCheck { json, .. }
         | org::OrgCommands::SetTimezone { json, .. }
         | org::OrgCommands::SetLogo { json, .. }
         | org::OrgCommands::PushTokenRegister { json, .. } => *json,
@@ -350,11 +317,6 @@ fn org_outputs_json(command: &org::OrgCommands) -> bool {
             org::AdSettingsCommands::Get { json, .. }
             | org::AdSettingsCommands::Set { json, .. }
             | org::AdSettingsCommands::SetMe { json, .. } => *json,
-        },
-        org::OrgCommands::Subscription { command } => match command {
-            org::SubscriptionCommands::Register { json, .. }
-            | org::SubscriptionCommands::Current { json, .. } => *json,
-            org::SubscriptionCommands::Cancel { json, force, .. } => *json && *force,
         },
         org::OrgCommands::Switch { .. } | org::OrgCommands::Rm { .. } => false,
     }
@@ -375,21 +337,10 @@ fn goal_outputs_json(command: &goal::GoalCommands) -> bool {
         | goal::GoalCommands::Archive { json, .. }
         | goal::GoalCommands::Unarchive { json, .. }
         | goal::GoalCommands::Restore { json, .. }
-        | goal::GoalCommands::Duplicate { json, .. }
         | goal::GoalCommands::Move { json, .. } => *json,
         goal::GoalCommands::Share { command } => match command {
-            goal::ShareCommands::Create { json, .. }
-            | goal::ShareCommands::GetPublic { json, .. } => *json,
+            goal::ShareCommands::Create { json, .. } => *json,
             goal::ShareCommands::Revoke { .. } => false,
-        },
-        goal::GoalCommands::Alias { command } => match command {
-            goal::AliasCommands::Add { json, .. } => *json,
-            goal::AliasCommands::Rm { .. } | goal::AliasCommands::Reorder { .. } => false,
-        },
-        goal::GoalCommands::Recurring { command } => match command {
-            goal::RecurringCommands::Get { json, .. }
-            | goal::RecurringCommands::Set { json, .. }
-            | goal::RecurringCommands::Remove { json, .. } => *json,
         },
         goal::GoalCommands::ReportSchedule { command } => match command {
             goal::ReportScheduleCommands::Get { json, .. }
@@ -407,10 +358,6 @@ fn diagnosis_outputs_json(command: &diagnosis::DiagnosisCommands) -> bool {
         | diagnosis::DiagnosisCommands::Stats { json, .. }
         | diagnosis::DiagnosisCommands::Profiles { json, .. }
         | diagnosis::DiagnosisCommands::Profile { json, .. } => *json,
-        diagnosis::DiagnosisCommands::Visibility { command } => match command {
-            diagnosis::VisibilityCommands::Get { json, .. }
-            | diagnosis::VisibilityCommands::Set { json, .. } => *json,
-        },
     }
 }
 
@@ -419,22 +366,6 @@ fn referral_outputs_json(command: &referral::ReferralCommands) -> bool {
         referral::ReferralCommands::LinkCreate { json, .. }
         | referral::ReferralCommands::List { json, .. }
         | referral::ReferralCommands::Convert { json, .. } => *json,
-    }
-}
-
-fn invoice_outputs_json(command: &invoice::InvoiceCommands) -> bool {
-    match command {
-        invoice::InvoiceCommands::List { json, .. } => *json,
-    }
-}
-
-fn sharetree_outputs_json(command: &sharetree::ShareTreeCommands) -> bool {
-    match command {
-        sharetree::ShareTreeCommands::Create { json, .. }
-        | sharetree::ShareTreeCommands::List { json, .. }
-        | sharetree::ShareTreeCommands::Clone { json, .. }
-        | sharetree::ShareTreeCommands::GetPublic { json, .. } => *json,
-        sharetree::ShareTreeCommands::Revoke { .. } => false,
     }
 }
 
@@ -448,35 +379,9 @@ fn media_outputs_json(command: &media::MediaCommands) -> bool {
 
 fn personal_outputs_json(command: &personal::PersonalCommands) -> bool {
     match command {
-        personal::PersonalCommands::Now { json }
-        | personal::PersonalCommands::Today { json, .. }
-        | personal::PersonalCommands::TodayAppend { json, .. }
-        | personal::PersonalCommands::Day { json, .. }
-        | personal::PersonalCommands::TextPatch { json, .. }
-        | personal::PersonalCommands::EnsureOrganization { json }
+        personal::PersonalCommands::EnsureOrganization { json }
         | personal::PersonalCommands::TodayList { json, .. }
         | personal::PersonalCommands::DailyActivity { json, .. } => *json,
-        personal::PersonalCommands::Reset { json, force } => *json && *force,
-        personal::PersonalCommands::Markdown { command } => match command {
-            personal::MarkdownCommands::Analyze { json, .. }
-            | personal::MarkdownCommands::ReplaceSection { json, .. }
-            | personal::MarkdownCommands::UpsertSection { json, .. }
-            | personal::MarkdownCommands::UpsertListItem { json, .. }
-            | personal::MarkdownCommands::ReplaceDocument { json, .. }
-            | personal::MarkdownCommands::AppendLogEntry { json, .. } => *json,
-        },
-        personal::PersonalCommands::AgentSession { command } => match command {
-            personal::AgentSessionCommands::List { json, .. }
-            | personal::AgentSessionCommands::Create { json, .. }
-            | personal::AgentSessionCommands::Get { json, .. }
-            | personal::AgentSessionCommands::Update { json, .. } => *json,
-        },
-        personal::PersonalCommands::Project { command } => match command {
-            personal::ProjectCommands::List { json, .. }
-            | personal::ProjectCommands::Create { json, .. }
-            | personal::ProjectCommands::Get { json, .. }
-            | personal::ProjectCommands::Update { json, .. } => *json,
-        },
     }
 }
 
@@ -492,8 +397,7 @@ fn execution_outputs_json(command: &execution::ExecutionCommands) -> bool {
             | execution::PreferenceCommands::Set { json, .. } => *json,
         },
         execution::ExecutionCommands::Codex { command } => match command {
-            execution::CodexCommands::View { json, .. }
-            | execution::CodexCommands::Apply { json, .. } => *json,
+            execution::CodexCommands::View { json, .. } => *json,
         },
     }
 }
@@ -507,68 +411,13 @@ fn meeting_outputs_json(command: &meeting::MeetingCommands) -> bool {
             | meeting::HuddleCommands::RecordingStart { json, .. }
             | meeting::HuddleCommands::RecordingStop { json, .. }
             | meeting::HuddleCommands::InviteableMembers { json, .. }
-            | meeting::HuddleCommands::Active { json, .. }
-            | meeting::HuddleCommands::TranscriptionProgress { json, .. }
             | meeting::HuddleCommands::Invite { json, .. } => *json,
         },
         meeting::MeetingCommands::Bot { command } => match command {
-            meeting::BotCommands::List { json, .. }
-            | meeting::BotCommands::Get { json, .. }
+            meeting::BotCommands::Get { json, .. }
             | meeting::BotCommands::Create { json, .. }
-            | meeting::BotCommands::Delete { json, .. } => *json,
+            | meeting::BotCommands::Stop { json, .. } => *json,
         },
-        meeting::MeetingCommands::Notes { command } => match command {
-            meeting::NotesCommands::Transcribe { json, .. }
-            | meeting::NotesCommands::Summarize { json, .. }
-            | meeting::NotesCommands::PostMinutes { json, .. }
-            | meeting::NotesCommands::SuggestGoals { json, .. }
-            | meeting::NotesCommands::CreateGoals { json, .. } => *json,
-        },
-        meeting::MeetingCommands::Minutes { command } => match command {
-            meeting::MinutesCommands::Create { json, .. }
-            | meeting::MinutesCommands::List { json, .. }
-            | meeting::MinutesCommands::Get { json, .. }
-            | meeting::MinutesCommands::Update { json, .. }
-            | meeting::MinutesCommands::Delete { json, .. } => *json,
-        },
-    }
-}
-
-fn skill_outputs_json(command: &skill::SkillCommands) -> bool {
-    match command {
-        skill::SkillCommands::Create { json, .. }
-        | skill::SkillCommands::List { json, .. }
-        | skill::SkillCommands::General { json, .. }
-        | skill::SkillCommands::Search { json, .. }
-        | skill::SkillCommands::Get { json, .. }
-        | skill::SkillCommands::Update { json, .. }
-        | skill::SkillCommands::Delete { json, .. }
-        | skill::SkillCommands::Performance { json, .. } => *json,
-        skill::SkillCommands::Resource { command } => match command {
-            skill::SkillResourceCommands::Create { json, .. }
-            | skill::SkillResourceCommands::List { json, .. }
-            | skill::SkillResourceCommands::Get { json, .. }
-            | skill::SkillResourceCommands::Update { json, .. }
-            | skill::SkillResourceCommands::Delete { json, .. } => *json,
-        },
-        skill::SkillCommands::Refinement { command } => match command {
-            skill::SkillRefinementCommands::Accept { json, .. }
-            | skill::SkillRefinementCommands::Reject { json, .. } => *json,
-        },
-    }
-}
-
-fn codex_job_outputs_json(command: &codex_job::CodexJobCommands) -> bool {
-    match command {
-        codex_job::CodexJobCommands::List { json, .. }
-        | codex_job::CodexJobCommands::Get { json, .. }
-        | codex_job::CodexJobCommands::Create { json, .. }
-        | codex_job::CodexJobCommands::Input { json, .. }
-        | codex_job::CodexJobCommands::Resume { json, .. }
-        | codex_job::CodexJobCommands::Cancel { json, .. }
-        | codex_job::CodexJobCommands::Events { json, .. } => *json,
-        codex_job::CodexJobCommands::Close { json, force, .. }
-        | codex_job::CodexJobCommands::Delete { json, force, .. } => *json && *force,
     }
 }
 
@@ -587,14 +436,6 @@ fn master_plan_outputs_json(command: &master_plan::MasterPlanCommands) -> bool {
         | master_plan::MasterPlanCommands::Start { json, .. }
         | master_plan::MasterPlanCommands::Threads { json, .. }
         | master_plan::MasterPlanCommands::Messages { json, .. } => *json,
-    }
-}
-
-fn api_key_outputs_json(command: &api_key::ApiKeyCommands) -> bool {
-    match command {
-        api_key::ApiKeyCommands::List { json, .. }
-        | api_key::ApiKeyCommands::Create { json, .. } => *json,
-        api_key::ApiKeyCommands::Rm { json, force, .. } => *json && *force,
     }
 }
 
@@ -622,9 +463,7 @@ fn comment_outputs_json(command: &comment::CommentCommands) -> bool {
         | comment::CommentCommands::Update { json, .. }
         | comment::CommentCommands::Resolve { json, .. }
         | comment::CommentCommands::Unresolve { json, .. } => *json,
-        comment::CommentCommands::Delete { .. }
-        | comment::CommentCommands::React { .. }
-        | comment::CommentCommands::Attachment { .. } => false,
+        comment::CommentCommands::Delete { .. } | comment::CommentCommands::React { .. } => false,
     }
 }
 
@@ -706,9 +545,7 @@ fn deliverable_outputs_json(command: &deliverable::DeliverableCommands) -> bool 
         deliverable::DeliverableCommands::Add { json, .. }
         | deliverable::DeliverableCommands::List { json, .. }
         | deliverable::DeliverableCommands::Update { json, .. }
-        | deliverable::DeliverableCommands::Rename { json, .. }
-        | deliverable::DeliverableCommands::Move { json, .. }
-        | deliverable::DeliverableCommands::BatchMove { json, .. } => *json,
+        | deliverable::DeliverableCommands::Rename { json, .. } => *json,
         deliverable::DeliverableCommands::Rm { .. }
         | deliverable::DeliverableCommands::BatchRm { .. } => false,
     }
@@ -757,10 +594,8 @@ fn user_outputs_json(command: &user::UserCommands) -> bool {
     match command {
         user::UserCommands::Me { json }
         | user::UserCommands::Get { json, .. }
-        | user::UserCommands::Update { json, .. }
-        | user::UserCommands::List { json, .. }
-        | user::UserCommands::Create { json, .. } => *json,
-        user::UserCommands::Rm { .. } => false,
+        | user::UserCommands::Update { json, .. } => *json,
+
         user::UserCommands::Settings { command } => match command {
             user::UserSettingsCommands::Get { json }
             | user::UserSettingsCommands::Update { json, .. } => *json,
@@ -790,25 +625,15 @@ fn invitation_outputs_json(command: &invitation::InvitationCommands) -> bool {
     match command {
         invitation::InvitationCommands::Create { json, .. }
         | invitation::InvitationCommands::Resend { json, .. }
-        | invitation::InvitationCommands::Accept { json, .. }
-        | invitation::InvitationCommands::LegacyAccept { json, .. }
-        | invitation::InvitationCommands::CheckPlanUpgrade { json, .. }
         | invitation::InvitationCommands::Preview { json, .. }
-        | invitation::InvitationCommands::AcceptToken { json, .. }
         | invitation::InvitationCommands::InvitedMembers { json, .. }
         | invitation::InvitationCommands::Overview { json, .. } => *json,
         invitation::InvitationCommands::Link { command } => match command {
             invitation::InviteLinkCommands::Create { json, .. }
-            | invitation::InviteLinkCommands::List { json, .. }
-            | invitation::InviteLinkCommands::Join { json, .. } => *json,
+            | invitation::InviteLinkCommands::List { json, .. } => *json,
             invitation::InviteLinkCommands::Deactivate { .. } => false,
         },
-        invitation::InvitationCommands::Pending { command } => match command {
-            invitation::PendingCommands::List { json }
-            | invitation::PendingCommands::Access { json, .. } => *json,
-        },
-        invitation::InvitationCommands::Revoke { .. }
-        | invitation::InvitationCommands::Decline { .. } => false,
+        invitation::InvitationCommands::Revoke { .. } => false,
     }
 }
 
@@ -976,14 +801,23 @@ async fn build_tui_client() -> Result<ApiClient> {
 }
 
 fn build_client() -> Result<ApiClient> {
+    build_client_for_organization(None)
+}
+
+fn build_client_for_organization(organization: Option<&str>) -> Result<ApiClient> {
     if let Some(client) = client_from_env() {
-        return client;
+        return client.map(|mut client| {
+            if let Some(organization) = organization {
+                client.set_org_id(Some(organization.to_string()));
+            }
+            client
+        });
     }
     let creds = Credentials::load()?;
     let settings = Settings::load()?;
     match creds {
         Some(c) => {
-            let org_id = settings.current_organization_id();
+            let org_id = organization.or_else(|| settings.current_organization_id());
             let token = match org_id {
                 Some(id) => c.token_for_org(id).ok_or_else(|| {
                     anyhow::anyhow!(
@@ -1041,6 +875,10 @@ async fn main() -> Result<()> {
     }
 
     match &cli.command {
+        Some(Commands::Mcp(args)) => {
+            let client = build_client_for_organization(args.org.as_deref())?;
+            mcp::handle_mcp(args, &client).await
+        }
         None => {
             let client = build_tui_client().await?;
             tui::run(client)
@@ -1146,14 +984,6 @@ async fn main() -> Result<()> {
             let client = build_client()?;
             referral::handle_referral(command, &client).await
         }
-        Some(Commands::Invoice { command }) => {
-            let client = build_client()?;
-            invoice::handle_invoice(command, &client).await
-        }
-        Some(Commands::ShareTree { command }) => {
-            let client = build_client()?;
-            sharetree::handle_sharetree(command, &client).await
-        }
         Some(Commands::Media { command }) => {
             let client = build_client()?;
             media::handle_media(command, &client).await
@@ -1169,18 +999,6 @@ async fn main() -> Result<()> {
         Some(Commands::Meeting { command }) => {
             let client = build_client()?;
             meeting::handle_meeting(command, &client).await
-        }
-        Some(Commands::Skill { command }) => {
-            let client = build_client()?;
-            skill::handle_skill(command, &client).await
-        }
-        Some(Commands::CodexJob { command }) => {
-            let client = build_client()?;
-            codex_job::handle_codex_job(command, &client).await
-        }
-        Some(Commands::ApiKey { command }) => {
-            let client = build_client()?;
-            api_key::handle_api_key(command, &client).await
         }
         Some(Commands::DesktopAuth { command }) => {
             let client = build_client()?;
@@ -1223,6 +1041,42 @@ mod tests {
     fn retired_backend_api_commands_are_not_exposed() {
         let retired_commands: &[&[&str]] = &[
             &["addness", "goal-chat"],
+            &["addness", "codex-job"],
+            &["addness", "skill"],
+            &["addness", "share-tree"],
+            &["addness", "invoice"],
+            &["addness", "goal", "duplicate"],
+            &["addness", "goal", "alias"],
+            &["addness", "goal", "recurring"],
+            &["addness", "goal", "share", "get-public"],
+            &["addness", "org", "subscription"],
+            &["addness", "org", "ai-agent-member"],
+            &["addness", "org", "admin-check"],
+            &["addness", "personal", "now"],
+            &["addness", "personal", "markdown"],
+            &["addness", "personal", "project"],
+            &["addness", "personal", "agent-session"],
+            &["addness", "personal", "reset"],
+            &["addness", "meeting", "notes"],
+            &["addness", "meeting", "minutes"],
+            &["addness", "meeting", "huddle", "active"],
+            &["addness", "meeting", "huddle", "transcription-progress"],
+            &["addness", "execution", "codex", "apply"],
+            &["addness", "comment", "attachment"],
+            &["addness", "invitation", "legacy-accept"],
+            &["addness", "invitation", "pending"],
+            &["addness", "invitation", "accept"],
+            &["addness", "invitation", "accept-token"],
+            &["addness", "invitation", "decline"],
+            &["addness", "invitation", "link", "join"],
+            &["addness", "api-key"],
+            &["addness", "meeting", "bot", "list"],
+            &["addness", "meeting", "bot", "delete"],
+            &["addness", "api-key", "rm"],
+            &["addness", "diagnosis", "visibility"],
+            &["addness", "user", "list"],
+            &["addness", "user", "create"],
+            &["addness", "user", "rm"],
             &["addness", "todo-chat"],
             &["addness", "thread"],
             &["addness", "kpi"],

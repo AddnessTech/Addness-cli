@@ -251,12 +251,31 @@ addness detect-goal --json
 
 例: `goal/19453a2d-6524-4bbb-8e4f-f8fd69f3fce4/add-email-notifications`
 
+## 最新 MCP の全機能を CLI から利用する
+
+CLI の固定サブコマンドにない機能は、公開中の MCP カタログから探して実行できます。
+フォーム、Analytics/KPI、CRM、Drive、テンプレート、ナレッジ、録画、権限、エージェント作業などを対象に、サーバー更新で追加されたツールにも対応します。
+
+```bash
+addness mcp list --json
+addness mcp list --query analytics --json
+addness mcp schema list_forms --json
+addness mcp call list_forms --args '{"limit":20}' --json
+addness mcp call <TOOL_NAME> --args-file ./arguments.json --json
+# stdin は --args-file -。個人用キーを使う場合は --scope personal。
+```
+
+`--org` は今回の対象組織を指定します。`--scope organization|personal|copilot|openai|admin|support` は接続入口を指定し、それぞれの入口に許可されたキーが必要です。個人用・運営用キーは `ADDNESS_API_TOKEN` で渡せます。権限を昇格させる機能ではありません。
+`mcp call` は書き込みも即時実行し、自動再送しません。JSON出力には content / structuredContent / isError を保持し、ツール失敗時は非ゼロ終了します。結果に次ページのカーソルがあれば、各ツールのschemaに従って続きを取得します（mcp listのカタログ自体は全ページ取得します）。
+
+v0.15.0では、廃止された旧個人ドキュメント・旧スキル・Codexジョブ・共有ツリー・請求書・ゴールalias/recurring/duplicate・旧議事録APIのコマンドを削除しました。APIキーを受け付けない招待承諾やキー作成などはWeb画面で行ってください。コメントはv2、成果物とPRリンクは新Driveへ移行しています。`comment list-all` には `--author <ORG_MEMBER_ID>` が必須です。定期実行はテンプレートscheduleまたは個人用ルーティンのMCPツールを確認してください。
+
 ## AIエージェント向けガイドライン
 
 ### 現行APIと移行先
 - `execution generate` は廃止され、バックエンドは `RECURRING_GENERATION_REMOVED` を返します。テンプレートの定期ルーティンは `addness today planned --help` で確認してください。
-- `goal-chat` / `todo-chat` / `thread` / `goal decompose` は、現行バックエンドに同じルートがないためCLIから削除されています。ゴール上の会話には `issue` または `comment`、AI診断には `core-values` / `master-plan`、Codexのエージェント作業には `codex-job` を使ってください。いずれも旧スレッドAPIと完全に同じ機能ではありません。ゴール分解APIの後継はないため、子ゴールは `addness goal create --parent <GOAL_ID>` で作成します。
-- 旧 `kpi add/update/rm` は廃止しました。現行バックエンドのKPIはAnalytics Recipeを定義し、KPIツリーに配置し、Runで実績を記録する構造です。CLIにはまだ同等の操作がないため、旧コマンドを代用しないでください。
+- `goal-chat` / `todo-chat` / `thread` / `goal decompose` は、現行バックエンドに同じルートがないためCLIから削除されています。ゴール上の会話には `issue` または `comment`、AI診断には `core-values` / `master-plan`を使ってください。旧 `codex-job` も現行バックエンドから削除済みです。エージェント機能は `addness mcp list --query agent --json` で現行ツールを確認してください。いずれも旧スレッドAPIと完全に同じ機能ではありません。ゴール分解APIの後継はないため、子ゴールは `addness goal create --parent <GOAL_ID>` で作成します。
+- 旧 `kpi add/update/rm` は廃止しました。現行バックエンドのKPIはAnalytics Recipeを定義し、KPIツリーに配置し、Runで実績を記録する構造です。現行操作は `addness mcp list --query analytics --json` / `--query kpi` で確認し、`mcp schema` / `mcp call` を使ってください。
 - 403でレスポンスがJSONではない場合は、画面側と同じくWAF/セキュリティルールによるブロックの可能性があります。OWNER/EDITOR権限の変更では直りません。発生時刻と `Request path` を添えて運用担当に確認してください。
 - `org get-context` / `set-context` / `context-revisions` は、backendが組織コンテキスト機能を撤去したためCLIから削除されています。保存内容がAddyの挙動に反映されなかった機能で、現行APIに直接の後継はありません。
 

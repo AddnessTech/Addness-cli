@@ -2,13 +2,12 @@ use anyhow::Result;
 
 use crate::api::{
     ActiveHuddlesResponse, ApiClient, ApiResponse, CalendarEvent, CalendarEventCompletionRequest,
-    CalendarEventCompletionResponse, CodexTodaysGoalsApplyRequest, CreatePlannedTodoRequest,
-    CreateTodayTodoRequest, DeletePlannedTodoResponse, ExecutionHistoryResponse, ExecutionRecord,
-    ExecutionSummaryResponse, GoalCalendarEnvelope, GoalCalendarResponse, GoalHistoryResponse,
-    GoalPreferenceResponse, MemberId, PlannedTodoMaterial, PlannedTodoView,
-    RecordTodayTodoActivityRequest, TodayTodoActivityView, TodayTodoView, TodaysGoalsData,
-    TodaysGoalsSummaryResponse, UpdateChatTodayTodoRequest, UpdateGoalPreferenceRequest,
-    UpdatePlannedTodoRequest,
+    CalendarEventCompletionResponse, CreatePlannedTodoRequest, CreateTodayTodoRequest,
+    DeletePlannedTodoResponse, ExecutionHistoryResponse, ExecutionRecord, ExecutionSummaryResponse,
+    GoalCalendarEnvelope, GoalCalendarResponse, GoalHistoryResponse, GoalPreferenceResponse,
+    MemberId, PlannedTodoMaterial, PlannedTodoView, RecordTodayTodoActivityRequest,
+    TodayTodoActivityView, TodayTodoView, TodaysGoalsData, TodaysGoalsSummaryResponse,
+    UpdateChatTodayTodoRequest, UpdateGoalPreferenceRequest, UpdatePlannedTodoRequest,
 };
 
 /// Build the `?a=1&b=2` query-string suffix, sharing the same encoding style
@@ -395,17 +394,6 @@ impl ApiClient {
             query_suffix(&[("date", date)])
         );
         let resp: ApiResponse<serde_json::Value> = self.get(&path).await?;
-        Ok(resp.data)
-    }
-
-    /// POST /api/v2/codex/todays-goals/apply — requires an X-Organization-ID
-    /// header.
-    pub async fn apply_codex_todays_goals(
-        &self,
-        req: &CodexTodaysGoalsApplyRequest,
-    ) -> Result<serde_json::Value> {
-        let resp: ApiResponse<serde_json::Value> =
-            self.post("/api/v2/codex/todays-goals/apply", req).await?;
         Ok(resp.data)
     }
 }

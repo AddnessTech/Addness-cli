@@ -118,14 +118,6 @@ pub enum OrgCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Show the organization's AI agent member
-    AiAgentMember {
-        /// Organization ID
-        id: String,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
     /// Show the organization's payment access state
     AccessState {
         /// Organization ID
@@ -136,14 +128,6 @@ pub enum OrgCommands {
     },
     /// Show your member record within the organization
     CurrentMember {
-        /// Organization ID
-        id: String,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Check whether you are an admin of the organization
-    AdminCheck {
         /// Organization ID
         id: String,
         /// Output as JSON
@@ -192,11 +176,6 @@ pub enum OrgCommands {
     AdSettings {
         #[command(subcommand)]
         command: AdSettingsCommands,
-    },
-    /// Manage the organization's paid subscription
-    Subscription {
-        #[command(subcommand)]
-        command: SubscriptionCommands,
     },
 }
 
@@ -262,36 +241,6 @@ pub enum AdSettingsCommands {
         /// Hide ads until this RFC3339 timestamp (within 48 hours)
         #[arg(long)]
         hidden_until: Option<String>,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Subcommand)]
-pub enum SubscriptionCommands {
-    /// Register a paid subscription from an Univapay subscription ID
-    Register {
-        /// Univapay subscription ID
-        #[arg(long)]
-        univapay_subscription_id: String,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Cancel a subscription by its ID
-    Cancel {
-        /// Organization subscription ID
-        id: String,
-        /// Skip confirmation prompt
-        #[arg(long)]
-        force: bool,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Show the current subscription for the active organization
-    Current {
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -508,12 +457,6 @@ pub async fn handle_org(cmd: &OrgCommands, client: &ApiClient) -> Result<()> {
                 .await?;
             print_json_value(&data)
         }
-        OrgCommands::AiAgentMember { id, json: _ } => {
-            let data = client_for_org(client, id)
-                .get_organization_ai_agent_member(id)
-                .await?;
-            print_json_value(&data)
-        }
         OrgCommands::AccessState { id, json: _ } => {
             let data = client_for_org(client, id)
                 .get_organization_access_state(id)
@@ -523,12 +466,6 @@ pub async fn handle_org(cmd: &OrgCommands, client: &ApiClient) -> Result<()> {
         OrgCommands::CurrentMember { id, json: _ } => {
             let data = client_for_org(client, id)
                 .get_organization_current_member(id)
-                .await?;
-            print_json_value(&data)
-        }
-        OrgCommands::AdminCheck { id, json: _ } => {
-            let data = client_for_org(client, id)
-                .check_organization_admin(id)
                 .await?;
             print_json_value(&data)
         }
@@ -561,7 +498,6 @@ pub async fn handle_org(cmd: &OrgCommands, client: &ApiClient) -> Result<()> {
             handle_onboarding_billing(command, client).await
         }
         OrgCommands::AdSettings { command } => handle_ad_settings(command, client).await,
-        OrgCommands::Subscription { command } => handle_subscription(command, client).await,
     }
 }
 
@@ -628,32 +564,6 @@ async fn handle_ad_settings(cmd: &AdSettingsCommands, client: &ApiClient) -> Res
             let data = client_for_org(client, id)
                 .set_my_organization_ad_settings(id, &body)
                 .await?;
-            print_json_value(&data)
-        }
-    }
-}
-
-async fn handle_subscription(cmd: &SubscriptionCommands, client: &ApiClient) -> Result<()> {
-    match cmd {
-        SubscriptionCommands::Register {
-            univapay_subscription_id,
-            json: _,
-        } => {
-            let data = client
-                .register_organization_subscription(univapay_subscription_id)
-                .await?;
-            print_json_value(&data)
-        }
-        SubscriptionCommands::Cancel { id, force, json: _ } => {
-            if !*force && !crate::cli::commands::confirm(&format!("Cancel subscription {id}?"))? {
-                println!("Cancelled.");
-                return Ok(());
-            }
-            let data = client.cancel_organization_subscription(id).await?;
-            print_json_value(&data)
-        }
-        SubscriptionCommands::Current { json: _ } => {
-            let data = client.get_current_organization_subscription().await?;
             print_json_value(&data)
         }
     }

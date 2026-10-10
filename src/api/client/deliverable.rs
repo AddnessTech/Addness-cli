@@ -1,12 +1,79 @@
-use std::{collections::HashMap, path::Path};
-
 use crate::api::{
-    ApiClient, ApiResponse, AttachmentUploadRequest, BatchDeleteDeliverableRequest,
-    BatchMoveDeliverableRequest, CreateDeliverableRequest, Deliverable, DeliverableCreateData,
-    DeliverableListData, DeliverableType, MoveDeliverableRequest, RelatedFetchError,
-    RenameDeliverableRequest, UpdateDeliverableRequest,
+    ApiClient, ApiResponse, Deliverable, DeliverableCreateData, DeliverableListData,
+    DeliverableType, RelatedFetchError,
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
+
+const NODES: &str = "/api/v2/drive/nodes";
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DriveNode {
+    id: String,
+    name: String,
+    kind: DeliverableType,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    parent_id: Option<String>,
+    #[serde(default)]
+    goals: Option<Vec<DriveGoal>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DriveGoal {
+    objective_id: String,
+}
+
+#[derive(Deserialize)]
+struct DrivePage {
+    items: Vec<DriveNode>,
+    total: i64,
+}
+
+impl DriveNode {
+    fn deliverable(self, goal: &str) -> Deliverable {
+        let file_name = (self.kind == DeliverableType::File).then(|| self.name.clone());
+        let folder = self.kind == DeliverableType::Folder;
+        Deliverable {
+            id: self.id,
+            display_name: self.name,
+            node_type: self.kind,
+            content: None,
+            link_url: self.url,
+            file_name,
+            objective_id: goal.to_string(),
+            is_root: self.parent_id.is_none(),
+            parent_deliverable_id: self.parent_id,
+            order_no: 0.0,
+            depth: 0,
+            has_children: folder,
+            children_count: 0,
+        }
+    }
+    fn created(self, goal: &str) -> ApiResponse<DeliverableCreateData> {
+        let node = self.deliverable(goal);
+        ApiResponse {
+            data: DeliverableCreateData {
+                id: node.id,
+                display_name: node.display_name,
+                node_type: node.node_type,
+                content: node.content,
+                link_url: node.link_url,
+                file_name: node.file_name,
+                objective_id: node.objective_id,
+                upload_request: None,
+            },
+        }
+    }
+}
 
 /// Links commonly use URLs or owner/repo names as their label. Keep them readable
 /// while respecting the backend's display-name contract (255 chars, no /, \\, NUL).
@@ -30,20 +97,44 @@ fn link_display_name(name: &str) -> String {
 }
 
 impl ApiClient {
+    async fn deliverable_folder(&self, goal_id: &str) -> Result<String> {
+        let result: Value = self
+            .post(
+                &format!("{NODES}/goal-folder"),
+                &json!({"objectiveId": goal_id}),
+            )
+            .await?;
+        Ok(result["nodeId"]
+            .as_str()
+            .context("Drive did not return nodeId")?
+            .to_string())
+    }
+
+    async fn scoped_deliverable(&self, goal_id: &str, id: &str) -> Result<DriveNode> {
+        let id = super::issue::encode_path_segment(id);
+        let node: DriveNode = self.get(&format!("{NODES}/{id}")).await?;
+        if !node
+            .goals
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|goal| goal.objective_id == goal_id)
+        {
+            bail!("Drive resource is not linked to goal {goal_id}");
+        }
+        Ok(node)
+    }
+
     pub async fn create_folder_deliverable(
         &self,
         goal_id: &str,
         display_name: &str,
     ) -> Result<ApiResponse<DeliverableCreateData>> {
-        let body = CreateDeliverableRequest {
-            node_type: DeliverableType::Folder,
-            display_name: display_name.to_string(),
-            content: None,
-            link_url: None,
-            file: None,
-        };
-        let path = format!("/api/v1/team/objectives/{goal_id}/deliverables");
-        self.post(&path, &body).await
+        let parent = self.deliverable_folder(goal_id).await?;
+        let node: DriveNode = self
+            .post(NODES, &json!({"name":display_name,"parentId":parent}))
+            .await?;
+        Ok(node.created(goal_id))
     }
 
     pub async fn create_link_deliverable(
@@ -52,15 +143,38 @@ impl ApiClient {
         url: &str,
         display_name: &str,
     ) -> Result<ApiResponse<DeliverableCreateData>> {
-        let body = CreateDeliverableRequest {
-            node_type: DeliverableType::Link,
-            display_name: link_display_name(display_name),
-            content: None,
-            link_url: Some(url.to_string()),
-            file: None,
-        };
-        let path = format!("/api/v1/team/objectives/{goal_id}/deliverables");
-        self.post(&path, &body).await
+        let parent = self.deliverable_folder(goal_id).await?;
+        let node: DriveNode = self
+            .post(
+                &format!("{NODES}/links"),
+                &json!({"name":link_display_name(display_name),"url":url,"parentId":parent}),
+            )
+            .await?;
+        Ok(node.created(goal_id))
+    }
+
+    async fn upload_drive_deliverable(
+        &self,
+        goal_id: &str,
+        name: &str,
+        content_type: &str,
+        bytes: Vec<u8>,
+    ) -> Result<ApiResponse<DeliverableCreateData>> {
+        if bytes.len() > 50 * 1024 * 1024 {
+            bail!("Drive upload exceeds 50 MiB");
+        }
+        let parent = self.deliverable_folder(goal_id).await?;
+        let query = form_urlencoded::Serializer::new(String::new())
+            .append_pair("parentId", &parent)
+            .finish();
+        let part = reqwest::multipart::Part::bytes(bytes)
+            .file_name(name.to_string())
+            .mime_str(content_type)?;
+        let form = reqwest::multipart::Form::new().part("file", part);
+        let node: DriveNode = self
+            .post_multipart(&format!("{NODES}/files?{query}"), form)
+            .await?;
+        Ok(node.created(goal_id))
     }
 
     pub async fn create_document_deliverable(
@@ -69,38 +183,44 @@ impl ApiClient {
         display_name: &str,
         content: &str,
     ) -> Result<ApiResponse<DeliverableCreateData>> {
-        let body = CreateDeliverableRequest {
-            node_type: DeliverableType::Document,
-            display_name: display_name.to_string(),
-            content: Some(content.to_string()),
-            link_url: None,
-            file: None,
+        let name = if Path::new(display_name).extension().is_none() {
+            format!("{display_name}.md")
+        } else {
+            display_name.to_string()
         };
-        let path = format!("/api/v1/team/objectives/{goal_id}/deliverables");
-        self.post(&path, &body).await
+        self.upload_drive_deliverable(
+            goal_id,
+            &name,
+            "text/markdown; charset=utf-8",
+            content.as_bytes().to_vec(),
+        )
+        .await
     }
 
-    pub async fn create_file_deliverable(
+    pub async fn create_file_deliverable_from_path(
         &self,
         goal_id: &str,
-        display_name: &str,
-        file_name: &str,
-        content_type: &str,
-        file_size: i64,
+        path: &Path,
+        display_name: Option<&str>,
     ) -> Result<ApiResponse<DeliverableCreateData>> {
-        let body = CreateDeliverableRequest {
-            node_type: DeliverableType::File,
-            display_name: display_name.to_string(),
-            content: None,
-            link_url: None,
-            file: Some(AttachmentUploadRequest {
-                file_name: file_name.to_string(),
-                content_type: content_type.to_string(),
-                file_size,
-            }),
-        };
-        let path = format!("/api/v1/team/objectives/{goal_id}/deliverables");
-        self.post(&path, &body).await
+        let metadata = std::fs::metadata(path)
+            .with_context(|| format!("Could not stat {}", path.display()))?;
+        if !metadata.is_file() || metadata.len() > 50 * 1024 * 1024 {
+            bail!("Upload must be a regular file of at most 50 MiB");
+        }
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .context("Invalid file name")?;
+        let content_type = guess_content_type(path)?;
+        let bytes = std::fs::read(path)?;
+        self.upload_drive_deliverable(
+            goal_id,
+            display_name.unwrap_or(filename),
+            &content_type,
+            bytes,
+        )
+        .await
     }
 
     /// S3 presigned POST URL に multipart で実ファイルをアップロードする。
@@ -138,146 +258,127 @@ impl ApiClient {
         Ok(())
     }
 
-    pub async fn create_file_deliverable_from_path(
-        &self,
-        goal_id: &str,
-        path: &Path,
-        display_name: Option<&str>,
-    ) -> Result<ApiResponse<DeliverableCreateData>> {
-        let metadata = std::fs::metadata(path)
-            .with_context(|| format!("Failed to stat file {}", path.display()))?;
-        if !metadata.is_file() {
-            anyhow::bail!("{} is not a regular file", path.display());
-        }
-
-        let file_name = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .map(String::from)
-            .ok_or_else(|| anyhow::anyhow!("Cannot derive file name from {}", path.display()))?;
-        let display = display_name.unwrap_or(&file_name);
-        let content_type = guess_content_type(path)?;
-
-        let resp = self
-            .create_file_deliverable(
-                goal_id,
-                display,
-                &file_name,
-                &content_type,
-                metadata.len() as i64,
-            )
-            .await?;
-
-        let upload = resp.data.upload_request.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("Server did not return an upload URL for the file deliverable")
-        })?;
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("Failed to read file {}", path.display()))?;
-
-        if let Err(upload_err) = self
-            .upload_attachment(
-                &upload.url,
-                &upload.values,
-                bytes,
-                &file_name,
-                &content_type,
-            )
-            .await
-        {
-            // アップロード失敗時はサーバ側に空のdeliverableが残るため削除する。
-            // 削除にも失敗した場合は孤立IDをユーザーに案内する。
-            if let Err(cleanup_err) = self.delete_deliverable(goal_id, &resp.data.id).await {
-                anyhow::bail!(
-                    "{upload_err}\n\nNote: failed to remove the placeholder deliverable \
-                     (id={}): {cleanup_err}. You may want to delete it from the web UI.",
-                    resp.data.id
-                );
-            }
-            return Err(upload_err.context("Failed to upload file deliverable"));
-        }
-
-        Ok(resp)
-    }
-
     pub async fn get_goal_deliverables(
         &self,
         goal_id: &str,
     ) -> Result<ApiResponse<DeliverableListData>> {
-        let path = format!("/api/v1/team/objectives/{goal_id}/deliverables");
-        self.get(&path).await
+        let mut deliverables = Vec::new();
+        let mut seen = HashSet::new();
+        let mut page_number = 1;
+        let total = loop {
+            let query = form_urlencoded::Serializer::new(String::new())
+                .append_pair("objectiveId", goal_id)
+                .append_pair("limit", "100")
+                .append_pair("page", &page_number.to_string())
+                .finish();
+            let page: DrivePage = self.get(&format!("{NODES}/search?{query}")).await?;
+            if page.total < 0 {
+                bail!("Drive returned an invalid total");
+            }
+            let previous = deliverables.len();
+            for node in page.items {
+                if !seen.insert(node.id.clone()) {
+                    bail!("Drive list changed during pagination; retry the list");
+                }
+                deliverables.push(node.deliverable(goal_id));
+            }
+            if deliverables.len() as i64 >= page.total {
+                break page.total;
+            }
+            if deliverables.len() == previous || page_number >= 10_000 {
+                bail!("Drive pagination ended before all deliverables were retrieved");
+            }
+            page_number += 1;
+        };
+        Ok(ApiResponse {
+            data: DeliverableListData {
+                total,
+                deliverables,
+            },
+        })
     }
 
     pub async fn update_deliverable(
         &self,
         goal_id: &str,
-        deliverable_id: &str,
+        id: &str,
         content: &str,
-        mentions: Vec<String>,
     ) -> Result<ApiResponse<Deliverable>> {
-        let path = format!("/api/v1/team/objectives/{goal_id}/deliverables/{deliverable_id}");
-        let body = UpdateDeliverableRequest {
-            content: content.to_string(),
-            mentions,
-        };
-        self.patch(&path, &body).await
+        if content.len() > 4 * 1024 * 1024 {
+            bail!("Drive content exceeds 4 MiB");
+        }
+        let node = self.scoped_deliverable(goal_id, id).await?;
+        let _: Value = self
+            .put(
+                &format!("{NODES}/{}/content", node.id),
+                &json!({"content": content}),
+            )
+            .await?;
+        let mut data = node.deliverable(goal_id);
+        data.content = Some(content.to_string());
+        Ok(ApiResponse { data })
     }
 
     pub async fn rename_deliverable(
         &self,
         goal_id: &str,
-        deliverable_id: &str,
-        display_name: &str,
+        id: &str,
+        name: &str,
     ) -> Result<ApiResponse<Deliverable>> {
-        let path =
-            format!("/api/v1/team/objectives/{goal_id}/deliverables/{deliverable_id}/rename");
-        let body = RenameDeliverableRequest {
-            display_name: display_name.to_string(),
-        };
-        self.patch(&path, &body).await
+        let node = self.scoped_deliverable(goal_id, id).await?;
+        let renamed: DriveNode = self
+            .patch(&format!("{NODES}/{}", node.id), &json!({"name": name}))
+            .await?;
+        Ok(ApiResponse {
+            data: renamed.deliverable(goal_id),
+        })
     }
 
     pub async fn move_deliverable(
         &self,
         goal_id: &str,
-        deliverable_id: &str,
-        target_parent_deliverable_id: Option<String>,
-        order_no: f64,
+        id: &str,
+        parent: Option<String>,
     ) -> Result<ApiResponse<Deliverable>> {
-        let path = format!("/api/v1/team/objectives/{goal_id}/deliverables/{deliverable_id}/move");
-        let body = MoveDeliverableRequest {
-            target_parent_deliverable_id,
-            order_no,
+        let node = self.scoped_deliverable(goal_id, id).await?;
+        let parent = match parent {
+            Some(parent) => {
+                let target = self.scoped_deliverable(goal_id, &parent).await?;
+                if target.kind != DeliverableType::Folder {
+                    bail!("Destination must be a folder");
+                }
+                target.id
+            }
+            None => self.deliverable_folder(goal_id).await?,
         };
-        self.patch(&path, &body).await
+        let mut expected = serde_json::Map::new();
+        expected.insert(node.id.clone(), json!(node.parent_id));
+        let _: Value = self
+            .post(
+                &format!("{NODES}/move"),
+                &json!({"nodeIds":[node.id], "parentId":parent, "expectedParents":expected}),
+            )
+            .await?;
+        Ok(ApiResponse {
+            data: self
+                .scoped_deliverable(goal_id, &node.id)
+                .await?
+                .deliverable(goal_id),
+        })
     }
 
-    pub async fn delete_deliverable(&self, goal_id: &str, deliverable_id: &str) -> Result<()> {
-        let path = format!("/api/v1/team/objectives/{goal_id}/deliverables/{deliverable_id}");
-        self.delete_no_body(&path).await
+    pub async fn delete_deliverable(&self, goal_id: &str, id: &str) -> Result<()> {
+        self.batch_delete_deliverables(goal_id, vec![id.to_string()])
+            .await
     }
 
-    pub async fn batch_move_deliverables(
-        &self,
-        goal_id: &str,
-        node_ids: Vec<String>,
-        target_parent_deliverable_id: Option<String>,
-    ) -> Result<ApiResponse<DeliverableListData>> {
-        let path = format!("/api/v1/team/objectives/{goal_id}/deliverables/batch_move");
-        let body = BatchMoveDeliverableRequest {
-            node_ids,
-            target_parent_deliverable_id,
-        };
-        self.post(&path, &body).await
-    }
-
-    pub async fn batch_delete_deliverables(
-        &self,
-        goal_id: &str,
-        node_ids: Vec<String>,
-    ) -> Result<()> {
-        let path = format!("/api/v1/team/objectives/{goal_id}/deliverables/batch_delete");
-        let body = BatchDeleteDeliverableRequest { node_ids };
-        self.post_no_content(&path, &body).await
+    pub async fn batch_delete_deliverables(&self, goal_id: &str, ids: Vec<String>) -> Result<()> {
+        let mut verified = Vec::new();
+        for id in ids {
+            verified.push(self.scoped_deliverable(goal_id, &id).await?.id);
+        }
+        self.post_no_content(&format!("{NODES}/trash"), &json!({"nodeIds": verified}))
+            .await
     }
 
     /// 各ゴールの成果物を並行取得してマップで返す

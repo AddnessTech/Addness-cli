@@ -1,8 +1,8 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Subcommand;
 use colored::Colorize;
 
-use crate::api::{ApiClient, CodexTodaysGoalsApplyRequest, UpdateGoalPreferenceRequest};
+use crate::api::{ApiClient, UpdateGoalPreferenceRequest};
 use crate::cli::commands::org::resolve_org_id;
 
 /// Build a client whose `X-Organization-ID` header targets `org_id`, for the
@@ -15,10 +15,6 @@ fn client_for_org(client: &ApiClient, org_id: &str) -> ApiClient {
     let mut scoped = client.clone();
     scoped.set_org_id(Some(org_id.to_string()));
     scoped
-}
-
-fn parse_json_arg(raw: &str, flag: &str) -> Result<serde_json::Value> {
-    serde_json::from_str(raw).with_context(|| format!("{flag} must be valid JSON"))
 }
 
 #[derive(Subcommand)]
@@ -178,25 +174,6 @@ pub enum CodexCommands {
         /// Date in YYYY-MM-DD (defaults to today)
         #[arg(long)]
         date: Option<String>,
-        /// Present for consistency with other commands; the response shape is
-        /// opaque (Codex-agent DSL) so it is always printed as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Apply a batch of Codex-agent changes to today's goals
-    Apply {
-        /// Organization ID (uses default if not specified)
-        #[arg(long)]
-        org: Option<String>,
-        /// Payload version (defaults to 1)
-        #[arg(long)]
-        version: Option<i32>,
-        /// Date in YYYY-MM-DD (defaults to today)
-        #[arg(long)]
-        date: Option<String>,
-        /// Raw JSON array of changes, per the Codex apply DSL returned by `execution codex view`
-        #[arg(long)]
-        changes_json: String,
         /// Present for consistency with other commands; the response shape is
         /// opaque (Codex-agent DSL) so it is always printed as JSON
         #[arg(long)]
@@ -426,43 +403,5 @@ async fn handle_codex(cmd: &CodexCommands, client: &ApiClient) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&view)?);
             Ok(())
         }
-        CodexCommands::Apply {
-            org,
-            version,
-            date,
-            changes_json,
-            json: _,
-        } => {
-            let org_id = resolve_org_id(org.as_deref())?;
-            let scoped = client_for_org(client, &org_id);
-            let changes = parse_json_arg(changes_json, "--changes-json")?;
-            let req = CodexTodaysGoalsApplyRequest {
-                version: version.unwrap_or(1),
-                date: date.clone(),
-                changes,
-            };
-            let resp = scoped.apply_codex_todays_goals(&req).await?;
-            println!("{}", serde_json::to_string_pretty(&resp)?);
-            Ok(())
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_json_arg;
-
-    #[test]
-    fn parse_json_arg_accepts_valid_json_array() {
-        let value =
-            parse_json_arg(r#"[{"op":"complete","goalId":"g1"}]"#, "--changes-json").unwrap();
-        assert!(value.is_array());
-        assert_eq!(value[0]["op"], "complete");
-    }
-
-    #[test]
-    fn parse_json_arg_rejects_invalid_json() {
-        let err = parse_json_arg("not json", "--changes-json").unwrap_err();
-        assert!(err.to_string().contains("--changes-json"));
     }
 }

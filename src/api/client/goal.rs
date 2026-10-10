@@ -1,11 +1,8 @@
 use crate::api::{
-    Alias, ApiClient, ApiResponse, ChangeParentRequest, CreateAliasRequest, CreateGoalRequest,
-    DuplicateRequest, Goal, GoalChildrenData, GoalSearchResponse, GoalTreeData,
-    ObjectiveIdsRequest, RecurringGoal, RecurringGoalRequest, ReorderAliasesRequest,
-    ReorderAliasesResponse, ShareLinkResponse, UpdateGoalRequest,
+    ApiClient, ApiResponse, ChangeParentRequest, CreateGoalRequest, Goal, GoalChildrenData,
+    GoalSearchResponse, GoalTreeData, ObjectiveIdsRequest, ShareLinkResponse, UpdateGoalRequest,
 };
-use anyhow::{Context, Result};
-use reqwest::{Method, StatusCode};
+use anyhow::Result;
 
 impl ApiClient {
     pub async fn get_goal_tree(
@@ -68,7 +65,7 @@ impl ApiClient {
 
     pub async fn search_goals(&self, query: &str) -> Result<ApiResponse<GoalSearchResponse>> {
         let encoded: String = form_urlencoded::byte_serialize(query.as_bytes()).collect();
-        let path = format!("/api/v1/team/objectives/search?title={encoded}&permission=read");
+        let path = format!("/api/v2/objectives/search?title={encoded}&permission=read");
         self.get(&path).await
     }
 
@@ -115,18 +112,6 @@ impl ApiClient {
             .await
     }
 
-    pub async fn duplicate_goal(
-        &self,
-        goal_id: &str,
-        parent_id: &str,
-    ) -> Result<ApiResponse<Goal>> {
-        let path = format!("/api/v2/objectives/{goal_id}/duplicate");
-        let body = DuplicateRequest {
-            parent_id: parent_id.to_string(),
-        };
-        self.post(&path, &body).await
-    }
-
     pub async fn change_goal_parent(
         &self,
         goal_id: &str,
@@ -138,94 +123,13 @@ impl ApiClient {
     }
 
     pub async fn create_share_link(&self, goal_id: &str) -> Result<ShareLinkResponse> {
-        let path = format!("/api/v1/team/objectives/{goal_id}/share");
-        self.post_empty(&path).await
+        let path = format!("/api/v2/objectives/{goal_id}/share");
+        let response: ApiResponse<ShareLinkResponse> = self.post_empty(&path).await?;
+        Ok(response.data)
     }
 
     pub async fn revoke_share_link(&self, goal_id: &str) -> Result<()> {
-        let path = format!("/api/v1/team/objectives/{goal_id}/share");
-        self.delete_no_body(&path).await
-    }
-
-    /// GET /api/v1/public/objectives/:publicId (no auth required).
-    /// Response is not envelope-wrapped and has many fields
-    /// (`resources.SharedObjectiveResponse`), so it is surfaced as raw JSON
-    /// rather than a fully-typed struct.
-    pub async fn get_public_shared_objective(&self, public_id: &str) -> Result<serde_json::Value> {
-        let path = format!("/api/v1/public/objectives/{public_id}");
-        self.get_without_org(&path).await
-    }
-
-    pub async fn create_alias(
-        &self,
-        parent_goal_id: &str,
-        target_objective_id: &str,
-        order_no: i32,
-    ) -> Result<ApiResponse<Alias>> {
-        let path = format!("/api/v1/team/objectives/{parent_goal_id}/aliases");
-        let body = CreateAliasRequest {
-            target_objective_id: target_objective_id.to_string(),
-            order_no,
-        };
-        self.post(&path, &body).await
-    }
-
-    pub async fn reorder_aliases(
-        &self,
-        parent_goal_id: &str,
-        alias_ids: Vec<String>,
-    ) -> Result<()> {
-        let path = format!("/api/v1/team/objectives/{parent_goal_id}/aliases/reorder");
-        let body = ReorderAliasesRequest { alias_ids };
-        let _: ApiResponse<ReorderAliasesResponse> = self.patch(&path, &body).await?;
-        Ok(())
-    }
-
-    pub async fn delete_alias(&self, parent_goal_id: &str, alias_id: &str) -> Result<()> {
-        let path = format!("/api/v1/team/objectives/{parent_goal_id}/aliases/{alias_id}");
-        self.delete_no_body(&path).await
-    }
-
-    pub async fn get_recurring_goal(&self, goal_id: &str) -> Result<ApiResponse<RecurringGoal>> {
-        let path = format!("/api/v2/objectives/{goal_id}/recurring");
-        self.get(&path).await
-    }
-
-    /// 繰り返し設定を作成または更新する。
-    /// バックエンドの `PUT` は既存の設定が無いと404になる一方、`POST` は既存設定があっても
-    /// そのまま既存値を返すだけで更新はしない（get-or-create）。そのためまず `PUT` を試み、
-    /// 404だった場合のみ `POST` にフォールバックして新規作成する（addness-mcpのset_recurringと同じ挙動）。
-    pub async fn set_recurring_goal(
-        &self,
-        goal_id: &str,
-        req: &RecurringGoalRequest,
-    ) -> Result<ApiResponse<RecurringGoal>> {
-        let path = format!("/api/v2/objectives/{goal_id}/recurring");
-        let (url, put_req) = self.request(Method::PUT, &path, true)?;
-        let response = Self::send_request(put_req.json(req), &url).await?;
-
-        if response.status() == StatusCode::NOT_FOUND {
-            return self.post(&path, req).await;
-        }
-        if !response.status().is_success() {
-            let status = response.status();
-            let content_type = response
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned);
-            let body = response.text().await.unwrap_or_default();
-            return Err(Self::api_error(status, &body, content_type.as_deref()));
-        }
-        let bytes = response
-            .bytes()
-            .await
-            .with_context(|| format!("Failed to read response body from {url}"))?;
-        Self::parse_json_bytes(&bytes, &url)
-    }
-
-    pub async fn remove_recurring_goal(&self, goal_id: &str) -> Result<()> {
-        let path = format!("/api/v2/objectives/{goal_id}/recurring");
+        let path = format!("/api/v2/objectives/{goal_id}/share");
         self.delete_no_body(&path).await
     }
 }

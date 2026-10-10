@@ -2,7 +2,7 @@ use anyhow::Result;
 
 use crate::api::{ApiClient, ApiResponse, SearchResponse};
 
-/// Query parameters for GET /api/v1/team/search.
+/// Query parameters for GET /api/v2/search.
 #[derive(Default)]
 pub struct SearchQueryParams<'a> {
     pub query: &'a str,
@@ -27,9 +27,9 @@ fn search_query_suffix(params: &SearchQueryParams<'_>) -> String {
 }
 
 impl ApiClient {
-    /// GET /api/v1/team/search (unified search across objectives/comments/members).
+    /// GET /api/v2/search (unified search across objectives/comments/members).
     pub async fn unified_search(&self, params: SearchQueryParams<'_>) -> Result<SearchResponse> {
-        let path = format!("/api/v1/team/search?{}", search_query_suffix(&params));
+        let path = format!("/api/v2/search?{}", search_query_suffix(&params));
         let resp: ApiResponse<SearchResponse> = self.get(&path).await?;
         Ok(resp.data)
     }

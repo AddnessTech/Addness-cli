@@ -491,26 +491,6 @@ pub struct ExecutionSummaryResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Codex 用「今日のゴール」read/apply —
-// internal/goalexecution/usecase/codex_todays_goals_{view,apply_ids}.go
-//
-// The view/apply payloads use a bespoke short-id + change-op DSL (assign,
-// unassign, transfer-owner, complete, reorder, ...) that mirrors the Codex
-// agent's internal representation rather than the CLI's own goal model.
-// Modeling it 1:1 would duplicate a large slice of backend-only logic for a
-// feature explicitly designed for machine (not human CLI) consumption, so
-// the CLI passes the view response and the apply request/response through
-// as opaque JSON, matching this codebase's existing convention for opaque
-// payloads (e.g. `chatMetadata`, `search.rs`, `sharetree.rs`).
-#[derive(Debug, Clone, Serialize, Default)]
-pub struct CodexTodaysGoalsApplyRequest {
-    pub version: i32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub date: Option<String>,
-    pub changes: serde_json::Value,
-}
-
-// ---------------------------------------------------------------------------
 // アクティブハドル — internal/huddle/usecase/{response,get_active_huddles_types}.go
 // (`GET /api/v2/todays-goals/active-huddles`; the only huddle endpoint in the
 // 実行タブ・カレンダー group).

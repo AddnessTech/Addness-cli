@@ -3,9 +3,7 @@ use clap::{Subcommand, ValueEnum};
 use serde::Serialize;
 use std::io::{self, Read, Write};
 
-use crate::api::{
-    ApiClient, CommentMutationResult, ListNotificationsParams, NotificationSettingRequest,
-};
+use crate::api::{ApiClient, Comment, ListNotificationsParams, NotificationSettingRequest};
 use crate::cli::commands::org::resolve_org_id;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -233,7 +231,7 @@ struct NotificationSendOutput<'a> {
     kind: &'a str,
     terminal_notification: &'a str,
     goal_id: &'a str,
-    comment: &'a CommentMutationResult,
+    comment: &'a Comment,
 }
 
 fn read_body(inline: Option<&String>, file: Option<&String>) -> Result<String> {

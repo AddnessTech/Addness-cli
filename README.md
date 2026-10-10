@@ -72,6 +72,24 @@ ADDNESS_API_RESOLVE=vt.api.addness.com=<api-ip> addness goal get <goal-id>
 
 IP は運用環境で変わる可能性があるため、通常は設定しないでください。
 
+## MCP の最新機能を CLI から使う
+
+フォーム、Analytics/KPI、CRM、Drive、テンプレート、ナレッジ、録画、権限、エージェント作業などは、サーバーが公開するツールを一覧から探して利用できます。追加・改名されたツールも最新のカタログに追従します。
+
+```bash
+addness mcp list --json
+addness mcp list --query analytics --json
+addness mcp schema list_forms --json
+addness mcp call list_forms --args '{"limit":20}' --json
+addness mcp call <tool-name> --args-file ./arguments.json --json
+```
+
+`--args-file -` で標準入力、`--org` で今回の組織、`--scope` で organization（既定）/ personal / copilot / openai / admin / support の入口を選べます。入口に対応する権限のキーが必要です。保存済みのログイン情報または `ADDNESS_API_TOKEN` を使います。
+
+`mcp list` はカタログの全ページを取得します。各ツールが返すデータのページ送りは、その入力仕様に従って行ってください。`mcp call` は書き込みも即時実行し、自動再送しません。`--json` は `content`・`structuredContent`・`isError` を保持し、ツール失敗時は非ゼロ終了します。
+
+v0.15.0 の削除コマンドと移行先、対応範囲は [MCP/CLI 対応と API 移行](docs/mcp-cli-parity.md) を参照してください。
+
 ## 使い方
 
 自分にアサインされたゴールを一覧表示する:
@@ -142,15 +160,13 @@ addness link --help
 ### 認証・設定
 
 - `login` / `logout` / `status` / `configure` — ブラウザ認証・資格情報と API 設定の管理。
-- `api-key` — 個人APIキーの一覧・作成・失効。例: `addness api-key list`
 - `desktop-auth` — デスクトップ認証の browser handoff 補助操作。例: `addness desktop-auth redeem --start-token <token> --browser-nonce-hash <hash>`
 - `update` / `completions` — CLI 自体の更新、シェル補完の生成。
 
 ### ゴール・成果物
 
-- `goal` — ゴールの作成・更新・削除・ツリー表示・検索・複製・アーカイブ・公開共有・エイリアス。
-  `goal recurring` で定期（繰り返し）スケジュール、`goal report-schedule` で活動レポート配信を管理。
-  例: `addness goal recurring get <goal-id>`
+- `goal` — ゴールの作成・更新・削除・ツリー表示・検索・アーカイブ・共有リンク。
+  `goal report-schedule` で活動レポート配信を管理。テンプレートの定期実行は `mcp list --query schedule --json` で確認。
 - `deliverable` — 成果物（ドキュメント/リンク/ファイル）の管理。例: `addness deliverable list --goal <goal-id>`
 - `assignment` — ゴールへのメンバー割り当て。
 - `link` — GitHub PR や URL をゴールに紐付け。例: `addness link pr --goal <goal-id> --url <pr-url>`
@@ -158,8 +174,8 @@ addness link --help
 
 ### コミュニケーション
 
-- `comment` — ゴールコメントの作成・一覧・リアクション・解決管理・グローバルフィード。
-  例: `addness comment list-all --json`
+- `comment` — ゴールコメントの作成・一覧・リアクション・解決管理・投稿者別一覧。
+  例: `addness comment list-all --author <member-id> --json`
 - `issue` — Goal Issue（ゴール上の v2 チャットスレッド）とゴールセクションの管理。
   例: `addness issue list --goal <goal-id>`、`addness issue delete <issue-id> --goal <goal-id>`
 - `chat` — 組織チャット（DM/グループのルーム・メッセージ・招待・横断検索）。
@@ -169,41 +185,35 @@ addness link --help
 
 ### 組織・メンバー
 
-- `org` — 組織の CRUD・切り替え・タイムゾーン・ロゴ・課金/広告/AIスケジュール設定・サブスクリプション。
+- `org` — 組織の CRUD・切り替え・タイムゾーン・ロゴ・オンボーディング課金/広告設定。
   例: `addness org get <org-id>`
 - `member` — メンバーの一覧/検索/詳細・管理者権限・ピン留め・タグ・アバター・削除プレビュー。
   例: `addness member browse --limit 20`
-- `invitation` — メール招待・招待リンクに加え、受け取る側の確認・承諾・辞退。
-  例: `addness invitation pending list`
+- `invitation` — メール招待・招待リンクに加え、招待状況の確認。承諾・辞退・参加はWeb画面で行います。
+  例: `addness invitation overview --json`
 - `user` — 自分のプロフィール・ユーザー設定・所属組織の管理。例: `addness user me`
-- `invoice` — 組織の請求書一覧。
 
 ### 実行・計画（今日のタスク）
 
 - `today` — 今日のゴールの読み書きに加え、`today todo`（今日の ToDo 行）、
   `today planned`（予定/定期/バックログの素材プール）、`today calendar`（外部カレンダーとヒートマップ）。
   例: `addness today todo list`
-- `execution` — 実行タブのサマリ・実行レコードの生成/更新/履歴・ゴール折りたたみ設定・
+- `execution` — 実行タブのサマリ・実行レコードの更新/履歴・ゴール折りたたみ設定・
   アクティブハドル・Codex エージェントビュー。例: `addness execution summary`
-- `meeting` — Huddle の状態/録音/招待、Meeting Bot、議事録文字起こし・要約・投稿、
-  Minutes CRUD。例: `addness meeting minutes list`
+- `meeting` — Huddle の状態/録音/招待と Meeting Bot。議事録・録画は `mcp list --query recording --json` で確認。
 - `activity` — メンバー別/ゴール別/組織全体のアクティビティログと集計。例: `addness activity list`
 - `streak` — 連続達成ストリークの確認・フリーズ・復活・公開共有。例: `addness streak get`
 
 ### AI・自動化
 
-- `skill` — AIスキルのCRUD・検索・パフォーマンス・リソース・改善提案の承認/却下。
-- `codex-job` — クラウドCodexジョブの作成・入力送信・resume・cancel/close・イベント購読。
-  例: `addness codex-job list`
+- `mcp` — サーバーで公開中の全ツールの一覧・入力仕様の取得と実行。新機能も CLI の更新を待たず利用できます。
 
 ### 個人スペース・横断機能
 
-- `personal` — 個人スペース（now/日次ドキュメント、構造化 Markdown 編集、エージェントセッション、
-  プロジェクト、組織横断の today 一覧・活動ヒートマップ）。例: `addness personal today`
+- `personal` — 個人組織の作成、組織横断の today 一覧・活動ヒートマップ。例: `addness personal today-list --json`
 - `search` — 目標・コメント・メンバーの横断検索。例: `addness search "リリース" --json`
-- `diagnosis` — 診断結果（ゴールスタイル・価値観・コアバリュー・マスタープラン）の保存・参照・公開設定。
+- `diagnosis` — 診断結果（ゴールスタイル・価値観・コアバリュー・マスタープラン）の保存・参照。
 - `referral` — 紹介リンクの作成と紹介実績の確認。
-- `share-tree` — ゴールツリーの持ち運び可能な公開エクスポートとクローン。
 - `media` — エディタ内インライン画像/動画のアップロードと表示 URL 取得。
 
 ## TUI（ターミナル UI）

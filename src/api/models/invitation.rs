@@ -43,15 +43,6 @@ pub struct InviteLink {
     pub is_external: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AcceptInvitationResponse {
-    #[serde(default)]
-    pub organization_id: Option<String>,
-    #[serde(default)]
-    pub organization_member_id: Option<String>,
-}
-
 // POST /api/v2/organizations/:id/invitations
 #[derive(Debug, Serialize)]
 pub struct CreateInvitationsRequest {
@@ -70,42 +61,4 @@ pub struct CreateInviteLinkRequest {
     pub expires_at: Option<String>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub is_external: bool,
-}
-
-// POST /api/v2/invitations/accept
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AcceptInvitationRequest {
-    pub invited_member_id: String,
-    pub token: String,
-}
-
-// POST /api/v1/team/organization_invitations/accept
-#[derive(Debug, Serialize)]
-pub struct LegacyAcceptInvitationRequest {
-    pub token: String,
-}
-
-// POST /api/v1/team/organization_invitations/check_plan_upgrade
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CheckPlanUpgradeRequest {
-    pub organization_id: String,
-    pub additional_members_count: i64,
-}
-
-// POST /api/v2/invitations/:token/accept
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AcceptInvitationByTokenRequest {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source_organization_id: Option<String>,
-}
-
-// POST /api/v2/invitations/decline
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DeclineInvitationRequest {
-    pub invited_member_id: String,
-    pub token: String,
 }

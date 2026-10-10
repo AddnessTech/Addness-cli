@@ -51,32 +51,6 @@ pub struct UserUpdateRequest {
     pub date_of_birth: Option<String>,
 }
 
-// POST /api/v1/team/users
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UserCreateRequest {
-    pub name: String,
-    pub email: String,
-}
-
-// GET /api/v1/team/users?name=&email=&limit=&offset=
-// Response: { "data": [UserResource, ...], "pagination": {...} }
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UserListResponse {
-    #[serde(default)]
-    pub data: Vec<User>,
-    pub pagination: UserListPagination,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UserListPagination {
-    pub total: i64,
-    pub limit: i64,
-    pub offset: i64,
-}
-
 // GET /api/v1/team/user_settings
 // PATCH /api/v1/team/user_settings
 // Response: { "data": UserSettingResource }

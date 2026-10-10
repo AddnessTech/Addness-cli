@@ -1,11 +1,11 @@
 mod activity;
-mod api_key;
 mod assignment;
 mod chat;
-mod codex_job;
 mod comment;
 mod consent;
 mod core_values;
+#[cfg(test)]
+mod current_api_tests;
 mod deliverable;
 mod desktop_auth;
 mod diagnosis;
@@ -15,9 +15,9 @@ mod goal_execution;
 mod goalreport;
 mod inlinemedia;
 mod invitation;
-mod invoice;
 mod issue;
 mod master_plan;
+pub mod mcp;
 mod meeting;
 mod member;
 mod notification;
@@ -25,8 +25,6 @@ mod org;
 mod personal;
 mod referral;
 mod search;
-mod sharetree;
-mod skill;
 mod streak;
 mod user;
 
@@ -37,14 +35,12 @@ pub use activity::{
 pub use chat::{ChatMessageListParams, ChatRoomListParams, ChatSearchParams};
 pub use comment::{ListAllCommentsParams, ListCommentsParams};
 pub use form::{FormListParams, FormResponseListParams};
-pub use invoice::InvoiceListParams;
 pub use issue::{GoalSectionListParams, IssueListParams};
-pub use meeting::{HuddleInviteableMembersParams, MinuteListParams};
+pub use meeting::HuddleInviteableMembersParams;
 pub use member::BrowseMembersParams;
 pub use notification::ListNotificationsParams;
 pub use org::{CreateOrganizationParams, ListAllOrganizationsParams};
 pub use search::SearchQueryParams;
-pub use user::ListUsersParams;
 
 use anyhow::{Context, Result};
 use reqwest::Client;
@@ -58,7 +54,7 @@ use std::time::Duration;
 const API_RESOLVE_ENV: &str = "ADDNESS_API_RESOLVE";
 const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 120;
 const REQUEST_SEND_ATTEMPTS: usize = 3;
-/// Long-lived SSE connections (e.g. Codex job event streams) outlive the
+/// Long-lived SSE connections (e.g. chat event streams) outlive the
 /// default per-request timeout, so `get_stream` overrides it with this much
 /// larger budget instead of leaving the whole request unbounded.
 const EVENT_STREAM_TIMEOUT_SECS: u64 = 1800;
@@ -403,7 +399,13 @@ impl ApiClient {
     }
 
     async fn send_request(req: RequestBuilder, url: &str) -> Result<Response> {
-        let retryable_req = req.try_clone();
+        // 書き込みのタイムアウトは処理済みか判別できないため再送しない。
+        let retryable_req = req.try_clone().filter(|request| {
+            request
+                .try_clone()
+                .and_then(|request| request.build().ok())
+                .is_some_and(|request| matches!(*request.method(), Method::GET | Method::HEAD))
+        });
         let mut first_req = Some(req);
 
         for attempt in 1..=REQUEST_SEND_ATTEMPTS {
@@ -669,17 +671,6 @@ impl ApiClient {
     ) -> Result<T> {
         let (url, req) = self.request(Method::POST, path, true)?;
         self.send_json(req.multipart(form), &url).await
-    }
-
-    /// GET a server-sent-events endpoint, returning the raw `Response` for
-    /// the caller to consume as a byte stream (e.g. via `bytes_stream()` +
-    /// `eventsource_stream::Eventsource`). Overrides the client's default
-    /// timeout — SSE connections are kept alive far longer than a normal
-    /// request/response round trip.
-    pub(super) async fn get_stream(&self, path: &str) -> Result<Response> {
-        let (url, req) = self.request(Method::GET, path, true)?;
-        let req = req.timeout(Duration::from_secs(EVENT_STREAM_TIMEOUT_SECS));
-        self.send(req, &url).await
     }
 
     /// POST a JSON body to a server-sent-events endpoint, returning the raw

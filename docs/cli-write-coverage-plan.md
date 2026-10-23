@@ -1,5 +1,7 @@
 # Addness CLI 書き込み機能カバレッジ計画
 
+> Historical plan. 2026-10-02の現行バックエンド照合で、旧KPI/AI thread系と組織コンテキストのルートをCLIから削除した。以下の集計と未実装一覧は当時のスナップショットで、現行APIの移行先は [`cli-current-api-migrations.md`](./cli-current-api-migrations.md) を参照すること。旧API行を再実装しない。
+
 ## ゴール
 Addness フロントエンド (`vision-todo-frontend`) からユーザーが実行できる **書き込み系操作（POST/PUT/PATCH/DELETE）すべて** を、CLI (`addness ...`) からも実行可能にする。TUI（ratatui）は対象外、純 CLI サブコマンド拡張のみ。
 
@@ -9,13 +11,21 @@ Addness フロントエンド (`vision-todo-frontend`) からユーザーが実�
 |---|---|
 | バックエンド書き込みエンドポイント | 約 200 |
 | フロントから叩かれている書き込み API | 約 120 |
-| CLI 実装済み書き込みサブコマンド | 7 |
+| CLI 実装済み書き込みサブコマンド | 58 |
 
 ### CLI 実装済み（書き込み）
-- `goal create` / `goal update` (title/status のみ) / `goal delete`
-- `comment create`
-- `deliverable add` (テキスト or ファイル添付)
+- `goal create` / `goal update` / `goal delete` / `goal archive` / `goal unarchive` / `goal restore`
+- `goal duplicate` / `goal move` / `goal share create` / `goal share revoke`
+- `goal alias add` / `goal alias rm` / `goal alias reorder`
+- `comment create` / `comment update` / `comment delete` / `comment resolve` / `comment unresolve` / `comment react` / `comment attachment rm`
+- `deliverable add` / `deliverable update` / `deliverable rename` / `deliverable move` / `deliverable rm` / `deliverable batch-move` / `deliverable batch-rm`
+- `assignment add` / `assignment update` / `assignment rm` / `assignment transfer`
 - `link pr` / `link progress`
+- `org create` / `org update` / `org rm`
+- `member update` / `member pin` / `member unpin` / `member rm` / `member admin grant` / `member admin revoke` / `member set-source-org`
+- `invitation create` / `invitation resend` / `invitation revoke` / `invitation accept` / `invitation link create` / `invitation link deactivate`
+- `today add` / `today done` / `today reopen` / `today status`
+- `notification send`
 - `org switch`（書き込みではないが状態変更）
 
 ## 全体ギャップ表（リソース単位、フロント書き込み機能 vs CLI 実装状況）
@@ -26,57 +36,55 @@ Addness フロントエンド (`vision-todo-frontend`) からユーザーが実�
 | 操作 | エンドポイント | CLI |
 |---|---|---|
 | create | POST /v2/objectives | ✅ |
-| update (全フィールド) | PATCH /v2/objectives/:id | 🟡 (title/status のみ) |
+| update (主要フィールド) | PATCH /v2/objectives/:id | ✅ (title/status/DoD/body/dueDate) |
 | delete | DELETE /v2/objectives/delete | ✅ |
-| archive | POST /v2/objectives/archive | 🔴 |
-| unarchive | POST /v2/objectives/unarchive | 🔴 |
-| restore | POST /v2/objectives/restore | 🔴 |
-| changeParent | POST /v2/objectives/:id/parent | 🔴 |
-| duplicate | POST /v2/objectives/:id/duplicate | 🔴 |
+| archive | POST /v2/objectives/archive | ✅ |
+| unarchive | POST /v2/objectives/unarchive | ✅ |
+| restore | POST /v2/objectives/restore | ✅ |
+| changeParent | POST /v2/objectives/:id/parent | ✅ |
+| duplicate | POST /v2/objectives/:id/duplicate | ✅ |
 | text-patch (description 部分更新) | POST /v2/objectives/:id/text-patch | 🔴 |
-| share create | POST /v1/objectives/:id/share | 🔴 |
-| share revoke | DELETE /v1/objectives/:id/share | 🔴 |
-| alias create | POST /v1/objectives/:id/aliases | 🔴 |
-| alias reorder | PATCH /v1/objectives/:id/aliases/reorder | 🔴 |
-| alias delete | DELETE /v1/objectives/:id/aliases/:aliasId | 🔴 |
+| share create | POST /v1/objectives/:id/share | ✅ |
+| share revoke | DELETE /v1/objectives/:id/share | ✅ |
+| alias create | POST /v1/objectives/:id/aliases | ✅ |
+| alias reorder | PATCH /v1/objectives/:id/aliases/reorder | ✅ |
+| alias delete | DELETE /v1/objectives/:id/aliases/:aliasId | ✅ |
 | bulk_replace (v1) | PUT /v1/objectives/:id/bulk_replace | 🔴 |
 
 ### Comment
 | 操作 | エンドポイント | CLI |
 |---|---|---|
-| create | POST /v1/comments | ✅ |
-| update | PUT /v1/comments/:id | 🔴 |
-| delete | DELETE /v1/comments/:id | 🔴 |
-| resolve | PATCH /v1/comments/:id/resolve | 🔴 |
-| unresolve | PATCH /v1/comments/:id/unresolve | 🔴 |
-| addReaction | POST /v1/comments/:id/reactions | 🔴 |
-| deleteAttachment | DELETE /v1/comments/:id/attachments/:attachmentId | 🔴 |
+| create | POST /v2/objectives/:id/issues（legacy-only時はv1 fallback） | ✅ |
+| update | PATCH /v2/objectives/:id/issues/...（mention変更等はv1 fallback） | ✅ |
+| delete | DELETE /v2/objectives/:id/issues/...（Goal Issue外はv1 fallback） | ✅ |
+| resolve | PATCH /v2/goal-issues/:id/resolution | ✅ |
+| unresolve | PATCH /v2/goal-issues/:id/resolution | ✅ |
+| addReaction | POST /v2/objectives/:id/issues/:issueId/messages/:id/reactions | ✅ |
+| deleteAttachment | DELETE /v1/comments/:id/attachments/:attachmentId | ✅ |
 
 ### Deliverable (Outcome)
 | 操作 | エンドポイント | CLI |
 |---|---|---|
 | create | POST /v1/objectives/:id/deliverables | ✅ (add) |
-| update | PATCH /v1/objectives/:id/deliverables/:id | 🔴 |
-| rename | PATCH .../rename | 🔴 |
-| move | PATCH .../move | 🔴 |
-| delete | DELETE .../:id | 🔴 |
-| batch_move | POST .../batch_move | 🔴 |
-| batch_delete | POST .../batch_delete | 🔴 |
+| update | PATCH /v1/objectives/:id/deliverables/:id | ✅ |
+| rename | PATCH .../rename | ✅ |
+| move | PATCH .../move | ✅ |
+| delete | DELETE .../:id | ✅ |
+| batch_move | POST .../batch_move | ✅ |
+| batch_delete | POST .../batch_delete | ✅ |
 
 ### Assignment（メンバーアサイン・権限）
 | 操作 | エンドポイント | CLI |
 |---|---|---|
-| create | POST /v2/objectives/:id/assignments | 🔴 |
-| update | PATCH .../:assignmentId | 🔴 |
-| delete | DELETE .../:assignmentId | 🔴 |
-| transferOwnership | PUT /v2/objectives/:id/transfer-ownership | 🔴 |
+| create | POST /v2/objectives/:id/assignments | ✅ |
+| update | PATCH .../:assignmentId | ✅ |
+| delete | DELETE .../:assignmentId | ✅ |
+| transferOwnership | PUT /v2/objectives/:id/transfer-ownership | ✅ |
 
 ### KPI（定量目標）
 | 操作 | エンドポイント | CLI |
 |---|---|---|
-| create | POST /v2/objectives/:id/kpis | 🔴 |
-| update | PATCH /v2/objective-kpis/:id | 🔴 |
-| delete | DELETE /v2/objective-kpis/:id | 🔴 |
+| 定義・実績・ツリー | `/v2/analytics/recipes*`, `/v2/analytics/kpi-tree*`, `/v2/analytics/runs*` | 未対応。旧 `kpi add/update/rm` は削除。現行APIの移行メモを参照 |
 
 ### AI Thread（AIチャット）
 - create / update / delete / chat / cancel
@@ -99,7 +107,6 @@ Addness フロントエンド (`vision-todo-frontend`) からユーザーが実�
 
 ### Organization
 - create / update / delete / uploadLogo / updateContext
-- AI schedule settings (PUT)
 
 ### Member
 - update / pin / delete / uploadAvatar
@@ -143,9 +150,8 @@ Addness フロントエンド (`vision-todo-frontend`) からユーザーが実�
 - test / sync / oauth start
 - toggle tool
 
-### Skill / Tool（組織レベル）
+### Skill（組織レベル）
 - skill: CRUD
-- tool: CRUD
 
 ### API Key
 - create / revoke
@@ -160,7 +166,6 @@ Addness フロントエンド (`vision-todo-frontend`) からユーザーが実�
 
 ### その他
 - Notification settings
-- ObjectiveAISchedule upsert
 - Push token register
 - User settings update
 - Referral link
@@ -223,11 +228,11 @@ Addness フロントエンド (`vision-todo-frontend`) からユーザーが実�
 
 | サブコマンド | 引数 | API |
 |---|---|---|
-| `comment update <ID>` | `--body` または `--body-file` | PUT /v1/comments/:id |
-| `comment delete <ID>` | [`--force`] | DELETE /v1/comments/:id |
-| `comment resolve <ID>` | `<ID>` | PATCH /v1/comments/:id/resolve |
-| `comment unresolve <ID>` | `<ID>` | PATCH /v1/comments/:id/unresolve |
-| `comment react <ID> --emoji <e>` | `<ID> --emoji` | POST /v1/comments/:id/reactions |
+| `comment update <ID>` | `--body` または `--body-file` | PATCH /v2/objectives/:id/issues/...（legacy-only時はv1） |
+| `comment delete <ID>` | [`--force`] | DELETE /v2/objectives/:id/issues/...（Goal Issue外はv1） |
+| `comment resolve <ID>` | `<ID>` | PATCH /v2/goal-issues/:id/resolution |
+| `comment unresolve <ID>` | `<ID>` | PATCH /v2/goal-issues/:id/resolution |
+| `comment react <ID> --emoji <e>` | `<ID> --emoji` | POST /v2/objectives/:id/issues/:issueId/messages/:id/reactions |
 | `comment attachment rm <CID> <AID>` | `<CID> <AID>` | DELETE .../:id/attachments/:attachmentId |
 
 **実装メモ**:
@@ -242,7 +247,7 @@ Addness フロントエンド (`vision-todo-frontend`) からユーザーが実�
 
 ---
 
-## Phase 2: Deliverable + Assignment + KPI
+## Phase 2: Deliverable + Assignment
 
 新規追加サブコマンド見込み: 14
 
@@ -250,9 +255,8 @@ Addness フロントエンド (`vision-todo-frontend`) からユーザーが実�
 |---|---|
 | Deliverable | `rename`, `move`, `rm`, `update`, `batch-move`, `batch-rm` |
 | Assignment | `assignment add/update/rm <GoalID>`, `assignment transfer <GoalID> --to <user>` |
-| KPI | `kpi add/update/rm` |
 
-実装ファイル: `deliverable.rs` 拡張 + 新規 `assignment.rs`、`kpi.rs`
+実装ファイル: `deliverable.rs` 拡張 + 新規 `assignment.rs`
 
 規模見積もり: 約 500〜700 行
 
@@ -261,8 +265,7 @@ Addness フロントエンド (`vision-todo-frontend`) からユーザーが実�
 ## Phase 3: AI 関連
 
 ### 3.1 AI Thread
-新規ファイル `src/cli/commands/ai.rs` を作る方針。
-サブコマンド: `ai thread create/list/update/rm/chat/cancel`、`ai thread share`、`ai trace revert`
+旧 `/api/v1/team/ai/threads*` は現行バックエンドに未登録のため実装対象から除外。現行移行先は [`cli-current-api-migrations.md`](./cli-current-api-migrations.md) を参照。
 
 ### 3.2 AI Background Tasks (11 種)
 統一サブコマンド: `addness ai run <task-type> --goal <ID> [--params <json>]`
@@ -279,7 +282,7 @@ Addness フロントエンド (`vision-todo-frontend`) からユーザーが実�
 ## Phase 4: 組織・メンバー・招待
 
 ### 4.1 Organization
-拡張: `org create/update/rm/upload-logo/set-context`
+拡張: `org create/update/rm/upload-logo`
 
 ### 4.2 Member
 新規 `src/cli/commands/member.rs`:
@@ -293,13 +296,12 @@ Addness フロントエンド (`vision-todo-frontend`) からユーザーが実�
 
 ---
 
-## Phase 5: 連携 (Integration / MCP / Skill / Tool / Binding)
+## Phase 5: 連携 (Integration / MCP / Skill / Binding)
 
 - `slack-binding add/rm`
 - `sheet-binding add/rm`（既存サービスアカウント対応含む。MEMORY.md `sheets_service_account_setup.md` 参照）
 - `mcp connection add/update/rm/test/sync/oauth-start/toggle` (Organization レベル)
 - `skill create/update/rm` (既存 `skills.rs` 拡張)
-- `tool create/update/rm`
 - `integration credential save/rm`（Slack/Google/GitHub/LINE）
 
 規模見積もり: 約 800〜1000 行
@@ -314,7 +316,7 @@ Addness フロントエンド (`vision-todo-frontend`) からユーザーが実�
 - `subscription register/cancel/change-plan/end-trial`
 - `apikey create/revoke`
 - `recurring create/update/rm`（Goal の繰り返し設定）
-- `goal-execution generate/update`
+- `goal-execution update`（`generate` は現行サーバーで廃止済み）
 
 規模見積もり: 約 800〜1200 行
 

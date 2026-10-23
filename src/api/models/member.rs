@@ -65,3 +65,28 @@ pub struct PinMemberRequest {
 pub struct SetSourceOrganizationRequest {
     pub source_organization_id: String,
 }
+
+/// A member tag defined within an organization.
+/// GET /api/v2/organizations/:id/member-tags, GET /api/v2/members/:id/tags
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemberTag {
+    pub id: String,
+    pub organization_id: String,
+    pub name: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+// POST /api/v2/organizations/:id/member-tags
+#[derive(Debug, Serialize)]
+pub struct CreateMemberTagRequest {
+    pub name: String,
+}
+
+// POST /api/v2/organizations/:id/members/:memberId/tags
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssignMemberTagRequest {
+    pub tag_id: String,
+}

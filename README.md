@@ -1,22 +1,26 @@
 # Addness CLI
 
-Addness CLI is a terminal interface for working with Addness from local development environments, scripts, and AI coding agents.
+<p align="center">
+  <img src="assets/addness-cli-demo.gif" alt="Addness CLI デモ" width="900">
+</p>
 
-Use it to inspect goals, update progress, write comments, switch organizations, and connect pull requests back to Addness without leaving the command line.
+Addness CLI は、ローカルの開発環境・スクリプト・AIコーディングエージェントから Addness を操作するためのターミナルインターフェースです。
 
-## Features
+コマンドラインから離れることなく、ゴールの確認、進捗の更新、コメントの記入、組織の切り替え、プルリクエストと Addness の紐付けを行えます。
 
-- Browse and inspect Addness goals from the terminal.
-- Update goal status and progress from scripts or local workflows.
-- Create comments on goals.
-- Link GitHub pull requests to Addness goals.
-- Switch between organizations.
-- Use machine-readable JSON output for automation.
-- Run as a single Rust binary on macOS, Linux, and Windows.
+## 主な機能
 
-## Installation
+- ターミナルから Addness のゴールを閲覧・確認する。
+- スクリプトやローカルのワークフローからゴールのステータス・進捗を更新する。
+- ゴールにコメントを作成する。
+- GitHub のプルリクエストを Addness のゴールに紐付ける。
+- 組織を切り替える。
+- 自動化向けに機械可読な JSON 出力を使う。
+- macOS・Linux・Windows 上で単一の Rust バイナリとして動作する。
 
-macOS and Linux:
+## インストール
+
+macOS・Linux:
 
 ```bash
 curl -fsSL https://cli.addness.com/install.sh | sh
@@ -28,7 +32,7 @@ Windows PowerShell:
 irm https://cli.addness.com/install.ps1 | iex
 ```
 
-From source:
+ソースから:
 
 ```bash
 git clone https://github.com/AddnessTech/Addness-cli.git
@@ -36,38 +40,108 @@ cd Addness-cli
 cargo build --release
 ```
 
-## Login
+## ログイン
 
-Run `addness login` and complete the browser-based authentication flow.
+`addness login` を実行し、ブラウザでの認証フローを完了してください。
 
-## Usage
+### 環境変数によるトークン認証（CI 向け）
 
-List goals assigned to you:
+ブラウザ認証が使えない CI 等では、環境変数で API トークンを渡して認証できます。
+以下の環境変数が設定されている場合、`~/.addness/credentials.json` より **優先** されます:
+
+| 環境変数 | 必須 | 説明 |
+|---|---|---|
+| `ADDNESS_API_TOKEN` | 必須 | Bearer トークン（発行済み API キー）。空文字・空白のみは未設定として扱われる |
+| `ADDNESS_API_URL` | 任意 | API ベース URL。未設定時は既定の `https://vt.api.addness.com` |
+| `ADDNESS_ORG_ID` | 任意 | 対象組織 ID。`--org` フラグ未指定時のデフォルト組織としても使われる |
+
+```bash
+ADDNESS_API_TOKEN=<api-key> ADDNESS_ORG_ID=<org-id> \
+  addness goal create --title "CI から作成" --json
+```
+
+`ADDNESS_API_TOKEN` が未設定（または空白のみ）の場合は、従来どおり
+`~/.addness/credentials.json` の資格情報が使われます。
+
+DNS が制限された環境で `failed to lookup address information` が出る場合は、一時回避として
+`ADDNESS_API_RESOLVE` で API ホストの解決先を固定できます:
+
+```bash
+ADDNESS_API_RESOLVE=vt.api.addness.com=<api-ip> addness goal get <goal-id>
+```
+
+IP は運用環境で変わる可能性があるため、通常は設定しないでください。
+
+## MCP の最新機能を CLI から使う
+
+フォーム、Analytics/KPI、CRM、Drive、テンプレート、ナレッジ、録画、権限、エージェント作業などは、サーバーが公開するツールを一覧から探して利用できます。追加・改名されたツールも最新のカタログに追従します。
+
+```bash
+addness mcp list --json
+addness mcp list --query analytics --json
+addness mcp schema list_forms --json
+addness mcp call list_forms --args '{"limit":20}' --json
+addness mcp call <tool-name> --args-file ./arguments.json --json
+```
+
+`--args-file -` で標準入力、`--org` で今回の組織、`--scope` で organization（既定）/ personal / copilot / openai / admin / support の入口を選べます。入口に対応する権限のキーが必要です。保存済みのログイン情報または `ADDNESS_API_TOKEN` を使います。
+
+`mcp list` はカタログの全ページを取得します。各ツールが返すデータのページ送りは、その入力仕様に従って行ってください。`mcp call` は書き込みも即時実行し、自動再送しません。`--json` は `content`・`structuredContent`・`isError` を保持し、ツール失敗時は非ゼロ終了します。
+
+v0.15.0 の削除コマンドと移行先、対応範囲は [MCP/CLI 対応と API 移行](docs/mcp-cli-parity.md) を参照してください。
+
+## 使い方
+
+自分にアサインされたゴールを一覧表示する:
 
 ```bash
 addness goal list --assigned-to me --status NOT_STARTED
 ```
 
-Use JSON output for scripts and agents:
+スクリプトやエージェント向けに JSON 出力を使う:
 
 ```bash
 addness goal list --assigned-to me --status NOT_STARTED --json
 ```
 
-Update progress:
+進捗を更新する:
 
 ```bash
 addness goal update <goal-id> --status IN_PROGRESS
-addness comment create --goal <goal-id> --body "Implementation started"
+addness goal update <goal-id> --body "現在の状態や次にやること"
+addness goal update <goal-id> --due-date 2026-07-01
+addness comment create --goal <goal-id> --body "実装を開始しました"
 ```
 
-Link a pull request:
+完了が確認できたゴールと、その配下をまとめて完了する:
+
+```bash
+addness goal complete <goal-id> --recursive --dry-run --json
+addness goal complete <goal-id> --recursive --json
+# フィードバック待ちなど、未完了で残す枝をIDで指定する（複数指定可）
+addness goal complete <goal-id> --recursive --exclude <feedback-goal-id> --json
+```
+
+`--recursive` は子一覧の全ページを全階層から取得し、子から順に完了して最後に指定ゴールを完了します。
+`--exclude` で指定した未完了の枝と、それを含む親ゴールは未完了のままです。
+途中で失敗した場合は完了済みIDと失敗したIDを表示して停止し、終了コードは非ゼロになります。
+同じコマンドを再実行すると、完了済みゴールを飛ばして残りを処理します。
+`--recursive` を省略すると指定した1件だけを完了し、未完了の子があれば停止します。
+`goal tree` / `goal get` の子一覧は標準で深さ2のプレビューです。全件完了の対象確認には上記の `--dry-run` を使ってください。
+
+プルリクエストを紐付ける:
 
 ```bash
 addness link pr --goal <goal-id> --url https://github.com/org/repo/pull/42
 ```
 
-Show command help:
+リンク成果物を追加する:
+
+```bash
+addness deliverable add --goal <goal-id> --link-url https://example.com --name "参考リンク"
+```
+
+コマンドのヘルプを表示する:
 
 ```bash
 addness --help
@@ -77,9 +151,206 @@ addness comment --help
 addness link --help
 ```
 
-## Development
+## CLIコマンド一覧
 
-Addness CLI is written in Rust.
+主なコマンドグループの概要です。各コマンドのフラグとサブコマンドの詳細は
+`addness <コマンド> --help` を、AIエージェント向けの網羅的な使い方は
+`addness skills` を参照してください。
+
+### 認証・設定
+
+- `login` / `logout` / `status` / `configure` — ブラウザ認証・資格情報と API 設定の管理。
+- `desktop-auth` — デスクトップ認証の browser handoff 補助操作。例: `addness desktop-auth redeem --start-token <token> --browser-nonce-hash <hash>`
+- `update` / `completions` — CLI 自体の更新、シェル補完の生成。
+
+### ゴール・成果物
+
+- `goal` — ゴールの作成・更新・削除・ツリー表示・検索・アーカイブ・共有リンク。
+  `goal report-schedule` で活動レポート配信を管理。テンプレートの定期実行は `mcp list --query schedule --json` で確認。
+- `deliverable` — 成果物（ドキュメント/リンク/ファイル）の管理。例: `addness deliverable list --goal <goal-id>`
+- `assignment` — ゴールへのメンバー割り当て。
+- `link` — GitHub PR や URL をゴールに紐付け。例: `addness link pr --goal <goal-id> --url <pr-url>`
+- `summary` / `detect-goal` — 全ゴールの進捗サマリ表示、git ブランチ名からのゴール ID 検出。
+
+### コミュニケーション
+
+- `comment` — ゴールコメントの作成・一覧・リアクション・解決管理・投稿者別一覧。
+  例: `addness comment list-all --author <member-id> --json`
+- `issue` — Goal Issue（ゴール上の v2 チャットスレッド）とゴールセクションの管理。
+  例: `addness issue list --goal <goal-id>`、`addness issue delete <issue-id> --goal <goal-id>`
+- `chat` — 組織チャット（DM/グループのルーム・メッセージ・招待・横断検索）。
+  例: `addness chat room list`
+- `notification` — 通知の一覧・未読数・既読/未読管理・購読チャネル（Slack/Email/LINE/Discord）設定・作業通知送信。
+  例: `addness notification count`
+
+### 組織・メンバー
+
+- `org` — 組織の CRUD・切り替え・タイムゾーン・ロゴ・オンボーディング課金/広告設定。
+  例: `addness org get <org-id>`
+- `member` — メンバーの一覧/検索/詳細・管理者権限・ピン留め・タグ・アバター・削除プレビュー。
+  例: `addness member browse --limit 20`
+- `invitation` — メール招待・招待リンクに加え、招待状況の確認。承諾・辞退・参加はWeb画面で行います。
+  例: `addness invitation overview --json`
+- `user` — 自分のプロフィール・ユーザー設定・所属組織の管理。例: `addness user me`
+
+### 実行・計画（今日のタスク）
+
+- `today` — 今日のゴールの読み書きに加え、`today todo`（今日の ToDo 行）、
+  `today planned`（予定/定期/バックログの素材プール）、`today calendar`（外部カレンダーとヒートマップ）。
+  例: `addness today todo list`
+- `execution` — 実行タブのサマリ・実行レコードの更新/履歴・ゴール折りたたみ設定・
+  アクティブハドル・Codex エージェントビュー。例: `addness execution summary`
+- `meeting` — Huddle の状態/録音/招待と Meeting Bot。議事録・録画は `mcp list --query recording --json` で確認。
+- `activity` — メンバー別/ゴール別/組織全体のアクティビティログと集計。例: `addness activity list`
+- `streak` — 連続達成ストリークの確認・フリーズ・復活・公開共有。例: `addness streak get`
+
+### AI・自動化
+
+- `mcp` — サーバーで公開中の全ツールの一覧・入力仕様の取得と実行。新機能も CLI の更新を待たず利用できます。
+
+### 個人スペース・横断機能
+
+- `personal` — 個人組織の作成、組織横断の today 一覧・活動ヒートマップ。例: `addness personal today-list --json`
+- `search` — 目標・コメント・メンバーの横断検索。例: `addness search "リリース" --json`
+- `diagnosis` — 診断結果（ゴールスタイル・価値観・コアバリュー・マスタープラン）の保存・参照。
+- `referral` — 紹介リンクの作成と紹介実績の確認。
+- `media` — エディタ内インライン画像/動画のアップロードと表示 URL 取得。
+
+## TUI（ターミナル UI）
+
+サブコマンドなしで起動すると、ゴールツリーを操作できる対話的な TUI が開きます:
+
+```bash
+addness
+```
+
+主な操作はアプリ内で `?` を押すとヘルプが表示されます。
+
+### Codex / Claude Code の対応状況
+
+v0.11.0 は Codex CLI **0.153.4**、Claude Code **2.1.266** で検証しています。
+
+- Codex の `/model` / F2 から `gpt-6-astra`、`/reasoning` / F3 から `max` / `ultra` を選択できます。
+  推論強度の対応範囲は使用モデルに従います。既定の `config` は上流設定を使用します。
+- Claude の `/permissions auto` と `/permissions manual` に対応します。`auto` と `dontAsk` は別のモードです。
+- Codex の `/sessions` は新しいページング履歴も取得し、`/rename` は上流の履歴名を更新します。
+- 両バックエンドの `/add-dir list` / `/add-dir clear` を使用でき、常駐中の変更も次ターンへ反映します。
+  Claude の追加先にある agent file の inline MCP を使うには、対象フォルダーで `claude` を
+  対話起動してフォルダーの信頼確認を完了してください。
+
+検証内容と上流機能との対応範囲は [互換性監査](docs/compatibility-2026-09-09.md) を参照してください。
+
+### TUI 内での codex 連携
+
+ゴール上でアクションメニュー（`o` または `Space`）から **「codexで作業」** を選ぶと、
+選択中ゴールの文脈（タイトル・完了基準(DoD)・説明）を渡した状態で
+[codex](https://github.com/openai/codex) を `codex exec --json` で起動し、
+Addness 側の独自会話ペインに JSONL イベントを表示します。
+起動直後は軽量コンテキストだけで即入力でき、実依頼を受けた時に必要に応じて
+`addness goal get --json --with-deliverable --with-comment` で対象ゴールを読みます。
+実装・バグ修正・リファクタ・ドキュメント/設定変更・テスト追加の依頼では、TUI が
+「必須小ゴールゲート」を Codex に渡します。Codex は最初のファイル変更より前に、
+選択中ゴールの直下へ今回の作業用子ゴールを1件作成し、DoD・対象ファイル・方針・検証方法を
+記録してから実装します。同じ依頼の継続ターンでは既存の作業中子ゴールを使い、重複作成しません。
+子ゴールの作成または記録に失敗した場合は、コード変更を行わず停止して失敗内容を報告します。
+長い運用ルールはチャット本文ではなく `developer_instructions` に渡します。
+codex は Addness をその組織/プロジェクト専用の
+作業DBとして読み、DoD や子ゴール分解の不足を確認します。Addness への書き込みは、
+追加の子ゴール作成やコンテキスト書き込みが必要な時は、軽量/低コストの記録専用
+サブエージェントへ委任するよう `developer_instructions` で指示します。
+codex は Addness を「タスク DB」として扱い、`addness` CLI 経由で DoD の具体化・
+子ゴール作成・進捗コメントを書き戻します。
+左の Addness ペインには、対象ゴールのステータス、DoD、子ゴール、コメント数、
+Addness への更新ログがライブ表示されます。更新ログは `body`、`DoD`、子ゴール、
+コメント/通知、成果物など、どの領域が動いたか分かる文言で出ます。
+codex の終了時またはペインを閉じる時には、作業フォルダ・ブランチ・git status・
+diff stat が対象ゴールの body に自動記録されます。
+codex が作業完了を通知したい時は
+`addness notification send --kind done --body "実装が完了しました"` を使えます。
+確認依頼は `--kind review`、ブロック中は `--kind blocked` です。TUI から起動した
+codex では対象ゴール ID が環境変数で渡されるため、`--goal` は省略できます。
+通知は Addness には対象ゴールのコメントとして残し、同時に TUI が動いている端末へ
+BEL/OSC で送ります。
+
+`codex exec` は非対話ターン実行のため、Codex TUI そのものの見た目や承認UIは使いません。
+Addness 側では会話履歴・スクロール・入力欄を保持し、各入力ごとに 1 ターン実行します。
+2 ターン目以降は `codex exec resume <thread_id> --json` で同じ Codex セッションを継続します。
+Codex が実行したコマンドやツール実行の開始・終了・出力イベントは、Addness 側の履歴に
+`Tool` 行として表示されます。履歴上部には現在状態、表示フィルタ、検索語、thread id、
+履歴保存状態を固定表示します。
+Codex 起動中は左上の「Codex 作業ダッシュボード」に短い操作一覧が常時表示され、
+詳細な一覧は `Ctrl-?` で開けます。
+`/goal <目標>` で Addness 側の Goal mode を開始できます。目標を永続化するだけでなく、
+その場でエージェントへ送信して着手させます（ターン実行中なら次ターンへ予約されます）。
+以後の `codex exec` ターンにもその永続目標が注入されます。
+登録だけして送信したくない場合は `/goal set <目標>` を使います。
+引数なしの `/goal` と `/goal show` は現在の目標を表示、`/goal pause` / `/goal resume` は
+一時停止/再開、`/goal clear` は解除です。
+`/status` と `/help` で現在状態と slash 一覧を確認できます。
+`/bypass`（または `F8`）で承認・サンドボックスを完全スキップする危険モードを ON/OFF できます
+（codex は `--dangerously-bypass-approvals-and-sandbox`、Claude Code は
+`--dangerously-skip-permissions` 相当。両バックエンド共通の入口で、`/bypass status` で現在値を確認できます）。
+実行中ターンは `Ctrl-C` で中断できます。`exec` モードでは承認待ちを同一ターン内で
+Addness 側に差し戻す経路がないため、追加承認が必要な操作は Codex の失敗/エラーイベントとして表示されます。
+
+### エージェント実行状況の可視化
+
+エージェントの実行中は、履歴とステータス行に「今なにをしているか」がライブ表示されます:
+
+- 実行中の直近ツール（コマンド実行・ファイル変更など）を 1 行で常時表示します。
+  ファイル変更（FileChange）イベントも「今」表示に即時反映されます。
+- 実行中はスピナーで動作中であることを示し、承認待ちになると強調表示に切り替わり、
+  応答がないまま放置されると端末へ BEL/OSC で再通知します。
+- 恒常的なステータス表示（status_note）と直近の作業アクション（work_action）は分離して
+  管理されるため、「直前に何をしたか」と「今何をしているか」が混ざりません。
+- 現在の作業対象はゴール階層のパンくずとして表示されます。
+- エージェントがサブエージェントを起動した場合は、稼働状況パネルに各サブエージェントの
+  状態が一覧表示されます。実行中は黄、完了は緑、失敗は赤で色分けされ、パネルが低いときでも
+  最低 1 件は表示されます。
+- サブエージェントとバックグラウンドタスクの起動・完了は `sub |` 行として履歴本文にも
+  残ります。この行は表示フィルタ（`Ctrl-T`）が「会話」でも「実行」でも消えません。
+- 実行中サブエージェントがある間は、ヘッダの「今」欄に件数と最新の 1 件が添えられます。
+
+codex 終了後は還流バーのキーで成果を Addness に反映できます:
+
+- `c` … 作業差分をプリフィルした進捗コメントを投稿
+- `s` … ゴールのステータスを変更
+- `d` … 成果物を登録
+- `v` … `codex exec`（read-only）で各 DoD 項目の達成可否を自動判定し、契約ペインにチェック
+- `Ctrl-?` … codex 起動中の操作方法一覧を表示 / 閉じる
+- codex 画面上でのトラックパッド/ホイール … ポインタ下の codex 履歴 / Addness 枠をスクロール
+- `Ctrl-T` … codex 履歴の表示を `All` / `Talk` / `Tools` / `Errors` で切り替え
+- `Ctrl-F` … codex 履歴検索を開始、`Enter` / `Esc` で検索入力を終了
+- `Ctrl-L` … codex 履歴検索を解除
+- `Alt-e` … 最新または表示中の turn を開閉
+- `Ctrl-O` … 入力可能な状態でも最新の turn を開閉
+- `Enter` / `Space` … 履歴を見ている時、codex 終了後、または入力欄が空の時に表示中の turn を開閉
+- `1`〜`9` / `Ctrl-1`〜`Ctrl-9` … 履歴を見ている時は数字、いつでも `Ctrl-数字` で指定番号の turn を直接開閉
+- `e` … 履歴を見ている時または codex 終了後、表示中の turn を開閉
+- `E` / `Ctrl-E` … 古い turn の一括開閉
+- `/goal <目標>` … Goal mode を開始してそのまま着手し、以後の Codex ターンへ永続目標を注入
+- `/goal set <目標>` … Goal mode の目標を登録するだけで送信しない
+- `/goal show` / `/goal pause` / `/goal resume` / `/goal clear` … 表示 / 一時停止 / 再開 / 解除
+- `/status` / `/help` … Addness側Codexセッション状態 / slash コマンド一覧
+- `F12` … 実行中の codex を終了して戻る / `Esc`・`q` … ペインを閉じる
+
+codex 枠の履歴は Addness 側でも `~/.addness/codex-sessions/` に JSONL 保存されます。
+表示用ログに加えて raw stdout/stderr イベントも残すため、Codex TUI のスクロールバック量には依存しません。
+保存量は既定で最大 20,000 レコードまたは約 20MB です。
+画面上では古い行を薄く表示し、取得データやツール出力は行数・文字数・短いプレビューに省略します。
+`cargo test` / `cargo clippy` / `cargo build`、`git diff`、Addness の JSON 取得結果は、
+生出力より先に結果サマリを表示します。
+
+前提:
+
+- 各ユーザーの環境に [codex](https://github.com/openai/codex) がインストールされ、ログイン済みであること
+  （未インストールの場合はその旨を案内し、TUI はクラッシュしません）。
+- 別パスの codex を使う場合は環境変数 `ADDNESS_CODEX_BIN` で実行ファイルを指定できます。
+- macOS・Linux で動作します（Windows は未検証です）。
+
+## 開発
+
+Addness CLI は Rust で書かれています。
 
 ```bash
 cargo build
@@ -89,22 +360,22 @@ cargo clippy -- -D warnings
 cargo test
 ```
 
-## Contributing
+## コントリビューション
 
-Contributions are welcome through GitHub Pull Requests. Before opening a PR, read [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, review expectations, and merge rules.
+コントリビューションは GitHub のプルリクエストで歓迎しています。PR を作成する前に、開発環境のセットアップ・レビューの方針・マージのルールについて [CONTRIBUTING.md](CONTRIBUTING.md) を読んでください。
 
-Do not include secrets, local settings, customer data, or private screenshots in issues or pull requests.
+Issue やプルリクエストに、シークレット・ローカル設定・顧客データ・非公開のスクリーンショットを含めないでください。
 
-## Security
+## セキュリティ
 
-Please do not report vulnerabilities through public GitHub issues. See [SECURITY.md](SECURITY.md) for the private reporting process.
+脆弱性は公開の GitHub Issue で報告しないでください。非公開での報告手順については [SECURITY.md](SECURITY.md) を参照してください。
 
-## Support
+## サポート
 
-Use GitHub Issues for reproducible bugs, feature requests, and documentation problems. See [SUPPORT.md](SUPPORT.md) for what to include.
+再現可能なバグ・機能要望・ドキュメントの問題には GitHub Issues を利用してください。記載すべき内容は [SUPPORT.md](SUPPORT.md) を参照してください。
 
-## License
+## ライセンス
 
-Addness CLI is released under the [MIT License](LICENSE).
+Addness CLI は [MIT License](LICENSE) の下で公開されています。
 
 Copyright (c) 2026 Addness.

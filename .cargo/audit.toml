@@ -1,0 +1,10 @@
+# cargo-audit configuration
+# https://github.com/rustsec/rustsec/tree/main/cargo-audit#configuration
+
+[advisories]
+# RUSTSEC-2026-0097: `rand` is unsound only when a custom logger calls
+# `rand::rng()`. This crate does not do that. The 0.9.x line is updated to the
+# patched 0.9.4; the remaining rand 0.8.5 comes transitively from `oauth2` and
+# has no patched 0.8.x release, so it cannot be removed. Tracked for revisit
+# when oauth2 moves off rand 0.8.
+ignore = ["RUSTSEC-2026-0097"]

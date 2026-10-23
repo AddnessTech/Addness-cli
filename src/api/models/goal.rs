@@ -106,6 +106,10 @@ pub struct UpdateGoalRequest {
     pub title: Option<String>,
     #[serde(rename = "definitionOfDone", skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(rename = "dueDate", skip_serializing_if = "Option::is_none")]
+    pub due_date: Option<Option<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -175,53 +179,11 @@ pub struct ObjectiveIdsRequest {
     pub objective_ids: Vec<String>,
 }
 
-// POST /api/v2/objectives/:id/duplicate
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DuplicateRequest {
-    pub parent_id: String,
-}
-
 // POST /api/v2/objectives/:id/parent
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChangeParentRequest {
     pub new_parent_id: Option<String>,
-}
-
-// POST /api/v1/team/objectives/:id/aliases
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateAliasRequest {
-    pub target_objective_id: String,
-    pub order_no: i32,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Alias {
-    #[serde(default)]
-    pub id: Option<String>,
-    #[serde(default)]
-    pub parent_objective_id: Option<String>,
-    #[serde(default)]
-    pub target_objective_id: Option<String>,
-    #[serde(default)]
-    pub order_no: Option<i32>,
-}
-
-// PATCH /api/v1/team/objectives/:id/aliases/reorder
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReorderAliasesRequest {
-    pub alias_ids: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReorderAliasesResponse {
-    #[serde(default)]
-    pub aliases: Vec<Alias>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -255,4 +217,45 @@ pub struct GoalSearchItem {
     pub title: String,
     #[serde(default)]
     pub owner: Option<Owner>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_goal_request_serializes_writable_goal_fields() {
+        let req = UpdateGoalRequest {
+            status: None,
+            completed_at: None,
+            title: None,
+            description: Some("完了基準".to_string()),
+            body: Some("現在の状態".to_string()),
+            due_date: Some(Some("2026-07-01".to_string())),
+        };
+
+        let value = serde_json::to_value(req).unwrap();
+
+        assert_eq!(value["definitionOfDone"], "完了基準");
+        assert_eq!(value["body"], "現在の状態");
+        assert_eq!(value["dueDate"], "2026-07-01");
+        assert!(value.get("description").is_none());
+    }
+
+    #[test]
+    fn update_goal_request_can_clear_due_date() {
+        let req = UpdateGoalRequest {
+            status: None,
+            completed_at: None,
+            title: None,
+            description: None,
+            body: None,
+            due_date: Some(None),
+        };
+
+        let value = serde_json::to_value(req).unwrap();
+
+        assert!(value.get("dueDate").is_some());
+        assert!(value["dueDate"].is_null());
+    }
 }

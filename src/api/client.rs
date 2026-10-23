@@ -1,26 +1,162 @@
+mod activity;
 mod assignment;
+mod chat;
 mod comment;
+mod consent;
+mod core_values;
+#[cfg(test)]
+mod current_api_tests;
 mod deliverable;
+mod desktop_auth;
+mod diagnosis;
+mod form;
 mod goal;
 mod goal_execution;
+mod goalreport;
+mod inlinemedia;
 mod invitation;
-mod kpi;
+mod issue;
+mod master_plan;
+pub mod mcp;
+mod meeting;
 mod member;
+mod notification;
 mod org;
+mod personal;
+mod referral;
+mod search;
+mod streak;
+mod user;
+
+pub use activity::{
+    ActivityLogByGoalParams, ActivityLogByMemberParams, ActivityLogSummaryParams,
+    GoalActivitySummaryParams,
+};
+pub use chat::{ChatMessageListParams, ChatRoomListParams, ChatSearchParams};
+pub use comment::{ListAllCommentsParams, ListCommentsParams};
+pub use form::{FormListParams, FormResponseListParams};
+pub use issue::{GoalSectionListParams, IssueListParams};
+pub use meeting::HuddleInviteableMembersParams;
+pub use member::BrowseMembersParams;
+pub use notification::ListNotificationsParams;
+pub use org::{CreateOrganizationParams, ListAllOrganizationsParams};
+pub use search::SearchQueryParams;
 
 use anyhow::{Context, Result};
 use reqwest::Client;
-use reqwest::StatusCode;
-use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+use reqwest::{Method, RequestBuilder, Response, StatusCode, Url};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 
+const API_RESOLVE_ENV: &str = "ADDNESS_API_RESOLVE";
+const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 120;
+const REQUEST_SEND_ATTEMPTS: usize = 3;
+/// Long-lived SSE connections (e.g. chat event streams) outlive the
+/// default per-request timeout, so `get_stream` overrides it with this much
+/// larger budget instead of leaving the whole request unbounded.
+const EVENT_STREAM_TIMEOUT_SECS: u64 = 1800;
+
+fn http_timeout_from_env_value(value: Option<&str>) -> Duration {
+    value
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(DEFAULT_HTTP_TIMEOUT_SECS))
+}
+
+fn configured_http_timeout() -> Duration {
+    http_timeout_from_env_value(std::env::var("ADDNESS_HTTP_TIMEOUT_SECS").ok().as_deref())
+}
+
+#[derive(Clone)]
 pub struct ApiClient {
     client: Client,
     base_url: String,
     org_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelatedFetchError {
+    pub kind: &'static str,
+    pub goal_id: String,
+    pub message: String,
+}
+
+fn dns_override_for_base_url(base_url: &str) -> Result<Option<(String, Vec<SocketAddr>)>> {
+    let override_value = match std::env::var(API_RESOLVE_ENV) {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => return Ok(None),
+    };
+    let url = Url::parse(base_url).context("Invalid API URL")?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("Invalid API URL: missing host"))?;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| anyhow::anyhow!("Invalid API URL: missing port"))?;
+    let addrs = parse_dns_override_addrs(&override_value, host, port)?;
+    if addrs.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((host.to_string(), addrs)))
+}
+
+fn parse_dns_override_addrs(raw: &str, host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+    let mut addrs = Vec::new();
+    for entry in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let addr_text = match entry.split_once('=') {
+            Some((entry_host, value)) if entry_host.trim() == host => value.trim(),
+            Some(_) => continue,
+            None => entry,
+        };
+        addrs.push(parse_dns_override_addr(addr_text, port)?);
+    }
+    Ok(addrs)
+}
+
+fn parse_dns_override_addr(raw: &str, port: u16) -> Result<SocketAddr> {
+    if let Ok(addr) = raw.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    let ip = raw
+        .parse::<IpAddr>()
+        .with_context(|| format!("Invalid {API_RESOLVE_ENV} address: {raw}"))?;
+    Ok(SocketAddr::new(ip, port))
+}
+
+/// パース失敗時の診断用に、レスポンスボディの先頭を短く整形して返す。
+/// 文字境界を壊さないよう chars 単位で切り、改行は潰す。
+fn body_snippet(bytes: &[u8]) -> String {
+    const MAX_CHARS: usize = 160;
+    let text = String::from_utf8_lossy(bytes);
+    let mut snippet: String = text
+        .chars()
+        .filter(|c| *c != '\n' && *c != '\r')
+        .take(MAX_CHARS)
+        .collect();
+    if text.chars().count() > MAX_CHARS {
+        snippet.push('…');
+    }
+    if snippet.is_empty() {
+        snippet.push_str("<empty>");
+    }
+    snippet
+}
+
+fn send_failure_context(url: &str, attempts: usize) -> String {
+    format!(
+        "Failed to send request to {url} after {attempts} attempt(s). \
+         If this is a DNS error in a restricted environment, set \
+         {API_RESOLVE_ENV}=<host>=<ip> to temporarily bypass local name resolution."
+    )
+}
 impl ApiClient {
     pub fn new(token: &str, base_url: &str) -> Result<Self> {
         let mut headers = HeaderMap::new();
@@ -30,9 +166,16 @@ impl ApiClient {
             HeaderValue::from_str(&auth_value).context("Invalid token format")?,
         );
 
-        let client = Client::builder()
+        let mut client_builder = Client::builder()
             .default_headers(headers)
             .user_agent(format!("addness-cli/{}", env!("CARGO_PKG_VERSION")))
+            .timeout(configured_http_timeout());
+
+        if let Some((host, addrs)) = dns_override_for_base_url(base_url)? {
+            client_builder = client_builder.resolve_to_addrs(&host, &addrs);
+        }
+
+        let client = client_builder
             .build()
             .context("Failed to create HTTP client")?;
 
@@ -52,15 +195,25 @@ impl ApiClient {
         self.org_id = org_id;
     }
 
-    fn api_error(status: StatusCode, body: &str) -> anyhow::Error {
-        let hint = Self::error_hint(status, body);
+    fn is_json_content_type(content_type: Option<&str>) -> bool {
+        content_type.is_some_and(|value| value.to_ascii_lowercase().contains("application/json"))
+    }
+
+    fn api_error(status: StatusCode, body: &str, content_type: Option<&str>) -> anyhow::Error {
+        let hint = Self::error_hint(status, body, content_type);
+        let display_body =
+            if status == StatusCode::FORBIDDEN && !Self::is_json_content_type(content_type) {
+                "<non-JSON response body omitted>"
+            } else {
+                body
+            };
         match hint {
-            Some(h) => anyhow::anyhow!("API error ({status}): {body}\n\nHint: {h}"),
-            None => anyhow::anyhow!("API error ({status}): {body}"),
+            Some(h) => anyhow::anyhow!("API error ({status}): {display_body}\n\nHint: {h}"),
+            None => anyhow::anyhow!("API error ({status}): {display_body}"),
         }
     }
 
-    fn error_hint(status: StatusCode, body: &str) -> Option<String> {
+    fn error_hint(status: StatusCode, body: &str, content_type: Option<&str>) -> Option<String> {
         match status {
             // 401 Unauthorized
             StatusCode::UNAUTHORIZED => {
@@ -86,7 +239,27 @@ impl ApiClient {
             }
             // 403 Forbidden
             StatusCode::FORBIDDEN => {
-                if body.contains("ORG_NOT_MEMBER") || body.contains("AUTH_ORG_NOT_MEMBER") {
+                if !Self::is_json_content_type(content_type) {
+                    Some(
+                        "Addness API がJSONではない403レスポンスを返しました。画面側と同じ判定では、WAFまたはセキュリティルールによる一時ブロックの可能性があります。ゴールのOWNER/EDITOR権限を変更しても解決しません。しばらく待って再試行し、続く場合は発生時刻とRequest pathを添えて運用担当に確認してください。"
+                            .to_string(),
+                    )
+                } else if body.contains("AUTH_API_KEY_SCOPE_FORBIDDEN") {
+                    Some(
+                        "このエンドポイントは現在のAPI Keyのスコープでは呼び出せません。\n\
+                         （例: `addness login` で発行されるキーは organization スコープのため、\n\
+                         personal スコープ必須のエンドポイントには使えません。\n\
+                         `addness api-key create` で作成したキーを `addness configure` で設定してください。）"
+                            .to_string(),
+                    )
+                } else if body.contains("AUTH_CLERK_ONLY") {
+                    Some(
+                        "このエンドポイントはブラウザ（Clerk）認証専用です。\n\
+                         API Keyによる代理実行は禁止されているため、CLIからは呼び出せません。\n\
+                         Webアプリから操作してください。"
+                            .to_string(),
+                    )
+                } else if body.contains("ORG_NOT_MEMBER") || body.contains("AUTH_ORG_NOT_MEMBER") {
                     Some(
                         "指定された組織に所属していません。\n\
                          Run `addness org list` で所属組織を確認し、\n\
@@ -129,10 +302,20 @@ impl ApiClient {
                          Run: addness goal search <keyword>"
                             .to_string(),
                     )
+                } else if body.trim().eq_ignore_ascii_case("404 page not found") {
+                    Some(
+                        "接続先のAddness APIにこのルートがありません。`addness status --json` でAPI URLを確認してください。URLが正しければ、CLIではなくサーバー側の対応が必要です。"
+                            .to_string(),
+                    )
                 } else {
                     None
                 }
             }
+            // 410 Gone
+            StatusCode::GONE if body.contains("RECURRING_GENERATION_REMOVED") => Some(
+                "定常ゴールの回生成は廃止され、テンプレートのルーティンに移行しました。CLIの予定・定期ToDo機能は `addness today planned --help` を確認してください。"
+                    .to_string(),
+            ),
             // 400 Bad Request
             StatusCode::BAD_REQUEST => {
                 if body.contains("タイトルは必須") {
@@ -177,27 +360,171 @@ impl ApiClient {
         }
     }
 
-    /// x-organization-id ヘッダーなしでGETリクエストを発行する。
-    /// 組織に依存しないエンドポイント（org list等）で使用。
-    pub(super) async fn get_without_org<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+    fn request(
+        &self,
+        method: Method,
+        path: &str,
+        include_org_header: bool,
+    ) -> Result<(String, RequestBuilder)> {
         let url = format!("{}{}", self.base_url, path);
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| format!("Failed to send request to {url}"))?;
+        let mut req = self.client.request(method, &url);
+
+        if include_org_header && let Some(org_id) = &self.org_id {
+            req = req.header(
+                HeaderName::from_static("x-organization-id"),
+                HeaderValue::from_str(org_id).context("Invalid organization ID")?,
+            );
+        }
+
+        Ok((url, req))
+    }
+
+    async fn send(&self, req: RequestBuilder, url: &str) -> Result<Response> {
+        let response = Self::send_request(req, url).await?;
 
         let status = response.status();
         if !status.is_success() {
+            let diagnostics = request_trace_context(response.headers());
+            let content_type = response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
             let body = response.text().await.unwrap_or_default();
-            return Err(Self::api_error(status, &body));
+            return Err(Self::api_error(status, &body, content_type.as_deref())
+                .context(format!("Request path: {}{diagnostics}", request_path(url))));
         }
 
-        response
-            .json::<T>()
-            .await
-            .with_context(|| format!("Failed to parse response from {url}"))
+        Ok(response)
+    }
+
+    async fn send_request(req: RequestBuilder, url: &str) -> Result<Response> {
+        // 書き込みのタイムアウトは処理済みか判別できないため再送しない。
+        let retryable_req = req.try_clone().filter(|request| {
+            request
+                .try_clone()
+                .and_then(|request| request.build().ok())
+                .is_some_and(|request| matches!(*request.method(), Method::GET | Method::HEAD))
+        });
+        let mut first_req = Some(req);
+
+        for attempt in 1..=REQUEST_SEND_ATTEMPTS {
+            let current_req = if attempt == 1 {
+                first_req
+                    .take()
+                    .expect("request builder should be available for first send")
+            } else if let Some(retryable_req) = &retryable_req {
+                retryable_req
+                    .try_clone()
+                    .expect("request builder clone should remain cloneable")
+            } else {
+                break;
+            };
+
+            match current_req.send().await {
+                Ok(response) => return Ok(response),
+                Err(err)
+                    if Self::should_retry_send_error(&err, attempt, retryable_req.is_some()) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(150 * attempt as u64)).await;
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| send_failure_context(url, attempt));
+                }
+            }
+        }
+
+        anyhow::bail!("{}", send_failure_context(url, REQUEST_SEND_ATTEMPTS))
+    }
+
+    fn should_retry_send_error(
+        err: &reqwest::Error,
+        attempt: usize,
+        request_cloneable: bool,
+    ) -> bool {
+        request_cloneable
+            && attempt < REQUEST_SEND_ATTEMPTS
+            && (err.is_connect() || err.is_timeout())
+    }
+
+    /// JSONレスポンスを期待するリクエストを送る。
+    ///
+    /// `retry_on_body_error` はステータス受信後にボディ読み取りが失敗した場合
+    /// （ローリングデプロイ中のコネクション切断等で 2xx でもボディが途中で
+    /// 切れることがある）にリクエスト全体を再送するか。サーバー側で処理が
+    /// 完了している可能性があるため、冪等な GET でのみ有効にすること。
+    async fn send_json_with_retry<T: DeserializeOwned>(
+        &self,
+        req: RequestBuilder,
+        url: &str,
+        retry_on_body_error: bool,
+    ) -> Result<T> {
+        let retryable_req = if retry_on_body_error {
+            req.try_clone()
+        } else {
+            None
+        };
+        let mut first_req = Some(req);
+
+        for attempt in 1..=REQUEST_SEND_ATTEMPTS {
+            let current_req = if attempt == 1 {
+                first_req
+                    .take()
+                    .expect("request builder should be available for first send")
+            } else if let Some(retryable_req) = &retryable_req {
+                retryable_req
+                    .try_clone()
+                    .expect("request builder clone should remain cloneable")
+            } else {
+                unreachable!("retry loop only continues when a cloneable request exists")
+            };
+
+            let response = self.send(current_req, url).await?;
+            let bytes = match response.bytes().await {
+                Ok(bytes) => bytes,
+                Err(_) if retryable_req.is_some() && attempt < REQUEST_SEND_ATTEMPTS => {
+                    tokio::time::sleep(Duration::from_millis(150 * attempt as u64)).await;
+                    continue;
+                }
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("Failed to read response body from {url}"));
+                }
+            };
+            return Self::parse_json_bytes(&bytes, url);
+        }
+
+        anyhow::bail!(
+            "Failed to read response body from {url} after {REQUEST_SEND_ATTEMPTS} attempts"
+        )
+    }
+
+    async fn send_json<T: DeserializeOwned>(&self, req: RequestBuilder, url: &str) -> Result<T> {
+        self.send_json_with_retry(req, url, false).await
+    }
+
+    /// 2xxレスポンスのボディをJSONとしてパースする。失敗時はボディ先頭の
+    /// スニペットをエラーメッセージに含め、切断による欠損かスキーマ不一致かを
+    /// 切り分けられるようにする。
+    fn parse_json_bytes<T: DeserializeOwned>(bytes: &[u8], url: &str) -> Result<T> {
+        serde_json::from_slice(bytes).with_context(|| {
+            format!(
+                "Failed to parse response from {url} (body: {})",
+                body_snippet(bytes)
+            )
+        })
+    }
+
+    async fn send_no_content(&self, req: RequestBuilder, url: &str) -> Result<()> {
+        self.send(req, url).await?;
+        Ok(())
+    }
+
+    /// x-organization-id ヘッダーなしでGETリクエストを発行する。
+    /// 組織に依存しないエンドポイント（org list等）で使用。
+    pub(super) async fn get_without_org<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+        let (url, req) = self.request(Method::GET, path, false)?;
+        self.send_json_with_retry(req, &url, true).await
     }
 
     /// ApiClient::get() は与えられた path をURLパスとして
@@ -206,31 +533,14 @@ impl ApiClient {
     /// mod api 以下に各エンティティに応じて
     /// このラッパをApiClientのメソッドとして実装する
     pub(super) async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        let url = format!("{}{}", self.base_url, path);
-        let mut req = self.client.get(&url);
+        let (url, req) = self.request(Method::GET, path, true)?;
+        self.send_json_with_retry(req, &url, true).await
+    }
 
-        if let Some(org_id) = &self.org_id {
-            req = req.header(
-                HeaderName::from_static("x-organization-id"),
-                HeaderValue::from_str(org_id).context("Invalid organization ID")?,
-            );
-        }
-
-        let response = req
-            .send()
-            .await
-            .with_context(|| format!("Failed to send request to {url}"))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Self::api_error(status, &body));
-        }
-
-        response
-            .json::<T>()
-            .await
-            .with_context(|| format!("Failed to parse response from {url}"))
+    /// CSV 等の JSON 以外の GET レスポンスを逐次読み込むために返す。
+    pub(super) async fn get_raw(&self, path: &str) -> Result<Response> {
+        let (url, req) = self.request(Method::GET, path, true)?;
+        self.send(req, &url).await
     }
 
     pub(super) async fn post<B: Serialize, T: DeserializeOwned>(
@@ -238,57 +548,25 @@ impl ApiClient {
         path: &str,
         body: &B,
     ) -> Result<T> {
-        let url = format!("{}{}", self.base_url, path);
-        let mut req = self.client.post(&url).json(body);
+        let (url, req) = self.request(Method::POST, path, true)?;
+        self.send_json(req.json(body), &url).await
+    }
 
-        if let Some(org_id) = &self.org_id {
-            req = req.header(
-                HeaderName::from_static("x-organization-id"),
-                HeaderValue::from_str(org_id).context("Invalid organization ID")?,
-            );
-        }
-
-        let response = req
-            .send()
-            .await
-            .with_context(|| format!("Failed to send request to {url}"))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Self::api_error(status, &body));
-        }
-
-        response
-            .json::<T>()
-            .await
-            .with_context(|| format!("Failed to parse response from {url}"))
+    /// x-organization-id ヘッダーなしでPOSTリクエストを発行する。
+    /// 組織作成など、まだ対象組織が存在しない操作で使用。
+    pub(super) async fn post_without_org<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        let (url, req) = self.request(Method::POST, path, false)?;
+        self.send_json(req.json(body), &url).await
     }
 
     /// DELETE with JSON body. Returns no response body (204 No Content).
     pub(super) async fn delete_with_body<B: Serialize>(&self, path: &str, body: &B) -> Result<()> {
-        let url = format!("{}{}", self.base_url, path);
-        let mut req = self.client.delete(&url).json(body);
-
-        if let Some(org_id) = &self.org_id {
-            req = req.header(
-                HeaderName::from_static("x-organization-id"),
-                HeaderValue::from_str(org_id).context("Invalid organization ID")?,
-            );
-        }
-
-        let response = req
-            .send()
-            .await
-            .with_context(|| format!("Failed to send request to {url}"))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Self::api_error(status, &body));
-        }
-
-        Ok(())
+        let (url, req) = self.request(Method::DELETE, path, true)?;
+        self.send_no_content(req.json(body), &url).await
     }
 
     pub(super) async fn patch<T: DeserializeOwned, B: Serialize>(
@@ -296,114 +574,32 @@ impl ApiClient {
         path: &str,
         body: &B,
     ) -> Result<T> {
-        let url = format!("{}{}", self.base_url, path);
-        let mut req = self.client.patch(&url).json(body);
-
-        if let Some(org_id) = &self.org_id {
-            req = req.header(
-                HeaderName::from_static("x-organization-id"),
-                HeaderValue::from_str(org_id).context("Invalid organization ID")?,
-            );
-        }
-
-        let response = req
-            .send()
-            .await
-            .with_context(|| format!("Failed to send request to {url}"))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Self::api_error(status, &body));
-        }
-
-        response
-            .json::<T>()
-            .await
-            .with_context(|| format!("Failed to parse response from {url}"))
+        let (url, req) = self.request(Method::PATCH, path, true)?;
+        self.send_json(req.json(body), &url).await
     }
 
     /// POST with JSON body, expects 204 No Content response (no body parsing).
     pub(super) async fn post_no_content<B: Serialize>(&self, path: &str, body: &B) -> Result<()> {
-        let url = format!("{}{}", self.base_url, path);
-        let mut req = self.client.post(&url).json(body);
-
-        if let Some(org_id) = &self.org_id {
-            req = req.header(
-                HeaderName::from_static("x-organization-id"),
-                HeaderValue::from_str(org_id).context("Invalid organization ID")?,
-            );
-        }
-
-        let response = req
-            .send()
-            .await
-            .with_context(|| format!("Failed to send request to {url}"))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Self::api_error(status, &body));
-        }
-        Ok(())
+        let (url, req) = self.request(Method::POST, path, true)?;
+        self.send_no_content(req.json(body), &url).await
     }
 
     /// POST with no request body, expects JSON response.
     pub(super) async fn post_empty<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        let url = format!("{}{}", self.base_url, path);
-        let mut req = self.client.post(&url);
+        let (url, req) = self.request(Method::POST, path, true)?;
+        self.send_json(req, &url).await
+    }
 
-        if let Some(org_id) = &self.org_id {
-            req = req.header(
-                HeaderName::from_static("x-organization-id"),
-                HeaderValue::from_str(org_id).context("Invalid organization ID")?,
-            );
-        }
-
-        let response = req
-            .send()
-            .await
-            .with_context(|| format!("Failed to send request to {url}"))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Self::api_error(status, &body));
-        }
-
-        response
-            .json::<T>()
-            .await
-            .with_context(|| format!("Failed to parse response from {url}"))
+    /// POST with no request body, expects 204 No Content response.
+    pub(super) async fn post_empty_no_content(&self, path: &str) -> Result<()> {
+        let (url, req) = self.request(Method::POST, path, true)?;
+        self.send_no_content(req, &url).await
     }
 
     /// PATCH with no request body, expects JSON response (used for resolve/unresolve).
     pub(super) async fn patch_empty<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        let url = format!("{}{}", self.base_url, path);
-        let mut req = self.client.patch(&url);
-
-        if let Some(org_id) = &self.org_id {
-            req = req.header(
-                HeaderName::from_static("x-organization-id"),
-                HeaderValue::from_str(org_id).context("Invalid organization ID")?,
-            );
-        }
-
-        let response = req
-            .send()
-            .await
-            .with_context(|| format!("Failed to send request to {url}"))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Self::api_error(status, &body));
-        }
-
-        response
-            .json::<T>()
-            .await
-            .with_context(|| format!("Failed to parse response from {url}"))
+        let (url, req) = self.request(Method::PATCH, path, true)?;
+        self.send_json(req, &url).await
     }
 
     /// PUT with JSON body and JSON response.
@@ -412,130 +608,403 @@ impl ApiClient {
         path: &str,
         body: &B,
     ) -> Result<T> {
-        let url = format!("{}{}", self.base_url, path);
-        let mut req = self.client.put(&url).json(body);
-
-        if let Some(org_id) = &self.org_id {
-            req = req.header(
-                HeaderName::from_static("x-organization-id"),
-                HeaderValue::from_str(org_id).context("Invalid organization ID")?,
-            );
-        }
-
-        let response = req
-            .send()
-            .await
-            .with_context(|| format!("Failed to send request to {url}"))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Self::api_error(status, &body));
-        }
-
-        response
-            .json::<T>()
-            .await
-            .with_context(|| format!("Failed to parse response from {url}"))
+        let (url, req) = self.request(Method::PUT, path, true)?;
+        self.send_json(req.json(body), &url).await
     }
 
     /// PUT with JSON body, expects 204 No Content response.
     pub(super) async fn put_no_content<B: Serialize>(&self, path: &str, body: &B) -> Result<()> {
-        let url = format!("{}{}", self.base_url, path);
-        let mut req = self.client.put(&url).json(body);
-
-        if let Some(org_id) = &self.org_id {
-            req = req.header(
-                HeaderName::from_static("x-organization-id"),
-                HeaderValue::from_str(org_id).context("Invalid organization ID")?,
-            );
-        }
-
-        let response = req
-            .send()
-            .await
-            .with_context(|| format!("Failed to send request to {url}"))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Self::api_error(status, &body));
-        }
-        Ok(())
+        let (url, req) = self.request(Method::PUT, path, true)?;
+        self.send_no_content(req.json(body), &url).await
     }
 
     /// PUT with no request body, expects 204 No Content response.
     pub(super) async fn put_empty_no_content(&self, path: &str) -> Result<()> {
-        let url = format!("{}{}", self.base_url, path);
-        let mut req = self.client.put(&url);
-
-        if let Some(org_id) = &self.org_id {
-            req = req.header(
-                HeaderName::from_static("x-organization-id"),
-                HeaderValue::from_str(org_id).context("Invalid organization ID")?,
-            );
-        }
-
-        let response = req
-            .send()
-            .await
-            .with_context(|| format!("Failed to send request to {url}"))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Self::api_error(status, &body));
-        }
-        Ok(())
+        let (url, req) = self.request(Method::PUT, path, true)?;
+        self.send_no_content(req, &url).await
     }
 
     /// PATCH with JSON body, expects 204 No Content response.
     pub(super) async fn patch_no_content<B: Serialize>(&self, path: &str, body: &B) -> Result<()> {
-        let url = format!("{}{}", self.base_url, path);
-        let mut req = self.client.patch(&url).json(body);
-
-        if let Some(org_id) = &self.org_id {
-            req = req.header(
-                HeaderName::from_static("x-organization-id"),
-                HeaderValue::from_str(org_id).context("Invalid organization ID")?,
-            );
-        }
-
-        let response = req
-            .send()
-            .await
-            .with_context(|| format!("Failed to send request to {url}"))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Self::api_error(status, &body));
-        }
-        Ok(())
+        let (url, req) = self.request(Method::PATCH, path, true)?;
+        self.send_no_content(req.json(body), &url).await
     }
 
     /// DELETE with no request body, expects 204 No Content response.
     pub(super) async fn delete_no_body(&self, path: &str) -> Result<()> {
-        let url = format!("{}{}", self.base_url, path);
-        let mut req = self.client.delete(&url);
+        let (url, req) = self.request(Method::DELETE, path, true)?;
+        self.send_no_content(req, &url).await
+    }
 
-        if let Some(org_id) = &self.org_id {
-            req = req.header(
-                HeaderName::from_static("x-organization-id"),
-                HeaderValue::from_str(org_id).context("Invalid organization ID")?,
-            );
+    /// DELETE with no request body, expects a JSON response body (unlike
+    /// `delete_no_body`; used by endpoints that return a status payload on
+    /// deletion, e.g. the goal activity report schedule).
+    pub(super) async fn delete_json<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+        let (url, req) = self.request(Method::DELETE, path, true)?;
+        self.send_json(req, &url).await
+    }
+
+    /// PUT with a raw binary body (e.g. organization logo upload), expects JSON response.
+    /// The backend reads the request body directly as the uploaded file, so this
+    /// sends the bytes as-is with an explicit `Content-Type`.
+    pub(super) async fn put_bytes<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        bytes: Vec<u8>,
+        content_type: &str,
+    ) -> Result<T> {
+        let (url, req) = self.request(Method::PUT, path, true)?;
+        let req = req
+            .header(reqwest::header::CONTENT_TYPE, content_type.to_string())
+            .body(bytes);
+        self.send_json(req, &url).await
+    }
+
+    /// POST a `multipart/form-data` body directly to our own API (unlike
+    /// `upload_attachment`, which posts to a third-party presigned URL).
+    /// Used by endpoints that accept a raw file upload alongside auth headers,
+    /// e.g. meeting-note audio transcription.
+    pub(super) async fn post_multipart<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        form: reqwest::multipart::Form,
+    ) -> Result<T> {
+        let (url, req) = self.request(Method::POST, path, true)?;
+        self.send_json(req.multipart(form), &url).await
+    }
+
+    /// POST a JSON body to a server-sent-events endpoint, returning the raw
+    /// `Response` for the caller to consume as a byte stream. Mirrors
+    /// `get_stream`, but for endpoints (e.g. mode-specific AI chat) whose SSE stream
+    /// is initiated with a POST + JSON payload rather than a GET.
+    pub(super) async fn post_stream<B: Serialize>(&self, path: &str, body: &B) -> Result<Response> {
+        let (url, req) = self.request(Method::POST, path, true)?;
+        let req = req
+            .json(body)
+            .timeout(Duration::from_secs(EVENT_STREAM_TIMEOUT_SECS));
+        self.send(req, &url).await
+    }
+}
+
+fn request_path(url: &str) -> String {
+    Url::parse(url)
+        .map(|parsed| parsed.path().to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string())
+}
+
+fn request_trace_context(headers: &HeaderMap) -> String {
+    const DIAGNOSTIC_HEADERS: &[&str] = &[
+        "cf-ray",
+        "x-amz-cf-id",
+        "x-amz-cf-pop",
+        "x-amzn-trace-id",
+        "x-amzn-requestid",
+        "x-request-id",
+        "request-id",
+        "server",
+        "via",
+        "date",
+    ];
+
+    let values = DIAGNOSTIC_HEADERS
+        .iter()
+        .filter_map(|name| {
+            let value = headers.get(*name)?.to_str().ok()?.trim();
+            if value.is_empty()
+                || value.len() > 160
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+            {
+                return None;
+            }
+            Some(format!("{name}={value}"))
+        })
+        .collect::<Vec<_>>();
+
+    if values.is_empty() {
+        String::new()
+    } else {
+        format!("; edge diagnostics: {}", values.join(", "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        API_RESOLVE_ENV, ApiClient, DEFAULT_HTTP_TIMEOUT_SECS, body_snippet,
+        http_timeout_from_env_value, parse_dns_override_addrs, request_path, request_trace_context,
+        send_failure_context,
+    };
+    use reqwest::StatusCode;
+    use reqwest::header::HeaderMap;
+    use std::fs;
+    use std::net::SocketAddr;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    fn collect_rust_sources(directory: &Path, files: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect_rust_sources(&path, files);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                files.push(path);
+            }
         }
+    }
 
-        let response = req
-            .send()
-            .await
-            .with_context(|| format!("Failed to send request to {url}"))?;
+    #[test]
+    fn retired_legacy_tools_api_path_is_absent_from_source() {
+        const LEGACY_ORGANIZATION_PREFIX: &str = "/api/v1/team/organizations/";
+        const LEGACY_TOOLS_SEGMENT: &str = "/tools";
+        let mut files = Vec::new();
+        collect_rust_sources(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
 
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Self::api_error(status, &body));
-        }
-        Ok(())
+        let offenders: Vec<_> = files
+            .into_iter()
+            .filter(|path| {
+                fs::read_to_string(path).unwrap().lines().any(|line| {
+                    line.contains(LEGACY_ORGANIZATION_PREFIX) && line.contains(LEGACY_TOOLS_SEGMENT)
+                })
+            })
+            .collect();
+
+        assert!(
+            offenders.is_empty(),
+            "legacy Tools API paths: {offenders:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_comment_routes_are_centralized_in_the_compatibility_client() {
+        let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let allowed = source_root.join("api/client/comment.rs");
+        let legacy_prefix = ["/api/v1/team", "/comments"].concat();
+        let mut files = Vec::new();
+        collect_rust_sources(&source_root, &mut files);
+
+        let offenders: Vec<_> = files
+            .into_iter()
+            .filter(|path| path != &allowed)
+            .filter(|path| fs::read_to_string(path).unwrap().contains(&legacy_prefix))
+            .collect();
+
+        assert!(
+            offenders.is_empty(),
+            "legacy comment routes must stay behind the v2-first compatibility client: {offenders:?}"
+        );
+    }
+
+    #[test]
+    fn http_timeout_uses_default_without_valid_override() {
+        assert_eq!(
+            http_timeout_from_env_value(None),
+            Duration::from_secs(DEFAULT_HTTP_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            http_timeout_from_env_value(Some("")),
+            Duration::from_secs(DEFAULT_HTTP_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            http_timeout_from_env_value(Some("0")),
+            Duration::from_secs(DEFAULT_HTTP_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            http_timeout_from_env_value(Some("abc")),
+            Duration::from_secs(DEFAULT_HTTP_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn http_timeout_accepts_positive_seconds_override() {
+        assert_eq!(
+            http_timeout_from_env_value(Some("15")),
+            Duration::from_secs(15)
+        );
+    }
+
+    #[test]
+    fn body_snippet_truncates_and_flattens_newlines() {
+        let long = "a".repeat(200);
+        let snippet = body_snippet(long.as_bytes());
+        assert_eq!(snippet.chars().count(), 161); // 160 chars + ellipsis
+        assert!(snippet.ends_with('…'));
+
+        assert_eq!(body_snippet(b"line1\nline2\r\n"), "line1line2");
+        assert_eq!(body_snippet(b""), "<empty>");
+    }
+
+    #[test]
+    fn parse_json_bytes_reports_body_snippet_on_mismatch() {
+        let err = ApiClient::parse_json_bytes::<serde_json::Value>(
+            b"<html>WAF challenge</html>",
+            "https://example.com/api",
+        )
+        .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("Failed to parse response from https://example.com/api"));
+        assert!(message.contains("<html>WAF challenge</html>"));
+    }
+
+    #[test]
+    fn parse_json_bytes_reports_truncated_body() {
+        // ローリングデプロイ中の切断で途中までしか届かなかったボディを想定
+        let err = ApiClient::parse_json_bytes::<serde_json::Value>(
+            br#"{"data":{"members":[{"id":"x"#,
+            "https://example.com/api",
+        )
+        .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains(r#"{"data":{"members":[{"id":"x"#));
+        // 根本原因(serde)がチェーンに残ること
+        assert!(message.contains("EOF") || message.contains("eof"));
+    }
+
+    #[test]
+    fn api_error_keeps_existing_auth_hint() {
+        let err = ApiClient::api_error(
+            StatusCode::UNAUTHORIZED,
+            "AUTH_INVALID_API_KEY",
+            Some("application/json"),
+        );
+        let message = err.to_string();
+
+        assert!(message.contains("API error (401 Unauthorized): AUTH_INVALID_API_KEY"));
+        assert!(message.contains("Run: addness login"));
+    }
+
+    #[test]
+    fn api_error_hints_api_key_scope_forbidden() {
+        let err = ApiClient::api_error(
+            StatusCode::FORBIDDEN,
+            r#"{"code":"AUTH_API_KEY_SCOPE_FORBIDDEN"}"#,
+            Some("application/json"),
+        );
+        let message = err.to_string();
+
+        assert!(message.contains("スコープでは呼び出せません"));
+        assert!(message.contains("addness api-key create"));
+    }
+
+    #[test]
+    fn api_error_hints_clerk_only_endpoints() {
+        let err = ApiClient::api_error(
+            StatusCode::FORBIDDEN,
+            r#"{"code":"AUTH_CLERK_ONLY"}"#,
+            Some("application/json"),
+        );
+        let message = err.to_string();
+
+        assert!(message.contains("ブラウザ（Clerk）認証専用"));
+    }
+
+    #[test]
+    fn api_error_classifies_non_json_forbidden_as_waf_without_role_hint() {
+        let err = ApiClient::api_error(
+            StatusCode::FORBIDDEN,
+            "<html><body>blocked</body></html>",
+            Some("text/html; charset=utf-8"),
+        );
+        let message = err.to_string();
+
+        assert!(message.contains("WAFまたはセキュリティルール"));
+        assert!(message.contains("OWNER/EDITOR権限を変更しても解決しません"));
+        assert!(message.contains("non-JSON response body omitted"));
+        assert!(!message.contains("<html>"));
+        assert!(!message.contains("対象ゴールに OWNER または EDITOR"));
+    }
+
+    #[test]
+    fn api_error_explains_unregistered_routes() {
+        let err = ApiClient::api_error(
+            StatusCode::NOT_FOUND,
+            "404 page not found",
+            Some("text/plain"),
+        );
+        let message = err.to_string();
+
+        assert!(message.contains("このルートがありません"));
+        assert!(message.contains("addness status --json"));
+    }
+
+    #[test]
+    fn api_error_explains_removed_recurring_generation() {
+        let err = ApiClient::api_error(
+            StatusCode::GONE,
+            r#"{"code":"RECURRING_GENERATION_REMOVED"}"#,
+            Some("application/json"),
+        );
+        let message = err.to_string();
+
+        assert!(message.contains("テンプレートのルーティン"));
+        assert!(message.contains("addness today planned --help"));
+    }
+
+    #[test]
+    fn request_path_omits_query_parameters() {
+        assert_eq!(
+            request_path("https://api.example.test/api/v2/search?q=private"),
+            "/api/v2/search"
+        );
+    }
+
+    #[test]
+    fn request_trace_context_includes_only_safe_diagnostic_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("cf-ray", "7ab123-lax".parse().unwrap());
+        headers.insert("x-request-id", "trace-42".parse().unwrap());
+        headers.insert("server", "cloudflare".parse().unwrap());
+        headers.insert("set-cookie", "session=private".parse().unwrap());
+
+        assert_eq!(
+            request_trace_context(&headers),
+            "; edge diagnostics: cf-ray=7ab123-lax, x-request-id=trace-42, server=cloudflare"
+        );
+    }
+
+    #[test]
+    fn dns_override_accepts_plain_ip_for_base_host() {
+        let addrs = parse_dns_override_addrs("54.248.80.181", "vt.api.addness.com", 443).unwrap();
+
+        assert_eq!(
+            addrs,
+            vec!["54.248.80.181:443".parse::<SocketAddr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn dns_override_filters_host_mapping() {
+        let addrs = parse_dns_override_addrs(
+            "other.example=10.0.0.1,vt.api.addness.com=54.248.80.181:8443",
+            "vt.api.addness.com",
+            443,
+        )
+        .unwrap();
+
+        assert_eq!(
+            addrs,
+            vec!["54.248.80.181:8443".parse::<SocketAddr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn dns_override_rejects_invalid_address() {
+        let err = parse_dns_override_addrs("not-an-ip", "vt.api.addness.com", 443)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("Invalid ADDNESS_API_RESOLVE address"));
+    }
+
+    #[test]
+    fn send_failure_context_mentions_dns_override_env() {
+        let context = send_failure_context("https://vt.api.addness.com/api/v2/objectives", 3);
+
+        assert!(context.contains(API_RESOLVE_ENV));
+        assert!(context.contains("after 3 attempt"));
     }
 }

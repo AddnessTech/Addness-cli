@@ -11,8 +11,10 @@ use clap::{CommandFactory, Parser, Subcommand};
 use crate::config::{Credentials, DEFAULT_API_URL, Settings};
 use api::ApiClient;
 use cli::commands::{
-    assignment, comment, configure, deliverable, detect, goal, invitation, kpi, link, login,
-    member, org, skills, summary,
+    activity, assignment, chat, comment, configure, consent, core_values, deliverable,
+    desktop_auth, detect, diagnosis, execution, form, goal, invitation, issue, link, login,
+    master_plan, mcp, media, meeting, member, notification, org, personal, referral, search,
+    skills, streak, summary, today, update, user,
 };
 
 #[derive(Parser)]
@@ -28,6 +30,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Discover and use every current Addness MCP tool through the CLI
+    Mcp(mcp::McpArgs),
     /// Log in via browser (recommended for first setup)
     Login {
         /// API base URL
@@ -57,10 +61,40 @@ enum Commands {
         #[command(subcommand)]
         command: goal::GoalCommands,
     },
+    /// Manage Addness Forms and read their responses
+    Form {
+        #[command(subcommand)]
+        command: form::FormCommands,
+    },
+    /// AI agent chat for the core-values diagnosis mode (tool-less
+    /// hearing-style dialogue, not scoped to a single goal): send a message
+    /// and stream the reply (SSE), fire the silent "opening" turn, and
+    /// browse threads/messages
+    CoreValues {
+        #[command(subcommand)]
+        command: core_values::CoreValuesCommands,
+    },
+    /// AI agent chat for the master-plan mode (not scoped to a single goal):
+    /// send a message and stream the reply (SSE), fire the silent "opening"
+    /// turn, and browse threads/messages
+    MasterPlan {
+        #[command(subcommand)]
+        command: master_plan::MasterPlanCommands,
+    },
     /// Manage comments on goals
     Comment {
         #[command(subcommand)]
         command: comment::CommentCommands,
+    },
+    /// Manage goal issues (v2 chat threads on goals) and goal sections
+    Issue {
+        #[command(subcommand)]
+        command: issue::IssueCommands,
+    },
+    /// Manage organization chat (DM/group rooms, messages, invitations)
+    Chat {
+        #[command(subcommand)]
+        command: chat::ChatCommands,
     },
     /// Link PRs/URLs to goals and track progress
     Link {
@@ -77,20 +111,40 @@ enum Commands {
         #[command(subcommand)]
         command: assignment::AssignmentCommands,
     },
-    /// Manage KPIs on goals
-    Kpi {
-        #[command(subcommand)]
-        command: kpi::KpiCommands,
-    },
     /// Manage organization members
     Member {
         #[command(subcommand)]
         command: member::MemberCommands,
     },
+    /// Manage your Addness user profile, settings, and account
+    User {
+        #[command(subcommand)]
+        command: user::UserCommands,
+    },
+    /// Send notifications, manage read status, and manage subscription channels
+    Notification {
+        #[command(subcommand)]
+        command: notification::NotificationCommands,
+    },
     /// Manage invitations and invite links
     Invitation {
         #[command(subcommand)]
         command: invitation::InvitationCommands,
+    },
+    /// Read activity logs (per-member, per-goal, and organization/goal summaries)
+    Activity {
+        #[command(subcommand)]
+        command: activity::ActivityCommands,
+    },
+    /// View and manage streaks (daily completion streaks, freeze, revive, sharing)
+    Streak {
+        #[command(subcommand)]
+        command: streak::StreakCommands,
+    },
+    /// Read and write today's todos (today's goals)
+    Today {
+        #[command(subcommand)]
+        command: Option<today::TodayCommands>,
     },
     /// Show progress summary of all goals
     Summary {
@@ -104,11 +158,79 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Unified search across objectives/comments/members (distinct from `goal search`)
+    Search {
+        /// Search query (supports `#goal:`/`#member:`/`#comment:` filters)
+        query: String,
+        /// Organization ID (uses default if not specified)
+        #[arg(long)]
+        org: Option<String>,
+        /// Max number of results to return
+        #[arg(long)]
+        limit: Option<u16>,
+        /// Pagination offset
+        #[arg(long)]
+        offset: Option<u16>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Manage your diagnosis results (goal style, values, core values, master plan)
+    Diagnosis {
+        #[command(subcommand)]
+        command: diagnosis::DiagnosisCommands,
+    },
+    /// Create referral links and view your referral performance
+    Referral {
+        #[command(subcommand)]
+        command: referral::ReferralCommands,
+    },
+    /// Manage inline media (editor paste/drop images and videos)
+    Media {
+        #[command(subcommand)]
+        command: media::MediaCommands,
+    },
+    /// Read cross-organization todos/activity and ensure your personal organization
+    Personal {
+        #[command(subcommand)]
+        command: personal::PersonalCommands,
+    },
+    /// Execution-tab reporting: summaries, execution-record history, goal-collapse
+    /// preferences, active huddles, and the Codex-agent today's-goals view/apply
+    Execution {
+        #[command(subcommand)]
+        command: execution::ExecutionCommands,
+    },
+    /// Manage meeting features: Huddle voice calls (status/recording/invites,
+    /// excluding live participation), Meeting Bot (Recall.ai) jobs, meeting-note
+    /// recording controls, and meeting bots
+    Meeting {
+        #[command(subcommand)]
+        command: meeting::MeetingCommands,
+    },
+    /// Manage desktop browser-auth handoff operations
+    DesktopAuth {
+        #[command(subcommand)]
+        command: desktop_auth::DesktopAuthCommands,
+    },
+    /// Show your consent status for admin-visibility disclosures (e.g. DM/group
+    /// chat secrecy). Read-only: recording consent requires a browser session
+    /// and cannot be done via the CLI's API key auth.
+    Consent {
+        #[command(subcommand)]
+        command: consent::ConsentCommands,
+    },
     /// Detect goal ID from current git branch name
     DetectGoal {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+    },
+    /// Update addness to the latest version via the official installer
+    Update {
+        /// Only check whether an update is available; do not install
+        #[arg(long)]
+        check: bool,
     },
     /// Output AI skills prompt for this CLI
     Skills,
@@ -119,31 +241,609 @@ enum Commands {
     },
 }
 
+impl Cli {
+    fn should_check_for_update(&self) -> bool {
+        match &self.command {
+            Some(Commands::Completions { .. }) => false,
+            Some(command) => !command_outputs_json(command),
+            None => true,
+        }
+    }
+}
+
+fn command_outputs_json(command: &Commands) -> bool {
+    match command {
+        Commands::Mcp(args) => args.json,
+        Commands::Status { json }
+        | Commands::Summary { json, .. }
+        | Commands::Search { json, .. }
+        | Commands::DetectGoal { json } => *json,
+        Commands::Diagnosis { command } => diagnosis_outputs_json(command),
+        Commands::Referral { command } => referral_outputs_json(command),
+        Commands::Form { command } => command.outputs_json(),
+        Commands::Media { command } => media_outputs_json(command),
+        Commands::Personal { command } => personal_outputs_json(command),
+        Commands::Execution { command } => execution_outputs_json(command),
+        Commands::Meeting { command } => meeting_outputs_json(command),
+        Commands::DesktopAuth { command } => desktop_auth_outputs_json(command),
+        Commands::Consent { command } => consent_outputs_json(command),
+        Commands::Org { command } => org_outputs_json(command),
+        Commands::Goal { command } => goal_outputs_json(command),
+        Commands::CoreValues { command } => core_values_outputs_json(command),
+        Commands::MasterPlan { command } => master_plan_outputs_json(command),
+        Commands::Comment { command } => comment_outputs_json(command),
+        Commands::Issue { command } => issue_outputs_json(command),
+        Commands::Chat { command } => chat_outputs_json(command),
+        Commands::Link { command } => link_outputs_json(command),
+        Commands::Deliverable { command } => deliverable_outputs_json(command),
+        Commands::Assignment { command } => assignment_outputs_json(command),
+        Commands::Member { command } => member_outputs_json(command),
+        Commands::User { command } => user_outputs_json(command),
+        Commands::Notification { command } => notification_outputs_json(command),
+        Commands::Invitation { command } => invitation_outputs_json(command),
+        Commands::Activity { command } => activity_outputs_json(command),
+        Commands::Streak { command } => streak_outputs_json(command),
+        Commands::Today { command } => command.as_ref().is_some_and(today_outputs_json),
+        Commands::Login { .. }
+        | Commands::Configure
+        | Commands::Logout
+        | Commands::Update { .. }
+        | Commands::Skills
+        | Commands::Completions { .. } => false,
+    }
+}
+
+fn org_outputs_json(command: &org::OrgCommands) -> bool {
+    match command {
+        org::OrgCommands::List { json }
+        | org::OrgCommands::Current { json }
+        | org::OrgCommands::Create { json, .. }
+        | org::OrgCommands::Update { json, .. }
+        | org::OrgCommands::Get { json, .. }
+        | org::OrgCommands::ListAll { json, .. }
+        | org::OrgCommands::RootOwner { json, .. }
+        | org::OrgCommands::AccessibleRoot { json, .. }
+        | org::OrgCommands::AccessState { json, .. }
+        | org::OrgCommands::CurrentMember { json, .. }
+        | org::OrgCommands::SetTimezone { json, .. }
+        | org::OrgCommands::SetLogo { json, .. }
+        | org::OrgCommands::PushTokenRegister { json, .. } => *json,
+        org::OrgCommands::OnboardingBilling { command } => match command {
+            org::OnboardingBillingCommands::State { json, .. }
+            | org::OnboardingBillingCommands::Require { json, .. }
+            | org::OnboardingBillingCommands::Free { json, .. } => *json,
+        },
+        org::OrgCommands::AdSettings { command } => match command {
+            org::AdSettingsCommands::Get { json, .. }
+            | org::AdSettingsCommands::Set { json, .. }
+            | org::AdSettingsCommands::SetMe { json, .. } => *json,
+        },
+        org::OrgCommands::Switch { .. } | org::OrgCommands::Rm { .. } => false,
+    }
+}
+
+fn goal_outputs_json(command: &goal::GoalCommands) -> bool {
+    match command {
+        goal::GoalCommands::Complete(args) => args.outputs_json(),
+        goal::GoalCommands::List { json, .. }
+        | goal::GoalCommands::Get { json, .. }
+        | goal::GoalCommands::Children { json, .. }
+        | goal::GoalCommands::Tree { json, .. }
+        | goal::GoalCommands::Siblings { json, .. }
+        | goal::GoalCommands::Search { json, .. }
+        | goal::GoalCommands::Create { json, .. }
+        | goal::GoalCommands::Update { json, .. }
+        | goal::GoalCommands::Delete { json, .. }
+        | goal::GoalCommands::Archive { json, .. }
+        | goal::GoalCommands::Unarchive { json, .. }
+        | goal::GoalCommands::Restore { json, .. }
+        | goal::GoalCommands::Move { json, .. } => *json,
+        goal::GoalCommands::Share { command } => match command {
+            goal::ShareCommands::Create { json, .. } => *json,
+            goal::ShareCommands::Revoke { .. } => false,
+        },
+        goal::GoalCommands::ReportSchedule { command } => match command {
+            goal::ReportScheduleCommands::Get { json, .. }
+            | goal::ReportScheduleCommands::Set { json, .. } => *json,
+            goal::ReportScheduleCommands::Rm { .. } => false,
+        },
+    }
+}
+
+fn diagnosis_outputs_json(command: &diagnosis::DiagnosisCommands) -> bool {
+    match command {
+        diagnosis::DiagnosisCommands::Save { json, .. }
+        | diagnosis::DiagnosisCommands::List { json }
+        | diagnosis::DiagnosisCommands::Get { json, .. }
+        | diagnosis::DiagnosisCommands::Stats { json, .. }
+        | diagnosis::DiagnosisCommands::Profiles { json, .. }
+        | diagnosis::DiagnosisCommands::Profile { json, .. } => *json,
+    }
+}
+
+fn referral_outputs_json(command: &referral::ReferralCommands) -> bool {
+    match command {
+        referral::ReferralCommands::LinkCreate { json, .. }
+        | referral::ReferralCommands::List { json, .. }
+        | referral::ReferralCommands::Convert { json, .. } => *json,
+    }
+}
+
+fn media_outputs_json(command: &media::MediaCommands) -> bool {
+    match command {
+        media::MediaCommands::View { json, .. } | media::MediaCommands::Upload { json, .. } => {
+            *json
+        }
+    }
+}
+
+fn personal_outputs_json(command: &personal::PersonalCommands) -> bool {
+    match command {
+        personal::PersonalCommands::EnsureOrganization { json }
+        | personal::PersonalCommands::TodayList { json, .. }
+        | personal::PersonalCommands::DailyActivity { json, .. } => *json,
+    }
+}
+
+fn execution_outputs_json(command: &execution::ExecutionCommands) -> bool {
+    match command {
+        execution::ExecutionCommands::Summary { json, .. }
+        | execution::ExecutionCommands::MemberSummary { json, .. }
+        | execution::ExecutionCommands::Update { json, .. }
+        | execution::ExecutionCommands::History { json, .. }
+        | execution::ExecutionCommands::ActiveHuddles { json, .. } => *json,
+        execution::ExecutionCommands::Preference { command } => match command {
+            execution::PreferenceCommands::Get { json, .. }
+            | execution::PreferenceCommands::Set { json, .. } => *json,
+        },
+        execution::ExecutionCommands::Codex { command } => match command {
+            execution::CodexCommands::View { json, .. } => *json,
+        },
+    }
+}
+
+fn meeting_outputs_json(command: &meeting::MeetingCommands) -> bool {
+    match command {
+        meeting::MeetingCommands::Huddle { command } => match command {
+            meeting::HuddleCommands::Status { json, .. }
+            | meeting::HuddleCommands::ActiveSubtree { json, .. }
+            | meeting::HuddleCommands::SessionStatus { json, .. }
+            | meeting::HuddleCommands::RecordingStart { json, .. }
+            | meeting::HuddleCommands::RecordingStop { json, .. }
+            | meeting::HuddleCommands::InviteableMembers { json, .. }
+            | meeting::HuddleCommands::Invite { json, .. } => *json,
+        },
+        meeting::MeetingCommands::Bot { command } => match command {
+            meeting::BotCommands::Get { json, .. }
+            | meeting::BotCommands::Create { json, .. }
+            | meeting::BotCommands::Stop { json, .. } => *json,
+        },
+    }
+}
+
+fn core_values_outputs_json(command: &core_values::CoreValuesCommands) -> bool {
+    match command {
+        core_values::CoreValuesCommands::Send { json, .. }
+        | core_values::CoreValuesCommands::Start { json, .. }
+        | core_values::CoreValuesCommands::Threads { json, .. }
+        | core_values::CoreValuesCommands::Messages { json, .. } => *json,
+    }
+}
+
+fn master_plan_outputs_json(command: &master_plan::MasterPlanCommands) -> bool {
+    match command {
+        master_plan::MasterPlanCommands::Send { json, .. }
+        | master_plan::MasterPlanCommands::Start { json, .. }
+        | master_plan::MasterPlanCommands::Threads { json, .. }
+        | master_plan::MasterPlanCommands::Messages { json, .. } => *json,
+    }
+}
+
+fn desktop_auth_outputs_json(command: &desktop_auth::DesktopAuthCommands) -> bool {
+    match command {
+        desktop_auth::DesktopAuthCommands::Redeem { json, .. }
+        | desktop_auth::DesktopAuthCommands::Complete { json, .. } => *json,
+    }
+}
+
+fn consent_outputs_json(command: &consent::ConsentCommands) -> bool {
+    match command {
+        consent::ConsentCommands::Get { json, .. } => *json,
+    }
+}
+
+fn comment_outputs_json(command: &comment::CommentCommands) -> bool {
+    match command {
+        comment::CommentCommands::List { json, .. }
+        | comment::CommentCommands::ListAll { json, .. }
+        | comment::CommentCommands::Get { json, .. }
+        | comment::CommentCommands::Context { json, .. }
+        | comment::CommentCommands::Reactions { json, .. }
+        | comment::CommentCommands::Create { json, .. }
+        | comment::CommentCommands::Update { json, .. }
+        | comment::CommentCommands::Resolve { json, .. }
+        | comment::CommentCommands::Unresolve { json, .. } => *json,
+        comment::CommentCommands::Delete { .. } | comment::CommentCommands::React { .. } => false,
+    }
+}
+
+fn issue_outputs_json(command: &issue::IssueCommands) -> bool {
+    match command {
+        issue::IssueCommands::List { json, .. }
+        | issue::IssueCommands::ListAll { json, .. }
+        | issue::IssueCommands::Create { json, .. }
+        | issue::IssueCommands::Update { json, .. }
+        | issue::IssueCommands::Messages { json, .. }
+        | issue::IssueCommands::Reply { json, .. }
+        | issue::IssueCommands::EditMessage { json, .. }
+        | issue::IssueCommands::React { json, .. }
+        | issue::IssueCommands::Reactions { json, .. }
+        | issue::IssueCommands::Search { json, .. }
+        | issue::IssueCommands::Preview { json, .. }
+        | issue::IssueCommands::Resolve { json, .. }
+        | issue::IssueCommands::Unresolve { json, .. } => *json,
+        issue::IssueCommands::Read { .. }
+        | issue::IssueCommands::Delete { .. }
+        | issue::IssueCommands::DeleteMessage { .. }
+        | issue::IssueCommands::Unreact { .. } => false,
+        issue::IssueCommands::Sections { command } => match command {
+            issue::SectionCommands::List { json, .. }
+            | issue::SectionCommands::Pinned { json, .. }
+            | issue::SectionCommands::UnreadCount { json, .. }
+            | issue::SectionCommands::UnreadMentions { json, .. } => *json,
+            issue::SectionCommands::Pin { .. } | issue::SectionCommands::Unpin { .. } => false,
+        },
+    }
+}
+
+fn chat_outputs_json(command: &chat::ChatCommands) -> bool {
+    match command {
+        chat::ChatCommands::Search { json, .. } => *json,
+        chat::ChatCommands::Room { command } => match command {
+            chat::RoomCommands::List { json, .. }
+            | chat::RoomCommands::ListPublic { json, .. }
+            | chat::RoomCommands::UnreadCount { json, .. }
+            | chat::RoomCommands::Get { json, .. }
+            | chat::RoomCommands::CreateDm { json, .. }
+            | chat::RoomCommands::CreateGroup { json, .. }
+            | chat::RoomCommands::Rename { json, .. }
+            | chat::RoomCommands::Members { json, .. }
+            | chat::RoomCommands::Join { json, .. }
+            | chat::RoomCommands::Invite { json, .. }
+            | chat::RoomCommands::SetIcon { json, .. } => *json,
+            chat::RoomCommands::Rm { .. }
+            | chat::RoomCommands::Leave { .. }
+            | chat::RoomCommands::RemoveMember { .. }
+            | chat::RoomCommands::RmIcon { .. }
+            | chat::RoomCommands::Read { .. }
+            | chat::RoomCommands::Hide { .. } => false,
+        },
+        chat::ChatCommands::Message { command } => match command {
+            chat::MessageCommands::List { json, .. }
+            | chat::MessageCommands::Post { json, .. }
+            | chat::MessageCommands::Update { json, .. }
+            | chat::MessageCommands::React { json, .. }
+            | chat::MessageCommands::Reactions { json, .. } => *json,
+            chat::MessageCommands::Rm { .. } | chat::MessageCommands::Unreact { .. } => false,
+        },
+        chat::ChatCommands::Invitation { command } => match command {
+            chat::ChatInvitationCommands::ListPending { json }
+            | chat::ChatInvitationCommands::Accept { json, .. } => *json,
+            chat::ChatInvitationCommands::Decline { .. } => false,
+        },
+    }
+}
+
+fn link_outputs_json(command: &link::LinkCommands) -> bool {
+    match command {
+        link::LinkCommands::Pr { json, .. } | link::LinkCommands::Progress { json, .. } => *json,
+    }
+}
+
+fn deliverable_outputs_json(command: &deliverable::DeliverableCommands) -> bool {
+    match command {
+        deliverable::DeliverableCommands::Add { json, .. }
+        | deliverable::DeliverableCommands::List { json, .. }
+        | deliverable::DeliverableCommands::Update { json, .. }
+        | deliverable::DeliverableCommands::Rename { json, .. } => *json,
+        deliverable::DeliverableCommands::Rm { .. }
+        | deliverable::DeliverableCommands::BatchRm { .. } => false,
+    }
+}
+
+fn assignment_outputs_json(command: &assignment::AssignmentCommands) -> bool {
+    match command {
+        assignment::AssignmentCommands::Add { json, .. }
+        | assignment::AssignmentCommands::Update { json, .. }
+        | assignment::AssignmentCommands::Transfer { json, .. } => *json,
+        assignment::AssignmentCommands::Rm { .. } => false,
+    }
+}
+
+fn member_outputs_json(command: &member::MemberCommands) -> bool {
+    match command {
+        member::MemberCommands::List { json, .. }
+        | member::MemberCommands::Search { json, .. }
+        | member::MemberCommands::Children { json, .. }
+        | member::MemberCommands::Admins { json, .. }
+        | member::MemberCommands::DeletePreview { json, .. }
+        | member::MemberCommands::Browse { json, .. }
+        | member::MemberCommands::Objectives { json, .. }
+        | member::MemberCommands::SetAvatar { json, .. }
+        | member::MemberCommands::Get { json, .. } => *json,
+        member::MemberCommands::Update { .. }
+        | member::MemberCommands::Pin { .. }
+        | member::MemberCommands::Unpin { .. }
+        | member::MemberCommands::Rm { .. }
+        | member::MemberCommands::SetSourceOrg { .. } => false,
+        member::MemberCommands::Admin { command } => match command {
+            member::AdminCommands::Grant { .. } | member::AdminCommands::Revoke { .. } => false,
+        },
+        member::MemberCommands::Tag { command } => match command {
+            member::MemberTagCommands::List { json, .. }
+            | member::MemberTagCommands::Create { json, .. }
+            | member::MemberTagCommands::ListFor { json, .. } => *json,
+            member::MemberTagCommands::Rm { .. }
+            | member::MemberTagCommands::Assign { .. }
+            | member::MemberTagCommands::Unassign { .. } => false,
+        },
+    }
+}
+
+fn user_outputs_json(command: &user::UserCommands) -> bool {
+    match command {
+        user::UserCommands::Me { json }
+        | user::UserCommands::Get { json, .. }
+        | user::UserCommands::Update { json, .. } => *json,
+
+        user::UserCommands::Settings { command } => match command {
+            user::UserSettingsCommands::Get { json }
+            | user::UserSettingsCommands::Update { json, .. } => *json,
+        },
+    }
+}
+
+fn notification_outputs_json(command: &notification::NotificationCommands) -> bool {
+    match command {
+        notification::NotificationCommands::Send { json, .. }
+        | notification::NotificationCommands::List { json, .. }
+        | notification::NotificationCommands::Count { json, .. }
+        | notification::NotificationCommands::CountsByGoal { json, .. }
+        | notification::NotificationCommands::MarkRead { json, .. }
+        | notification::NotificationCommands::MarkUnread { json, .. }
+        | notification::NotificationCommands::MarkAllRead { json, .. } => *json,
+        notification::NotificationCommands::Subscription { command } => match command {
+            notification::SubscriptionCommands::List { json }
+            | notification::SubscriptionCommands::Add { json, .. }
+            | notification::SubscriptionCommands::Update { json, .. }
+            | notification::SubscriptionCommands::EmailDestinations { json } => *json,
+        },
+    }
+}
+
+fn invitation_outputs_json(command: &invitation::InvitationCommands) -> bool {
+    match command {
+        invitation::InvitationCommands::Create { json, .. }
+        | invitation::InvitationCommands::Resend { json, .. }
+        | invitation::InvitationCommands::Preview { json, .. }
+        | invitation::InvitationCommands::InvitedMembers { json, .. }
+        | invitation::InvitationCommands::Overview { json, .. } => *json,
+        invitation::InvitationCommands::Link { command } => match command {
+            invitation::InviteLinkCommands::Create { json, .. }
+            | invitation::InviteLinkCommands::List { json, .. } => *json,
+            invitation::InviteLinkCommands::Deactivate { .. } => false,
+        },
+        invitation::InvitationCommands::Revoke { .. } => false,
+    }
+}
+
+fn activity_outputs_json(command: &activity::ActivityCommands) -> bool {
+    match command {
+        activity::ActivityCommands::List { json, .. }
+        | activity::ActivityCommands::Goal { json, .. }
+        | activity::ActivityCommands::Summary { json, .. }
+        | activity::ActivityCommands::GoalSummary { json, .. } => *json,
+    }
+}
+
+fn streak_outputs_json(command: &streak::StreakCommands) -> bool {
+    match command {
+        streak::StreakCommands::Get { json, .. }
+        | streak::StreakCommands::Freeze { json, .. }
+        | streak::StreakCommands::Revive { json, .. }
+        | streak::StreakCommands::Public { json, .. } => *json,
+        streak::StreakCommands::Unfreeze { .. } => false,
+        streak::StreakCommands::Share { command } => match command {
+            streak::StreakShareCommands::Status { json, .. }
+            | streak::StreakShareCommands::Create { json, .. } => *json,
+            streak::StreakShareCommands::Revoke { .. } => false,
+        },
+    }
+}
+
+fn today_outputs_json(command: &today::TodayCommands) -> bool {
+    match command {
+        today::TodayCommands::List { json, .. }
+        | today::TodayCommands::Add { json, .. }
+        | today::TodayCommands::Done { json, .. }
+        | today::TodayCommands::Reopen { json, .. }
+        | today::TodayCommands::Status { json, .. } => *json,
+        today::TodayCommands::Todo { command } => today_todo_outputs_json(command),
+        today::TodayCommands::Planned { command } => today_planned_outputs_json(command),
+        today::TodayCommands::Calendar { command } => today_calendar_outputs_json(command),
+    }
+}
+
+fn today_todo_outputs_json(command: &today::TodoCommands) -> bool {
+    match command {
+        today::TodoCommands::List { json, .. }
+        | today::TodoCommands::Add { json, .. }
+        | today::TodoCommands::Update { json, .. }
+        | today::TodoCommands::Rm { json, .. }
+        | today::TodoCommands::Activity { json, .. } => *json,
+    }
+}
+
+fn today_planned_outputs_json(command: &today::PlannedCommands) -> bool {
+    match command {
+        today::PlannedCommands::List { json, .. }
+        | today::PlannedCommands::Material { json, .. }
+        | today::PlannedCommands::Add { json, .. }
+        | today::PlannedCommands::Update { json, .. }
+        | today::PlannedCommands::Rm { json, .. }
+        | today::PlannedCommands::Adopt { json, .. } => *json,
+    }
+}
+
+fn today_calendar_outputs_json(command: &today::CalendarCommands) -> bool {
+    match command {
+        today::CalendarCommands::Events { json, .. }
+        | today::CalendarCommands::Complete { json, .. }
+        | today::CalendarCommands::GoalCalendar { json, .. }
+        | today::CalendarCommands::GoalHistory { json, .. } => *json,
+    }
+}
+
+/// Resolved token-auth settings taken from the `ADDNESS_*` environment
+/// variables. Separated from the raw `std::env::var` reads so the trim/empty
+/// handling can be unit-tested without racing on process-global env state in
+/// parallel `cargo test` runs (same pattern as `http_timeout_from_env_value`).
+struct EnvClientConfig {
+    token: String,
+    api_url: String,
+    org_id: Option<String>,
+}
+
+/// Build an [`EnvClientConfig`] from raw env values. Returns `None` when no
+/// usable token is present (unset, empty, or whitespace-only), in which case
+/// callers fall back to `credentials.json`.
+fn env_client_config(
+    token: Option<&str>,
+    api_url: Option<&str>,
+    org_id: Option<&str>,
+) -> Option<EnvClientConfig> {
+    let token = token.map(str::trim).filter(|t| !t.is_empty())?;
+    let api_url = api_url
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .unwrap_or(DEFAULT_API_URL)
+        .to_string();
+    let org_id = org_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+    Some(EnvClientConfig {
+        token: token.to_string(),
+        api_url,
+        org_id,
+    })
+}
+
+/// Construct an [`ApiClient`] from the `ADDNESS_*` environment variables when a
+/// token is present. Used in CI (e.g. upstream-sync) where `addness login` is
+/// unavailable. Returns `None` when no token env var is set so callers fall
+/// back to the stored credentials.
+fn client_from_env() -> Option<Result<ApiClient>> {
+    let cfg = env_client_config(
+        std::env::var("ADDNESS_API_TOKEN").ok().as_deref(),
+        std::env::var("ADDNESS_API_URL").ok().as_deref(),
+        std::env::var("ADDNESS_ORG_ID").ok().as_deref(),
+    )?;
+    Some(ApiClient::new(&cfg.token, &cfg.api_url).map(|client| client.with_org_id(cfg.org_id)))
+}
+
+/// Return the API URL to use for browser login when the interactive TUI has no
+/// usable authentication source. Environment-token authentication takes
+/// precedence over stored credentials, matching [`build_client`].
+fn browser_login_api_url(
+    env_token: Option<&str>,
+    credentials: Option<&Credentials>,
+    current_org_id: Option<&str>,
+) -> Option<String> {
+    if env_token.is_some_and(|token| !token.trim().is_empty()) {
+        return None;
+    }
+
+    let has_stored_token = credentials.is_some_and(|creds| match current_org_id {
+        Some(org_id) => creds.token_for_org(org_id).is_some(),
+        None => creds.any_token().is_some(),
+    });
+    if has_stored_token {
+        return None;
+    }
+
+    Some(
+        credentials
+            .map(|creds| creds.api_url())
+            .unwrap_or(DEFAULT_API_URL)
+            .to_string(),
+    )
+}
+
+fn pending_browser_login_api_url() -> Result<Option<String>> {
+    let credentials = Credentials::load()?;
+    let settings = Settings::load()?;
+    Ok(browser_login_api_url(
+        std::env::var("ADDNESS_API_TOKEN").ok().as_deref(),
+        credentials.as_ref(),
+        settings.current_organization_id(),
+    ))
+}
+
+async fn build_tui_client() -> Result<ApiClient> {
+    if let Some(api_url) = pending_browser_login_api_url()? {
+        println!("Authentication is required. Starting browser login...");
+        println!();
+        login::handle_login(&api_url, None).await?;
+    }
+
+    build_client()
+}
+
 fn build_client() -> Result<ApiClient> {
+    build_client_for_organization(None)
+}
+
+fn build_client_for_organization(organization: Option<&str>) -> Result<ApiClient> {
+    if let Some(client) = client_from_env() {
+        return client.map(|mut client| {
+            if let Some(organization) = organization {
+                client.set_org_id(Some(organization.to_string()));
+            }
+            client
+        });
+    }
     let creds = Credentials::load()?;
     let settings = Settings::load()?;
     match creds {
         Some(c) => {
-            let org_id = settings.current_organization_id();
+            let org_id = organization.or_else(|| settings.current_organization_id());
             let token = match org_id {
                 Some(id) => c.token_for_org(id).ok_or_else(|| {
                     anyhow::anyhow!(
-                        "No API key stored for organization '{id}'. Run `addness login` to authenticate."
+                        "No API key stored for organization '{id}'. Run `addness login` to authenticate this org, or `addness configure` if you have a key for it."
                     )
                 })?,
                 None => c.any_token().ok_or_else(|| {
-                    anyhow::anyhow!("Not configured. Run: addness login")
+                    anyhow::anyhow!(
+                        "Not configured. Run: addness login (or 'addness configure' if you already have an API key)."
+                    )
                 })?,
             };
             Ok(ApiClient::new(token, c.api_url())?.with_org_id(org_id.map(|id| id.to_string())))
         }
-        None => bail!("Not configured. Run: addness login"),
+        None => bail!(
+            "Not configured. Run: addness login (or 'addness configure' if you already have an API key)."
+        ),
     }
 }
 
 /// Build a client for org-level commands (org list, org current, etc.)
 /// Falls back to any available token when the current org has no key stored.
 fn build_client_for_org_commands() -> Result<ApiClient> {
+    if let Some(client) = client_from_env() {
+        return client;
+    }
     let creds = Credentials::load()?;
     let settings = Settings::load()?;
     match creds {
@@ -153,10 +853,16 @@ fn build_client_for_org_commands() -> Result<ApiClient> {
                 Some(id) => c.token_for_org(id).or_else(|| c.any_token()),
                 None => c.any_token(),
             }
-            .ok_or_else(|| anyhow::anyhow!("Not configured. Run: addness login"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Not configured. Run: addness login (or 'addness configure' if you already have an API key)."
+                )
+            })?;
             Ok(ApiClient::new(token, c.api_url())?.with_org_id(org_id.map(|id| id.to_string())))
         }
-        None => bail!("Not configured. Run: addness login"),
+        None => bail!(
+            "Not configured. Run: addness login (or 'addness configure' if you already have an API key)."
+        ),
     }
 }
 
@@ -164,11 +870,17 @@ fn build_client_for_org_commands() -> Result<ApiClient> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let update_handle = tokio::spawn(update_check::check_for_update());
+    if cli.should_check_for_update() {
+        update_check::auto_update_before_launch().await;
+    }
 
-    let result = match &cli.command {
+    match &cli.command {
+        Some(Commands::Mcp(args)) => {
+            let client = build_client_for_organization(args.org.as_deref())?;
+            mcp::handle_mcp(args, &client).await
+        }
         None => {
-            let client = build_client()?;
+            let client = build_tui_client().await?;
             tui::run(client)
         }
         Some(Commands::Login {
@@ -186,9 +898,29 @@ async fn main() -> Result<()> {
             let client = build_client()?;
             goal::handle_goals(command, &client).await
         }
+        Some(Commands::Form { command }) => {
+            let client = build_client()?;
+            form::handle_form(command, &client).await
+        }
+        Some(Commands::CoreValues { command }) => {
+            let client = build_client()?;
+            core_values::handle_core_values(command, &client).await
+        }
+        Some(Commands::MasterPlan { command }) => {
+            let client = build_client()?;
+            master_plan::handle_master_plan(command, &client).await
+        }
         Some(Commands::Comment { command }) => {
             let client = build_client()?;
             comment::handle_comments(command, &client).await
+        }
+        Some(Commands::Issue { command }) => {
+            let client = build_client()?;
+            issue::handle_issue(command, &client).await
+        }
+        Some(Commands::Chat { command }) => {
+            let client = build_client()?;
+            chat::handle_chat(command, &client).await
         }
         Some(Commands::Link { command }) => {
             let client = build_client()?;
@@ -202,23 +934,82 @@ async fn main() -> Result<()> {
             let client = build_client()?;
             assignment::handle_assignment(command, &client).await
         }
-        Some(Commands::Kpi { command }) => {
-            let client = build_client()?;
-            kpi::handle_kpi(command, &client).await
-        }
         Some(Commands::Member { command }) => {
             let client = build_client()?;
             member::handle_member(command, &client).await
+        }
+        Some(Commands::User { command }) => {
+            let client = build_client()?;
+            user::handle_user(command, &client).await
+        }
+        Some(Commands::Notification { command }) => {
+            let client = build_client()?;
+            notification::handle_notification(command, &client).await
         }
         Some(Commands::Invitation { command }) => {
             let client = build_client()?;
             invitation::handle_invitation(command, &client).await
         }
+        Some(Commands::Activity { command }) => {
+            let client = build_client()?;
+            activity::handle_activity(command, &client).await
+        }
+        Some(Commands::Streak { command }) => {
+            let client = build_client()?;
+            streak::handle_streak(command, &client).await
+        }
+        Some(Commands::Today { command }) => {
+            let client = build_client()?;
+            today::handle_today(command.as_ref(), &client).await
+        }
         Some(Commands::Summary { org, depth, json }) => {
             let client = build_client()?;
             summary::handle_summary(org.as_deref(), *depth, *json, &client).await
         }
+        Some(Commands::Search {
+            query,
+            org,
+            limit,
+            offset,
+            json,
+        }) => {
+            let client = build_client()?;
+            search::handle_search(query, org.as_deref(), *limit, *offset, *json, &client).await
+        }
+        Some(Commands::Diagnosis { command }) => {
+            let client = build_client()?;
+            diagnosis::handle_diagnosis(command, &client).await
+        }
+        Some(Commands::Referral { command }) => {
+            let client = build_client()?;
+            referral::handle_referral(command, &client).await
+        }
+        Some(Commands::Media { command }) => {
+            let client = build_client()?;
+            media::handle_media(command, &client).await
+        }
+        Some(Commands::Personal { command }) => {
+            let client = build_client()?;
+            personal::handle_personal(command, &client).await
+        }
+        Some(Commands::Execution { command }) => {
+            let client = build_client()?;
+            execution::handle_execution(command, &client).await
+        }
+        Some(Commands::Meeting { command }) => {
+            let client = build_client()?;
+            meeting::handle_meeting(command, &client).await
+        }
+        Some(Commands::DesktopAuth { command }) => {
+            let client = build_client()?;
+            desktop_auth::handle_desktop_auth(command, &client).await
+        }
+        Some(Commands::Consent { command }) => {
+            let client = build_client()?;
+            consent::handle_consent(command, &client).await
+        }
         Some(Commands::DetectGoal { json }) => detect::handle_detect_goal(*json),
+        Some(Commands::Update { check }) => update::handle_update(*check).await,
         Some(Commands::Skills) => skills::handle_skills(),
         Some(Commands::Completions { shell }) => {
             clap_complete::generate(
@@ -229,9 +1020,209 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
-    };
+    }
+}
 
-    let _ = update_handle.await;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::error::ErrorKind;
 
-    result
+    #[test]
+    fn retired_tool_command_is_not_exposed() {
+        let error = Cli::try_parse_from(["addness", "tool", "list"])
+            .err()
+            .expect("tool command must be retired");
+
+        assert_eq!(error.kind(), ErrorKind::InvalidSubcommand);
+    }
+
+    #[test]
+    fn retired_backend_api_commands_are_not_exposed() {
+        let retired_commands: &[&[&str]] = &[
+            &["addness", "goal-chat"],
+            &["addness", "codex-job"],
+            &["addness", "skill"],
+            &["addness", "share-tree"],
+            &["addness", "invoice"],
+            &["addness", "goal", "duplicate"],
+            &["addness", "goal", "alias"],
+            &["addness", "goal", "recurring"],
+            &["addness", "goal", "share", "get-public"],
+            &["addness", "org", "subscription"],
+            &["addness", "org", "ai-agent-member"],
+            &["addness", "org", "admin-check"],
+            &["addness", "personal", "now"],
+            &["addness", "personal", "markdown"],
+            &["addness", "personal", "project"],
+            &["addness", "personal", "agent-session"],
+            &["addness", "personal", "reset"],
+            &["addness", "meeting", "notes"],
+            &["addness", "meeting", "minutes"],
+            &["addness", "meeting", "huddle", "active"],
+            &["addness", "meeting", "huddle", "transcription-progress"],
+            &["addness", "execution", "codex", "apply"],
+            &["addness", "comment", "attachment"],
+            &["addness", "invitation", "legacy-accept"],
+            &["addness", "invitation", "pending"],
+            &["addness", "invitation", "accept"],
+            &["addness", "invitation", "accept-token"],
+            &["addness", "invitation", "decline"],
+            &["addness", "invitation", "link", "join"],
+            &["addness", "api-key"],
+            &["addness", "meeting", "bot", "list"],
+            &["addness", "meeting", "bot", "delete"],
+            &["addness", "api-key", "rm"],
+            &["addness", "diagnosis", "visibility"],
+            &["addness", "user", "list"],
+            &["addness", "user", "create"],
+            &["addness", "user", "rm"],
+            &["addness", "todo-chat"],
+            &["addness", "thread"],
+            &["addness", "kpi"],
+            &["addness", "goal", "decompose"],
+            &["addness", "execution", "generate"],
+            &["addness", "org", "set-context"],
+            &["addness", "org", "get-context", "org-1"],
+            &["addness", "org", "context-revisions", "org-1"],
+        ];
+
+        for args in retired_commands {
+            let error = Cli::try_parse_from(*args)
+                .err()
+                .unwrap_or_else(|| panic!("retired command was accepted: {args:?}"));
+            assert_eq!(error.kind(), ErrorKind::InvalidSubcommand, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn env_client_config_none_without_token() {
+        assert!(env_client_config(None, None, None).is_none());
+    }
+
+    #[test]
+    fn env_client_config_treats_blank_token_as_unset() {
+        assert!(env_client_config(Some(""), None, None).is_none());
+        assert!(env_client_config(Some("   "), None, None).is_none());
+    }
+
+    #[test]
+    fn env_client_config_trims_token_and_defaults_api_url() {
+        let cfg = env_client_config(Some("  secret-token  "), None, None).expect("some");
+        assert_eq!(cfg.token, "secret-token");
+        assert_eq!(cfg.api_url, DEFAULT_API_URL);
+        assert_eq!(cfg.org_id, None);
+    }
+
+    #[test]
+    fn env_client_config_uses_custom_api_url_and_org_id() {
+        let cfg = env_client_config(
+            Some("token"),
+            Some("  https://api.example.test  "),
+            Some("  org-123  "),
+        )
+        .expect("some");
+        assert_eq!(cfg.api_url, "https://api.example.test");
+        assert_eq!(cfg.org_id.as_deref(), Some("org-123"));
+    }
+
+    #[test]
+    fn env_client_config_ignores_blank_api_url_and_org_id() {
+        let cfg = env_client_config(Some("token"), Some("   "), Some("   ")).expect("some");
+        assert_eq!(cfg.api_url, DEFAULT_API_URL);
+        assert_eq!(cfg.org_id, None);
+    }
+
+    #[test]
+    fn browser_login_uses_default_api_without_authentication() {
+        assert_eq!(
+            browser_login_api_url(None, None, None).as_deref(),
+            Some(DEFAULT_API_URL)
+        );
+        assert_eq!(
+            browser_login_api_url(Some("   "), None, None).as_deref(),
+            Some(DEFAULT_API_URL)
+        );
+    }
+
+    #[test]
+    fn browser_login_is_skipped_for_environment_token() {
+        assert_eq!(browser_login_api_url(Some(" token "), None, None), None);
+    }
+
+    #[test]
+    fn browser_login_is_skipped_for_current_organization_token() {
+        let mut credentials = Credentials::new("https://api.example.test".to_string());
+        credentials.set_token("org-1".to_string(), "token".to_string());
+
+        assert_eq!(
+            browser_login_api_url(None, Some(&credentials), Some("org-1")),
+            None
+        );
+        assert_eq!(browser_login_api_url(None, Some(&credentials), None), None);
+    }
+
+    #[test]
+    fn browser_login_uses_stored_api_for_missing_organization_token() {
+        let mut credentials = Credentials::new("https://api.example.test".to_string());
+        credentials.set_token("org-1".to_string(), "token".to_string());
+
+        assert_eq!(
+            browser_login_api_url(None, Some(&credentials), Some("org-2")).as_deref(),
+            Some("https://api.example.test")
+        );
+    }
+
+    #[test]
+    fn update_check_runs_for_tui_and_human_commands() {
+        assert!(Cli { command: None }.should_check_for_update());
+        assert!(
+            Cli {
+                command: Some(Commands::Status { json: false })
+            }
+            .should_check_for_update()
+        );
+        assert!(
+            Cli {
+                command: Some(Commands::Today { command: None })
+            }
+            .should_check_for_update()
+        );
+    }
+
+    #[test]
+    fn update_check_skips_json_commands() {
+        assert!(
+            !Cli {
+                command: Some(Commands::Status { json: true })
+            }
+            .should_check_for_update()
+        );
+        assert!(
+            !Cli {
+                command: Some(Commands::Goal {
+                    command: goal::GoalCommands::List {
+                        org: None,
+                        depth: 3,
+                        assigned_to: None,
+                        status: None,
+                        json: true,
+                    }
+                })
+            }
+            .should_check_for_update()
+        );
+    }
+
+    #[test]
+    fn update_check_skips_completions() {
+        assert!(
+            !Cli {
+                command: Some(Commands::Completions {
+                    shell: clap_complete::Shell::Bash,
+                })
+            }
+            .should_check_for_update()
+        );
+    }
 }

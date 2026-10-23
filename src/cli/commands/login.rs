@@ -81,11 +81,61 @@ fn sign_message(signing_key: &SigningKey, message: &str) -> String {
     URL_SAFE_NO_PAD.encode(signature.to_bytes())
 }
 
+fn build_privileged_exchange_signature_message(
+    installation_id: &str,
+    handoff_id: &str,
+    code_verifier: &str,
+    organization_id: Option<&str>,
+    timestamp: i64,
+) -> String {
+    let organization_id = organization_id.unwrap_or_default();
+
+    format!(
+        r#"visiontodo-desktop-auth-exchange-privileged-v1
+installation_id={installation_id}
+handoff_id={handoff_id}
+code_verifier={code_verifier}
+source=cli
+organization_id={organization_id}
+timestamp={timestamp}"#
+    )
+}
+
+fn build_exchange_body(
+    installation_id: &str,
+    handoff_id: &str,
+    code_verifier: &str,
+    timestamp: i64,
+    signatures: (&str, &str),
+    organization_id: Option<&str>,
+) -> serde_json::Value {
+    let (signature, privileged_signature) = signatures;
+    let mut body = serde_json::json!({
+        "handoffId": handoff_id,
+        "codeVerifier": code_verifier,
+        "installationId": installation_id,
+        "timestamp": timestamp,
+        "signature": signature,
+        "privilegedSignature": privileged_signature,
+        "source": "cli",
+    });
+
+    if let Some(org_id) = organization_id {
+        body["organizationId"] = serde_json::Value::String(org_id.to_string());
+    }
+
+    body
+}
+
 fn timestamp() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock before Unix epoch")
         .as_secs() as i64
+}
+
+fn is_callback_path(path: &str, expected_state: &str) -> bool {
+    path == "/callback" || path == format!("/callback/{expected_state}")
 }
 
 pub async fn handle_login(api_url: &str, frontend_url: Option<&str>) -> Result<()> {
@@ -200,10 +250,12 @@ timestamp={ts}"#,
     println!("Waiting for login...");
 
     // 8. localhostでコールバックを待機（hyperでHTTPリクエストを処理）
-    let (handoff_id, callback_state) =
-        tokio::time::timeout(Duration::from_secs(300), wait_for_callback(listener))
-            .await
-            .map_err(|_| anyhow::anyhow!("Login timed out (5 minutes). Please try again."))??;
+    let (handoff_id, callback_state) = tokio::time::timeout(
+        Duration::from_secs(300),
+        wait_for_callback(listener, &state),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Login timed out (5 minutes). Please try again."))??;
 
     if callback_state != state {
         bail!("State mismatch: expected {}, got {}", state, callback_state);
@@ -219,27 +271,22 @@ code_verifier={code_verifier}
 timestamp={ts}"#
     );
     let exchange_signature = sign_message(&signing_key, &exchange_message);
-
-    let exchange_body = if let Some(org_id) = &current_org_id {
-        serde_json::json!({
-            "handoffId": handoff_id,
-            "codeVerifier": code_verifier,
-            "installationId": installation_id,
-            "timestamp": ts,
-            "signature": exchange_signature,
-            "source": "cli",
-            "organizationId": org_id,
-        })
-    } else {
-        serde_json::json!({
-            "handoffId": handoff_id,
-            "codeVerifier": code_verifier,
-            "installationId": installation_id,
-            "timestamp": ts,
-            "signature": exchange_signature,
-            "source": "cli",
-        })
-    };
+    let privileged_exchange_message = build_privileged_exchange_signature_message(
+        &installation_id,
+        &handoff_id,
+        &code_verifier,
+        current_org_id.as_deref(),
+        ts,
+    );
+    let privileged_exchange_signature = sign_message(&signing_key, &privileged_exchange_message);
+    let exchange_body = build_exchange_body(
+        &installation_id,
+        &handoff_id,
+        &code_verifier,
+        ts,
+        (&exchange_signature, &privileged_exchange_signature),
+        current_org_id.as_deref(),
+    );
 
     let exchange_resp = client
         .post(format!(
@@ -321,11 +368,15 @@ timestamp={ts}"#
     Ok(())
 }
 
-async fn wait_for_callback(listener: tokio::net::TcpListener) -> Result<(String, String)> {
+async fn wait_for_callback(
+    listener: tokio::net::TcpListener,
+    expected_state: &str,
+) -> Result<(String, String)> {
     use tokio::sync::oneshot;
 
     let (tx, rx) = oneshot::channel::<(String, String)>();
     let tx = std::sync::Mutex::new(Some(tx));
+    let expected_state = expected_state.to_string();
 
     let (stream, _) = listener
         .accept()
@@ -334,9 +385,14 @@ async fn wait_for_callback(listener: tokio::net::TcpListener) -> Result<(String,
     let io = hyper_util::rt::TokioIo::new(stream);
 
     let service = service_fn(move |req: Request<Incoming>| {
-        let tx = tx.lock().unwrap().take();
+        let is_callback = is_callback_path(req.uri().path(), &expected_state);
+        let tx = if is_callback {
+            tx.lock().unwrap().take()
+        } else {
+            None
+        };
         async move {
-            if !req.uri().path().starts_with("/callback") {
+            if !is_callback {
                 return Ok::<_, Infallible>(
                     Response::builder()
                         .status(StatusCode::NOT_FOUND)
@@ -383,4 +439,117 @@ async fn wait_for_callback(listener: tokio::net::TcpListener) -> Result<(String,
     }
 
     Ok((handoff_id, state))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_exchange_body, build_privileged_exchange_signature_message, is_callback_path,
+        wait_for_callback,
+    };
+    use reqwest::StatusCode;
+
+    #[test]
+    fn callback_path_accepts_current_and_legacy_contracts_exactly() {
+        let state = "session-1";
+
+        assert!(is_callback_path("/callback", state));
+        assert!(is_callback_path("/callback/session-1", state));
+        assert!(!is_callback_path("/callback/session-2", state));
+        assert!(!is_callback_path("/callback/session-1/extra", state));
+        assert!(!is_callback_path("/callback-extra", state));
+    }
+
+    #[test]
+    fn privileged_exchange_signature_binds_cli_capability_and_organization() {
+        assert_eq!(
+            build_privileged_exchange_signature_message(
+                "installation-1",
+                "handoff-1",
+                "verifier-1",
+                Some("org-1"),
+                1_775_000_000,
+            ),
+            r#"visiontodo-desktop-auth-exchange-privileged-v1
+installation_id=installation-1
+handoff_id=handoff-1
+code_verifier=verifier-1
+source=cli
+organization_id=org-1
+timestamp=1775000000"#
+        );
+    }
+
+    #[test]
+    fn privileged_exchange_signature_binds_empty_organization() {
+        assert_eq!(
+            build_privileged_exchange_signature_message(
+                "installation-1",
+                "handoff-1",
+                "verifier-1",
+                None,
+                1_775_000_000,
+            ),
+            r#"visiontodo-desktop-auth-exchange-privileged-v1
+installation_id=installation-1
+handoff_id=handoff-1
+code_verifier=verifier-1
+source=cli
+organization_id=
+timestamp=1775000000"#
+        );
+    }
+
+    #[test]
+    fn exchange_body_sends_privileged_signature() {
+        let body = build_exchange_body(
+            "installation-1",
+            "handoff-1",
+            "verifier-1",
+            1_775_000_000,
+            ("legacy-signature", "privileged-signature"),
+            Some("org-1"),
+        );
+
+        assert_eq!(body["source"], "cli");
+        assert_eq!(body["organizationId"], "org-1");
+        assert_eq!(body["signature"], "legacy-signature");
+        assert_eq!(body["privilegedSignature"], "privileged-signature");
+    }
+
+    #[test]
+    fn exchange_body_omits_unselected_organization() {
+        let body = build_exchange_body(
+            "installation-1",
+            "handoff-1",
+            "verifier-1",
+            1_775_000_000,
+            ("legacy-signature", "privileged-signature"),
+            None,
+        );
+
+        assert!(body.get("organizationId").is_none());
+        assert_eq!(body["privilegedSignature"], "privileged-signature");
+    }
+
+    #[tokio::test]
+    async fn callback_listener_accepts_state_scoped_path() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let callback =
+            tokio::spawn(async move { wait_for_callback(listener, "session-1").await.unwrap() });
+
+        let response = reqwest::get(format!(
+            "http://{address}/callback/session-1?state=session-1&handoff_id=handoff-1"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(response);
+
+        assert_eq!(
+            callback.await.unwrap(),
+            ("handoff-1".to_string(), "session-1".to_string())
+        );
+    }
 }

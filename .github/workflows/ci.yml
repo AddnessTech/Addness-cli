@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -27,10 +27,30 @@ jobs:
         run: cargo fmt --check
 
       - name: clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: build
         run: cargo build
 
       - name: test
         run: cargo test
+
+      - name: Upstream read retries
+        run: bash .github/scripts/test-retry-read.sh
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install verified agent CLI versions
+        run: >-
+          npm install --prefix "$RUNNER_TEMP/addness-upstream" --no-audit --no-fund
+          @openai/codex@0.154.0 @anthropic-ai/claude-code@2.1.267
+
+      - name: Agent protocol compatibility
+        env:
+          ADDNESS_PROBE_CODEX_BIN: ${{ runner.temp }}/addness-upstream/node_modules/.bin/codex
+          ADDNESS_PROBE_CLAUDE_BIN: ${{ runner.temp }}/addness-upstream/node_modules/.bin/claude
+        run: |
+          cargo test --locked upstream_probe_ -- --ignored
+          python3 .github/scripts/probe-claude-prompt.py

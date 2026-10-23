@@ -12,3 +12,6 @@ CLAUDE.md
 .claude/settings.local.json
 .addness/
 tmp-addness/
+
+# Playwright MCP scratch output
+.playwright-mcp/

@@ -109,6 +109,8 @@ pub async fn handle_link(cmd: &LinkCommands, client: &ApiClient) -> Result<()> {
                     completed_at,
                     title: None,
                     description: None,
+                    body: None,
+                    due_date: None,
                 };
                 let _: ApiResponse<Goal> = client.update_goal(goal, &req).await?;
             }

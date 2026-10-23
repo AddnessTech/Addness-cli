@@ -1,6 +1,6 @@
 use std::io::{self, Write};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use crate::config::{Credentials, Settings};
 
@@ -29,6 +29,13 @@ fn mask_key(key: &str) -> String {
     } else {
         "***".to_string()
     }
+}
+
+fn ensure_non_empty_api_key(api_key: &str) -> Result<()> {
+    if api_key.trim().is_empty() {
+        bail!("API Key cannot be empty. Run `addness login` or enter an API key.");
+    }
+    Ok(())
 }
 
 pub fn handle_configure() -> Result<()> {
@@ -64,6 +71,7 @@ pub fn handle_configure() -> Result<()> {
     } else {
         api_key
     };
+    ensure_non_empty_api_key(&api_key)?;
 
     // API URL
     let api_url = prompt("API URL", existing_creds.api_url())?;
@@ -128,7 +136,7 @@ pub fn handle_status(json: bool) -> Result<()> {
                     println!("  Organization: {}", id);
                     if creds.token_for_org(id).is_none() {
                         println!(
-                            "  Warning: No API key for this organization. Run 'addness login' to authenticate."
+                            "  Warning: No API key for this organization. Run 'addness login' to authenticate this org, or 'addness configure' if you have a key for it."
                         );
                     }
                 }
@@ -145,7 +153,9 @@ pub fn handle_status(json: bool) -> Result<()> {
                 let output = serde_json::json!({ "authenticated": false });
                 println!("{}", serde_json::to_string_pretty(&output)?);
             } else {
-                println!("Not configured. Run: addness configure");
+                println!(
+                    "Not configured. Run: addness login (or 'addness configure' if you already have an API key)."
+                );
             }
         }
     }
@@ -157,4 +167,20 @@ pub fn handle_logout() -> Result<()> {
     Settings::delete()?;
     println!("Logged out. Credentials and settings removed.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_non_empty_api_key;
+
+    #[test]
+    fn api_key_validation_rejects_blank_values() {
+        assert!(ensure_non_empty_api_key("").is_err());
+        assert!(ensure_non_empty_api_key("   ").is_err());
+    }
+
+    #[test]
+    fn api_key_validation_accepts_non_blank_values() {
+        assert!(ensure_non_empty_api_key("ak_test").is_ok());
+    }
 }

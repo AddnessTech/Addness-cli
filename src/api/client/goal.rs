@@ -1,8 +1,6 @@
 use crate::api::{
-    Alias, ApiClient, ApiResponse, ChangeParentRequest, CreateAliasRequest, CreateGoalRequest,
-    DuplicateRequest, Goal, GoalChildrenData, GoalSearchResponse, GoalTreeData,
-    ObjectiveIdsRequest, ReorderAliasesRequest, ReorderAliasesResponse, ShareLinkResponse,
-    UpdateGoalRequest,
+    ApiClient, ApiResponse, ChangeParentRequest, CreateGoalRequest, Goal, GoalChildrenData,
+    GoalSearchResponse, GoalTreeData, ObjectiveIdsRequest, ShareLinkResponse, UpdateGoalRequest,
 };
 use anyhow::Result;
 
@@ -30,7 +28,17 @@ impl ApiClient {
             org_id, depth
         );
 
-        self.get(&path).await
+        // `include_completed=true` を付けるとサーバーが 5xx を返す不具合があるため、
+        // 失敗時は完了ゴールを除いた通常ツリーへフォールバックし、一覧が空に
+        // ならないようにする。サーバー復旧後は自動的に完了ゴールも再表示される。
+        // 通常ツリーも失敗した場合は本来のエラーを返す（認証切れ等の握り潰し回避）。
+        match self.get(&path).await {
+            Ok(resp) => Ok(resp),
+            Err(primary_err) => self
+                .get_goal_tree(org_id, depth)
+                .await
+                .map_err(|_| primary_err),
+        }
     }
 
     pub async fn get_goal(&self, goal_id: &str) -> Result<ApiResponse<Goal>> {
@@ -57,7 +65,7 @@ impl ApiClient {
 
     pub async fn search_goals(&self, query: &str) -> Result<ApiResponse<GoalSearchResponse>> {
         let encoded: String = form_urlencoded::byte_serialize(query.as_bytes()).collect();
-        let path = format!("/api/v1/team/objectives/search?title={encoded}&permission=read");
+        let path = format!("/api/v2/objectives/search?title={encoded}&permission=read");
         self.get(&path).await
     }
 
@@ -104,18 +112,6 @@ impl ApiClient {
             .await
     }
 
-    pub async fn duplicate_goal(
-        &self,
-        goal_id: &str,
-        parent_id: &str,
-    ) -> Result<ApiResponse<Goal>> {
-        let path = format!("/api/v2/objectives/{goal_id}/duplicate");
-        let body = DuplicateRequest {
-            parent_id: parent_id.to_string(),
-        };
-        self.post(&path, &body).await
-    }
-
     pub async fn change_goal_parent(
         &self,
         goal_id: &str,
@@ -127,42 +123,13 @@ impl ApiClient {
     }
 
     pub async fn create_share_link(&self, goal_id: &str) -> Result<ShareLinkResponse> {
-        let path = format!("/api/v1/team/objectives/{goal_id}/share");
-        self.post_empty(&path).await
+        let path = format!("/api/v2/objectives/{goal_id}/share");
+        let response: ApiResponse<ShareLinkResponse> = self.post_empty(&path).await?;
+        Ok(response.data)
     }
 
     pub async fn revoke_share_link(&self, goal_id: &str) -> Result<()> {
-        let path = format!("/api/v1/team/objectives/{goal_id}/share");
-        self.delete_no_body(&path).await
-    }
-
-    pub async fn create_alias(
-        &self,
-        parent_goal_id: &str,
-        target_objective_id: &str,
-        order_no: i32,
-    ) -> Result<ApiResponse<Alias>> {
-        let path = format!("/api/v1/team/objectives/{parent_goal_id}/aliases");
-        let body = CreateAliasRequest {
-            target_objective_id: target_objective_id.to_string(),
-            order_no,
-        };
-        self.post(&path, &body).await
-    }
-
-    pub async fn reorder_aliases(
-        &self,
-        parent_goal_id: &str,
-        alias_ids: Vec<String>,
-    ) -> Result<()> {
-        let path = format!("/api/v1/team/objectives/{parent_goal_id}/aliases/reorder");
-        let body = ReorderAliasesRequest { alias_ids };
-        let _: ApiResponse<ReorderAliasesResponse> = self.patch(&path, &body).await?;
-        Ok(())
-    }
-
-    pub async fn delete_alias(&self, parent_goal_id: &str, alias_id: &str) -> Result<()> {
-        let path = format!("/api/v1/team/objectives/{parent_goal_id}/aliases/{alias_id}");
+        let path = format!("/api/v2/objectives/{goal_id}/share");
         self.delete_no_body(&path).await
     }
 }

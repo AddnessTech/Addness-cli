@@ -151,6 +151,21 @@ addness comment --help
 addness link --help
 ```
 
+## チャレンジ
+
+```bash
+addness challenge list --json
+addness challenge start <key> --json
+addness challenge verify <key> <run-id> --json
+addness challenge complete <key> <run-id> --manual-step <completed-step> --json
+addness challenge --help
+```
+
+一覧の `openRun` を先に確認してください。開始すると既存の開いた券は破棄されます。
+完了時には実際に終えた manual 手順を `--manual-step` で繰り返し指定し、その他の手順はサーバーが検証します。
+`--org` と `--platform` で対象を選べます。対象組織に束縛された組織APIキーと、対応バックエンドが必要です。
+`count-roads` は到達済みの節目に加点する場合があります。
+
 ## CLIコマンド一覧
 
 主なコマンドグループの概要です。各コマンドのフラグとサブコマンドの詳細は
@@ -203,6 +218,7 @@ addness link --help
 - `meeting` — Huddle の状態/録音/招待と Meeting Bot。議事録・録画は `mcp list --query recording --json` で確認。
 - `activity` — メンバー別/ゴール別/組織全体のアクティビティログと集計。例: `addness activity list`
 - `streak` — 連続達成ストリークの確認・フリーズ・復活・公開共有。例: `addness streak get`
+- `challenge` — 自分のチャレンジの一覧・開始・進捗確認・完了。例: `addness challenge list --json`
 
 ### AI・自動化
 

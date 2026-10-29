@@ -11,7 +11,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use crate::config::{Credentials, DEFAULT_API_URL, Settings};
 use api::ApiClient;
 use cli::commands::{
-    activity, assignment, chat, comment, configure, consent, core_values, deliverable,
+    activity, assignment, challenge, chat, comment, configure, consent, core_values, deliverable,
     desktop_auth, detect, diagnosis, execution, form, goal, invitation, issue, link, login,
     master_plan, mcp, media, meeting, member, notification, org, personal, referral, search,
     skills, streak, summary, today, update, user,
@@ -65,6 +65,11 @@ enum Commands {
     Form {
         #[command(subcommand)]
         command: form::FormCommands,
+    },
+    /// Manage your Addness challenges and runs
+    Challenge {
+        #[command(subcommand)]
+        command: challenge::ChallengeCommands,
     },
     /// AI agent chat for the core-values diagnosis mode (tool-less
     /// hearing-style dialogue, not scoped to a single goal): send a message
@@ -261,6 +266,7 @@ fn command_outputs_json(command: &Commands) -> bool {
         Commands::Diagnosis { command } => diagnosis_outputs_json(command),
         Commands::Referral { command } => referral_outputs_json(command),
         Commands::Form { command } => command.outputs_json(),
+        Commands::Challenge { command } => command.outputs_json(),
         Commands::Media { command } => media_outputs_json(command),
         Commands::Personal { command } => personal_outputs_json(command),
         Commands::Execution { command } => execution_outputs_json(command),
@@ -901,6 +907,11 @@ async fn main() -> Result<()> {
         Some(Commands::Form { command }) => {
             let client = build_client()?;
             form::handle_form(command, &client).await
+        }
+        Some(Commands::Challenge { command }) => {
+            let org_id = org::resolve_org_id(command.org())?;
+            let client = build_client_for_organization(Some(&org_id))?;
+            challenge::handle_challenge(command, &client).await
         }
         Some(Commands::CoreValues { command }) => {
             let client = build_client()?;

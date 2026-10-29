@@ -1,5 +1,6 @@
 mod activity;
 mod assignment;
+mod challenge;
 mod chat;
 mod comment;
 mod consent;

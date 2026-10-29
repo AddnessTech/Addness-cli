@@ -181,6 +181,23 @@ addness link progress --goal <GOAL_ID> --message "実装完了" --status COMPLET
 addness link progress --goal <GOAL_ID> --message "着手開始" --status IN_PROGRESS --json
 ```
 
+## チャレンジ
+
+```bash
+addness challenge list --json
+addness challenge summary --json
+addness challenge start <KEY> --json
+addness challenge verify <KEY> <RUN_ID> --json
+addness challenge complete <KEY> <RUN_ID> --manual-step <STEP_KEY> --json
+addness challenge skip <KEY> --json
+addness challenge unskip <KEY> --json
+```
+
+各操作は本人と対象組織に束縛された組織APIキーを使います。対応バックエンドが必要です。
+開始は既存の開いた券を破棄するため、まず一覧の `openRun` を確認してください。
+完了はサーバーの実績検証に従い、実際に終えたmanual手順だけを `--manual-step` で指定します。未達の手順を自動で完了扱いにはしません。
+`--org` と `--platform pc|mobile` で対象を選べます。 `challenge count-roads` は到達済みの節目に加点する場合があります。
+
 ## 今日のtodo（今日のゴール）
 
 その日に取り組むゴールを「今日のtodo」として読み書きします。

@@ -1,6 +1,7 @@
 pub mod activity;
 pub mod ai_chat_render;
 pub mod assignment;
+pub mod challenge;
 pub mod chat;
 pub mod comment;
 pub mod configure;

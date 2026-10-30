@@ -54,8 +54,10 @@ jobs:
           # --- 最新リリースの取得 ---
           source .github/scripts/retry-read.sh
           latest_claude="$(retry_read gh api repos/anthropics/claude-code/releases/latest --jq '.tag_name // empty')"
-          latest_codex="$(retry_read gh api 'repos/openai/codex/releases?per_page=100' \
-            --jq '[.[] | select(.prerelease == false)][0].tag_name // empty')"
+          # codex は releases 一覧 API（per_page=100）が body 込みで約 37MB になり
+          # stream error で切られるため、tag 名だけを返す gh release list を使う。
+          latest_codex="$(retry_read gh release list -R openai/codex --exclude-pre-releases --exclude-drafts \
+            --limit 1 --json tagName --jq '.[0].tagName // empty')"
           if [ -z "$latest_claude" ] || [ -z "$latest_codex" ]; then
             echo "::error::最新リリースの取得に失敗しました (claude-code='${latest_claude}' codex='${latest_codex}')"
             exit 1
@@ -182,16 +184,33 @@ jobs:
             codex)
               # 安定版（prerelease でない）release の body を新しい順に連結。
               # LAST_VERSION が一覧に無い場合は直近 15 件、force 再実行（区間が空）は最新 1 件。
-              retry_read gh api 'repos/openai/codex/releases?per_page=100' > /tmp/releases.json
+              # 一覧 API（per_page=100）は body 込みで約 37MB になり stream error で切られるため、
+              # tag 名だけを gh release list で取り、区間内の release の body を 1 件ずつ取得する。
+              retry_read gh release list -R openai/codex --exclude-pre-releases --exclude-drafts \
+                --limit 50 --json tagName > /tmp/release-tags.json
+              if ! jq -e --arg from "$LAST_VERSION" 'map(.tagName) | index($from) != null' \
+                  /tmp/release-tags.json > /dev/null; then
+                echo "::warning::state の ${LAST_VERSION} が直近 50 件の安定版に見つからないため直近 15 件を使用します"
+              fi
               jq -r --arg from "$LAST_VERSION" '
-                [.[] | select(.prerelease == false) | {tag: .tag_name, body: (.body // "")}]
-                | (map(.tag) | index($from)) as $idx
+                map(.tagName)
+                | index($from) as $idx
                 | (if $idx == null then .[0:15]
                    elif $idx == 0 then .[0:1]
                    else .[0:$idx] end)
-                | map("## " + .tag + "\n\n" + .body + "\n")
-                | join("\n")
-              ' /tmp/releases.json > /tmp/upstream-changes.md
+                | .[]
+              ' /tmp/release-tags.json > /tmp/release-range.txt
+              echo "対象 release: $(wc -l < /tmp/release-range.txt | tr -d ' ') 件"
+              : > /tmp/upstream-changes.md
+              while IFS= read -r tag; do
+                retry_read gh api "repos/openai/codex/releases/tags/${tag}" \
+                  --jq '"## " + .tag_name + "\n\n" + (.body // "") + "\n"' >> /tmp/upstream-changes.md
+                # 後段で 200000 バイトに切り詰めるため、超えた時点で取得を打ち切る
+                if [ "$(wc -c < /tmp/upstream-changes.md)" -ge 200000 ]; then
+                  echo "チェンジログが 200000 バイトを超えたため ${tag} で取得を打ち切ります"
+                  break
+                fi
+              done < /tmp/release-range.txt
               ;;
             *)
               echo "::error::未知の target: ${TARGET}"
@@ -210,7 +229,7 @@ jobs:
       # 使用中 CLI フラグの存在）を実測検証する。チェンジログに現れない挙動変更
       # （例: codex 0.142.5 の JSON-RPC `jsonrpc` フィールド欠落）を捕まえるための保険。
       - name: Node セットアップ（プローブ用 CLI インストール）
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
 

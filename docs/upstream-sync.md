@@ -12,9 +12,9 @@
 ┌─ detect ジョブ（bash/jq のみ・API コストゼロ）────────────────┐
 │ 1. automation/upstream-state ブランチの state.json を読む      │
 │    （無ければ現在の最新版で初期化して正常終了）                │
-│ 2. gh api で最新リリース取得                                   │
-│    - claude-code: releases/latest（v2.1.201 形式）             │
-│    - codex: prerelease==false の最新（rust-v0.142.5 形式）     │
+│ 2. gh で最新リリース取得                                       │
+│    - claude-code: gh api releases/latest（v2.1.201 形式）      │
+│    - codex: gh release list の安定版最新（rust-v0.142.5 形式） │
 │ 3. state と差分があり、かつ同 target の open PR                │
 │    （label: upstream-sync）が無い target を matrix へ          │
 └──────────────────────┬─────────────────────────────────────────┘

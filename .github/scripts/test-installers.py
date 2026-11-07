@@ -126,7 +126,7 @@ def main():
                 command = (["powershell", "-NoProfile", "-Command", (REPO / "install.ps1").read_text(encoding="utf-8")]
                            if WINDOWS else ["sh", str(REPO / "install.sh")])
                 try:
-                    result = subprocess.run(command, env=environment, text=True,
+                    result = subprocess.run(command, env=environment, text=True, encoding="utf-8", errors="replace",
                                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
                     succeeds = case in ("success", "pinned", "running")
                     assert (result.returncode == 0) == succeeds, f"{case}: {result.stdout}"

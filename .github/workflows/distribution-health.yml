@@ -1,0 +1,31 @@
+name: Distribution health
+
+on:
+  schedule:
+    - cron: '17 1 * * *'
+  workflow_dispatch:
+    inputs:
+      expected_version:
+        description: 'Optional stable tag to verify, e.g. v0.16.0'
+        type: string
+        required: false
+  workflow_call:
+    inputs:
+      expected_version:
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Verify public TLS, installers, version and all platform archives
+        env:
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+        run: bash .github/scripts/check-distribution.sh "$EXPECTED_VERSION"

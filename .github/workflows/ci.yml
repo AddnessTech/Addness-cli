@@ -38,6 +38,9 @@ jobs:
       - name: Upstream read retries
         run: bash .github/scripts/test-retry-read.sh
 
+      - name: Distribution health regression tests
+        run: bash .github/scripts/test-distribution-health.sh
+
       - uses: actions/setup-node@v7
         with:
           node-version: 22

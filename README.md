@@ -23,13 +23,13 @@ Addness CLI は、ローカルの開発環境・スクリプト・AIコーディ
 macOS・Linux:
 
 ```bash
-curl -fsSL https://cli.addness.com/install.sh | sh
+curl -fsSL https://d22sm2skny3y0p.cloudfront.net/install.sh | sh
 ```
 
 Windows PowerShell:
 
 ```powershell
-irm https://cli.addness.com/install.ps1 | iex
+irm https://d22sm2skny3y0p.cloudfront.net/install.ps1 | iex
 ```
 
 ソースから:
@@ -39,6 +39,17 @@ git clone https://github.com/AddnessTech/Addness-cli.git
 cd Addness-cli
 cargo build --release
 ```
+
+### アップデート
+
+```bash
+addness update --check
+addness update
+```
+
+v0.16.0以前は更新先が `cli.addness.com` に固定されています。上のインストールコマンドを一度実行して移行してください。認証情報・設定はそのまま使えます。v0.16.1以降はCloudFrontの配布URLから更新します。
+
+更新は実行中のCLIの場所へ、確認したバージョンを指定して行います。ダウンロード・SHA-256・実行ファイルのバージョン検証に失敗した場合は更新を中断します。`--check` は確認のみで、インストールしません。
 
 ## ログイン
 

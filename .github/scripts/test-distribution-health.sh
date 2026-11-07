@@ -38,7 +38,7 @@ while [ "$#" -gt 0 ]; do
 done
 printf '%s\n' "$url" >> "$TEST_ROOT/requests"
 if [ "${TEST_FAILURE:-}" = 'tls' ]; then exit 60; fi
-relative="${url#https://cli.addness.com/}"
+relative="${url#https://d22sm2skny3y0p.cloudfront.net/}"
 case "${TEST_FAILURE:-}:$relative" in
   stale:releases/latest/version.txt) printf 'v0.15.1\n' > "$destination"; exit 0 ;;
   invalid-version:releases/latest/version.txt) printf '<html>broken</html>\n' > "$destination"; exit 0 ;;
@@ -54,7 +54,7 @@ cat > "$test_root/bin/openssl" <<'MOCK'
 set -euo pipefail
 case "$1" in
   s_client)
-    [[ " $* " == *' -verify_hostname cli.addness.com '* ]]
+    [[ " $* " == *' -verify_hostname d22sm2skny3y0p.cloudfront.net '* ]]
     [[ " $* " == *' -verify_return_error '* ]]
     printf 'fixture certificate\n'
     ;;

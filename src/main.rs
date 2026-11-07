@@ -249,7 +249,7 @@ enum Commands {
 impl Cli {
     fn should_check_for_update(&self) -> bool {
         match &self.command {
-            Some(Commands::Completions { .. }) => false,
+            Some(Commands::Completions { .. } | Commands::Update { .. }) => false,
             Some(command) => !command_outputs_json(command),
             None => true,
         }
@@ -1237,5 +1237,17 @@ mod tests {
             }
             .should_check_for_update()
         );
+    }
+
+    #[test]
+    fn explicit_update_does_not_auto_install_before_handling_check_flag() {
+        for check in [true, false] {
+            assert!(
+                !Cli {
+                    command: Some(Commands::Update { check })
+                }
+                .should_check_for_update()
+            );
+        }
     }
 }

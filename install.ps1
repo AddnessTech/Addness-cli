@@ -1,9 +1,9 @@
 # Addness CLI installer for Windows
-# Usage: irm https://cli.addness.com/install.ps1 | iex
+# Usage: irm https://d22sm2skny3y0p.cloudfront.net/install.ps1 | iex
 
 $ErrorActionPreference = "Stop"
 
-$CdnBase = if ($env:ADDNESS_CDN_BASE) { $env:ADDNESS_CDN_BASE } else { "https://cli.addness.com" }
+$CdnBase = if ($env:ADDNESS_CDN_BASE) { $env:ADDNESS_CDN_BASE } else { "https://d22sm2skny3y0p.cloudfront.net" }
 $InstallDir = if ($env:ADDNESS_INSTALL_DIR) { $env:ADDNESS_INSTALL_DIR } else { "$env:LOCALAPPDATA\addness\bin" }
 $Version = if ($env:ADDNESS_VERSION) { $env:ADDNESS_VERSION } else { "latest" }
 
@@ -66,6 +66,13 @@ function Write-Err {
 function Main {
     Write-Banner
 
+    if ($Version -eq "latest") {
+        $Version = (Invoke-RestMethod -Uri "${CdnBase}/releases/latest/version.txt" -TimeoutSec 30).Trim()
+    }
+    if ($Version -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+        throw "Invalid release version: ${Version}"
+    }
+
     $Target = "x86_64-pc-windows-msvc"
     Write-Info "Platform  $Target"
     Write-Info "Version   $Version"
@@ -84,14 +91,18 @@ function Main {
         $archivePath = Join-Path $TmpDir $Archive
         Write-Step "Downloading"
         $ProgressPreference = 'SilentlyContinue'
-        Invoke-WebRequest -Uri $Url -OutFile $archivePath -UseBasicParsing
-        Invoke-WebRequest -Uri $ShaUrl -OutFile (Join-Path $TmpDir "${Archive}.sha256") -UseBasicParsing
+        Invoke-WebRequest -Uri $Url -OutFile $archivePath -UseBasicParsing -TimeoutSec 120
+        Invoke-WebRequest -Uri $ShaUrl -OutFile (Join-Path $TmpDir "${Archive}.sha256") -UseBasicParsing -TimeoutSec 30
         $ProgressPreference = 'Continue'
         Write-StepOk
 
         Write-Step "Verifying checksum"
         $expectedLine = (Get-Content (Join-Path $TmpDir "${Archive}.sha256") -Raw).Trim()
-        $expectedHash = ($expectedLine -split "\s+")[0].ToLower()
+        $checksumParts = $expectedLine -split "\s+"
+        if ($checksumParts.Count -ne 2 -or $checksumParts[0] -notmatch '^[a-fA-F0-9]{64}$' -or $checksumParts[1] -cne $Archive) {
+            throw "Invalid checksum record for ${Archive}"
+        }
+        $expectedHash = $checksumParts[0].ToLower()
         $actualHash = (Get-FileHash -Algorithm SHA256 (Join-Path $TmpDir $Archive)).Hash.ToLower()
         if ($actualHash -ne $expectedHash) {
             Write-Host " failed" -ForegroundColor Red
@@ -100,18 +111,46 @@ function Main {
         }
         Write-StepOk
 
+        Expand-Archive -Path (Join-Path $TmpDir $Archive) -DestinationPath $TmpDir -Force
+        $downloadedVersion = & (Join-Path $TmpDir "addness.exe") --version
+        if ($LASTEXITCODE -ne 0 -or $downloadedVersion -cne "addness $($Version.Substring(1))") {
+            throw "Downloaded binary version mismatch: expected addness $($Version.Substring(1)), got ${downloadedVersion}"
+        }
+
         Write-Step "Installing to ${InstallDir}"
         if (-not (Test-Path $InstallDir)) {
             New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
         }
-        Expand-Archive -Path (Join-Path $TmpDir $Archive) -DestinationPath $TmpDir -Force
-        Copy-Item (Join-Path $TmpDir "addness.exe") (Join-Path $InstallDir "addness.exe") -Force
+        $CurrentBin = Join-Path $InstallDir "addness.exe"
+        # Windows cannot overwrite a running executable. Rename it first, and
+        # restore it if placing the verified replacement fails.
+        Get-ChildItem -LiteralPath $InstallDir -Filter 'addness.exe.old-*' -File |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+        $BackupBin = Join-Path $InstallDir "addness.exe.old-$([System.Guid]::NewGuid())"
+        $StagedBin = Join-Path $InstallDir ".addness-new-$([System.Guid]::NewGuid()).exe"
+        Copy-Item (Join-Path $TmpDir "addness.exe") $StagedBin
+        try {
+            if (Test-Path -LiteralPath $CurrentBin) {
+                Move-Item -LiteralPath $CurrentBin -Destination $BackupBin
+            }
+            try {
+                Move-Item -LiteralPath $StagedBin -Destination $CurrentBin
+            } catch {
+                if (Test-Path -LiteralPath $BackupBin) {
+                    Move-Item -LiteralPath $BackupBin -Destination $CurrentBin
+                }
+                throw
+            }
+        } finally {
+            Remove-Item -LiteralPath $StagedBin -Force -ErrorAction SilentlyContinue
+        }
+        Remove-Item -LiteralPath $BackupBin -Force -ErrorAction SilentlyContinue
         Write-StepOk
 
         # Clean up legacy install location
         $LegacyBin = Join-Path $env:USERPROFILE ".addness\bin\addness.exe"
         $CurrentBin = Join-Path $InstallDir "addness.exe"
-        if ((Test-Path $LegacyBin) -and ($LegacyBin -ne $CurrentBin)) {
+        if ($InstallDir -eq "$env:LOCALAPPDATA\addness\bin" -and (Test-Path $LegacyBin)) {
             Write-Step "Removing old binary at $LegacyBin"
             Remove-Item -Force $LegacyBin -ErrorAction SilentlyContinue
             Write-StepOk
@@ -119,7 +158,7 @@ function Main {
 
         # Add to PATH if not already present
         $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-        if ($userPath -notlike "*${InstallDir}*") {
+        if ($env:ADDNESS_NO_MODIFY_PATH -ne '1' -and $userPath -notlike "*${InstallDir}*") {
             Write-Step "Adding to PATH"
             [Environment]::SetEnvironmentVariable("Path", "${userPath};${InstallDir}", "User")
             $env:Path = "${env:Path};${InstallDir}"

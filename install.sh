@@ -2,9 +2,9 @@
 set -eu
 
 # Addness CLI installer
-# Usage: curl -fsSL https://cli.addness.com/install.sh | sh
+# Usage: curl -fsSL https://d22sm2skny3y0p.cloudfront.net/install.sh | sh
 
-CDN_BASE="${ADDNESS_CDN_BASE:-https://cli.addness.com}"
+CDN_BASE="${ADDNESS_CDN_BASE:-https://d22sm2skny3y0p.cloudfront.net}"
 INSTALL_DIR="${ADDNESS_INSTALL_DIR:-${HOME}/.local/bin}"
 VERSION="${ADDNESS_VERSION:-latest}"
 
@@ -82,11 +82,23 @@ err() {
 
 main() {
   banner
+  resolve_version
   detect_platform
   printf "\n"
   download_and_install
   ensure_path
   verify_installation
+}
+
+resolve_version() {
+  if [ "${VERSION}" = "latest" ]; then
+    VERSION="$(curl -fsSL --connect-timeout 10 --max-time 30 "${CDN_BASE}/releases/latest/version.txt")"
+    VERSION="$(printf '%s' "${VERSION}" | tr -d '\r')"
+  fi
+  if ! printf '%s\n' "${VERSION}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+    err "Invalid release version: ${VERSION}"
+    exit 1
+  fi
 }
 
 detect_platform() {
@@ -127,23 +139,30 @@ download_and_install() {
   URL="${BASE_URL}/${ARCHIVE}"
   SHA_URL="${URL}.sha256"
 
-  TMPDIR="$(mktemp -d)"
-  trap 'rm -rf "${TMPDIR}"' EXIT
+  INSTALL_TMP_DIR="$(mktemp -d)"
+  STAGED_BINARY=''
+  trap 'rm -rf "${INSTALL_TMP_DIR}"; if [ -n "${STAGED_BINARY}" ]; then rm -f "${STAGED_BINARY}"; fi' EXIT
 
   if [ -t 1 ]; then
     printf "  ${DIM}>${RESET} Downloading\n"
-    curl -fSL --progress-bar "${URL}" -o "${TMPDIR}/${ARCHIVE}"
+    curl -fSL --connect-timeout 10 --max-time 120 --progress-bar "${URL}" -o "${INSTALL_TMP_DIR}/${ARCHIVE}"
     printf "\033[1A\033[2K"
     printf "  ${DIM}>${RESET} Downloading     ${GREEN}100%%${RESET}\n"
   else
     printf "  > Downloading..."
-    curl -fsSL "${URL}" -o "${TMPDIR}/${ARCHIVE}"
+    curl -fsSL --connect-timeout 10 --max-time 120 "${URL}" -o "${INSTALL_TMP_DIR}/${ARCHIVE}"
     printf " done\n"
   fi
-  curl -fsSL "${SHA_URL}" -o "${TMPDIR}/${ARCHIVE}.sha256"
+  curl -fsSL --connect-timeout 10 --max-time 30 "${SHA_URL}" -o "${INSTALL_TMP_DIR}/${ARCHIVE}.sha256"
 
   step "Verifying checksum"
-  cd "${TMPDIR}"
+  cd "${INSTALL_TMP_DIR}"
+  read -r EXPECTED_HASH CHECKSUM_NAME < "${ARCHIVE}.sha256"
+  CHECKSUM_NAME="$(printf '%s' "${CHECKSUM_NAME}" | tr -d '\r')"
+  if [ "${CHECKSUM_NAME}" != "${ARCHIVE}" ] || ! printf '%s\n' "${EXPECTED_HASH}" | grep -Eq '^[a-fA-F0-9]{64}$'; then
+    err "Invalid checksum record for ${ARCHIVE}"
+    exit 1
+  fi
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum -c "${ARCHIVE}.sha256" >/dev/null
   elif command -v shasum >/dev/null 2>&1; then
@@ -155,17 +174,27 @@ download_and_install() {
   fi
   step_ok
 
-  step "Installing to ${INSTALL_DIR}"
   tar -xzf "${ARCHIVE}"
+  chmod +x addness
+  DOWNLOADED_VERSION="$(./addness --version)"
+  if [ "${DOWNLOADED_VERSION}" != "addness ${VERSION#v}" ]; then
+    err "Downloaded binary version mismatch: expected addness ${VERSION#v}, got ${DOWNLOADED_VERSION}"
+    exit 1
+  fi
 
+  step "Installing to ${INSTALL_DIR}"
   mkdir -p "${INSTALL_DIR}"
-  mv addness "${INSTALL_DIR}/addness"
-  chmod +x "${INSTALL_DIR}/addness"
+  # Stage on the destination filesystem so replacement is atomic even when /tmp
+  # is a different mount, and a running CLI is never overwritten in place.
+  STAGED_BINARY="$(mktemp "${INSTALL_DIR}/.addness-new.XXXXXX")"
+  cp addness "${STAGED_BINARY}"
+  chmod +x "${STAGED_BINARY}"
+  mv -f "${STAGED_BINARY}" "${INSTALL_DIR}/addness"
   step_ok
 
   # Clean up legacy install location
   LEGACY_BIN="${HOME}/.addness/bin/addness"
-  if [ -x "${LEGACY_BIN}" ] && [ "${INSTALL_DIR}/addness" != "${LEGACY_BIN}" ]; then
+  if [ "${INSTALL_DIR}" = "${HOME}/.local/bin" ] && [ -x "${LEGACY_BIN}" ]; then
     step "Removing old binary at ${LEGACY_BIN}"
     rm -f "${LEGACY_BIN}"
     step_ok
@@ -173,6 +202,7 @@ download_and_install() {
 }
 
 ensure_path() {
+  if [ "${ADDNESS_NO_MODIFY_PATH:-}" = '1' ]; then return; fi
   # Already in PATH — nothing to do
   case ":${PATH}:" in
     *":${INSTALL_DIR}:"*) return ;;

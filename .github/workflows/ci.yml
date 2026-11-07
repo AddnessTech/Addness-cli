@@ -41,6 +41,9 @@ jobs:
       - name: Distribution health regression tests
         run: bash .github/scripts/test-distribution-health.sh
 
+      - name: Installer regression tests
+        run: python3 .github/scripts/test-installers.py target/debug/addness
+
       - uses: actions/setup-node@v7
         with:
           node-version: 22
@@ -57,3 +60,19 @@ jobs:
         run: |
           cargo test --locked upstream_probe_ -- --ignored
           python3 .github/scripts/probe-claude-prompt.py
+
+  installers:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked
+      - name: Test native installer, including replacement of a running CLI
+        shell: bash
+        run: python .github/scripts/test-installers.py target/debug/addness${{ runner.os == 'Windows' && '.exe' || '' }}

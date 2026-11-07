@@ -116,3 +116,11 @@ jobs:
           aws cloudfront create-invalidation \
             --distribution-id "${CDN_DISTRIBUTION_ID}" \
             --paths "/releases/latest/*" "/install.sh" "/install.ps1"
+
+  verify:
+    needs: upload
+    uses: ./.github/workflows/distribution-health.yml
+    permissions:
+      contents: read
+    with:
+      expected_version: ${{ github.ref_name }}

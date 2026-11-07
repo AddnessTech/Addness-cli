@@ -1,4 +1,4 @@
-//! 429 の待機期限を同じ API キーを使う CLI プロセス間で共有する。
+//! 送信前の呼び出し上限と 429 の待機期限を CLI プロセス間で共有する。
 #[cfg(test)]
 mod tests;
 
@@ -13,6 +13,8 @@ use sha2::{Digest, Sha256};
 
 const MIN_WAIT_SECS: u64 = 60;
 const MAX_BACKOFF_SECS: u64 = 3_600;
+const REQUEST_WINDOWS: [(u64, usize); 2] = [(60, 60), (3_600, 600)];
+const MAX_STATE_BYTES: u64 = 32_768;
 
 #[derive(Clone)]
 pub(super) struct RateLimitGuard {
@@ -23,6 +25,8 @@ pub(super) struct RateLimitGuard {
 struct State {
     until: u64,
     backoff: u64,
+    #[serde(default)]
+    requests: Vec<u64>,
 }
 
 impl RateLimitGuard {
@@ -48,23 +52,42 @@ impl RateLimitGuard {
         }
     }
 
-    pub(super) fn check(&self) -> Result<()> {
-        self.check_at(now())
+    pub(super) fn reserve(&self) -> Result<()> {
+        self.reserve_at(now())
     }
 
-    fn check_at(&self, now: u64) -> Result<()> {
-        let mut file = match File::open(&self.path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error).context("Could not read the rate-limit cooldown"),
-        };
-        file.lock_shared()
-            .context("Could not lock the rate-limit cooldown")?;
-        let state = read_state(&mut file)?;
+    fn reserve_at(&self, now: u64) -> Result<()> {
+        // 確認と予約を同じ排他ロック内で行い、並列起動で上限をすり抜けない。
+        let mut file = self.lock_state()?;
+        let mut state = read_state(&mut file)?;
         if state.until > now {
             bail!("{} No request was sent.", wait_message(state.until - now));
         }
-        Ok(())
+        state
+            .requests
+            .retain(|sent| sent.saturating_add(3_600) > now);
+        let mut wait = 0;
+        for (window, limit) in REQUEST_WINDOWS {
+            let recent: Vec<_> = state
+                .requests
+                .iter()
+                .filter(|sent| sent.saturating_add(window) > now)
+                .collect();
+            if recent.len() >= limit {
+                let oldest = **recent.iter().min().expect("non-empty request window");
+                wait = wait.max(oldest.saturating_add(window).saturating_sub(now));
+            }
+        }
+        if wait > 0 {
+            bail!(
+                "Local request budget exhausted (60 requests/minute, 600 requests/hour). \
+                 {} No request was sent.",
+                wait_message(wait)
+            );
+        }
+        // 接続失敗や読み取りの再試行も消費する。保存できなければ送信しない。
+        state.requests.push(now);
+        write_state(&mut file, &state)
     }
 
     pub(super) fn record(&self, retry_after: Option<&str>) -> Result<String> {
@@ -73,7 +96,7 @@ impl RateLimitGuard {
         Ok(wait_message(wait))
     }
 
-    fn record_at(&self, retry_after: Option<&str>, now: u64) -> Result<u64> {
+    fn lock_state(&self) -> Result<File> {
         fs::create_dir_all(self.path.parent().expect("rate-limit directory"))
             .context("Could not create the rate-limit directory")?;
         let mut options = OpenOptions::new();
@@ -83,11 +106,16 @@ impl RateLimitGuard {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let mut file = options
+        let file = options
             .open(&self.path)
             .context("Could not save the rate-limit cooldown")?;
         file.lock()
             .context("Could not lock the rate-limit cooldown")?;
+        Ok(file)
+    }
+
+    fn record_at(&self, retry_after: Option<&str>, now: u64) -> Result<u64> {
+        let mut file = self.lock_state()?;
         let previous = read_state(&mut file)?;
         // 待機後も 429 が続く場合は最大 1 時間まで延ばす。同時に返った 429 で
         // 指数的に延ばさず、他プロセスが既に保存した長い期限も短縮しない。
@@ -107,23 +135,32 @@ impl RateLimitGuard {
         let state = State {
             until: previous.until.max(now.saturating_add(wait)),
             backoff,
+            requests: previous.requests,
         };
-        let bytes = serde_json::to_vec(&state)?;
-        file.seek(SeekFrom::Start(0))?;
-        file.write_all(&bytes)?;
-        file.set_len(bytes.len() as u64)?;
-        file.sync_data()?;
+        write_state(&mut file, &state)?;
         Ok(state.until.saturating_sub(now))
     }
 }
 
 fn read_state(file: &mut File) -> Result<State> {
     let mut bytes = Vec::new();
-    file.take(4_097).read_to_end(&mut bytes)?;
+    file.take(MAX_STATE_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_STATE_BYTES {
+        bail!("Local rate-limit state is too large; no request was sent");
+    }
     if bytes.is_empty() {
         return Ok(State::default());
     }
     serde_json::from_slice(&bytes).context("Invalid local rate-limit cooldown; no request was sent")
+}
+
+fn write_state(file: &mut File, state: &State) -> Result<()> {
+    let bytes = serde_json::to_vec(state)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&bytes)?;
+    file.set_len(bytes.len() as u64)?;
+    file.sync_data()?;
+    Ok(())
 }
 
 fn retry_after_seconds(value: Option<&str>, now: u64) -> Option<u64> {

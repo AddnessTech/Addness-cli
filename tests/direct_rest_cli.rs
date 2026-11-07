@@ -40,6 +40,7 @@ impl Fixture {
                     }
                     Err(error) => panic!("{error}"),
                 };
+                socket.set_nonblocking(false).unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
@@ -98,7 +99,10 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        self.server.take().unwrap().join().unwrap();
+        let result = self.server.take().unwrap().join();
+        if !std::thread::panicking() {
+            result.unwrap();
+        }
         let _ = std::fs::remove_dir_all(&self.cache);
     }
 }
@@ -226,6 +230,69 @@ fn a_429_blocks_later_processes_before_network_but_not_other_api_keys() {
             .success()
     );
     assert_eq!(fixture.paths().len(), 2);
+}
+
+#[test]
+fn parallel_cli_processes_stop_successful_polling_before_the_server_limits_them() {
+    let fixture = Fixture::new(vec![("200 OK", json!({"data":{"id":ID}})); 81]);
+    let outputs = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let fixture = &fixture;
+                scope.spawn(move || {
+                    (0..10)
+                        .map(|_| fixture.run("polling-token", &["goal", "detail", ID]))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        outputs
+            .iter()
+            .filter(|output| output.status.success())
+            .count(),
+        60
+    );
+    for output in outputs.iter().filter(|output| !output.status.success()) {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("Local request budget"), "{stderr}");
+        assert!(stderr.contains("No request was sent"), "{stderr}");
+    }
+    assert_eq!(fixture.paths().len(), 60);
+    // コマンドを変えても同じ上限が適用され、別キーは巻き込まない。
+    assert!(
+        !fixture
+            .run("polling-token", &["crm", "get", ID])
+            .status
+            .success()
+    );
+    assert_eq!(fixture.paths().len(), 60);
+    assert!(
+        fixture
+            .run("other-token", &["crm", "get", ID])
+            .status
+            .success()
+    );
+    assert_eq!(fixture.paths().len(), 61);
+}
+
+#[test]
+fn cache_failures_stop_the_cli_before_network() {
+    let fixture = Fixture::new(vec![]);
+    std::fs::write(&fixture.cache, "not a directory").unwrap();
+    assert!(
+        !fixture
+            .run("test-token", &["goal", "detail", ID])
+            .status
+            .success()
+    );
+    assert!(fixture.paths().is_empty());
+    std::fs::remove_file(&fixture.cache).unwrap();
 }
 
 #[test]

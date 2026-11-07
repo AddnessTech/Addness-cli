@@ -432,7 +432,7 @@ impl ApiClient {
         let mut first_req = Some(req);
 
         for attempt in 1..=REQUEST_SEND_ATTEMPTS {
-            self.rate_limit.check()?;
+            self.rate_limit.reserve()?;
             let current_req = if attempt == 1 {
                 first_req
                     .take()

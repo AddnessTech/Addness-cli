@@ -22,6 +22,14 @@ pub struct BrowseMembersParams<'a> {
     pub target_member_id: Option<&'a str>,
 }
 
+pub struct MemberObjectivesParams<'a> {
+    pub limit: u16,
+    pub offset: u32,
+    pub include_completed: bool,
+    pub include_counts: bool,
+    pub created_after: Option<&'a str>,
+}
+
 impl ApiClient {
     pub async fn get_members(&self, org_id: &str) -> Result<ApiResponse<MembersListData>> {
         let path = format!("/api/v2/organizations/{org_id}/members?pageSize=100");
@@ -117,8 +125,22 @@ impl ApiClient {
 
     /// GET /api/v2/members/:id/objectives
     /// Organization is resolved purely from the `X-Organization-ID` header.
-    pub async fn get_member_objectives(&self, member_id: &str) -> Result<Value> {
-        let path = format!("/api/v2/members/{member_id}/objectives");
+    pub async fn get_member_objectives(
+        &self,
+        member_id: &str,
+        params: &MemberObjectivesParams<'_>,
+    ) -> Result<Value> {
+        let member_id = super::issue::encode_path_segment(member_id);
+        let mut query = form_urlencoded::Serializer::new(String::new());
+        query.append_pair("limit", &params.limit.to_string());
+        query.append_pair("offset", &params.offset.to_string());
+        query.append_pair("include_completed", &params.include_completed.to_string());
+        query.append_pair("include_counts", &params.include_counts.to_string());
+        if let Some(created_after) = params.created_after {
+            query.append_pair("created_after", created_after);
+        }
+        let query = query.finish();
+        let path = format!("/api/v2/members/{member_id}/objectives?{query}");
         self.get(&path).await
     }
 

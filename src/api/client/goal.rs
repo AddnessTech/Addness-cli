@@ -46,6 +46,13 @@ impl ApiClient {
         self.get(&path).await
     }
 
+    /// 本文・版を1回で返す。子孫や関連データを自動で読み足さない。
+    pub async fn get_goal_detail(&self, goal_id: &str) -> Result<serde_json::Value> {
+        let id = super::issue::encode_path_segment(goal_id);
+        self.get(&format!("/api/v2/objectives/{id}?include_version=true"))
+            .await
+    }
+
     pub async fn get_goal_children(
         &self,
         goal_id: &str,

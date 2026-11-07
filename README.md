@@ -72,23 +72,28 @@ ADDNESS_API_RESOLVE=vt.api.addness.com=<api-ip> addness goal get <goal-id>
 
 IP は運用環境で変わる可能性があるため、通常は設定しないでください。
 
-## MCP の最新機能を CLI から使う
+## REST に直接つながる CLI
 
-フォーム、Analytics/KPI、CRM、Drive、テンプレート、ナレッジ、録画、権限、エージェント作業などは、サーバーが公開するツールを一覧から探して利用できます。追加・改名されたツールも最新のカタログに追従します。
+CLI は各機能の REST API を直接呼び出します。`addness mcp` と MCP の初期化・カタログ取得・ツール実行は撤去しました。
 
 ```bash
-addness mcp list --json
-addness mcp list --query analytics --json
-addness mcp schema list_forms --json
-addness mcp call list_forms --args '{"limit":20}' --json
-addness mcp call <tool-name> --args-file ./arguments.json --json
+# 本文と版だけを1回で取得（子孫や関連情報を読み足さない）
+addness goal detail <GOAL_ID> --json
+# 担当ゴールの1ページ。続きは --offset、完了分は --include-completed
+addness member objectives <MEMBER_ID> --limit 100 --offset 0 --json
+# リスト設定と顧客行を必要な時だけ取得
+addness crm list --query 商談 --json
+addness crm get <LIST_ID> --json
+addness crm rows <LIST_ID> --limit 100 --json
+# チャット画像を新しいファイルへ保存して表示ツールで開く
+addness chat attachment --room <ROOM_ID> --message <MESSAGE_ID> --attachment <ATTACHMENT_ID> --output ./image.png --json
 ```
 
-`--args-file -` で標準入力、`--org` で今回の組織、`--scope` で organization（既定）/ personal / copilot / openai / admin / support の入口を選べます。入口に対応する権限のキーが必要です。保存済みのログイン情報または `ADDNESS_API_TOKEN` を使います。
+429 を受けると `Retry-After`（秒数・HTTP日付）を尊重し、最低60秒の待機期限を保存します。待機後も429なら待機を倍増し、クライアント側の待機は最大1時間、サーバー指定がそれ以上ならそちらを優先します。同じ接続先・APIキーを使う次のCLIプロセスも、期限前は通信せず非ゼロ終了します。429の自動再送はしません。
 
-`mcp list` はカタログの全ページを取得します。各ツールが返すデータのページ送りは、その入力仕様に従って行ってください。`mcp call` は書き込みも即時実行し、自動再送しません。`--json` は `content`・`structuredContent`・`isError` を保持し、ツール失敗時は非ゼロ終了します。
+待機状態はOSのキャッシュディレクトリ内 `addness/rate-limits` に保存します。`ADDNESS_CACHE_DIR` はCLI専用キャッシュの保存先を指定します。同じキーの自動処理では保存先を共有してください。キーの生値は保存しません。
 
-v0.15.0 の削除コマンドと移行先、対応範囲は [MCP/CLI 対応と API 移行](docs/mcp-cli-parity.md) を参照してください。
+変更点・取得範囲・未対応機能は [REST CLI への移行](docs/rest-cli-migration.md) を参照してください。
 
 ## 使い方
 
@@ -181,7 +186,7 @@ addness challenge --help
 ### ゴール・成果物
 
 - `goal` — ゴールの作成・更新・削除・ツリー表示・検索・アーカイブ・共有リンク。
-  `goal report-schedule` で活動レポート配信を管理。テンプレートの定期実行は `mcp list --query schedule --json` で確認。
+  `goal report-schedule` で活動レポート配信を管理。予定の素材は `today planned --help` で確認。
 - `deliverable` — 成果物（ドキュメント/リンク/ファイル）の管理。例: `addness deliverable list --goal <goal-id>`
 - `assignment` — ゴールへのメンバー割り当て。
 - `link` — GitHub PR や URL をゴールに紐付け。例: `addness link pr --goal <goal-id> --url <pr-url>`
@@ -215,14 +220,14 @@ addness challenge --help
   例: `addness today todo list`
 - `execution` — 実行タブのサマリ・実行レコードの更新/履歴・ゴール折りたたみ設定・
   アクティブハドル・Codex エージェントビュー。例: `addness execution summary`
-- `meeting` — Huddle の状態/録音/招待と Meeting Bot。議事録・録画は `mcp list --query recording --json` で確認。
+- `meeting` — Huddle の状態/録音/招待と Meeting Bot。対応コマンドは `meeting --help` で確認。
 - `activity` — メンバー別/ゴール別/組織全体のアクティビティログと集計。例: `addness activity list`
 - `streak` — 連続達成ストリークの確認・フリーズ・復活・公開共有。例: `addness streak get`
 - `challenge` — 自分のチャレンジの一覧・開始・進捗確認・完了。例: `addness challenge list --json`
 
-### AI・自動化
+### CRM
 
-- `mcp` — サーバーで公開中の全ツールの一覧・入力仕様の取得と実行。新機能も CLI の更新を待たず利用できます。
+- `crm` — 閲覧可能な顧客リストの検索、設定の取得、顧客行のページ取得。例: `addness crm rows <list-id> --limit 100 --json`
 
 ### 個人スペース・横断機能
 

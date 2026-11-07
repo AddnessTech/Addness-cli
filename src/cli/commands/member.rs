@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use clap::Subcommand;
 
-use crate::api::{ApiClient, BrowseMembersParams};
+use crate::api::{ApiClient, BrowseMembersParams, MemberObjectivesParams};
 use crate::cli::commands::org::resolve_org_id;
 
 /// Build a client whose `X-Organization-ID` header targets `org_id`.
@@ -185,13 +185,26 @@ pub enum MemberCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Show the objectives assigned to a member
+    /// Read one page of a member's objectives (no hierarchy expansion or counts by default)
+    #[command(alias = "goals")]
     Objectives {
         /// Member ID
         id: String,
         /// Organization ID (uses default if not specified)
         #[arg(long)]
         org: Option<String>,
+        #[arg(long, default_value = "100", value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+        #[arg(long, default_value = "0")]
+        offset: u32,
+        #[arg(long)]
+        include_completed: bool,
+        /// Include per-goal child counts (extra server work)
+        #[arg(long)]
+        include_counts: bool,
+        /// Only goals created at/after this RFC3339 timestamp
+        #[arg(long)]
+        created_after: Option<chrono::DateTime<chrono::FixedOffset>>,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -436,10 +449,29 @@ pub async fn handle_member(cmd: &MemberCommands, client: &ApiClient) -> Result<(
                 .await?;
             print_json_value(&data)
         }
-        MemberCommands::Objectives { id, org, json: _ } => {
+        MemberCommands::Objectives {
+            id,
+            org,
+            limit,
+            offset,
+            include_completed,
+            include_counts,
+            created_after,
+            ..
+        } => {
             let org_id = resolve_org_id(org.as_deref())?;
+            let created_after = created_after.map(|date| date.to_rfc3339());
             let data = client_for_org(client, &org_id)
-                .get_member_objectives(id)
+                .get_member_objectives(
+                    id,
+                    &MemberObjectivesParams {
+                        limit: *limit,
+                        offset: *offset,
+                        include_completed: *include_completed,
+                        include_counts: *include_counts,
+                        created_after: created_after.as_deref(),
+                    },
+                )
                 .await?;
             print_json_value(&data)
         }

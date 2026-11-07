@@ -52,6 +52,8 @@ impl ChatVisibility {
 
 #[derive(Subcommand)]
 pub enum ChatCommands {
+    /// Download a message attachment through REST for local viewing
+    Attachment(super::chat_attachment::AttachmentArgs),
     /// Search messages (and matching room names) across your DM/group rooms
     Search {
         /// Search query
@@ -506,6 +508,9 @@ fn print_messages_table(messages: &[ChatMessage]) {
 
 pub async fn handle_chat(cmd: &ChatCommands, client: &ApiClient) -> Result<()> {
     match cmd {
+        ChatCommands::Attachment(args) => {
+            super::chat_attachment::handle_attachment(args, client).await
+        }
         ChatCommands::Search {
             query,
             limit,

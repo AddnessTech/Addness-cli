@@ -105,6 +105,12 @@ pub enum GoalCommands {
         #[arg(long)]
         strict_related_fetch: bool,
     },
+    /// Read a goal's full body and version with one request (no child/related fetches)
+    Detail {
+        id: uuid::Uuid,
+        #[arg(long)]
+        json: bool,
+    },
     /// List children of a goal
     Children {
         /// Goal ID
@@ -531,6 +537,11 @@ pub(crate) fn parse_status(status: &str) -> Result<(Option<Option<String>>, Opti
 
 pub async fn handle_goals(cmd: &GoalCommands, client: &ApiClient) -> Result<()> {
     match cmd {
+        GoalCommands::Detail { id, .. } => {
+            let result = client.get_goal_detail(&id.to_string()).await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(())
+        }
         GoalCommands::List {
             org,
             depth,

@@ -11,9 +11,9 @@ use clap::{CommandFactory, Parser, Subcommand};
 use crate::config::{Credentials, DEFAULT_API_URL, Settings};
 use api::ApiClient;
 use cli::commands::{
-    activity, assignment, challenge, chat, comment, configure, consent, core_values, deliverable,
-    desktop_auth, detect, diagnosis, execution, form, goal, invitation, issue, link, login,
-    master_plan, mcp, media, meeting, member, notification, org, personal, referral, search,
+    activity, assignment, challenge, chat, comment, configure, consent, core_values, crm,
+    deliverable, desktop_auth, detect, diagnosis, execution, form, goal, invitation, issue, link,
+    login, master_plan, media, meeting, member, notification, org, personal, referral, search,
     skills, streak, summary, today, update, user,
 };
 
@@ -30,8 +30,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Discover and use every current Addness MCP tool through the CLI
-    Mcp(mcp::McpArgs),
+    /// Read CRM lists and customer rows directly through REST
+    Crm(crm::CrmArgs),
     /// Log in via browser (recommended for first setup)
     Login {
         /// API base URL
@@ -258,7 +258,7 @@ impl Cli {
 
 fn command_outputs_json(command: &Commands) -> bool {
     match command {
-        Commands::Mcp(args) => args.json,
+        Commands::Crm(args) => args.json,
         Commands::Status { json }
         | Commands::Summary { json, .. }
         | Commands::Search { json, .. }
@@ -333,6 +333,7 @@ fn goal_outputs_json(command: &goal::GoalCommands) -> bool {
         goal::GoalCommands::Complete(args) => args.outputs_json(),
         goal::GoalCommands::List { json, .. }
         | goal::GoalCommands::Get { json, .. }
+        | goal::GoalCommands::Detail { json, .. }
         | goal::GoalCommands::Children { json, .. }
         | goal::GoalCommands::Tree { json, .. }
         | goal::GoalCommands::Siblings { json, .. }
@@ -504,6 +505,7 @@ fn issue_outputs_json(command: &issue::IssueCommands) -> bool {
 
 fn chat_outputs_json(command: &chat::ChatCommands) -> bool {
     match command {
+        chat::ChatCommands::Attachment(args) => args.json,
         chat::ChatCommands::Search { json, .. } => *json,
         chat::ChatCommands::Room { command } => match command {
             chat::RoomCommands::List { json, .. }
@@ -881,9 +883,9 @@ async fn main() -> Result<()> {
     }
 
     match &cli.command {
-        Some(Commands::Mcp(args)) => {
+        Some(Commands::Crm(args)) => {
             let client = build_client_for_organization(args.org.as_deref())?;
-            mcp::handle_mcp(args, &client).await
+            crm::handle_crm(args, &client).await
         }
         None => {
             let client = build_tui_client().await?;

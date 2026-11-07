@@ -159,7 +159,7 @@ impl ApiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::client::mcp::tests::server;
+    use crate::api::client::test_support::server;
 
     const ORG: &str = "79e5df38-ffbb-4a95-9d41-f5968427c653";
     const RUN: &str = "11111111-2222-4333-8444-555555555555";

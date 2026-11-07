@@ -1,6 +1,6 @@
 # 現行バックエンドに合わせたCLI API移行
 
-> この文書は2026-10-02時点の記録です。v0.15.0 の現行仕様・削除コマンド・後継機能は [MCP/CLI 対応と API 移行](mcp-cli-parity.md) を参照してください。以下の `codex-job` 等への案内は現在使えません。
+> 過去の API 断面の記録です。現在の対応範囲・未対応機能は [REST CLI への移行](rest-cli-migration.md) を参照してください。
 
 確認基準: vision-todo-backend `origin/main` (`b801a8a`, 2026-10-02)。CLIに残っていた経路を現行ルート登録とハンドラで照合した。
 

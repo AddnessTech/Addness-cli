@@ -1,3 +1,5 @@
+> この文書は v0.15.0 の履歴です。現在の変更では `addness mcp` を撤去しました。[REST CLI への移行](rest-cli-migration.md) を参照してください。
+
 # MCP/CLI 対応と API 移行（v0.15.0）
 
 確認基準は backend `1fa0c21607`（2026-10-11）の `cmd/server/router`、各 feature の route/handler、`internal/mcp/handler/catalog.go`。本番の組織 MCP カタログは CLI 自身で取得し、301 ツールを確認した。カタログは権限・入口・サーバー更新で変わるため、301 は固定の上限ではない。

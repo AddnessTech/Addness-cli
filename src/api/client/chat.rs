@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use super::issue::encode_path_segment;
 use crate::api::{
@@ -89,6 +89,24 @@ fn chat_message_list_query_suffix(params: &ChatMessageListParams<'_>) -> String 
 }
 
 impl ApiClient {
+    pub async fn get_chat_attachment_url(
+        &self,
+        room: &str,
+        message: &str,
+        attachment: &str,
+    ) -> Result<String> {
+        let room = encode_path_segment(room);
+        let message = encode_path_segment(message);
+        let attachment = encode_path_segment(attachment);
+        let path =
+            format!("/api/v2/chat/rooms/{room}/messages/{message}/attachments/{attachment}/url");
+        let response: ApiResponse<serde_json::Value> = self.get(&path).await?;
+        response.data["url"]
+            .as_str()
+            .map(str::to_owned)
+            .context("Attachment response did not contain a URL")
+    }
+
     /// GET /api/v2/chat/search
     pub async fn search_chat_messages(
         &self,

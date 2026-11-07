@@ -18,15 +18,17 @@ mod inlinemedia;
 mod invitation;
 mod issue;
 mod master_plan;
-pub mod mcp;
 mod meeting;
 mod member;
 mod notification;
 mod org;
 mod personal;
+mod rate_limit;
 mod referral;
 mod search;
 mod streak;
+#[cfg(test)]
+mod test_support;
 mod user;
 
 pub use activity::{
@@ -38,7 +40,9 @@ pub use comment::{ListAllCommentsParams, ListCommentsParams};
 pub use form::{FormListParams, FormResponseListParams};
 pub use issue::{GoalSectionListParams, IssueListParams};
 pub use meeting::HuddleInviteableMembersParams;
-pub use member::BrowseMembersParams;
+pub use member::{BrowseMembersParams, MemberObjectivesParams};
+mod crm;
+pub use crm::{CrmListParams, CrmRowsParams};
 pub use notification::ListNotificationsParams;
 pub use org::{CreateOrganizationParams, ListAllOrganizationsParams};
 pub use search::SearchQueryParams;
@@ -77,6 +81,7 @@ pub struct ApiClient {
     client: Client,
     base_url: String,
     org_id: Option<String>,
+    rate_limit: rate_limit::RateLimitGuard,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,6 +189,7 @@ impl ApiClient {
             client,
             base_url: base_url.trim_end_matches('/').to_string(),
             org_id: None,
+            rate_limit: rate_limit::RateLimitGuard::new(token, base_url)?,
         })
     }
 
@@ -381,10 +387,22 @@ impl ApiClient {
     }
 
     async fn send(&self, req: RequestBuilder, url: &str) -> Result<Response> {
-        let response = Self::send_request(req, url).await?;
+        let response = self.send_request(req, url).await?;
 
         let status = response.status();
         if !status.is_success() {
+            let cooldown = if status == StatusCode::TOO_MANY_REQUESTS {
+                Some(
+                    self.rate_limit.record(
+                        response
+                            .headers()
+                            .get(reqwest::header::RETRY_AFTER)
+                            .and_then(|value| value.to_str().ok()),
+                    )?,
+                )
+            } else {
+                None
+            };
             let diagnostics = request_trace_context(response.headers());
             let content_type = response
                 .headers()
@@ -392,14 +410,18 @@ impl ApiClient {
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned);
             let body = response.text().await.unwrap_or_default();
-            return Err(Self::api_error(status, &body, content_type.as_deref())
-                .context(format!("Request path: {}{diagnostics}", request_path(url))));
+            let mut error = Self::api_error(status, &body, content_type.as_deref())
+                .context(format!("Request path: {}{diagnostics}", request_path(url)));
+            if let Some(cooldown) = cooldown {
+                error = error.context(cooldown);
+            }
+            return Err(error);
         }
 
         Ok(response)
     }
 
-    async fn send_request(req: RequestBuilder, url: &str) -> Result<Response> {
+    async fn send_request(&self, req: RequestBuilder, url: &str) -> Result<Response> {
         // 書き込みのタイムアウトは処理済みか判別できないため再送しない。
         let retryable_req = req.try_clone().filter(|request| {
             request
@@ -410,6 +432,7 @@ impl ApiClient {
         let mut first_req = Some(req);
 
         for attempt in 1..=REQUEST_SEND_ATTEMPTS {
+            self.rate_limit.reserve()?;
             let current_req = if attempt == 1 {
                 first_req
                     .take()

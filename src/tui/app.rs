@@ -2370,7 +2370,7 @@ impl App {
         }
     }
 
-    /// 一定間隔（3秒）ごとに、対象ゴールの再取得をバックグラウンドで開始する。
+    /// 一定間隔（60秒）ごとに、対象ゴールの再取得をバックグラウンドで開始する。
     /// codex が CLI 経由で書き戻した DoD 更新を契約ペインに反映するため。
     fn maybe_start_codex_refresh(&mut self) {
         let Some(pane) = self.codex.as_ref() else {
@@ -2382,14 +2382,15 @@ impl App {
         }
         let due = self
             .last_codex_refresh
-            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(3));
+            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(60));
         if !due {
             return;
         }
         let goal_id = pane.goal_id.clone();
         let client = self.client.clone();
         self.codex_refresh = Some(self.rt.spawn(async move {
-            // ゴール本体・子ゴール数・コメント数を 1 往復に畳んで取得する。
+            // ゴール本体・子ゴール・コメント・成果物を並列取得する。
+            // 少なくとも4要求になるため、60秒間隔にして共通の送信予算を使い切らない。
             // 子ゴール／コメントの取得は失敗しても本体があれば続行する。
             let (goal_res, children_res, comments_res, deliverables_res) = tokio::join!(
                 client.get_goal(&goal_id),

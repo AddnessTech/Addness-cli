@@ -1,6 +1,6 @@
 use serde_json::{Value, json};
 
-use super::mcp::tests::server;
+use super::test_support::server;
 use super::{ListAllCommentsParams, SearchQueryParams};
 
 fn reply(value: Value) -> (&'static str, String) {
@@ -204,7 +204,8 @@ async fn timed_out_writes_are_not_replayed_while_reads_remain_retryable() {
             .request(method.clone(), &url)
             .timeout(Duration::from_millis(100))
             .json(&json!({"value": 1}));
-        let result = super::ApiClient::send_request(request, &url).await;
+        let client = super::ApiClient::new("test-token", &url).unwrap();
+        let result = client.send_request(request, &url).await;
         finished.store(true, Ordering::SeqCst);
         let received = server.join().unwrap();
         assert!(result.is_err());

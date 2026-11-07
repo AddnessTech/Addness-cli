@@ -268,38 +268,46 @@ addness detect-goal --json
 
 例: `goal/19453a2d-6524-4bbb-8e4f-f8fd69f3fce4/add-email-notifications`
 
-## 最新 MCP の全機能を CLI から利用する
+## 必要な範囲だけを REST で取得する
 
-CLI の固定サブコマンドにない機能は、公開中の MCP カタログから探して実行できます。
-フォーム、Analytics/KPI、CRM、Drive、テンプレート、ナレッジ、録画、権限、エージェント作業などを対象に、サーバー更新で追加されたツールにも対応します。
+`addness mcp` は撤去しました。CLIの専用コマンドがREST APIを直接呼びます。利用できる操作は `addness --help` と各サブコマンドの `--help` で確認し、未対応の操作を別経路へ自動で切り替えないでください。
 
 ```bash
-addness mcp list --json
-addness mcp list --query analytics --json
-addness mcp schema list_forms --json
-addness mcp call list_forms --args '{"limit":20}' --json
-addness mcp call <TOOL_NAME> --args-file ./arguments.json --json
-# stdin は --args-file -。個人用キーを使う場合は --scope personal。
+# 本文と版を1回で取得（子孫・コメント・成果物は取得しない）
+addness goal detail <GOAL_ID> --json
+# 担当ゴールを1ページだけ取得。子目標数は必要時だけ --include-counts
+addness member objectives <MEMBER_ID> --limit 100 --offset 0 --json
+addness member objectives <MEMBER_ID> --include-completed --created-after 2026-11-01T00:00:00+09:00 --json
+addness crm list --query 商談 --json
+addness crm get <LIST_ID> --json
+addness crm rows <LIST_ID> --limit 100 --json
+# 続きは応答のcursorを --cursor に渡す
+# チャットの添付を保存して、画像表示ツールで読む
+addness chat attachment --room <ROOM_ID> --message <MESSAGE_ID> --attachment <ATTACHMENT_ID> --output ./image.png --json
 ```
 
-`--org` は今回の対象組織を指定します。`--scope organization|personal|copilot|openai|admin|support` は接続入口を指定し、それぞれの入口に許可されたキーが必要です。個人用・運営用キーは `ADDNESS_API_TOKEN` で渡せます。権限を昇格させる機能ではありません。
-`mcp call` は書き込みも即時実行し、自動再送しません。JSON出力には content / structuredContent / isError を保持し、ツール失敗時は非ゼロ終了します。結果に次ページのカーソルがあれば、各ツールのschemaに従って続きを取得します（mcp listのカタログ自体は全ページ取得します）。
+- 一覧・本文を短い間隔で繰り返し取得しない。取得済みの結果を作業中に使い、変更の確認が必要な時だけ読み直す。
+- REST送信には接続先・APIキー単位で直近60秒60回・直近3600秒600回の上限がある。並列プロセスやコマンド変更でも共有される。ローカル上限・429のどちらで停止した場合も、表示された待機時間を守る。キャッシュを消したり、キー・保存先を変えたりして制限を回避しない。
+- 429 の後は呼び出しを止め、表示された秒数以上待つ。CLIはサーバー指定を尊重した待機期限を同じAPIキーのプロセス間で共有する。直後に別コマンドや別プロセスで再実行しても通信しない。
+- `member objectives` は既定で未完了・最大100件・子目標数なし。祖先や子孫は自動取得しない。返った `total` / `has_more` を確認し、必要な場合だけ `--offset` で次ページを読む。
+- `crm get` は設定、`crm rows` は顧客行。行の続きを取るたびに設定を読み直さない。全ページを自動巡回しない。
+- `goal detail` の本文はRESTの保存形式で返る。`goal get` は従来どおり子のプレビューも取得するので、本文だけ必要な時は `detail` を使う。
 
-v0.15.0では、廃止された旧個人ドキュメント・旧スキル・Codexジョブ・共有ツリー・請求書・ゴールalias/recurring/duplicate・旧議事録APIのコマンドを削除しました。APIキーを受け付けない招待承諾やキー作成などはWeb画面で行ってください。コメントはv2、成果物とPRリンクは新Driveへ移行しています。`comment list-all` には `--author <ORG_MEMBER_ID>` が必須です。定期実行はテンプレートscheduleまたは個人用ルーティンのMCPツールを確認してください。
+廃止済みの旧個人ドキュメント・旧スキル・Codexジョブ・共有ツリー・請求書・ゴールalias/recurring/duplicate・旧議事録APIは復活させていません。APIキーを受け付けない招待承諾やキー作成などはWeb画面で行ってください。コメントはv2、成果物とPRリンクは新Driveへ移行しています。`comment list-all` には `--author <ORG_MEMBER_ID>` が必須です。
 
 ## AIエージェント向けガイドライン
 
 ### 現行APIと移行先
 - `execution generate` は廃止され、バックエンドは `RECURRING_GENERATION_REMOVED` を返します。テンプレートの定期ルーティンは `addness today planned --help` で確認してください。
-- `goal-chat` / `todo-chat` / `thread` / `goal decompose` は、現行バックエンドに同じルートがないためCLIから削除されています。ゴール上の会話には `issue` または `comment`、AI診断には `core-values` / `master-plan`を使ってください。旧 `codex-job` も現行バックエンドから削除済みです。エージェント機能は `addness mcp list --query agent --json` で現行ツールを確認してください。いずれも旧スレッドAPIと完全に同じ機能ではありません。ゴール分解APIの後継はないため、子ゴールは `addness goal create --parent <GOAL_ID>` で作成します。
-- 旧 `kpi add/update/rm` は廃止しました。現行バックエンドのKPIはAnalytics Recipeを定義し、KPIツリーに配置し、Runで実績を記録する構造です。現行操作は `addness mcp list --query analytics --json` / `--query kpi` で確認し、`mcp schema` / `mcp call` を使ってください。
+- `goal-chat` / `todo-chat` / `thread` / `goal decompose` は、現行バックエンドに同じルートがないためCLIから削除されています。ゴール上の会話には `issue` または `comment`、AI診断には `core-values` / `master-plan`を使ってください。旧 `codex-job` も現行バックエンドから削除済みです。現行エージェント機能の専用CLIは未対応です。いずれも旧スレッドAPIと完全に同じ機能ではありません。ゴール分解APIの後継はないため、子ゴールは `addness goal create --parent <GOAL_ID>` で作成します。
+- 旧 `kpi add/update/rm` は廃止しました。現行バックエンドのKPIはAnalytics Recipeを定義し、KPIツリーに配置し、Runで実績を記録する構造です。現行Analytics/KPIの専用CLIは未対応です。
 - 403でレスポンスがJSONではない場合は、画面側と同じくWAF/セキュリティルールによるブロックの可能性があります。OWNER/EDITOR権限の変更では直りません。発生時刻と `Request path` を添えて運用担当に確認してください。
 - `org get-context` / `set-context` / `context-revisions` は、backendが組織コンテキスト機能を撤去したためCLIから削除されています。保存内容がAddyの挙動に反映されなかった機能で、現行APIに直接の後継はありません。
 
 ### 作業開始時（必須）
 1. `addness detect-goal --json` でブランチに紐づくゴールを確認してください。
 2. ゴールが検出された場合、`addness goal get <ID> --json --with-deliverable --with-comment` で詳細を確認してから作業を開始してください。
-3. ゴールが検出されない場合、`addness goal list --json --depth 3` で全体を確認し、関連するゴールを特定してください。
+3. ゴールが検出されない場合は、依頼中のゴールIDやキーワードで対象を絞ってください。作業開始のたびに組織全体の一覧を取り直さないでください。
 
 ### DoD（完了基準）の確認と具体化
 - 取り組む前に、対象ゴールのDoD（`--description` の内容）が十分かを確認してください。

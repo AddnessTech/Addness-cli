@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cdn_base='https://cli.addness.com'
+cdn_base='https://d22sm2skny3y0p.cloudfront.net'
 expected_version="${1:-}"
 if [ -n "$expected_version" ] && ! [[ "$expected_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   echo 'Expected version must be a stable vX.Y.Z tag' >&2
@@ -35,8 +35,8 @@ for attempt in {1..12}; do
   sleep 15
 done
 
-openssl s_client -connect cli.addness.com:443 -servername cli.addness.com \
-  -verify_hostname cli.addness.com -verify_return_error </dev/null \
+openssl s_client -connect d22sm2skny3y0p.cloudfront.net:443 -servername d22sm2skny3y0p.cloudfront.net \
+  -verify_hostname d22sm2skny3y0p.cloudfront.net -verify_return_error </dev/null \
   > "$check_root/certificate.pem" 2> "$check_root/tls.log" || {
     cat "$check_root/tls.log" >&2
     exit 1

@@ -23,18 +23,12 @@ pub async fn handle_update(check_only: bool) -> Result<()> {
     println!("Update available: v{current} → v{latest}");
 
     if check_only {
-        if cfg!(windows) {
-            println!("Run `addness update` (or: irm https://cli.addness.com/install.ps1 | iex)");
-        } else {
-            println!(
-                "Run `addness update` (or: curl -fsSL https://cli.addness.com/install.sh | sh)"
-            );
-        }
+        println!("Run `addness update` to install it.");
         return Ok(());
     }
 
     println!("Updating via the official installer...");
-    run_installer()?;
+    run_installer(&latest)?;
     println!("Updated to v{latest}. Restart any running `addness` sessions to use it.");
     Ok(())
 }

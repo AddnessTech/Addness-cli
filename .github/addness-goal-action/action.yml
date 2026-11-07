@@ -54,7 +54,8 @@ runs:
       if: steps.extract.outputs.skip != 'true'
       shell: bash
       run: |
-        curl -fsSL https://cli.addness.com/install.sh | ADDNESS_INSTALL_DIR="$RUNNER_TEMP/addness" sh
+        curl -fsSL https://d22sm2skny3y0p.cloudfront.net/install.sh -o "$RUNNER_TEMP/addness-install.sh"
+        ADDNESS_INSTALL_DIR="$RUNNER_TEMP/addness" sh "$RUNNER_TEMP/addness-install.sh"
         echo "$RUNNER_TEMP/addness" >> "$GITHUB_PATH"
 
     - name: Link PR and update goal

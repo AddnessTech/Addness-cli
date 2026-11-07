@@ -1,6 +1,10 @@
 # CLI配布の検証と復旧
 
-配布先は `https://cli.addness.com`。GitHub Releasesにも同じ実行ファイルとSHA-256を公開する。配布用S3・CloudFrontの識別子はリポジトリ変数 `CLI_S3_BUCKET` / `CLI_CDN_DISTRIBUTION_ID` を参照する。
+配布先は `https://d22sm2skny3y0p.cloudfront.net`。CLIの更新はWebサイト `cli.addness.com` の証明書・DNSに依存しない。GitHub Releasesにも同じ実行ファイルとSHA-256を公開する。配布用S3・CloudFrontの識別子はリポジトリ変数 `CLI_S3_BUCKET` / `CLI_CDN_DISTRIBUTION_ID` を参照する。
+
+v0.16.0以前のCLIは更新先が旧ドメインに固定されているため、READMEのCloudFrontインストールコマンドを一度実行して移行する。v0.16.1以降は `addness update` と起動時の自動更新が同じCloudFront配布先を使用する。
+
+CLIは同梱のインストーラへ確認済みの版と現在の実行ファイルの保存先を渡す。インストーラは固定版のアーカイブ・SHA-256・展開した実行ファイルのバージョンを確認してから置換する。更新時にはPATHを変更せず、更新後にもバージョンを確認してから成功表示・再起動する。単独でインストーラを使う場合は `ADDNESS_INSTALL_DIR` で保存先を、`ADDNESS_NO_MODIFY_PATH=1` でPATH変更の省略を指定できる。
 
 ## リリース時と日次の確認
 
@@ -16,11 +20,13 @@ Distribution healthワークフローは毎日と手動実行にも対応し、�
 CloudFrontの反映待ちはバージョンが古い場合に限り、最大12回・15秒間隔で行う。TLS検証を無効化しない。日次チェックの失敗はGitHub Actionsの失敗として表示される。通知はリポジトリ利用者のGitHub通知設定に従い、個別のメッセージやIssueを自動投稿しない。
 
 ```bash
-bash .github/scripts/check-distribution.sh v0.16.0
-gh workflow run distribution-health.yml -f expected_version=v0.16.0
+bash .github/scripts/check-distribution.sh v0.16.1
+gh workflow run distribution-health.yml -f expected_version=v0.16.1
 ```
 
-## 証明書の復旧
+## 旧Webサイトの証明書を別途復旧する場合
+
+以下は旧ドメイン用の手順で、CLIの更新・リリースの前提条件ではない。
 
 1. 本番AWSに認証し、対象CloudFrontディストリビューションの現在の設定とETagを保存する。
 2. 関連付いているACM証明書をus-east-1で確認し、失効理由・検証方法・必要なDNS検証レコードを確認する。

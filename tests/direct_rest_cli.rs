@@ -206,6 +206,46 @@ fn native_reads_make_one_rest_request_each_and_preserve_full_json_and_cursors() 
 }
 
 #[test]
+fn quick_memo_list_preserves_status_and_cursor_with_one_scoped_rest_request() {
+    let page = json!({
+        "items": [{"id": ID, "content": "日本語のメモ", "status": "ready", "revision": 2,
+                   "recommendations": [{"goal_id": ID}]}],
+        "next_cursor": "next+/="
+    });
+    let fixture = Fixture::new(vec![("200 OK", json!({"data": page.clone()}))]);
+    let organization = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    let output = fixture.run(
+        "test-token",
+        &[
+            "quick-memo",
+            "list",
+            "--cursor",
+            "opaque+/=",
+            "--limit",
+            "5",
+            "--org",
+            organization,
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        page
+    );
+    assert_eq!(
+        fixture.paths(),
+        vec!["GET /api/v2/quick-memos?limit=5&cursor=opaque%2B%2F%3D HTTP/1.1"]
+    );
+    assert!(
+        fixture.requests.lock().unwrap()[0].contains(&format!("x-organization-id: {organization}"))
+    );
+}
+
+#[test]
 fn a_429_blocks_later_processes_before_network_but_not_other_api_keys() {
     let fixture = Fixture::new(vec![
         (
@@ -302,6 +342,8 @@ fn removed_mcp_and_invalid_native_arguments_fail_without_network() {
         vec!["mcp", "call", "get_goal"],
         vec!["crm", "get", "bad-id"],
         vec!["crm", "rows", ID, "--limit", "0"],
+        vec!["quick-memo", "list", "--limit", "0"],
+        vec!["quick-memo", "list", "--limit", "51"],
         vec!["member", "objectives", ID, "--created-after", "yesterday"],
     ] {
         assert!(!fixture.run("test-token", &args).status.success());

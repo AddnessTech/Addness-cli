@@ -23,6 +23,7 @@ mod member;
 mod notification;
 mod org;
 mod personal;
+mod quick_memo;
 mod rate_limit;
 mod referral;
 mod search;

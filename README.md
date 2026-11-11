@@ -96,6 +96,9 @@ addness member objectives <MEMBER_ID> --limit 100 --offset 0 --json
 addness crm list --query 商談 --json
 addness crm get <LIST_ID> --json
 addness crm rows <LIST_ID> --limit 100 --json
+
+# 自分のクイックメモと推薦の状態を1ページ取得
+addness quick-memo list --limit 20 --json
 # チャット画像を新しいファイルへ保存して表示ツールで開く
 addness chat attachment --room <ROOM_ID> --message <MESSAGE_ID> --attachment <ATTACHMENT_ID> --output ./image.png --json
 ```
@@ -244,6 +247,7 @@ addness challenge --help
 
 ### 個人スペース・横断機能
 
+- `quick-memo` — 自分の保存済みメモと推薦状態を取得。`list --limit 20 --cursor <cursor> --org <organization-id> --json` でページ・組織を指定でき、後続ページは自動取得しない。
 - `personal` — 個人組織の作成、組織横断の today 一覧・活動ヒートマップ。例: `addness personal today-list --json`
 - `search` — 目標・コメント・メンバーの横断検索。例: `addness search "リリース" --json`
 - `diagnosis` — 診断結果（ゴールスタイル・価値観・コアバリュー・マスタープラン）の保存・参照。

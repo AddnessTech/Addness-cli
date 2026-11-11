@@ -28,6 +28,7 @@ pub mod member;
 pub mod notification;
 pub mod org;
 pub mod personal;
+pub mod quick_memo;
 pub mod referral;
 pub mod search;
 pub mod skills;

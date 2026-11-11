@@ -281,6 +281,7 @@ addness member objectives <MEMBER_ID> --include-completed --created-after 2026-1
 addness crm list --query 商談 --json
 addness crm get <LIST_ID> --json
 addness crm rows <LIST_ID> --limit 100 --json
+addness quick-memo list --limit 20 --json
 # 続きは応答のcursorを --cursor に渡す
 # チャットの添付を保存して、画像表示ツールで読む
 addness chat attachment --room <ROOM_ID> --message <MESSAGE_ID> --attachment <ATTACHMENT_ID> --output ./image.png --json

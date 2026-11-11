@@ -13,8 +13,8 @@ use api::ApiClient;
 use cli::commands::{
     activity, assignment, challenge, chat, comment, configure, consent, core_values, crm,
     deliverable, desktop_auth, detect, diagnosis, execution, form, goal, invitation, issue, link,
-    login, master_plan, media, meeting, member, notification, org, personal, referral, search,
-    skills, streak, summary, today, update, user,
+    login, master_plan, media, meeting, member, notification, org, personal, quick_memo, referral,
+    search, skills, streak, summary, today, update, user,
 };
 
 #[derive(Parser)]
@@ -32,6 +32,8 @@ struct Cli {
 enum Commands {
     /// Read CRM lists and customer rows directly through REST
     Crm(crm::CrmArgs),
+    /// Read your quick memos and their background recommendation state
+    QuickMemo(quick_memo::QuickMemoArgs),
     /// Log in via browser (recommended for first setup)
     Login {
         /// API base URL
@@ -259,6 +261,7 @@ impl Cli {
 fn command_outputs_json(command: &Commands) -> bool {
     match command {
         Commands::Crm(args) => args.json,
+        Commands::QuickMemo(args) => args.json,
         Commands::Status { json }
         | Commands::Summary { json, .. }
         | Commands::Search { json, .. }
@@ -886,6 +889,10 @@ async fn main() -> Result<()> {
         Some(Commands::Crm(args)) => {
             let client = build_client_for_organization(args.org.as_deref())?;
             crm::handle_crm(args, &client).await
+        }
+        Some(Commands::QuickMemo(args)) => {
+            let client = build_client_for_organization(args.org.as_deref())?;
+            quick_memo::handle_quick_memo(args, &client).await
         }
         None => {
             let client = build_tui_client().await?;

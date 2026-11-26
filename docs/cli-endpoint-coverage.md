@@ -150,8 +150,10 @@ CLIから叩く実装対象として扱わない（DoDの分母から除外す�
 | GET | /api/v1/team/organizations/:id | `org get` | 実装済み |
 | DELETE | /api/v1/team/organizations/:id | `org rm` | 実装済み |
 | GET | /api/v1/team/organizations/:id/organization_members | - | 対象外（v1レガシー重複: v2 members系で代替可能） |
-| GET | /api/v1/team/organizations/:id/root_owner | `org root-owner` | 実装済み |
-| GET | /api/v1/team/organizations/:id/accessible_root | `org accessible-root` | 実装済み |
+| GET | /api/v1/team/organizations/:id/root_owner | - | 対象外（v1レガシー重複: v2 `org root-owner` で代替済み） |
+| GET | /api/v2/organizations/:id/root-owner | `org root-owner` | 実装済み |
+| GET | /api/v1/team/organizations/:id/accessible_root | - | 対象外（v1レガシー重複: v2 `org accessible-root` で代替済み） |
+| GET | /api/v2/organizations/:id/accessible-root | `org accessible-root` | 実装済み |
 | GET | /api/v1/team/organizations/:id/ai_agent_member | `org ai-agent-member` | 実装済み |
 | GET | /api/v1/team/organizations/:id/access-state | `org access-state` | 実装済み |
 | POST | /api/v1/team/organizations/:id/push_tokens | `org push-token-register` | 実装済み |

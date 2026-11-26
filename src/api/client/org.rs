@@ -79,16 +79,18 @@ impl ApiClient {
         Ok(resp.data)
     }
 
-    /// GET /api/v1/team/organizations/:id/root_owner
+    /// GET /api/v2/organizations/:id/root-owner — requires an X-Organization-ID header
+    /// (`client_for_org` sets it to the same organization).
     pub async fn get_organization_root_owner(&self, org_id: &str) -> Result<Value> {
-        let path = format!("/api/v1/team/organizations/{org_id}/root_owner");
+        let path = format!("/api/v2/organizations/{org_id}/root-owner");
         let resp: ApiResponse<Value> = self.get(&path).await?;
         Ok(resp.data)
     }
 
-    /// GET /api/v1/team/organizations/:id/accessible_root
+    /// GET /api/v2/organizations/:id/accessible-root — requires an X-Organization-ID header
+    /// (`client_for_org` sets it to the same organization).
     pub async fn get_organization_accessible_root(&self, org_id: &str) -> Result<Value> {
-        let path = format!("/api/v1/team/organizations/{org_id}/accessible_root");
+        let path = format!("/api/v2/organizations/{org_id}/accessible-root");
         let resp: ApiResponse<Value> = self.get(&path).await?;
         Ok(resp.data)
     }

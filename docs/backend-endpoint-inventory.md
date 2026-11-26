@@ -164,6 +164,8 @@
 | GET | /api/v1/team/organizations/:id/organization_members | organizationHandler.GetMembers | Clerk/APIKey | 組織メンバー一覧（v1） |
 | GET | /api/v1/team/organizations/:id/root_owner | organizationHandler.GetRootOwner | Clerk/APIKey | ルートオーナー取得 |
 | GET | /api/v1/team/organizations/:id/accessible_root | organizationHandler.GetAccessibleRoot | Clerk/APIKey | アクセス可能ルート取得 |
+| GET | /api/v2/organizations/:id/root-owner | organizationV2Handler.GetRootOwner | Clerk/APIKey | ルートオーナー取得（v2、X-Organization-ID 必須） |
+| GET | /api/v2/organizations/:id/accessible-root | organizationV2Handler.GetAccessibleRoot | Clerk/APIKey | アクセス可能ルート取得（v2、X-Organization-ID 必須） |
 | GET | /api/v1/team/organizations/:id/ai_agent_member | organizationHandler.GetAIAgentMember | Clerk/APIKey | AIエージェントメンバー取得 |
 | GET | /api/v1/team/organizations/:id/access-state | organizationHandler.GetAccessState | Clerk/APIKey | 課金アクセス状態取得 |
 | POST | /api/v1/team/organizations/:id/push_tokens | pushTokenHandler.Register | Clerk/APIKey | プッシュ通知トークン登録 |

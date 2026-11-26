@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-// GET /api/v1/team/organizations/:id/activity-logs/by-member
-// GET /api/v1/team/organizations/:id/activity-logs/objectives/:goalId
+// GET /api/v2/organizations/:id/activity-logs/by-member
+// GET /api/v2/organizations/:id/activity-logs/objectives/:goalId
 // レスポンスは `{"data": ..., "message": "success"}` でラップされる
 // （presentation/handlers/team.BaseHandler.RespondWithJSON がラップするため）。
 #[derive(Debug, Serialize, Deserialize)]
@@ -99,7 +99,7 @@ pub struct ActivityLogValueChange {
     pub after_value: String,
 }
 
-// GET /api/v1/team/organizations/:id/activity-logs/summary
+// GET /api/v2/organizations/:id/activity-logs/summary
 // `{"data": ..., "message": "success"}` でラップされる。
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

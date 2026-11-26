@@ -587,6 +587,10 @@ v1（`/api/v1/team/objectives`, Clerk/APIKey+Sub）、v2（`/api/v2/objectives`,
 | GET | /api/v1/team/organizations/:id/activity-logs/by-member | activityLogHandler.GetByMember | Clerk/APIKey+Sub | メンバー別アクティビティ（v1） |
 | GET | /api/v1/team/organizations/:id/activity-logs/objectives/:goalId | activityLogHandler.GetByGoal | Clerk/APIKey+Sub | ゴール別アクティビティ（v1） |
 | GET | /api/v1/team/organizations/:id/activity-logs/summary | activityLogHandler.GetSummary | Clerk/APIKey+Sub | アクティビティサマリ（v1） |
+| GET | /api/v2/organizations/:id/activity-logs | activityLogHandler.GetByOrganization | Clerk/APIKey+Sub | 組織のアクティビティ一覧（v2、X-Organization-ID 必須、処理は v1 と同じ） |
+| GET | /api/v2/organizations/:id/activity-logs/by-member | activityLogHandler.GetByMember | Clerk/APIKey+Sub | メンバー別アクティビティ（v2、X-Organization-ID 必須、処理は v1 と同じ） |
+| GET | /api/v2/organizations/:id/activity-logs/objectives/:goalId | activityLogHandler.GetByGoal | Clerk/APIKey+Sub | ゴール別アクティビティ（v2、X-Organization-ID 必須、処理は v1 と同じ） |
+| GET | /api/v2/organizations/:id/activity-logs/summary | activityLogHandler.GetSummary | Clerk/APIKey+Sub | アクティビティサマリ（v2、X-Organization-ID 必須、処理は v1 と同じ） |
 | GET | /api/v2/organizations/:id/activity-logs/objectives/:goalId/summary | activityLogV2Handler.GetGoalSummary | Clerk/APIKey+Sub | ゴールアクティビティウィジェット用サマリ（v2） |
 
 ## 17. ミーティング (Huddle音声通話 / Meeting Bot / Meeting Note・Minutes)

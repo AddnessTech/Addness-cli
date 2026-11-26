@@ -6,7 +6,7 @@ use crate::api::{
     ActivityLogSummaryParams, ApiClient, GoalActivitySummaryParams,
 };
 use crate::cli::commands::member::resolve_self_member_id;
-use crate::cli::commands::org::resolve_org_id;
+use crate::cli::commands::org::{client_for_org, resolve_org_id};
 
 #[derive(Subcommand)]
 pub enum ActivityCommands {
@@ -163,6 +163,8 @@ pub async fn handle_activity(cmd: &ActivityCommands, client: &ApiClient) -> Resu
             json,
         } => {
             let org_id = resolve_org_id(org.as_deref())?;
+            // v2 の組織の口はヘッダーの組織が path と同じことを求めるので、--org の組織で揃えた client だけを使う。
+            let client = &client_for_org(client, &org_id);
             let member_id = match member {
                 Some(id) => id.clone(),
                 None => resolve_self_member_id(client, &org_id).await?,
@@ -202,6 +204,8 @@ pub async fn handle_activity(cmd: &ActivityCommands, client: &ApiClient) -> Resu
             json,
         } => {
             let org_id = resolve_org_id(org.as_deref())?;
+            // v2 の組織の口はヘッダーの組織が path と同じことを求めるので、--org の組織で揃えた client だけを使う。
+            let client = &client_for_org(client, &org_id);
             let event_types = flatten_values(event_type);
             let resp = client
                 .list_activity_logs_by_goal(
@@ -231,6 +235,8 @@ pub async fn handle_activity(cmd: &ActivityCommands, client: &ApiClient) -> Resu
             json,
         } => {
             let org_id = resolve_org_id(org.as_deref())?;
+            // v2 の組織の口はヘッダーの組織が path と同じことを求めるので、--org の組織で揃えた client だけを使う。
+            let client = &client_for_org(client, &org_id);
             let resp = client
                 .get_activity_log_summary(
                     &org_id,
@@ -269,6 +275,8 @@ pub async fn handle_activity(cmd: &ActivityCommands, client: &ApiClient) -> Resu
             json,
         } => {
             let org_id = resolve_org_id(org.as_deref())?;
+            // v2 の組織の口はヘッダーの組織が path と同じことを求めるので、--org の組織で揃えた client だけを使う。
+            let client = &client_for_org(client, &org_id);
             let resp = client
                 .get_goal_activity_summary(
                     &org_id,

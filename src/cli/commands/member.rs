@@ -2,19 +2,7 @@ use anyhow::{Result, bail};
 use clap::Subcommand;
 
 use crate::api::{ApiClient, BrowseMembersParams, MemberObjectivesParams};
-use crate::cli::commands::org::resolve_org_id;
-
-/// Build a client whose `X-Organization-ID` header targets `org_id`.
-///
-/// Mirrors `org::client_for_org`. Duplicated here (rather than imported, since
-/// the original is private to `org.rs`) because several new member endpoints
-/// resolve their organization purely from the header — or need the header to
-/// match an explicit `--org` even when the path also carries an organization id.
-fn client_for_org(client: &ApiClient, org_id: &str) -> ApiClient {
-    let mut scoped = client.clone();
-    scoped.set_org_id(Some(org_id.to_string()));
-    scoped
-}
+use crate::cli::commands::org::{client_for_org, resolve_org_id};
 
 /// Print a JSON value as pretty-printed text (mirrors `org::print_json_value`,
 /// used by the read-only subcommands whose response shapes vary per endpoint).

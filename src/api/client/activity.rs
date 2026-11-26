@@ -69,7 +69,7 @@ impl ApiClient {
             }
             query.finish()
         };
-        let path = format!("/api/v1/team/organizations/{org_id}/activity-logs/by-member?{query}");
+        let path = format!("/api/v2/organizations/{org_id}/activity-logs/by-member?{query}");
         let resp: ApiResponse<ActivityLogListResponse> = self.get(&path).await?;
         Ok(resp.data)
     }
@@ -107,9 +107,8 @@ impl ApiClient {
         } else {
             format!("?{query}")
         };
-        let path = format!(
-            "/api/v1/team/organizations/{org_id}/activity-logs/objectives/{goal_id}{suffix}"
-        );
+        let path =
+            format!("/api/v2/organizations/{org_id}/activity-logs/objectives/{goal_id}{suffix}");
         let resp: ApiResponse<ActivityLogListResponse> = self.get(&path).await?;
         Ok(resp.data)
     }
@@ -134,7 +133,7 @@ impl ApiClient {
         } else {
             format!("?{query}")
         };
-        let path = format!("/api/v1/team/organizations/{org_id}/activity-logs/summary{suffix}");
+        let path = format!("/api/v2/organizations/{org_id}/activity-logs/summary{suffix}");
         let resp: ApiResponse<ActivityLogSummaryResponse> = self.get(&path).await?;
         Ok(resp.data)
     }

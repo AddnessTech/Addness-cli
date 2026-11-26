@@ -411,7 +411,7 @@ comment mutation は Goal Issue v2 を優先し、v2 で表現できない legac
 
 ## 16. アクティビティログ (Activity Log)
 
-メンバー別/ゴール別/サマリ/ゴールサマリ（すべて v2 の `/api/v2/organizations/:id/activity-logs*`）: 全4本 **実装済み**（`activity list` / `activity goal` / `activity summary` / `activity goal-summary`）。v1 の `/api/v1/team/organizations/:id/activity-logs*` は v2 で代替済みのため対象外。
+メンバー別/ゴール別/サマリ/ゴールサマリ（すべて v2 の `/api/v2/organizations/:id/activity-logs*`）: 全4本 **実装済み**（`activity list` / `activity goal` / `activity summary` / `activity goal-summary`）。v1 の `/api/v1/team/organizations/:id/activity-logs*` は v2 で代替済みのため対象外。組織全体の一覧 `GET /api/v2/organizations/:id/activity-logs` は未実装（`activity list` はメンバー別の `/by-member` を呼ぶ）。
 
 ## 17. ミーティング (Huddle音声通話 / Meeting Bot / Meeting Note・Minutes)
 

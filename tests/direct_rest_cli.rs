@@ -243,18 +243,25 @@ fn org_root_reads_use_v2_routes_with_the_argument_organization_header() {
 #[test]
 fn activity_reads_use_v2_routes_with_the_flag_organization_header() {
     // 既定の組織（ADDNESS_ORG_ID）と違う組織を --org で渡し、その組織が URL とヘッダーの両方に載ることを確かめる。
+    // --member を省いた list は、自分のメンバーを探す要求も同じ組織のヘッダーで送る。
     const OTHER: &str = "99999999-8888-4777-8666-555555555555";
+    let members = json!({"data":{"members":[{"id":ID,"name":"自分","isCurrentUser":true}]},"message":"success"});
     let list = json!({"data":{"items":[],"hasMore":false},"message":"success"});
     let summary = json!({"data":{"totalCount":0,"countByCategory":{},"mostActiveMembers":[]},"message":"success"});
+    let goal_summary =
+        json!({"data":{"members":[],"createdTotal":0,"completedTotal":0},"message":"success"});
     let fixture = Fixture::new(vec![
+        ("200 OK", members),
         ("200 OK", list.clone()),
-        ("200 OK", list.clone()),
-        ("200 OK", summary.clone()),
+        ("200 OK", list),
+        ("200 OK", summary),
+        ("200 OK", goal_summary),
     ]);
     for args in [
-        vec!["activity", "list", "--org", OTHER, "--member", ID],
+        vec!["activity", "list", "--org", OTHER],
         vec!["activity", "goal", ID, "--org", OTHER],
         vec!["activity", "summary", "--org", OTHER],
+        vec!["activity", "goal-summary", ID, "--org", OTHER],
     ] {
         let output = fixture.run("test-token", &args);
         assert!(
@@ -266,17 +273,41 @@ fn activity_reads_use_v2_routes_with_the_flag_organization_header() {
     assert_eq!(
         fixture.paths(),
         vec![
+            format!("GET /api/v2/organizations/{OTHER}/members?pageSize=100 HTTP/1.1"),
             format!(
                 "GET /api/v2/organizations/{OTHER}/activity-logs/by-member?member_id={ID} HTTP/1.1"
             ),
             format!("GET /api/v2/organizations/{OTHER}/activity-logs/objectives/{ID} HTTP/1.1"),
             format!("GET /api/v2/organizations/{OTHER}/activity-logs/summary HTTP/1.1"),
+            format!(
+                "GET /api/v2/organizations/{OTHER}/activity-logs/objectives/{ID}/summary HTTP/1.1"
+            ),
         ]
     );
     for request in fixture.requests.lock().unwrap().iter() {
         assert!(request.contains(&format!("x-organization-id: {OTHER}")));
         assert!(request.contains("authorization: Bearer test-token"));
     }
+}
+
+#[test]
+fn activity_reads_without_org_flag_use_the_default_organization() {
+    let summary = json!({"data":{"totalCount":0,"countByCategory":{},"mostActiveMembers":[]},"message":"success"});
+    let fixture = Fixture::new(vec![("200 OK", summary)]);
+    let output = fixture.run("test-token", &["activity", "summary"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fixture.paths(),
+        vec![format!(
+            "GET /api/v2/organizations/{ID}/activity-logs/summary HTTP/1.1"
+        )]
+    );
+    let requests = fixture.requests.lock().unwrap();
+    assert!(requests[0].contains(&format!("x-organization-id: {ID}")));
 }
 
 #[test]

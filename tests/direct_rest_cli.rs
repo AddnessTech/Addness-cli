@@ -206,6 +206,41 @@ fn native_reads_make_one_rest_request_each_and_preserve_full_json_and_cursors() 
 }
 
 #[test]
+fn org_root_reads_use_v2_routes_with_the_argument_organization_header() {
+    // 既定の組織（ADDNESS_ORG_ID）と違う組織を引数で渡し、その組織が URL とヘッダーの両方に載ることを確かめる。
+    const OTHER: &str = "99999999-8888-4777-8666-555555555555";
+    let root = json!({"data":{"id":ID,"title":"起点"},"message":"success"});
+    let owner = json!({"data":{"id":ID,"name":"責任者"},"message":"success"});
+    let fixture = Fixture::new(vec![("200 OK", root.clone()), ("200 OK", owner.clone())]);
+    for (args, reply) in [
+        (["org", "accessible-root", OTHER], &root),
+        (["org", "root-owner", OTHER], &owner),
+    ] {
+        let output = fixture.run("test-token", &args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+            reply["data"]
+        );
+    }
+    assert_eq!(
+        fixture.paths(),
+        vec![
+            format!("GET /api/v2/organizations/{OTHER}/accessible-root HTTP/1.1"),
+            format!("GET /api/v2/organizations/{OTHER}/root-owner HTTP/1.1"),
+        ]
+    );
+    for request in fixture.requests.lock().unwrap().iter() {
+        assert!(request.contains(&format!("x-organization-id: {OTHER}")));
+        assert!(request.contains("authorization: Bearer test-token"));
+    }
+}
+
+#[test]
 fn a_429_blocks_later_processes_before_network_but_not_other_api_keys() {
     let fixture = Fixture::new(vec![
         (

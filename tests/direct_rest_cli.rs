@@ -241,6 +241,45 @@ fn org_root_reads_use_v2_routes_with_the_argument_organization_header() {
 }
 
 #[test]
+fn activity_reads_use_v2_routes_with_the_flag_organization_header() {
+    // 既定の組織（ADDNESS_ORG_ID）と違う組織を --org で渡し、その組織が URL とヘッダーの両方に載ることを確かめる。
+    const OTHER: &str = "99999999-8888-4777-8666-555555555555";
+    let list = json!({"data":{"items":[],"hasMore":false},"message":"success"});
+    let summary = json!({"data":{"totalCount":0,"countByCategory":{},"mostActiveMembers":[]},"message":"success"});
+    let fixture = Fixture::new(vec![
+        ("200 OK", list.clone()),
+        ("200 OK", list.clone()),
+        ("200 OK", summary.clone()),
+    ]);
+    for args in [
+        vec!["activity", "list", "--org", OTHER, "--member", ID],
+        vec!["activity", "goal", ID, "--org", OTHER],
+        vec!["activity", "summary", "--org", OTHER],
+    ] {
+        let output = fixture.run("test-token", &args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(
+        fixture.paths(),
+        vec![
+            format!(
+                "GET /api/v2/organizations/{OTHER}/activity-logs/by-member?member_id={ID} HTTP/1.1"
+            ),
+            format!("GET /api/v2/organizations/{OTHER}/activity-logs/objectives/{ID} HTTP/1.1"),
+            format!("GET /api/v2/organizations/{OTHER}/activity-logs/summary HTTP/1.1"),
+        ]
+    );
+    for request in fixture.requests.lock().unwrap().iter() {
+        assert!(request.contains(&format!("x-organization-id: {OTHER}")));
+        assert!(request.contains("authorization: Bearer test-token"));
+    }
+}
+
+#[test]
 fn a_429_blocks_later_processes_before_network_but_not_other_api_keys() {
     let fixture = Fixture::new(vec![
         (

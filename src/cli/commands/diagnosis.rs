@@ -3,7 +3,7 @@ use clap::{Subcommand, ValueEnum};
 use colored::Colorize;
 
 use crate::api::{ApiClient, DiagnosisMemberProfile};
-use crate::cli::commands::org::resolve_org_id;
+use crate::cli::commands::org::{client_for_org, resolve_org_id};
 
 /// Diagnosis kind (`domain/models/diagnosis`). `GoalStyle`/`Values` require a
 /// `type_code`; `CoreValues`/`MasterPlan` are free-form markdown results.
@@ -30,14 +30,6 @@ impl DiagnosisKind {
     fn supports_stats(self) -> bool {
         matches!(self, DiagnosisKind::GoalStyle | DiagnosisKind::Values)
     }
-}
-
-/// Build a client whose `X-Organization-ID` header targets `org_id`.
-/// Mirrors `member::client_for_org`.
-fn client_for_org(client: &ApiClient, org_id: &str) -> ApiClient {
-    let mut scoped = client.clone();
-    scoped.set_org_id(Some(org_id.to_string()));
-    scoped
 }
 
 #[derive(Subcommand)]

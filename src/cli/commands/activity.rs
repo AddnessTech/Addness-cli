@@ -6,7 +6,7 @@ use crate::api::{
     ActivityLogSummaryParams, ApiClient, GoalActivitySummaryParams,
 };
 use crate::cli::commands::member::resolve_self_member_id;
-use crate::cli::commands::org::resolve_org_id;
+use crate::cli::commands::org::{client_for_org, resolve_org_id};
 
 #[derive(Subcommand)]
 pub enum ActivityCommands {
@@ -169,7 +169,7 @@ pub async fn handle_activity(cmd: &ActivityCommands, client: &ApiClient) -> Resu
             };
             let event_types = flatten_values(event_type);
             let event_categories = flatten_values(event_category);
-            let resp = client
+            let resp = client_for_org(client, &org_id)
                 .list_activity_logs_by_member(
                     &org_id,
                     ActivityLogByMemberParams {
@@ -203,7 +203,7 @@ pub async fn handle_activity(cmd: &ActivityCommands, client: &ApiClient) -> Resu
         } => {
             let org_id = resolve_org_id(org.as_deref())?;
             let event_types = flatten_values(event_type);
-            let resp = client
+            let resp = client_for_org(client, &org_id)
                 .list_activity_logs_by_goal(
                     &org_id,
                     goal_id,
@@ -231,7 +231,7 @@ pub async fn handle_activity(cmd: &ActivityCommands, client: &ApiClient) -> Resu
             json,
         } => {
             let org_id = resolve_org_id(org.as_deref())?;
-            let resp = client
+            let resp = client_for_org(client, &org_id)
                 .get_activity_log_summary(
                     &org_id,
                     ActivityLogSummaryParams {
@@ -269,7 +269,7 @@ pub async fn handle_activity(cmd: &ActivityCommands, client: &ApiClient) -> Resu
             json,
         } => {
             let org_id = resolve_org_id(org.as_deref())?;
-            let resp = client
+            let resp = client_for_org(client, &org_id)
                 .get_goal_activity_summary(
                     &org_id,
                     goal_id,

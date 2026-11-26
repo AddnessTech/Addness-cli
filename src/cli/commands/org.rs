@@ -253,7 +253,7 @@ pub enum AdSettingsCommands {
 /// several handlers additionally require the header org to equal the path `:id`,
 /// so id-scoped subcommands must send the header for the organization named in
 /// the argument rather than the shell's current organization.
-fn client_for_org(client: &ApiClient, id: &str) -> ApiClient {
+pub(crate) fn client_for_org(client: &ApiClient, id: &str) -> ApiClient {
     let mut scoped = client.clone();
     scoped.set_org_id(Some(id.to_string()));
     scoped
